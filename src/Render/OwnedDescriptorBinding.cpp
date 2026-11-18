@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <stdexcept>
+#include <string>
 #include "Render/DescriptorHeap.h"
 #include "Render/PublicationBindingBundle.h"
 #include "Render/Runtime/ResourceCleanupQueue.h"
@@ -36,12 +37,21 @@ OwnedDescriptorBinding OwnedDescriptorBinding::CaptureResourceView(
     state->slot = slot;
     state->identity = {deviceGeneration, (uint64_t{slot.heap.generation} << 32) | slot.heap.index,
         snapshot->backingGeneration, nextBinding.fetch_add(1, std::memory_order_relaxed)};
-    // The snapshot owns both the allocation and descriptor lease; unlike the
-    // factory path this state must never call ReleaseDescriptor itself.
+    // The snapshot owns both the allocation and the descriptor lease. Unlike
+    // the factory path, this state must never call ReleaseDescriptor itself.
     state->backingOwner = std::move(snapshot);
     OwnedDescriptorBinding result;
     result.m_state = std::move(state);
     return result;
+}
+
+OwnedDescriptorBinding OwnedDescriptorBinding::CaptureUndeclaredView(
+    std::shared_ptr<const ResourceBindingSnapshot> snapshot, const BindlessViewRequest& view,
+    uint64_t deviceGeneration, std::shared_ptr<runtime::ResourceCleanupQueue> cleanup) {
+    if (snapshot && !snapshot->externallyImmutable)
+        throw std::logic_error("Resource " + std::to_string(snapshot->resourceID) + " is graph-managed, so shaders can't read it "
+            "through a descriptor the graph doesn't know about: the graph would not transition it or order its writes");
+    return CaptureResourceView(std::move(snapshot), view, deviceGeneration, std::move(cleanup));
 }
 
 OwnedDescriptorBinding OwnedDescriptorBinding::CaptureSampler(uint32_t index, uint64_t deviceGeneration,

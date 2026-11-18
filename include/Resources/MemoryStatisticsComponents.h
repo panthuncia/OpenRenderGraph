@@ -35,6 +35,22 @@ namespace MemoryStatisticsComponents
 		std::string usage;
 	};
 
+	// Who the memory is for (a host's subsystem or feature); '/' nests levels.
+	struct ResourceOwner {
+		std::string owner;
+	};
+
+	// The allocation is placed in an aliasing pool's memory, which the pool's own entity counts.
+	struct PlacedInAliasPool {
+		uint64_t poolID = 0;
+	};
+
+	// The heap an allocation was made in, which is a buffer's access type. An allocation without one is device-local,
+	// as textures are.
+	struct HeapKind {
+		rhi::HeapType type = rhi::HeapType::DeviceLocal;
+	};
+
 	struct TextureShape {
 		uint32_t width = 0;
 		uint32_t height = 0;

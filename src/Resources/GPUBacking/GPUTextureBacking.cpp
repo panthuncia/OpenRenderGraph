@@ -14,7 +14,6 @@
 
 namespace org {
 
-namespace {
 uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
 {
 	if (desc.imageDimensions.empty()) {
@@ -38,6 +37,52 @@ uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
 
 	return 1;
 }
+
+rhi::ResourceDesc TextureResourceDesc(const TextureDescription& desc)
+{
+	uint32_t arraySize = desc.arraySize;
+	if (!desc.isArray && !desc.isCubemap) {
+		arraySize = 1;
+	}
+	auto width = desc.imageDimensions[0].width;
+	auto height = desc.imageDimensions[0].height;
+	if (desc.type == rhi::ResourceType::Texture1D) height = 1;
+	if (desc.padInternalResolution) { // Pad the width and height to the next power of two
+		width = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(width)))));
+		height = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(height)))));
+	}
+	rhi::ResourceDesc textureDesc{
+		.type = desc.type,
+		.queueSharing = desc.queueSharing,
+		.texture = {
+			.format = desc.format,
+			.width = static_cast<uint32_t>(width),
+			.height = static_cast<uint32_t>(height),
+			.depthOrLayers = static_cast<uint16_t>(desc.type == rhi::ResourceType::Texture3D ?
+				desc.depth : (desc.isCubemap ? 6 * arraySize : arraySize)),
+			.mipLevels = ResolveTextureMipLevels(desc),
+			.sampleCount = desc.sampleCount,
+			.initialLayout = desc.initialLayout,
+			.optimizedClear = nullptr
+		}
+	};
+	if (desc.isCubemap) {
+		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_TextureCubeCompatible;
+	}
+	if (desc.hasRTV) {
+		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowRenderTarget;
+	}
+	if (desc.hasDSV) {
+		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowDepthStencil;
+	}
+	if (desc.hasUAV) {
+		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
+	}
+	// The span points into desc: the caller uses the description while desc is alive.
+	const auto castableCount = static_cast<uint32_t>(desc.castableFormats.size());
+	const rhi::Format* castable = castableCount ? desc.castableFormats.data() : nullptr;
+	textureDesc.castableFormats = rhi::Span<rhi::Format>(castable, castableCount);
+	return textureDesc;
 }
 
 GpuTextureBacking::GpuTextureBacking(CreateTag)
@@ -47,8 +92,8 @@ GpuTextureBacking::GpuTextureBacking(CreateTag)
 
 GpuTextureBacking::~GpuTextureBacking()
 {
-	UnregisterLiveAlloc();
-	DeletionManager::GetInstance().MarkForDelete(std::move(m_textureHandle));
+	auto name = UnregisterLiveAlloc();
+	DeletionManager::GetInstance().MarkForDelete(std::move(m_textureHandle), std::move(name));
 }
 
 std::unique_ptr<GpuTextureBacking>
@@ -58,9 +103,6 @@ GpuTextureBacking::CreateUnique(const TextureDescription& desc,
 {
 	auto pb = std::make_unique<GpuTextureBacking>(CreateTag{});
 	pb->initialize(desc, owningResourceID, nullptr, name);
-#if BUILD_TYPE == BUILD_DEBUG
-	pb->m_creation = std::stacktrace::current();
-#endif
 	return std::move(pb);
 }
 
@@ -72,9 +114,6 @@ GpuTextureBacking::CreateUnique(const TextureDescription& desc,
 {
 	auto pb = std::make_unique<GpuTextureBacking>(CreateTag{});
 	pb->initialize(desc, owningResourceID, &placement, name);
-#if BUILD_TYPE == BUILD_DEBUG
-	pb->m_creation = std::stacktrace::current();
-#endif
 	return std::move(pb);
 }
 
@@ -93,28 +132,6 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	m_desc = desc;
     if (placement && !placement->heap) throw std::invalid_argument("Missing alias heap owner");
 	DescriptorHeapManager& rm = DescriptorHeapManager::GetInstance();
-
-	// Honor explicit subresource chains for file-backed textures and caches.
-	uint16_t mipLevels = ResolveTextureMipLevels(desc);
-
-	// Determine the array size
-	uint32_t arraySize = desc.arraySize;
-	if (!desc.isArray && !desc.isCubemap) {
-		arraySize = 1;
-	}
-
-	// Create the texture resource description
-	auto width = desc.imageDimensions[0].width;
-	auto height = desc.imageDimensions[0].height;
-	if (desc.type == rhi::ResourceType::Texture1D) height = 1;
-	if (desc.padInternalResolution) { // Pad the width and height to the next power of two
-		width = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(width)))));
-		height = std::max(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(height)))));
-	}
-
-	if (width > std::numeric_limits<uint32_t>().max() || height > std::numeric_limits<uint32_t>().max()) {
-		spdlog::error("Texture dimensions above uint32_max not implemented");
-	}
 
 	// Handle clear values for RTV and DSV
 	rhi::ClearValue* clearValue = nullptr;
@@ -137,33 +154,10 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 		clearValue = &colorClearValue;
 	}
 
-	rhi::ResourceDesc textureDesc{
-		.type = desc.type,
-		.queueSharing = desc.queueSharing,
-		.texture = {
-			.format = desc.format,
-			.width = static_cast<uint32_t>(width),
-			.height = static_cast<uint32_t>(height),
-			.depthOrLayers = static_cast<uint16_t>(desc.type == rhi::ResourceType::Texture3D ?
-				desc.depth : (desc.isCubemap ? 6 * arraySize : arraySize)),
-			.mipLevels = mipLevels,
-			.sampleCount = desc.sampleCount,
-			.initialLayout = desc.initialLayout,
-			.optimizedClear = clearValue
-		}
-	};
-	if (desc.isCubemap) {
-		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_TextureCubeCompatible;
-	}
-	if (desc.hasRTV) {
-		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowRenderTarget;
-	}
-	if (desc.hasDSV) {
-		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowDepthStencil;
-	}
-	if (desc.hasUAV) {
-		textureDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
-	}
+	rhi::ResourceDesc textureDesc = TextureResourceDesc(desc);
+	textureDesc.texture.optimizedClear = clearValue;
+	const auto castableCount = static_cast<UINT32>(desc.castableFormats.size());
+	const rhi::Format* castable = castableCount ? desc.castableFormats.data() : nullptr;
 	// Create the texture resource
 
 	AllocationTrackDesc trackDesc(static_cast<int>(owningResourceID));
@@ -173,10 +167,10 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	}
 
 	auto device = DeviceManager::GetInstance().GetDevice();
-	// Vulkan images are born in UNDEFINED (the only other legal initial layout is
-	// PREINITIALIZED for linear host-written images).  ResourceLayout::Common is
-	// a useful D3D12 creation state, but treating it as GENERAL in Vulkan's
-	// symbolic tracker skips the first real layout transition and makes uploads
+	// Vulkan images start in UNDEFINED. The only other legal initial layout is
+	// PREINITIALIZED, for linear images that the host writes. ResourceLayout::Common
+	// is a useful creation state on D3D12. But if Vulkan's symbolic tracker treats it
+	// as GENERAL, the tracker skips the first real layout transition. Uploads then
 	// submit an image that validation still knows is UNDEFINED.
 	rhi::VulkanDeviceInfo vulkanDeviceInfo{};
 	const bool vulkanInitialUndefined = rhi::QueryNativeDevice(
@@ -217,14 +211,15 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 		if (placement->poolID.has_value()) {
 			allocationBundle.Set<MemoryStatisticsComponents::AliasingPool>({ placement->poolID });
 		}
+		allocationBundle.Set<MemoryStatisticsComponents::PlacedInAliasPool>({ placement->poolID.value_or(0) });
 		trackDesc.attach = allocationBundle;
 
 		const auto result = DeviceManager::GetInstance().CreateAliasingResourceTracked(
 			placement->heap->Allocation(),
 			placement->offset,
 			textureDesc,
-			0,
-			nullptr,
+			castableCount,
+			castable,
 			m_textureHandle,
 			trackDesc);
 		if (!rhi::IsOk(result)) {
@@ -241,13 +236,16 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 		const auto result = DeviceManager::GetInstance().CreateResourceTracked(
 			allocationDesc,
 			textureDesc,
-			0,
-			nullptr,
+			castableCount,
+			castable,
 			m_textureHandle,
 			trackDesc);
 		if (!rhi::IsOk(result)) {
 			throw std::runtime_error("Failed to create committed texture resource backing");
 		}
+		const rhi::ResidencyPriority priority = desc.residencyPriority.value_or(
+			desc.hasRTV || desc.hasDSV || desc.hasUAV ? rhi::ResidencyPriorityHigh : rhi::ResidencyPriorityNormal);
+		if (priority != rhi::ResidencyPriorityNormal) DeviceManager::GetInstance().SetResidencyPriority(m_textureHandle, priority);
 
 		//auto result = device.CreateCommittedResource(textureDesc, textureResource);
 	}
@@ -359,10 +357,15 @@ void GpuTextureBacking::RegisterLiveAlloc() {
 	liveAllocs[this] = info;
 }
 
-void GpuTextureBacking::UnregisterLiveAlloc() {
+std::string GpuTextureBacking::UnregisterLiveAlloc() {
 	auto& liveAllocs = LiveAllocs();
 	std::scoped_lock lock(LiveAllocMutex());
-	liveAllocs.erase(this);
+	std::string name;
+	if (auto it = liveAllocs.find(this); it != liveAllocs.end()) {
+		name = std::move(it->second.name);
+		liveAllocs.erase(it);
+	}
+	return name;
 }
 
 void GpuTextureBacking::UpdateLiveAllocName(const char* name) {

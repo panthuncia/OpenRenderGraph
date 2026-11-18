@@ -26,6 +26,76 @@ void RetireDescriptorSlotsForDeferredRelease(
     DescriptorHeapManager::GetInstance().RetireDescriptorSlots(std::move(slots));
 }
 
+namespace {
+	// A depth format with a stencil plane: its 2D textures also get a stencil SRV (SRVViewType::Texture2DStencil).
+	bool HasStencilPlane(rhi::Format format) {
+		switch (format) {
+		case rhi::Format::R24G8_Typeless:
+		case rhi::Format::D24_UNorm_S8_UInt:
+		case rhi::Format::R32G8X24_Typeless:
+		case rhi::Format::D32_Float_S8X24_UInt:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	bool WantsStencilSrv(const DescriptorHeapManager::ViewRequirements::TextureViews& tex) {
+		return tex.createSRV && !tex.isArray && !tex.isCubemap && !tex.is3D &&
+			(HasStencilPlane(tex.baseFormat) || HasStencilPlane(tex.dsvFormat));
+	}
+
+	// A texture's UAV of one mip and slice: every depth slice of a 3D texture, one array slice of an array or cube, else the 2D mip.
+	rhi::UavDesc TextureUav(const DescriptorHeapManager::ViewRequirements::TextureViews& tex, rhi::Format format, uint32_t mip, uint32_t slice) {
+		rhi::UavDesc uavDesc{};
+		uavDesc.formatOverride = format;
+		if (tex.is3D) {
+			uavDesc.dimension = rhi::UavDim::Texture3D;
+			uavDesc.texture3D.mipSlice = mip + tex.uavFirstMip;
+			uavDesc.texture3D.firstWSlice = 0;
+			uavDesc.texture3D.wSize = (std::max)(tex.depth >> (mip + tex.uavFirstMip), 1u);
+		}
+		else if (tex.isArray || tex.isCubemap) {
+			uavDesc.dimension = rhi::UavDim::Texture2DArray;
+			uavDesc.texture2DArray.mipSlice = mip + tex.uavFirstMip;
+			uavDesc.texture2DArray.firstArraySlice = slice;
+			uavDesc.texture2DArray.arraySize = 1;
+			uavDesc.texture2DArray.planeSlice = 0;
+		}
+		else {
+			uavDesc.dimension = rhi::UavDim::Texture2D;
+			uavDesc.texture2D.mipSlice = mip + tex.uavFirstMip;
+			uavDesc.texture2D.planeSlice = 0;
+		}
+		return uavDesc;
+	}
+
+	struct ShaderVisibleCapacities {
+		UINT resources = 0;
+		UINT samplers = 0;
+	};
+
+	// The shader-visible heap capacities the device was set up with, from ShaderFeatureInfo. A backend may hold fewer
+	// than the preferred 1,000,000 / 2048. Defaults are used where the backend does not report them. Logged once per
+	// device.
+	ShaderVisibleCapacities QueryShaderVisibleCapacities(rhi::Device device) {
+		const rhi::DescriptorHeapCapacities defaults{};
+		ShaderVisibleCapacities capacities{ defaults.preferredResources, defaults.preferredSamplers };
+		ShaderFeatureInfo features{};
+		if (device.QueryFeatureInfo(&features.header) == rhi::Result::Ok) {
+			if (features.maxShaderVisibleResourceDescriptors != 0) capacities.resources = features.maxShaderVisibleResourceDescriptors;
+			if (features.maxShaderVisibleSamplerDescriptors != 0) capacities.samplers = features.maxShaderVisibleSamplerDescriptors;
+		}
+		static const void* loggedDevice = nullptr;
+		if (loggedDevice != device.impl) {
+			loggedDevice = device.impl;
+			spdlog::info("DescriptorHeapManager: shader-visible heaps of {} CBV/SRV/UAV and {} sampler descriptors{}", capacities.resources,
+				capacities.samplers, features.maxShaderVisibleResourceDescriptors == 0 ? " (defaults: the backend reports no capacity)" : "");
+		}
+		return capacities;
+	}
+}
+
 void DescriptorHeapManager::Initialize() {
 	if (m_cbvSrvUavHeap) {
 		return;
@@ -36,18 +106,19 @@ void DescriptorHeapManager::Initialize() {
     m_deferredReleases.clear();
     m_deferredResourcePointers.clear();
     m_latestQueueFenceSnapshot.clear();
+    const ShaderVisibleCapacities capacities = QueryShaderVisibleCapacities(device);
 
     m_cbvSrvUavHeap = std::make_shared<DescriptorHeap>(
         device,
         rhi::DescriptorHeapType::CbvSrvUav,
-        1000000,
+        capacities.resources,
         true,
         "cbvSrvUavHeap");
 
     m_samplerHeap = std::make_shared<DescriptorHeap>(
         device,
         rhi::DescriptorHeapType::Sampler,
-        2048,
+        capacities.samplers,
         true,
         "samplerHeap");
 
@@ -95,10 +166,11 @@ void DescriptorHeapManager::RegisterBackend(BackendInstanceId backendInstance, r
 	const std::string suffix = ".backend" + std::to_string(key);
 	BackendHeaps heaps{};
 	heaps.device = device;
+	const ShaderVisibleCapacities capacities = QueryShaderVisibleCapacities(device);
 	heaps.cbvSrvUav = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::CbvSrvUav,
-		1000000, true, "cbvSrvUavHeap" + suffix);
+		capacities.resources, true, "cbvSrvUavHeap" + suffix);
 	heaps.sampler = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::Sampler,
-		2048, true, "samplerHeap" + suffix);
+		capacities.samplers, true, "samplerHeap" + suffix);
 	heaps.rtv = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::RTV,
 		10000, false, "rtvHeap" + suffix);
 	heaps.dsv = std::make_shared<DescriptorHeap>(device, rhi::DescriptorHeapType::DSV,
@@ -123,8 +195,9 @@ const DescriptorHeapManager::BackendHeaps* DescriptorHeapManager::FindBackendHea
 }
 
 void DescriptorHeapManager::Cleanup() {
-    // Destruction can recursively retire other owners, not just one final
-    // wave of descriptor slots. Quiescent cleanup must reach a fixed point.
+    // Destroying an owner can retire other owners in turn, so there can be more
+    // than one final wave of descriptor slots. Cleanup on an idle device must
+    // repeat until nothing more is released.
     DrainDeferredReleasesAfterDeviceIdle();
     if (m_resourceCleanup) m_resourceCleanup->Drain();
     DrainDeferredReleasesAfterDeviceIdle();
@@ -145,7 +218,7 @@ void DescriptorHeapManager::RetireDescriptorSlots(std::vector<std::pair<std::sha
 
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = m_latestQueueFenceSnapshot;
+    CaptureFencesUnlocked(release);
     release.descriptorSlots = std::move(slots);
     m_deferredReleases.push_back(std::move(release));
 }
@@ -160,7 +233,7 @@ void DescriptorHeapManager::RetireResource(std::shared_ptr<Resource> resource) {
         return;
     }
     DeferredRelease release{};
-    release.requiredFences = m_latestQueueFenceSnapshot;
+    CaptureFencesUnlocked(release);
     release.resources.push_back(std::move(resource));
     m_deferredReleases.push_back(std::move(release));
 }
@@ -172,7 +245,7 @@ void DescriptorHeapManager::RetireNativeResource(rhi::ResourcePtr resource) {
 
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = m_latestQueueFenceSnapshot;
+    CaptureFencesUnlocked(release);
     release.nativeResources.push_back(std::move(resource));
     m_deferredReleases.push_back(std::move(release));
 }
@@ -184,9 +257,35 @@ void DescriptorHeapManager::RetireBufferBacking(std::unique_ptr<GpuBufferBacking
 
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = m_latestQueueFenceSnapshot;
+    CaptureFencesUnlocked(release);
     release.bufferBackings.push_back(std::move(backing));
     m_deferredReleases.push_back(std::move(release));
+}
+
+void DescriptorHeapManager::SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached,
+    std::function<bool()> settled) {
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    m_frontier = std::move(frontier);
+    m_reached = std::move(reached);
+    m_settled = std::move(settled);
+}
+
+void DescriptorHeapManager::CaptureFencesUnlocked(DeferredRelease& release) const {
+    // A submission still queued on a host's submission thread may use what is released here. Its values are not handed out
+    // yet, so the frontier now would miss it. The release waits for a frontier taken once nothing is queued.
+    if (m_settled && !m_settled()) {
+        release.open = true;
+        return;
+    }
+    release.requiredFences = ReleaseFencesUnlocked();
+}
+
+std::vector<DescriptorHeapManager::QueueFenceSnapshotPoint> DescriptorHeapManager::ReleaseFencesUnlocked() const {
+    std::vector<QueueFenceSnapshotPoint> fences = m_latestQueueFenceSnapshot;
+    if (m_frontier)
+        for (auto& point : m_frontier())
+            fences.push_back({ .timeline = point.timeline, .value = point.value });
+    return fences;
 }
 
 void DescriptorHeapManager::PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot) {
@@ -199,10 +298,10 @@ void DescriptorHeapManager::PublishQueueFenceSnapshot(std::vector<QueueFenceSnap
                 return !point.timeline.IsValid() || point.value == 0 || point.value == UINT64_MAX;
             }),
         fenceSnapshot.end());
-    // Callers publish only values that were actually submitted. Preserve the
-    // last known signal for queues that were idle this frame so a transiently
-    // idle queue cannot make its previous in-flight work disappear from the
-    // retirement dependency set.
+    // Callers publish only values that were actually submitted. Keep the last
+    // known signal for queues that were idle this frame. Otherwise a queue that
+    // is idle for one frame would drop its earlier in-flight work from the set
+    // of work that retirement waits for.
     for (auto& published : fenceSnapshot) {
         const auto publishedHandle = published.timeline.GetHandle();
         auto existing = std::find_if(
@@ -229,7 +328,7 @@ void DescriptorHeapManager::RetireExecutionLease(std::shared_ptr<const void> lea
     if (!lease) return;
     std::scoped_lock lock(m_descriptorMutationMutex);
     DeferredRelease release{};
-    release.requiredFences = m_latestQueueFenceSnapshot;
+    CaptureFencesUnlocked(release);
     release.executionLeases.push_back(std::move(lease));
     m_deferredReleases.push_back(std::move(release));
 }
@@ -248,16 +347,34 @@ void DescriptorHeapManager::RetireExecutionLease(std::shared_ptr<const void> lea
     m_deferredReleases.push_back(std::move(release));
 }
 
-void DescriptorHeapManager::ProcessDeferredReleases(uint8_t frameIndex) {
+void DescriptorHeapManager::ProcessDeferredReleases(uint32_t frameIndex) {
     (void)frameIndex;
+    // Resource destruction can itself retire descriptor slots. It runs here, outside m_descriptorMutationMutex, to avoid
+    // recursive singleton entry.
+    (void)ProcessDeferredReleasesElsewhere();
+}
+
+std::shared_ptr<void> DescriptorHeapManager::ProcessDeferredReleasesElsewhere() {
     std::vector<DeferredRelease> readyReleases;
     {
         std::scoped_lock lock(m_descriptorMutationMutex);
 
-        auto releaseIsSafe = [](DeferredRelease& release) {
+        // Open releases take their frontier now, when it is settled.
+        if (!m_settled || m_settled())
+            for (auto& release : m_deferredReleases)
+                if (release.open) {
+                    release.requiredFences = ReleaseFencesUnlocked();
+                    release.open = false;
+                }
+        auto releaseIsSafe = [this](DeferredRelease& release) {
+            if (release.open) return false;
             for (auto& point : release.requiredFences) {
                 if (!point.timeline.IsValid()) {
                     return false;
+                }
+                if (m_reached) {
+                    if (!m_reached({ point.timeline, point.value })) return false;
+                    continue;
                 }
                 const uint64_t completed = point.timeline.GetCompletedValue();
                 if (completed == UINT64_MAX || completed < point.value) {
@@ -290,9 +407,9 @@ void DescriptorHeapManager::ProcessDeferredReleases(uint8_t frameIndex) {
             m_deferredReleases.pop_back();
         }
     }
-    // Resource destruction can itself retire descriptor slots. Keep it outside
-    // m_descriptorMutationMutex to avoid recursive singleton entry.
-    readyReleases.clear();
+    // Destroyed wherever the caller drops them, never under m_descriptorMutationMutex.
+    if (readyReleases.empty()) return {};
+    return std::make_shared<std::vector<DeferredRelease>>(std::move(readyReleases));
 }
 
 DescriptorHeapManager::DeferredReleaseStats DescriptorHeapManager::GetDeferredReleaseStats() {
@@ -310,7 +427,7 @@ DescriptorHeapManager::DeferredReleaseStats DescriptorHeapManager::GetDeferredRe
             }
         }
 
-        bool blocked = false;
+        bool blocked = release.open;
         for (auto& point : release.requiredFences) {
             if (!point.timeline.IsValid()) {
                 stats.invalidTimelineCount++;
@@ -458,6 +575,9 @@ void DescriptorHeapManager::ReserveDescriptorSlotsUnlocked(
             if (tex->createCubemapAsArraySRV && tex->isCubemap) {
                 target.SetSRVView(SRVViewType::Texture2DArray, m_cbvSrvUavHeap, makeShaderVisibleGrid(6u, tex->mipLevels, m_cbvSrvUavHeap));
             }
+            if (WantsStencilSrv(*tex)) {
+                target.SetSRVView(SRVViewType::Texture2DStencil, m_cbvSrvUavHeap, makeShaderVisibleGrid(1u, tex->mipLevels, m_cbvSrvUavHeap));
+            }
         }
 
         if (tex->createUAV) {
@@ -579,7 +699,12 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     rhi::SrvDesc srvDesc{};
                     srvDesc.formatOverride = srvFormat;
 
-                    if (tex->isCubemap) {
+                    if (tex->is3D) {
+                        srvDesc.dimension = rhi::SrvDim::Texture3D;
+                        srvDesc.tex3D.mostDetailedMip = mip;
+                        srvDesc.tex3D.mipLevels = mipLevelsForView;
+                    }
+                    else if (tex->isCubemap) {
                         if (tex->isArray) {
                             srvDesc.dimension = rhi::SrvDim::TextureCubeArray;
                             srvDesc.cubeArray.mostDetailedMip = mip;
@@ -657,6 +782,18 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                 }
             }
 
+            if (WantsStencilSrv(*tex)) {
+                for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
+                    rhi::SrvDesc srvDesc{};
+                    srvDesc.dimension = rhi::SrvDim::Texture2D;
+                    srvDesc.tex2D.mostDetailedMip = mip;
+                    srvDesc.tex2D.mipLevels = 1u;
+                    srvDesc.tex2D.planeSlice = 1u;
+                    const auto& slot = target.GetSRVInfo(SRVViewType::Texture2DStencil, mip, 0u).slot;
+                    device.CreateShaderResourceView({ shaderHeap, slot.index }, apiResource.GetHandle(), srvDesc);
+                }
+            }
+
             if (tex->createCubemapAsArraySRV && tex->isCubemap) {
                 for (uint32_t slice = 0; slice < 6u; ++slice) {
                     for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
@@ -690,21 +827,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
             const uint32_t uavSlices = (tex->isArray || tex->isCubemap) ? tex->totalArraySlices : 1u;
             for (uint32_t slice = 0; slice < uavSlices; ++slice) {
                 for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
-                    rhi::UavDesc uavDesc{};
-                    uavDesc.formatOverride = uavFormat;
-                    if (tex->isArray || tex->isCubemap) {
-                        uavDesc.dimension = rhi::UavDim::Texture2DArray;
-                        uavDesc.texture2DArray.mipSlice = mip + tex->uavFirstMip;
-                        uavDesc.texture2DArray.firstArraySlice = slice;
-                        uavDesc.texture2DArray.arraySize = 1;
-                        uavDesc.texture2DArray.planeSlice = 0;
-                    }
-                    else {
-                        uavDesc.dimension = rhi::UavDim::Texture2D;
-                        uavDesc.texture2D.mipSlice = mip + tex->uavFirstMip;
-                        uavDesc.texture2D.planeSlice = 0;
-                    }
-
+                    rhi::UavDesc uavDesc = TextureUav(*tex, uavFormat, mip, slice);
                     const auto& slot = target.GetUAVShaderVisibleInfo(mip, slice).slot;
                     device.CreateUnorderedAccessView({ shaderHeap, slot.index }, apiResource.GetHandle(), uavDesc);
                 }
@@ -731,21 +854,7 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
             const uint32_t uavSlices = (tex->isArray || tex->isCubemap) ? tex->totalArraySlices : 1u;
             for (uint32_t slice = 0; slice < uavSlices; ++slice) {
                 for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
-                    rhi::UavDesc uavDesc{};
-                    uavDesc.formatOverride = uavFormat;
-                    if (tex->isArray || tex->isCubemap) {
-                        uavDesc.dimension = rhi::UavDim::Texture2DArray;
-                        uavDesc.texture2DArray.mipSlice = mip + tex->uavFirstMip;
-                        uavDesc.texture2DArray.firstArraySlice = slice;
-                        uavDesc.texture2DArray.arraySize = 1;
-                        uavDesc.texture2DArray.planeSlice = 0;
-                    }
-                    else {
-                        uavDesc.dimension = rhi::UavDim::Texture2D;
-                        uavDesc.texture2D.mipSlice = mip + tex->uavFirstMip;
-                        uavDesc.texture2D.planeSlice = 0;
-                    }
-
+                    rhi::UavDesc uavDesc = TextureUav(*tex, uavFormat, mip, slice);
                     const auto& slot = target.GetUAVNonShaderVisibleInfo(mip, slice).slot;
                     device.CreateUnorderedAccessView({ cpuHeap, slot.index }, apiResource.GetHandle(), uavDesc);
                 }
@@ -882,6 +991,24 @@ rhi::DescriptorSlot DescriptorHeapManager::ResolveDescriptorSlot(BackendInstance
 		: rhi::DescriptorSlot{};
 }
 
+rhi::DescriptorSlot DescriptorHeapManager::TranslateDescriptorSlot(rhi::DescriptorSlot slot,
+	BackendInstanceId backendInstance) const {
+	if (backendInstance == BackendInstanceId::Primary || !slot.heap.valid()) return slot;
+	const auto* primary = FindBackendHeaps(BackendInstanceId::Primary);
+	const auto* target = FindBackendHeaps(backendInstance);
+	if (!primary || !target) return slot;
+	const std::pair<const std::shared_ptr<DescriptorHeap>*, const std::shared_ptr<DescriptorHeap>*> kinds[] = {
+		{&primary->cbvSrvUav, &target->cbvSrvUav}, {&primary->sampler, &target->sampler}, {&primary->rtv, &target->rtv},
+		{&primary->dsv, &target->dsv}, {&primary->nonShaderVisible, &target->nonShaderVisible}};
+	for (const auto& [from, to] : kinds) {
+		if (!*from || !*to || !(*from)->GetHeap() || !(*to)->GetHeap()) continue;
+		const auto handle = (*from)->GetHeap().GetHandle();
+		if (handle.index == slot.heap.index && handle.generation == slot.heap.generation)
+			return {(*to)->GetHeap().GetHandle(), slot.index};
+	}
+	return slot;
+}
+
 UINT DescriptorHeapManager::CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc) {
     std::scoped_lock lock(m_descriptorMutationMutex);
 
@@ -892,9 +1019,9 @@ UINT DescriptorHeapManager::CreateIndexedSampler(const rhi::SamplerDesc& sampler
 
     auto device = DeviceManager::GetInstance().GetDevice();
     UINT index = m_samplerHeap->AllocateDescriptor();
-    // A slot whose sampler was not created holds no descriptor: a shader sampling through it reads with whatever
-    // the heap memory decodes to (no filtering, no mips, and on some hardware no sRGB conversion). Never hand
-    // one out.
+    // A slot whose sampler was not created holds no descriptor. A shader that samples through it reads with whatever
+    // the heap memory decodes to. That means no filtering, no mips, and on some hardware no sRGB conversion. Never
+    // hand out such a slot.
     if (const auto result = device.CreateSampler({ m_samplerHeap->GetHeap().GetHandle(), index }, samplerDesc); rhi::Failed(result)) {
         m_samplerHeap->ReleaseDescriptor(index);
         spdlog::error("DescriptorHeapManager::CreateIndexedSampler: the backend could not create the sampler (result {})", static_cast<int>(result));
@@ -959,7 +1086,7 @@ void DescriptorHeapManager::RetireDescriptorSlotWithOwner(rhi::DescriptorSlot sl
 		const auto handle = heap->GetHeap().GetHandle();
 		if (handle.index != slot.heap.index || handle.generation != slot.heap.generation) continue;
 		DeferredRelease release{};
-		release.requiredFences = m_latestQueueFenceSnapshot;
+		CaptureFencesUnlocked(release);
 		release.descriptorSlots.emplace_back(heap, slot.index);
 		release.descriptorOwner = std::move(owner);
 		m_deferredReleases.push_back(std::move(release));

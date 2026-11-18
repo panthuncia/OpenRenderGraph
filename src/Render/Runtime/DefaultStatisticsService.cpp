@@ -31,6 +31,14 @@ public:
         StatisticsManager::GetInstance().SetupQueryHeap();
     }
 
+    void EnsureFrameCapacity(unsigned frames) override {
+        StatisticsManager::GetInstance().EnsureFrameCapacity(frames);
+    }
+
+    unsigned FrameCapacity() const override {
+        return StatisticsManager::GetInstance().FrameCapacity();
+    }
+
     void BeginQuery(unsigned passIndex, unsigned frameIndex, rhi::Queue& queue, rhi::CommandList& cmdList) override {
         StatisticsManager::GetInstance().BeginQuery(passIndex, frameIndex, queue, cmdList);
     }
@@ -57,6 +65,10 @@ public:
 
     void MergePendingResolves(rhi::QueueKind queueKind, unsigned frameIndex, QueryRecordingContext& ctx) override {
         StatisticsManager::GetInstance().MergePendingResolves(queueKind, frameIndex, ctx);
+    }
+
+    void PublishAtCompletion(unsigned frameIndex, std::function<void()> publish) override {
+        StatisticsManager::GetInstance().PublishAtCompletion(frameIndex, std::move(publish));
     }
 
     void OnFrameComplete(unsigned frameIndex, rhi::Queue& queue) override {
@@ -105,6 +117,29 @@ public:
 
     double GetGpuTicksToMilliseconds() const override {
         return StatisticsManager::GetInstance().GetGpuTicksToMilliseconds();
+    }
+
+    std::shared_ptr<OwnedTimestampQueries> CreateOwnedTimestamps(rhi::QueueKind queueKind, uint32_t ranges) override {
+        return StatisticsManager::GetInstance().CreateOwnedTimestamps(queueKind, ranges);
+    }
+
+    void BeginRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().BeginRangeQuery(name, cmdList, ctx);
+    }
+
+    bool BeginSubRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        return StatisticsManager::GetInstance().BeginSubRangeQuery(name, cmdList, ctx);
+    }
+
+    void BeginListRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().BeginListRangeQuery(name, cmdList, ctx);
+    }
+    void EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx) override {
+        StatisticsManager::GetInstance().EndRangeQuery(cmdList, ctx);
+    }
+
+    const std::vector<CompletedTimestamp>& GetCompletedTimestamps() const override {
+        return StatisticsManager::GetInstance().GetCompletedTimestamps();
     }
 };
 }

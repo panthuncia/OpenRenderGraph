@@ -1,0 +1,478 @@
+#pragma once
+
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "Render/Runtime/ITaskService.h"
+
+namespace rhi { class CommandList; }
+namespace org::compiler { struct PreparedTimelineBinding; struct UntouchedResources; }
+#include "Render/RenderGraph/CompilerAlgorithms.h"
+
+namespace org::compiler {
+
+// This extraction produces dependencies and a symbolic queue schedule. It is deliberately
+// not executable: realization, alias planning and ordered admission must be
+// extracted before a candidate can replace a live execution graph.
+enum class ScheduleStage : uint8_t { Dependencies, SymbolicSchedule };
+
+// Numeric, owned metadata only. Unlike the legacy ResourceState comparison,
+// synchronization scopes are part of the fresh frame-owned compiler input.
+struct CompileResourceShape {
+    // {0,0,false} is a dependency-only identity, with no stateful resource.
+    // A state declaration referencing it is unsupported, never treated as 1x1.
+    uint32_t mips = 1, slices = 1;
+    bool hasLayout = false;
+    // Simultaneous-access texture (Resource::CommonLayoutOnly): every state keeps layout Common.
+    bool commonLayoutOnly = false;
+    bool operator==(const CompileResourceShape&) const = default;
+};
+struct CompileRange {
+    uint32_t mip = 0, mips = 1, slice = 0, slices = 1;
+    bool operator==(const CompileRange&) const = default;
+};
+struct CompileResourceState {
+    uint64_t access = 0, layout = 0, sync = 0;
+    bool write = false;
+    bool operator==(const CompileResourceState&) const = default;
+};
+struct CompileStateUse {
+    uint32_t resource = 0;
+    CompileRange range;
+    CompileResourceState state;
+    // Internal scheduling may conservatively use the whole resource, but an
+    // execution boundary must retain the caller's exact buffer/image extent.
+    uint64_t byteOffset = 0;
+    uint64_t byteSize = UINT64_MAX;
+    uint32_t aspects = 0;
+    bool operator==(const CompileStateUse&) const = default;
+};
+
+struct CompileAccess {
+    uint32_t resourceIndex = 0;
+    bool write = false;
+    bool operator==(const CompileAccess&) const = default;
+};
+struct CompilePass {
+    // Authored position. Hazards between passes touching the same resource are
+    // derived in this order (ties by index), so it need not follow the index.
+    uint32_t originalOrder = 0;
+    uint32_t backend = 0;
+    std::vector<CompileAccess> accesses;
+    std::vector<uint32_t> compatibleQueueSlots{0};
+    uint32_t preferredQueueSlot = 0;
+    std::vector<CompileStateUse> entryStates;
+    // Declared callback postconditions, not compiler-emitted barriers.
+    std::vector<CompileStateUse> exitStates;
+    // Stable index into the prepared frame-pass array. Execution must not infer
+    // this association from compiler-local order or a mutable pass container.
+    uint32_t preparedPassIndex = UINT32_MAX;
+    // Immediate/single-consumption work and pass-local external waits retain a
+    // batch boundary. This is authored preparation metadata, not worker access
+    // to the mutable pass object.
+    bool forceBatchIsolation = false;
+    // Recorded at execution (ExternalPassDesc::recordAtExecution): in a batch of such passes alone, which an external epoch's
+    // host records when it executes the epoch (ExternalEpochExecution), not ahead.
+    bool recordAtExecution = false;
+    bool operator==(const CompilePass&) const = default;
+};
+struct CompileQueue {
+    uint32_t backendInstance = 0;
+    bool active = true;
+    // Copies on this queue leave textures in Common (a D3D12 copy queue: its lists take no copy layouts). The compiler records the
+    // states its copy-layout steps leave as Common, so the next use, in this execution or a later one, transitions from there.
+    bool copyLayoutsCommon = false;
+    bool operator==(const CompileQueue&) const = default;
+};
+struct GraphCompileStructure {
+    uint64_t generation = 0;
+    uint64_t registryGeneration = 0;
+    std::vector<uint64_t> resourceIDs;
+    // Empty for persistent concrete identities. Named frame-transient slots
+    // use a semantic key so a new backing/global ID does not force recompilation.
+    // The string is retained for full collision-safe equality.
+    std::vector<std::string> resourceKeys;
+    std::vector<CompilePass> passes;
+    // Optional immutable trace labels, indexed exactly like passes. Workers
+    // never ask a live pass for its name. Empty during normal compilation.
+    std::vector<std::string> diagnosticPassNames;
+    std::vector<std::string> diagnosticResourceNames;
+    std::vector<std::pair<uint32_t, uint32_t>> explicitEdges;
+    // Additional constraints from owned alias-placement preparation. These do
+    // not substitute for independently deriving the resource dependency DAG.
+    std::vector<std::pair<uint32_t, uint32_t>> placementEdges;
+    std::vector<CompileQueue> queues{{}};
+    // Empty means dependency/schedule-only capture. Otherwise one per ID.
+    std::vector<CompileResourceShape> resourceShapes;
+    bool operator==(const GraphCompileStructure&) const = default;
+};
+using DependencyEdges = std::vector<std::pair<uint32_t, uint32_t>>;
+
+class IFramePayloadLifecycle {
+public:
+    virtual ~IFramePayloadLifecycle() = default;
+    virtual void Abandon(uint8_t reason) const noexcept = 0;
+};
+
+struct GraphCompileInput {
+    GraphCompileStructure structure;
+    // Realization identity, ordered with structure.resourceIDs. It is excluded
+    // from symbolic compilation equality: same layout/new backing reuses a plan.
+    std::vector<uint64_t> backingGenerations;
+    // Retains the exact publication/backings that preparation resolved. No
+    // worker dereferences an opaque lease or calls a resource/pass interface.
+    std::vector<std::shared_ptr<const void>> leases;
+    // Owned frame recording payload paired with this request. The pure
+    // compiler never dereferences it; realization/admission interprets it.
+    std::shared_ptr<const void> executionPayload;
+    std::shared_ptr<const IFramePayloadLifecycle> executionLifecycle;
+    // Produced once for this request before alias realization; never reused between frames.
+    std::shared_ptr<const DependencyEdges> analyzedDependencies;
+    std::shared_ptr<const DependencyEdges> expectedEdges;
+    std::shared_ptr<const DependencyEdges> expectedSchedulingEdges;
+};
+
+// Ordered passes recorded on one queue. Batch indices and waits are relative:
+// no queue timeline is touched here. The initial policy may still isolate
+// passes, but the representation is shared-scheduler ready and does not encode
+// that temporary restriction.
+struct SymbolicBatch {
+    std::vector<uint32_t> passes;
+    uint32_t queue = 0;
+    SymbolicBatch() = default;
+    SymbolicBatch(uint32_t pass, uint32_t queueSlot) : passes{pass}, queue(queueSlot) {}
+    bool operator==(const SymbolicBatch&) const = default;
+};
+struct RelativeQueueWait {
+    uint32_t consumerBatch = 0, producerBatch = 0;
+    bool operator==(const RelativeQueueWait&) const = default;
+};
+
+struct SymbolicStateStep {
+    uint32_t resource = 0, batch = 0;
+    // UINT32_MAX means resolve the incoming state/ownership at admission.
+    uint32_t previousBatch = UINT32_MAX;
+    CompileRange range;
+    CompileResourceState before, after;
+    // Consuming compiler pass. Required to place barriers between passes that
+    // share a command-list batch rather than hoisting them to batch entry.
+    uint32_t pass = UINT32_MAX;
+    // Producer compiler pass for cross-queue release placement. UINT32_MAX
+    // denotes the execution-boundary state supplied by admission.
+    uint32_t previousPass = UINT32_MAX;
+    bool operator==(const SymbolicStateStep&) const = default;
+};
+struct SymbolicFinalState {
+    uint32_t resource = 0, batch = 0;
+    CompileRange range;
+    CompileResourceState state;
+    bool operator==(const SymbolicFinalState&) const = default;
+};
+struct SymbolicStatePlan {
+    bool complete = false;
+    std::string fallbackReason;
+    // Conservative state dependencies, not backend barriers. Read/read steps
+    // may later be elided only after queue/API-specific validation.
+    std::vector<SymbolicStateStep> steps;
+    std::vector<SymbolicFinalState> finalStates;
+    // Indices into steps, in step order: the execution-boundary ones (previousBatch UINT32_MAX, what admission resolves from the
+    // ledger), and the last step of each mip/slice cell of each resource (what an execution leaves in the ledger). An admission
+    // whose body is recorded already walks these alone (BackingStateAdmissionLedger::Prepare's entryOnly).
+    std::vector<uint32_t> entrySteps, exitSteps;
+};
+
+struct Schedule {
+    ScheduleStage stage = ScheduleStage::Dependencies;
+    // Structural reuse must not pin the first content publication indefinitely.
+    // Publication leases belong to bundles/execution instances, not this plan.
+    std::shared_ptr<const GraphCompileStructure> structure;
+    DependencyEdges edges;
+    DependencyEdges schedulingEdges;
+    std::vector<uint32_t> topologicalOrder;
+    std::vector<uint32_t> criticality;
+    std::vector<SymbolicBatch> batches;
+    // Dense execution placement produced once by the compiler. Admission must
+    // not rebuild these graph-structural lookup tables for every frame.
+    std::vector<uint32_t> batchByPass;
+    std::vector<uint32_t> positionByPass;
+    struct BarrierCapacity {
+        uint32_t beforeTextures = 0;
+        uint32_t beforeBuffers = 0;
+        uint32_t afterTextures = 0;
+    };
+    // Upper bounds indexed by compiler pass. They are exact for textures and
+    // conservative for buffers whose heap/state policy is admission-bound.
+    std::vector<BarrierCapacity> barrierCapacityByPass;
+    std::vector<uint32_t> stateDeltaCapacityByBatch;
+    std::vector<uint32_t> stateSeedCapacityByBatch;
+    // Dense access stream in execution order. Admission consumes this directly
+    // and never walks pass declarations to rediscover resource boundaries.
+    std::vector<std::vector<CompileStateUse>> boundaryAccessesByBatch;
+    // Minimal entry hazard stream: first access per subresource, plus its first
+    // write when the first access was a read. This preserves RAW/WAR/WAW while
+    // avoiding a full intra-frame access walk during admission.
+    std::vector<std::vector<CompileStateUse>> incomingBoundaryAccessesByBatch;
+    // Whole-allocation alias admission needs only the first use and the final
+    // use on each queue, not every subresource access in between.
+    std::vector<std::vector<uint32_t>> aliasFirstResourcesByBatch;
+    std::vector<std::vector<uint32_t>> aliasFinalResourcesByBatch;
+    std::vector<RelativeQueueWait> relativeWaits;
+    SymbolicStatePlan states;
+    bool scheduleValidated = false;
+    std::string scheduleValidationError;
+    std::string stateValidationError;
+};
+
+// Normalizes enumeration order only; concrete identities and pass order remain
+// significant. Invalid or duplicate global IDs are rejected, never conflated.
+void NormalizeCompileInput(GraphCompileInput&);
+// Independent schedule legality check, including same-queue order and actual
+// wait reachability. Does not require the live scheduler's exact batch choices.
+std::string ValidateSymbolicSchedule(const GraphCompileInput&, const Schedule&);
+std::string ValidateSymbolicStates(const GraphCompileInput&, const Schedule&);
+
+// A cache of compiled schedules, shared by every graph on a runtime (docs/job-graphs.md, Phase 3).
+// If a compile input matches an earlier one, the earlier schedule is reused instead of compiling again.
+// Two inputs match when their structures are equal (ignoring the generation number) and their analyzed
+// dependencies are equal.
+// Inputs with leases, an execution payload or expected edges are never cached.
+// When full, the least recently used entry is dropped. Safe to use from any thread.
+// A hit also returns the original input, because a schedule must stay paired with the exact input it was
+// compiled from (BuildPersistentExecutionLayout checks this).
+class ScheduleCache {
+public:
+    explicit ScheduleCache(size_t capacity = 64) : m_capacity(capacity) {}
+    static bool Cacheable(const GraphCompileInput& input) noexcept;
+    struct Hit {
+        std::shared_ptr<const GraphCompileInput> input;
+        std::shared_ptr<const Schedule> schedule;
+    };
+    std::optional<Hit> Find(const GraphCompileInput& input);
+    void Insert(std::shared_ptr<const GraphCompileInput> input, std::shared_ptr<const Schedule> schedule);
+    void Clear();
+    struct Stats { uint64_t hits = 0, misses = 0; size_t entries = 0; };
+    Stats GetStats() const;
+private:
+    struct Entry {
+        uint64_t hash = 0;
+        Hit compiled;
+        uint64_t lastUse = 0;
+    };
+    mutable std::mutex m_mutex;
+    std::vector<Entry> m_entries;
+    size_t m_capacity;
+    uint64_t m_clock = 0, m_hits = 0, m_misses = 0;
+};
+
+class CompileWorkspace {
+public:
+    std::shared_ptr<const DependencyEdges> AnalyzeDependencies(
+        const GraphCompileStructure&, const std::atomic_bool& cancelled,
+        std::span<const uint32_t> accessOrder = {});
+    std::shared_ptr<const Schedule> Compile(
+        std::shared_ptr<const GraphCompileInput> input, const std::atomic_bool& cancelled);
+    // The schedule cache that CompileGraphCached checks before compiling. None by default.
+    void SetScheduleCache(std::shared_ptr<ScheduleCache> cache) noexcept { m_scheduleCache = std::move(cache); }
+    ScheduleCache* GetScheduleCache() const noexcept { return m_scheduleCache.get(); }
+private:
+    std::shared_ptr<ScheduleCache> m_scheduleCache;
+    std::vector<compiler::DependencySequence<uint32_t>> m_resources;
+    std::vector<std::vector<uint32_t>> m_successors;
+    std::vector<uint32_t> m_indegrees;
+    std::vector<uint32_t> m_ready;
+};
+
+// Single owned-input compiler entry point used by both workers and synchronous
+// validation tools. Keep alternate compiler routes out of call sites.
+std::shared_ptr<const Schedule> CompileGraph(
+    std::shared_ptr<const GraphCompileInput> input,
+    CompileWorkspace& workspace,
+    const std::atomic_bool& cancelled);
+// Like CompileGraph, but checks the workspace's schedule cache first, if it has one.
+// On a hit, `input` is replaced with the input the cached schedule was compiled from. It is equal to the
+// given input except for its generation number.
+std::shared_ptr<const Schedule> CompileGraphCached(
+    std::shared_ptr<const GraphCompileInput>& input,
+    CompileWorkspace& workspace,
+    const std::atomic_bool& cancelled);
+
+struct ScheduleBundle {
+    uint64_t sequence = 0;
+    std::shared_ptr<const Schedule> graph;
+    // Exact input that produced this fresh graph; never substituted by a
+    // structurally equivalent request.
+    std::shared_ptr<const GraphCompileInput> input;
+};
+
+// A compile result is paired permanently with the exact owned frame request
+// that produced it. No structural result is shared between frame requests.
+struct ExecutableCompiledFrame {
+    uint64_t sequence = 0;
+    std::shared_ptr<const ScheduleBundle> bundle;
+};
+
+// Admission-side compatibility check. This is intentionally independent of
+// coordinator publication order: a completed candidate is selectable only for
+// the exact freshly prepared structure, with an unambiguous prepared-pass map.
+bool IsExecutionCompatible(const ScheduleBundle&, const GraphCompileInput&) noexcept;
+
+struct ExecutionPassPlacement {
+    uint32_t preparedPass = 0;
+    uint32_t batch = 0;
+    uint32_t queue = 0;
+    bool operator==(const ExecutionPassPlacement&) const = default;
+};
+struct GraphExecutionLayout {
+    std::shared_ptr<const ScheduleBundle> bundle;
+    // Indexed by prepared pass, so recording never consults compiler scratch.
+    std::vector<ExecutionPassPlacement> placements;
+};
+std::shared_ptr<const GraphExecutionLayout> BuildExecutionLayout(
+    std::shared_ptr<const ScheduleBundle>, const GraphCompileInput& prepared);
+
+
+// A point on a queue's (or a foreign) timeline, by admission identity.
+struct ExecutionTimelinePoint {
+    uint64_t timeline = 0;
+    uint64_t value = 0;
+    // Written out, not defaulted: the MSVC STL treats a defaulted == on a 16-byte type as bitwise-comparable under Clang
+    // and routes std::find to a vectorized path that only takes 1-8 byte elements.
+    bool operator==(const ExecutionTimelinePoint& other) const { return timeline == other.timeline && value == other.value; }
+};
+struct ExecutionBatchTimeline {
+    ExecutionTimelinePoint signal;
+    std::vector<ExecutionTimelinePoint> waits;
+    // Lists submitted ahead of the batch's own in the same submission, behind its waits: the handoff into the execution recorded
+    // when it was admitted (its entry barriers). Only for the call that submits it; not retained.
+    std::span<const rhi::CommandList> leading;
+    // Timelines the batch waits on beyond those its packet binds (another graph's, from its admission). Only for the call that
+    // submits it.
+    std::span<const PreparedTimelineBinding> extraTimelines;
+    // A late batch recorded by its submission: its passes' skip answers, asked once by the submission (empty: the recording asks),
+    // and the resources no running pass of the execution touches, whose barriers it leaves out. Only for the call that submits it.
+    std::span<const uint8_t> skips;
+    const UntouchedResources* untouched = nullptr;
+};
+class IPreparedExecutionBatch;
+// Timeline portion only, not an executable command packet. The admission owner
+// must supply exclusive queue timelines and cross-frame/resource waits after
+// backing/ownership resolution. Workers never construct absolute fence values.
+struct GraphExecutionTimeline {
+    uint64_t submission = 0;
+    std::shared_ptr<const ScheduleBundle> bundle;
+    std::vector<ExecutionBatchTimeline> batches;
+    std::vector<std::shared_ptr<const void>> executionLeases;
+    // Kept separately from opaque leases so lifecycle completion can be
+    // delivered when all queue signals for this execution are observed.
+    std::vector<std::shared_ptr<const IPreparedExecutionBatch>> preparedBatches;
+    std::vector<ExecutionTimelinePoint> tailCompletions;
+};
+// Prepared packets contain no live pass callbacks. Implementations own closed
+// command lists, allocators, backing/descriptor versions and timeline leases.
+enum class SubmissionState { NotSubmitted, SubmissionUncertain, SubmittedWithoutSignal, Signaled };
+enum class SubmissionFailureStage { None, Validation, Wait, Submit, Lifecycle, Signal, Replay };
+struct SubmissionReceipt {
+    SubmissionState state = SubmissionState::NotSubmitted;
+    SubmissionFailureStage failureStage = SubmissionFailureStage::None;
+    uint32_t backendResult = 0;
+    explicit operator bool() const noexcept { return state == SubmissionState::Signaled; }
+};
+struct FailedExecutionBatch {
+    uint64_t submission = 0;
+    uint32_t batch = 0;
+    SubmissionReceipt receipt;
+};
+class IPreparedExecutionBatch {
+public:
+    virtual ~IPreparedExecutionBatch() = default;
+    virtual uint32_t QueueSlot() const noexcept = 0;
+    virtual SubmissionReceipt Submit(const ExecutionBatchTimeline&) const noexcept = 0;
+    virtual void Complete(uint64_t submission) const noexcept = 0;
+    virtual void Abandon() const noexcept = 0;
+    // Submittable again once the previous submission has completed (PreparedRhiExecutionBatch's replayable packets): a
+    // submission commits nothing but its commands, and completion releases nothing; the owner's last reference does.
+    virtual bool Replayable() const noexcept { return false; }
+};
+class ExecutionTimelineAdmission {
+public:
+    explicit ExecutionTimelineAdmission(std::vector<ExecutionTimelinePoint> queues,
+        size_t maximumInFlight = 3);
+    ExecutionTimelineAdmission(const ExecutionTimelineAdmission&) = delete;
+    ExecutionTimelineAdmission& operator=(const ExecutionTimelineAdmission&) = delete;
+    std::shared_ptr<const GraphExecutionTimeline> Prepare(
+        std::shared_ptr<const ScheduleBundle>,
+        const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
+        std::vector<std::shared_ptr<const void>> executionLeases = {},
+        std::vector<std::shared_ptr<const IPreparedExecutionBatch>> preparedBatches = {},
+        std::span<const ExecutionTimelinePoint> reservedSignals = {});
+    // leading: per batch, lists submitted ahead of its own (ExecutionBatchTimeline::leading); empty for none. leases: kept with the
+    // execution until it retires (the leading lists' allocations).
+    std::shared_ptr<const GraphExecutionTimeline> SubmitPrepared(
+        std::shared_ptr<const ScheduleBundle>,
+        const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
+        const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
+        std::span<const ExecutionTimelinePoint> reservedSignals = {},
+        std::span<const std::span<const rhi::CommandList>> leading = {},
+        std::vector<std::shared_ptr<const void>> leases = {},
+        std::span<const PreparedTimelineBinding> extraTimelines = {});
+    // Call only after the backend successfully submits this batch's signal.
+    void CommitBatch(uint64_t submission, uint32_t batch);
+    // A submission of the owner's own on a queue between executions (a queue handoff's release): the value it signals, recorded as
+    // submitted.
+    ExecutionTimelinePoint SubmitOutside(uint32_t queue);
+    // A queue's timeline shared with other owners (RenderGraph::SetSharedQueueTimelines): their submissions reached `value`, so this
+    // owner's next signal there comes after it, and waits up to it reference submitted work. Never lowers; not during a submission.
+    void AdvanceTo(uint32_t queue, uint64_t value);
+    // An execution another thread has already submitted with these signal values (async epochs: the values
+    // are assigned at submission, in submission order, and recorded here by the ordered owner in the same
+    // order). Values above the reserved ones may skip - timelines only need to rise.
+    std::shared_ptr<const GraphExecutionTimeline> RecordSubmitted(
+        std::shared_ptr<const ScheduleBundle>,
+        const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
+        const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
+        std::span<const ExecutionTimelinePoint> signals);
+    // A partial failure preserves committed values and permanently closes this
+    // admission owner until device/error recovery constructs a fresh owner.
+    void Fail(uint64_t submission, SubmissionReceipt receipt = {});
+    // Keyed by the unique submission id rather than the bundle sequence, which
+    // persistent executables share across frames.
+    void ExtendSubmittedExecution(uint64_t submission, ExecutionTimelinePoint completion);
+    // Called by the ordered owner with observed GPU completion values, in the
+    // same queue order as construction. Releases only fully completed bundles.
+    size_t RetireCompleted(std::span<const ExecutionTimelinePoint> completed);
+    // Lowers lowest[queue] to the lowest signal any retained execution waits for on that queue, in the queue order of
+    // construction. RetireCompleted releases nothing while each queue's completed value is below its entry. False when an
+    // execution waits for a timeline that is not one of the queues', or has no batch: then nothing can be ruled out.
+    bool LowestRetainedSignals(std::span<uint64_t> lowest) const;
+    // Transfers already-retired ownership so destruction may run on a
+    // non-critical cleanup lane after owner-thread completion callbacks.
+    std::vector<std::shared_ptr<GraphExecutionTimeline>> TakeRetiredGarbage();
+    size_t InFlight() const { return m_retained.size() + (m_pending ? 1 : 0); }
+    std::span<const ExecutionTimelinePoint> Submitted() const { return m_submitted; }
+    bool Failed() const { return m_failed; }
+    const std::optional<FailedExecutionBatch>& Failure() const { return m_failure; }
+    std::shared_ptr<const GraphExecutionTimeline> PendingExecution() const { return m_pending; }
+private:
+    std::vector<ExecutionTimelinePoint> m_reserved, m_submitted;
+    std::shared_ptr<GraphExecutionTimeline> m_pending;
+    std::vector<std::shared_ptr<GraphExecutionTimeline>> m_retained;
+    std::vector<std::shared_ptr<GraphExecutionTimeline>> m_retiredGarbage;
+    std::vector<ExecutionTimelinePoint> m_completed;
+    size_t m_maximumInFlight;
+    uint64_t m_sequence = 0;
+    uint32_t m_nextBatch = 0;
+    bool m_failed = false;
+    std::optional<FailedExecutionBatch> m_failure;
+};
+
+} // namespace org::compiler

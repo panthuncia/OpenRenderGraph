@@ -1,6 +1,7 @@
 #pragma once
 
 #include <optional>
+#include <vector>
 
 #include <rhi.h>
 
@@ -37,7 +38,14 @@ struct TextureDescription {
     rhi::Format uavFormat = rhi::Format::Unknown;
 	bool hasSRV = false;
     rhi::Format srvFormat = rhi::Format::Unknown;
+	// Formats views of the texture may use besides its own (D3D12 castable formats). A block-compressed texture listing an
+	// uncompressed format of its block size (BC7 and R32G32B32A32_UINT) can be written through a UAV of one texel per block,
+	// where rhi::EnhancedBarriersFeatureInfo::relaxedFormatCasting allows it.
+	std::vector<rhi::Format> castableFormats;
 	bool hasNonShaderVisibleUAV = false;
+	// Unset: high for a texture the GPU writes (render targets, depth, UAVs), which over the OS budget are the costliest to
+	// leave in system memory, and normal otherwise. Placed in an alias pool, it has the pool's priority.
+	std::optional<rhi::ResidencyPriority> residencyPriority;
 
 	bool generateMipMaps = false;
 	bool allowAlias = false;

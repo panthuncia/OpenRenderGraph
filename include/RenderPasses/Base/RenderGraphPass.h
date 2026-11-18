@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <source_location>
 
@@ -25,9 +26,14 @@ struct PassParameters;
 // declaration and is not encoded by the pass object's C++ type.
 class RenderGraphPass : public IResourceProvider, public RenderGraphPassBase {
 public:
-    virtual ~RenderGraphPass() = default;
+    ~RenderGraphPass() override;
     std::shared_ptr<const ResourceUseLayout> ResourceUses() const { return m_resourceUses; }
     void SetResourceUses(std::shared_ptr<const ResourceUseLayout> uses) { m_resourceUses = std::move(uses); }
+    // A declared pass's typed bindings (TypedRenderGraphPass), from the same declaration as ResourceUses. They are
+    // type-erased, so a graph can keep the declaration that a compiled executable was built from. Null for undeclared
+    // passes.
+    std::shared_ptr<const void> DeclaredBindings() const { return m_declaredBindingsSnapshot; }
+    void SetDeclaredBindings(std::shared_ptr<const void> bindings) { m_declaredBindingsSnapshot = std::move(bindings); }
 
     // Nonvirtual to preserve contributor vtables. The graph installs its exact
     // service generation before Setup; accepted frames retain the same owners.
@@ -56,12 +62,20 @@ public:
     // pass must never also be captured through the legacy immediate replay
     // adapter, even if an intermediate class still implements that interface.
     virtual bool UsesTypedPreparation() const noexcept { return false; }
-    // Async epochs: a hash of what the pass's preparation depends on (a reusable typed pass's
-    // InvocationRevision), so an invocation prepared ahead of its execution can be checked, on the
-    // submitting thread, against what the pass would prepare now. Safe to call concurrently with the pass's
-    // own preparation. False when the pass cannot tell - its preparation may depend on anything - and a
-    // prepared execution holding it is then never current.
-    virtual bool InvocationRevisionHash(uint64_t&) const { return false; }
+    // For async epochs. Computes a hash of what the pass's recording depends on beyond its bindings and the
+    // frame's resources. For a typed pass, this is its Revision. With it, the submitting thread can check an
+    // invocation prepared ahead of its execution against what the pass would prepare now, and reuse a kept
+    // recording. Safe to call at the same time as the pass's own preparation. Returns false when the pass cannot
+    // tell, because its recording may depend on anything. A prepared execution that holds it is then never current.
+    virtual bool RevisionHash(uint64_t&) const { return false; }
+    // A host that turns the pass off for some executions by its host data (a frame description passed as the preparation's
+    // host data). At each preparation the graph asks the predicate with that host data. True means the pass does nothing in
+    // the execution: its recorder records only the barriers around it, as for a pass recorded at execution that skips. The
+    // predicate must give the same answer for the same host data, because a kept recording keeps the answer. Set it before
+    // the pass's first preparation. Without one, the pass is never skipped this way.
+    void SetSkipWhen(std::function<bool(const IHostExecutionData*)> predicate) { m_skipWhen = std::move(predicate); }
+    // The predicate's answer for host data (false without a predicate).
+    bool SkipsFor(const IHostExecutionData* hostData) const { return m_skipWhen && m_skipWhen(hostData); }
 protected:
     runtime::IUploadService& UploadService() const;
     runtime::IDescriptorService& DescriptorService() const;
@@ -69,8 +83,10 @@ protected:
         size_t offset, std::source_location source = std::source_location::current()) const;
 private:
     std::shared_ptr<const ResourceUseLayout> m_resourceUses;
+    std::shared_ptr<const void> m_declaredBindingsSnapshot;
     std::weak_ptr<runtime::IUploadService> m_uploadService;
     std::weak_ptr<runtime::IDescriptorService> m_descriptorService;
+    std::function<bool(const IHostExecutionData*)> m_skipWhen;
 };
 
 } // namespace org

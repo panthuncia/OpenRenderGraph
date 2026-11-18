@@ -1,12 +1,13 @@
-#include "RenderPasses/Base/PersistentTypedPass.h"
+#include "OpenRenderGraph/Runtime.h"
+#include "TestSupport.h"
 #include <Resources/ExternalBufferResource.h>
 #include <Resources/ExternalTextureResource.h>
 #include <Render/Runtime/RuntimeDevice.h>
-#include <Render/PassBuilders.h>
+#include <Render/RenderGraph/RenderGraph.h>
 #include <RenderPasses/Base/TypedRenderGraphPass.h>
-#include <Render/RenderGraph/ExperimentalRhiExecution.h>
+#include <Render/RenderGraph/RhiExecution.h>
 #include "../src/Render/RenderGraph/FrameRecording.h"
-#include <Render/RenderGraph/ExperimentalExecutionState.h>
+#include <Render/RenderGraph/ExecutionState.h>
 #include <Render/RenderGraph/PersistentGraph.h>
 #include <Render/BufferBarrierHelpers.h>
 #include <Render/DescriptorSnapshots.h>
@@ -24,11 +25,15 @@
 #include <cstring>
 #include <type_traits>
 
-#define CHECK(x) do { if (!(x)) return __LINE__; } while (false)
-int TestDelayedFrameRecording(const rhi::DeviceCreateInfo& create);
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
+int TestRuntimeRetirement(rhi::Device device);
+int TestAssignedTimelineRetirement(rhi::Device device);
+int TestStatisticsPoolRetirement(rhi::Device device);
+int TestExternalClient(rhi::Device device);
 int TestProgramVersions(rhi::Device device);
+int TestPipelineLibrary(rhi::Device device);
 int TestReadbackCaptures(rhi::Device device);
+int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime);
 
 namespace {
 struct RecordingStatisticsProbe final : org::runtime::IStatisticsService {
@@ -73,7 +78,7 @@ struct DirectRecordingPass : org::TypedRenderGraphPass<DirectRecordingPass> {
     static void Record(org::PassRecordContext&) { ++recordings; }
 };
 int TestUnifiedDeclarations(rhi::Device device, const std::shared_ptr<org::Resource>& resource) {
-    org::RenderGraph graph(device, rhi::Backend::D3D12);
+    org::RenderGraph graph(org::Runtime::Current()->shared_from_this());
     const org::ResourceIdentifier name("test.unified");
     graph.RegisterResource(name, resource);
     auto& builder = graph.BuildPass<DirectRecordingPass>("Unified");
@@ -264,53 +269,53 @@ int TestServiceWorkReservations() {
 }
 
 int TestOwnedRenderFrameSnapshot() {
-    org::experimental::GraphCompileInput input;
+    org::compiler::GraphCompileInput input;
     input.structure.generation = input.structure.registryGeneration = 1;
     input.structure.resourceIDs = {1};
     input.structure.resourceShapes = {{1, 1, false}};
     input.structure.passes = {{0, 0, {{0, false}}}};
     input.structure.passes[0].preparedPassIndex = 0;
     std::atomic_bool cancelled{false};
-    org::experimental::CompileWorkspace workspace;
-    auto ownedInput = std::make_shared<const org::experimental::GraphCompileInput>(input);
-    auto graph = org::experimental::CompileGraph(ownedInput, workspace, cancelled);
-    auto bundle = std::make_shared<const org::experimental::CompiledGraphBundle>(
-        org::experimental::CompiledGraphBundle{1, graph, ownedInput});
-    auto layout = org::experimental::BuildExecutionLayout(bundle, *ownedInput);
+    org::compiler::CompileWorkspace workspace;
+    auto ownedInput = std::make_shared<const org::compiler::GraphCompileInput>(input);
+    auto graph = org::compiler::CompileGraph(ownedInput, workspace, cancelled);
+    auto bundle = std::make_shared<const org::compiler::ScheduleBundle>(
+        org::compiler::ScheduleBundle{1, graph, ownedInput});
+    auto layout = org::compiler::BuildExecutionLayout(bundle, *ownedInput);
     auto bindings = std::make_shared<const org::FrozenExecutionBindings>(
         std::vector<org::FrozenExecutionBindings::ResourceBinding>{});
     auto record = +[](const uint32_t&, org::RecordingContext&) {};
     auto lease = std::make_shared<int>(3);
-    auto barriers = std::make_shared<org::experimental::PreparedExecutionBarrierPlan>();
+    auto barriers = std::make_shared<org::compiler::PreparedExecutionBarrierPlan>();
     barriers->batches.resize(1);
-    auto frame = org::experimental::BuildRenderFrameSnapshot(7, layout,
+    auto frame = org::compiler::BuildRenderFrameSnapshot(7, layout,
         {org::PreparedPass::Make(uint32_t{1}, record)}, bindings,
-        std::make_shared<const std::vector<org::experimental::PreparedBackingState>>(
-            std::initializer_list<org::experimental::PreparedBackingState>{{.graphResourceID = 1}}),
+        std::make_shared<const std::vector<org::compiler::PreparedBackingState>>(
+            std::initializer_list<org::compiler::PreparedBackingState>{{.graphResourceID = 1}}),
         barriers, {lease});
     CHECK(frame->frameNumber == 7 && frame->layout == layout && frame->passes.size() == 1);
-    auto recordings = org::experimental::BuildPreparedBatchRecordings(*frame);
+    auto recordings = org::compiler::BuildPreparedBatchRecordings(*frame);
     CHECK(recordings.size() == 1 && recordings[0].queueSlot == 0
         && recordings[0].passes.size() == 1);
-    auto realized = std::make_shared<org::experimental::RealizedResourceBundle>();
+    auto realized = std::make_shared<org::compiler::RealizedResourceBundle>();
     realized->backingGenerations = {9};
     realized->bindings = bindings;
-    realized->initialStates = std::make_shared<const std::vector<org::experimental::PreparedBackingState>>(
-        std::initializer_list<org::experimental::PreparedBackingState>{{
+    realized->initialStates = std::make_shared<const std::vector<org::compiler::PreparedBackingState>>(
+        std::initializer_list<org::compiler::PreparedBackingState>{{
             .graphResourceID = 1, .resource = rhi::ResourceHandle{0, 1}}});
     realized->leases = {lease};
     std::vector<std::vector<org::ExternalTimelinePoint>> waits(1);
     waits[0].push_back({{}, 17});
-    auto payload = org::experimental::BuildPreparedFramePayload(8,
+    auto payload = org::compiler::BuildPreparedFramePayload(8,
         {org::PreparedPass::Make(uint32_t{2}, record)}, realized, waits);
-    org::experimental::BackingStateAdmissionLedger ledger;
-    auto realizedFrame = org::experimental::BuildRenderFrameSnapshot(layout, payload, ledger);
+    org::compiler::BackingStateAdmissionLedger ledger;
+    auto realizedFrame = org::compiler::BuildRenderFrameSnapshot(layout, payload, ledger);
     CHECK(realizedFrame->resources == realized);
     CHECK(realizedFrame->resources->backingGenerations == std::vector<uint64_t>{9});
     CHECK(realizedFrame->externalWaitsByPreparedPass.size() == 1
         && realizedFrame->externalWaitsByPreparedPass[0][0].value == 17);
     bool rejected = false;
-    try { org::experimental::BuildRenderFrameSnapshot(8, layout, {}, bindings, {}, barriers); }
+    try { org::compiler::BuildRenderFrameSnapshot(8, layout, {}, bindings, {}, barriers); }
     catch (const std::invalid_argument&) { rejected = true; }
     CHECK(rejected);
     return 0;
@@ -333,104 +338,26 @@ struct EmptyResolver final : org::ClonableResolver<EmptyResolver> {
 		return state;
 	}
 };
-struct DeclarationTestPass final : org::ComputePass {
+struct DeclarationTestPass final : org::RenderPass {
 	void Setup() override {}
 	void Cleanup() override {}
 };
-struct RefreshTestPass final : org::ComputePass {
-	std::shared_ptr<EmptyResolver> resolver;
-	std::shared_ptr<EmptyResolver> secondResolver;
-	bool symbolic;
-	int declarations = 0, setups = 0;
-	RefreshTestPass(std::shared_ptr<EmptyResolver> r, bool s, std::shared_ptr<EmptyResolver> second = {})
-		: resolver(std::move(r)), secondResolver(std::move(second)), symbolic(s) {}
-	void Setup() override { ++setups; }
-	void Cleanup() override {}
-	org::ResourceRegistryView* View() const { return m_resourceRegistryView.get(); }
-	void DeclareResourceUsages(org::ComputePassBuilder* builder) override {
-		++declarations;
-		if (symbolic) builder->ShaderResource(org::ResourceIdentifier("test.empty-resolver"));
-		else builder->ShaderResource(*resolver);
-		if (secondResolver) builder->ShaderResource(*secondResolver);
-	}
-};
-
-int TestEmptyResolverRefresh(rhi::Device device, const std::shared_ptr<org::Resource>& resource) {
-	org::RenderGraph graph(device, rhi::Backend::D3D12);
-	auto resolver = std::make_shared<EmptyResolver>();
-	graph.RegisterResolver(org::ResourceIdentifier("test.empty-resolver"), resolver);
-	graph.BuildComputePass<RefreshTestPass>("Direct", resolver, false);
-	graph.BuildComputePass<RefreshTestPass>("Symbolic", resolver, true);
-	graph.CompileStructural();
-	graph.Setup();
-	auto direct = std::dynamic_pointer_cast<RefreshTestPass>(graph.GetComputePassByName("Direct"));
-	auto symbolic = std::dynamic_pointer_cast<RefreshTestPass>(graph.GetComputePassByName("Symbolic"));
-	CHECK(direct && symbolic && direct->declarations == 1 && symbolic->declarations == 1);
-	auto* directView = direct->View();
-	auto* symbolicView = symbolic->View();
-	const auto setupCount = direct->setups;
-	for (unsigned step = 0; step != 3; ++step) {
-		resolver->identity->resources = std::make_shared<const org::ResolverResourceList>(
-			step == 1 ? org::ResolverResourceList{} : org::ResolverResourceList{resource});
-		++resolver->identity->setRevision;
-		org::UpdateExecutionContext context{};
-		context.frameIndex = step % 2;
-		context.frameFenceValue = step + 1;
-		graph.Update(context, device);
-		CHECK(direct->declarations == 1 && symbolic->declarations == 1);
-		CHECK(direct->setups == setupCount + step + 1);
-		CHECK(direct->View() == directView && symbolic->View() == symbolicView);
-		const org::ResourceIdentifier numericID(std::to_string(resource->GetGlobalResourceID()));
-		if (step != 1) {
-			CHECK(directView->RequestHandle(numericID).GetGlobalResourceID() == resource->GetGlobalResourceID());
-			CHECK(symbolicView->RequestHandle(numericID).GetGlobalResourceID() == resource->GetGlobalResourceID());
-		} else {
-			bool denied = false;
-			try { directView->RequestHandle(numericID); } catch (const std::runtime_error&) { denied = true; }
-			CHECK(denied);
-		}
-	}
-	++resolver->identity->contentRevision;
-	graph.Update(org::UpdateExecutionContext{}, device);
-	CHECK(direct->declarations == 1 && direct->setups == setupCount + 3);
-	return 0;
-}
-
-int TestMixedResolverCollision(rhi::Device device, const std::shared_ptr<org::Resource>& resource) {
-	org::RenderGraph graph(device, rhi::Backend::D3D12);
-	auto initiallyEmpty = std::make_shared<EmptyResolver>();
-	auto populated = std::make_shared<EmptyResolver>();
-	populated->identity->resources = std::make_shared<const org::ResolverResourceList>(org::ResolverResourceList{resource});
-	graph.BuildComputePass<RefreshTestPass>("Mixed", initiallyEmpty, false, populated);
-	graph.CompileStructural();
-	graph.Setup();
-	auto pass = std::dynamic_pointer_cast<RefreshTestPass>(graph.GetComputePassByName("Mixed"));
-	CHECK(pass && pass->declarations == 1);
-	initiallyEmpty->identity->resources = populated->identity->resources;
-	++initiallyEmpty->identity->setRevision;
-	graph.Update(org::UpdateExecutionContext{}, device);
-	// A new set overlapping an unchanged resolver must use the full merge path,
-	// not silently duplicate accesses after discarding unchanged membership IDs.
-	CHECK(pass->declarations == 2);
-	return 0;
-}
-
 int TestEmptyResolverDeclarations(rhi::Device device) {
-	org::RenderGraph graph(device, rhi::Backend::D3D12);
+	org::RenderGraph graph(org::Runtime::Current()->shared_from_this());
 	auto resolver = std::make_shared<EmptyResolver>();
 	const org::ResourceIdentifier identifier("test.empty-resolver");
 	graph.RegisterResolver(identifier, resolver);
-	auto& direct = graph.BuildComputePass<DeclarationTestPass>("Direct");
+	auto& direct = graph.BuildRenderPass<DeclarationTestPass>("Direct");
 	direct.ShaderResource(*resolver);
-	auto& symbolic = graph.BuildComputePass<DeclarationTestPass>("Symbolic");
+	auto& symbolic = graph.BuildRenderPass<DeclarationTestPass>("Symbolic");
 	symbolic.ShaderResource(identifier);
 	auto directStates = direct.TakeResolverSnapshots();
 	auto symbolicStates = symbolic.TakeResolverSnapshots();
 	CHECK(directStates.size() == 1 && symbolicStates.size() == 1);
 	const auto& a = directStates.front();
 	const auto& b = symbolicStates.front();
-	CHECK(a.resourceIDs.empty() && b.resourceIDs.empty());
-	CHECK(a.dependencyIdentity == b.dependencyIdentity);
+	CHECK(a.state && a.state->resources->empty() && b.state && b.state->resources->empty());
+	CHECK(a.DependencyIdentity() == b.DependencyIdentity());
 	CHECK(a.resolver.get() != resolver.get());
 	CHECK(!a.hasUnclassifiedDeclaration && !b.hasUnclassifiedDeclaration);
 	CHECK(a.declaredRequirementTemplates.size() == 1 && b.declaredRequirementTemplates.size() == 1);
@@ -438,13 +365,56 @@ int TestEmptyResolverDeclarations(rhi::Device device) {
 	CHECK(a.declaredRequirementTemplates[0].state == b.declaredRequirementTemplates[0].state);
 	CHECK(a.declaredRequirementTemplates[0].state.sync == b.declaredRequirementTemplates[0].state.sync);
 	// Multiple authored uses must survive an empty initial capture, too.
-	auto& multiple = graph.BuildComputePass<DeclarationTestPass>("Multiple");
+	auto& multiple = graph.BuildRenderPass<DeclarationTestPass>("Multiple");
 	multiple.ShaderResource(*resolver);
 	multiple.UnorderedAccess(*resolver);
 	multiple.ShaderResource(*resolver);
 	auto multiStates = multiple.TakeResolverSnapshots();
 	CHECK(multiStates.size() == 1);
 	CHECK(multiStates[0].declaredRequirementTemplates.size() == 2);
+	return 0;
+}
+
+// A resolver that publishes a new resource set between any two captures (another thread's publication, made
+// deterministic).
+struct RacingResolver final : org::ClonableResolver<RacingResolver> {
+	struct State {
+		std::vector<std::shared_ptr<org::Resource>> pool;
+		mutable uint64_t captures = 0;
+	};
+	std::shared_ptr<State> identity = std::make_shared<State>();
+	std::vector<std::shared_ptr<org::Resource>> Resolve() const override { return *CaptureDeclarationState()->resources; }
+	std::shared_ptr<const org::ResolverDeclarationState> CaptureDeclarationState() const override {
+		// Capture n holds the first n + 1 resources of the pool (capped).
+		const auto count = (std::min<size_t>)(identity->pool.size(), ++identity->captures);
+		auto state = std::make_shared<org::ResolverDeclarationState>();
+		state->tracked = true;
+		state->dependencyIdentity = identity;
+		state->resourceSetIdentity = {count, 0};
+		state->resources = std::make_shared<const org::ResolverResourceList>(identity->pool.begin(), identity->pool.begin() + count);
+		return state;
+	}
+};
+// Every capture one declaration takes of a resolver (each use, the snapshot) describes one resource set.
+int TestDeclarationCapturesOneSet(rhi::Device device) {
+	org::RenderGraph graph(org::Runtime::Current()->shared_from_this());
+	auto resolver = std::make_shared<RacingResolver>();
+	for (int i = 0; i < 4; ++i)
+		resolver->identity->pool.push_back(org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 256, true));
+	auto& pass = graph.BuildRenderPass<DeclarationTestPass>("Racing");
+	{
+		const org::RenderGraph::ResolverCaptureScope captures;
+		pass.ShaderResource(*resolver);
+		pass.UnorderedAccess(*resolver);
+	}
+	const auto inScope = resolver->identity->captures;
+	auto snapshots = pass.TakeResolverSnapshots();
+	CHECK(snapshots.size() == 1 && snapshots[0].state);
+	// The scope's first capture held one member; later captures in the scope returned it again.
+	CHECK(snapshots[0].state->resources->size() == 1);
+	CHECK(inScope > 1);
+	// Outside a scope, every capture is fresh.
+	CHECK(graph.CaptureResolverDeclarationState(*resolver)->resources->size() == (std::min<size_t>)(4, inScope + 1));
 	return 0;
 }
 
@@ -461,7 +431,7 @@ Microsoft::WRL::ComPtr<ID3D12Resource> MakeResource(ID3D12Device* device, bool t
 }
 
 int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
-    using namespace org::experimental;
+    using namespace org::compiler;
     GraphCompileInput input;
     input.structure.generation = input.structure.registryGeneration = 1;
     input.structure.resourceIDs = {1,2,3};
@@ -491,7 +461,7 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
     });
     auto compiled = job.get();
     CHECK(compiled && compiled->states.complete && compiled->stateValidationError.empty());
-    auto bundle = std::make_shared<const CompiledGraphBundle>(CompiledGraphBundle{1,compiled,owned});
+    auto bundle = std::make_shared<const ScheduleBundle>(ScheduleBundle{1,compiled,owned});
     rhi::TimelinePtr timeline;
     CHECK(device.CreateTimeline(timeline, 0, "Experimental submission test") == rhi::Result::Ok);
     ExecutionTimelineAdmission admission({{1,0}});
@@ -576,7 +546,7 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
         org::PreparedPass declaredPacket;
         {
             DeclaredRecordingPass pass;
-            org::RenderGraph declarationGraph(device, rhi::Backend::D3D12);
+            org::RenderGraph declarationGraph(org::Runtime::Current()->shared_from_this());
             auto& declaration = declarationGraph.BuildRenderPass<DeclaredRecordingPass>("Declared binding lifetime");
             pass.DeclareUnified(declaration);
             auto permissions = std::make_shared<org::FramePreparationContext::ResourceSlots>();
@@ -887,26 +857,25 @@ int TestDescriptorSnapshots(const rhi::DeviceCreateInfo& create) {
     return 0;
 }
 
+// Persistent passes declared straight into a graph edit. Their packets name the publication they were prepared
+// for by identity only (the frame recorder roots it) and resolve every token through the recording context.
 struct PersistentNativeClear {
     struct Bindings { org::persistent::BindingToken resource; org::persistent::ViewToken shader, cpu; };
-    struct ProgramInterface { uint32_t multiplier; };
-    using Invocation = uint32_t;
-    org::persistent::ResourceSlotId resource;
-    unsigned declarationCalls = 0;
-    Bindings Declare(org::persistent::PassDeclaration& declaration) {
-        ++declarationCalls;
-        auto token = declaration.Resource(resource,
+    struct Invocation { Bindings bindings; uint32_t value = 0; const org::persistent::SelectedPublication* selected = nullptr; };
+    static Bindings Declare(org::persistent::GraphEditTransaction& edit, org::persistent::PassId pass,
+        org::persistent::ResourceSlotId resource) {
+        auto token = edit.Declare(pass,resource,{},
             {static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccessClear),0,
              static_cast<uint64_t>(rhi::ResourceSyncState::ClearUnorderedAccessView),true});
-        return {token,declaration.View(token,{org::BindlessViewKind::UnorderedAccess}),
-            declaration.View(token,{org::BindlessViewKind::NonShaderVisibleUnorderedAccess})};
+        return {token,edit.DeclareView(token,{org::BindlessViewKind::UnorderedAccess}),
+            edit.DeclareView(token,{org::BindlessViewKind::NonShaderVisibleUnorderedAccess})};
     }
-    ProgramInterface BuildProgramInterface(const Bindings&, uint32_t multiplier) const { return {multiplier}; }
-    static Invocation PrepareInvocation(const ProgramInterface&, const Bindings&, uint32_t value) { return value; }
-    static void Record(const ProgramInterface& program, const Bindings& bindings, const Invocation& value,
-        org::RecordingContext& context) {
+    static void Record(const Invocation& invocation, org::RecordingContext& context) {
+        if (context.PersistentPublication() != invocation.selected)
+            throw std::logic_error("Persistent invocation recorded against a different publication");
+        const auto& bindings = invocation.bindings;
         const auto shader = context.Resolve(bindings.shader);
-        const auto clear = value * program.multiplier;
+        const auto clear = invocation.value;
         context.Commands().SetDescriptorHeaps(shader.heap,{});
         context.Commands().ClearUavUint({shader,context.Resolve(bindings.cpu),context.Resolve(bindings.resource)},
             rhi::UavClearUint(std::array<uint32_t,4>{clear,clear,clear,clear}));
@@ -914,25 +883,24 @@ struct PersistentNativeClear {
 };
 struct PersistentNativeCopy {
     struct Bindings { org::persistent::BindingToken source, destination; };
-    struct ProgramInterface {};
-    using Invocation = uint8_t;
-    org::persistent::ResourceSlotId source, destination;
-    Bindings Declare(org::persistent::PassDeclaration& declaration) {
-        return {declaration.Resource(source,{static_cast<uint64_t>(rhi::ResourceAccessType::CopySource),0,
+    struct Invocation { Bindings bindings; const org::persistent::SelectedPublication* selected = nullptr; };
+    static Bindings Declare(org::persistent::GraphEditTransaction& edit, org::persistent::PassId pass,
+        org::persistent::ResourceSlotId source, org::persistent::ResourceSlotId destination) {
+        return {edit.Declare(pass,source,{},{static_cast<uint64_t>(rhi::ResourceAccessType::CopySource),0,
                     static_cast<uint64_t>(rhi::ResourceSyncState::Copy),false}),
-                declaration.Resource(destination,{static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),0,
+                edit.Declare(pass,destination,{},{static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),0,
                     static_cast<uint64_t>(rhi::ResourceSyncState::Copy),true})};
     }
-    ProgramInterface BuildProgramInterface(const Bindings&, uint8_t) const { return {}; }
-    static Invocation PrepareInvocation(const ProgramInterface&, const Bindings&, uint8_t value) { return value; }
-    static void Record(const ProgramInterface&, const Bindings& bindings, const Invocation&, org::RecordingContext& context) {
-        context.Commands().CopyBufferRegion(context.Resolve(bindings.destination).GetHandle(),0,
-            context.Resolve(bindings.source).GetHandle(),0,4096);
+    static void Record(const Invocation& invocation, org::RecordingContext& context) {
+        if (context.PersistentPublication() != invocation.selected)
+            throw std::logic_error("Persistent invocation recorded against a different publication");
+        context.Commands().CopyBufferRegion(context.Resolve(invocation.bindings.destination).GetHandle(),0,
+            context.Resolve(invocation.bindings.source).GetHandle(),0,4096);
     }
 };
 
 int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
-    using namespace org::experimental;
+    using namespace org::compiler;
     struct Runtime {
         rhi::DevicePtr device;
         rhi::TimelinePtr timeline;
@@ -1056,12 +1024,14 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         initial[0].aliasHeap = backing->heapGeneration;
         initial[0].aliasHeapIdentity = backing->heapGeneration.get();
         initial[0].aliasSize = backing->aliasSize;
+        initial[0].aliasPoolID = 1;  // as an ORG alias pool places it
         initial[1].heapType = rhi::HeapType::Readback;
         // Exercise stable logical tokens through the production prepared-pass
         // executor, using real native resources and exact publication ownership.
         std::shared_ptr<const org::persistent::SelectedPublication> selected;
-        std::optional<org::persistent::TypedPassExecutable<PersistentNativeClear>> clearExecutable;
-        std::optional<org::persistent::TypedPassExecutable<PersistentNativeCopy>> copyExecutable;
+        org::persistent::PassId clearPass{}, copyPass{};
+        PersistentNativeClear::Bindings clearBindings{};
+        PersistentNativeCopy::Bindings copyBindings{};
         {
             org::persistent::GraphProgram persistentProgram;
             auto edit = persistentProgram.BeginEdit();
@@ -1094,20 +1064,19 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
             // backing. Compilation must still synchronize clear before copy.
             auto aliasInitial = initial[0]; aliasInitial.graphResourceID = 3;
             const auto copySource = edit.AddSnapshot(sourceSnapshot,aliasInitial);
-            PersistentNativeClear clearAuthor{slots[0]};
-            PersistentNativeCopy copyAuthor{copySource,slots[1]};
-            clearExecutable.emplace(org::persistent::TypedPassExecutable<PersistentNativeClear>::Build(edit,{},clearAuthor,uint32_t{1}));
-            copyExecutable.emplace(org::persistent::TypedPassExecutable<PersistentNativeCopy>::Build(edit,{},copyAuthor,uint8_t{}));
+            clearPass = edit.AddPass({});
+            clearBindings = PersistentNativeClear::Declare(edit,clearPass,slots[0]);
+            copyPass = edit.AddPass({});
+            copyBindings = PersistentNativeCopy::Declare(edit,copyPass,copySource,slots[1]);
             selected = edit.Build(workspace,cancelled);
             CHECK(persistentProgram.Install(selected));
             CHECK(selected->bindings.Size() == 3 && selected->executable->resourceSlots.size() == 2);
+            // A non-structural edit of a pass (its recording interface) keeps the executable.
             auto programEdit = persistentProgram.BeginEdit();
-            auto changedExecutable = clearExecutable->RebuildProgramInterface(programEdit,clearAuthor,iteration);
+            programEdit.SetPassRecordingInterface(clearPass,std::make_shared<const uint32_t>(iteration));
             auto changed = programEdit.Build(workspace,cancelled);
             CHECK(changed->executable == selected->executable);
             CHECK(persistentProgram.Install(changed));
-            CHECK(clearAuthor.declarationCalls == 1);
-            clearExecutable.emplace(std::move(changedExecutable));
             selected = std::move(changed);
         }
         auto frame = persistentAdmission.Prepare(selected,std::array<ExecutionTimelinePoint,1>{{{1,iteration-1}}});
@@ -1122,27 +1091,29 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         CHECK(barrierPlan.batches[0].beforePass[0].buffers.empty());
         CHECK(!barrierPlan.batches[0].beforePass[1].buffers.empty());
         std::vector<org::PreparedPass> invocations(selectedLayout->placements.size());
-        invocations[clearExecutable->Id().index] = clearExecutable->PrepareInvocation(*selected,uint32_t{1});
+        invocations[clearPass.index] = org::PreparedPass::FromTyped<PersistentNativeClear>(
+            PersistentNativeClear::Invocation{clearBindings,iteration,selected.get()});
         const auto step = std::find_if(graph->states.steps.begin(),graph->states.steps.end(),
             [](const auto& s) { return s.resource == 0 && s.batch == 0 && s.pass == 1; });
         CHECK(step != graph->states.steps.end() && step->previousBatch == 0);
-        invocations[copyExecutable->Id().index] = copyExecutable->PrepareInvocation(*selected,uint8_t{});
+        invocations[copyPass.index] = org::PreparedPass::FromTyped<PersistentNativeCopy>(
+            PersistentNativeCopy::Invocation{copyBindings,selected.get()});
         auto rejectSeal = [&](const org::persistent::FrameAdmission& invalid) {
             try { SealPersistentFrame(iteration,invalid,invocations); }
             catch (const std::invalid_argument&) { return true; }
             return false;
         };
-        auto invalidSeal = frame; invalidSeal.backings.pop_back();
+        auto invalidSeal = frame; invalidSeal.backings.Mutable().pop_back();
         CHECK(rejectSeal(invalidSeal));
-        invalidSeal = frame; std::swap(invalidSeal.backings[0],invalidSeal.backings[1]);
+        invalidSeal = frame; std::swap(invalidSeal.backings.Mutable()[0],invalidSeal.backings.Mutable()[1]);
         CHECK(rejectSeal(invalidSeal));
-        invalidSeal = frame; invalidSeal.backings[0].regions.reset();
+        invalidSeal = frame; invalidSeal.backings.Mutable()[0].regions.reset();
         CHECK(rejectSeal(invalidSeal));
         // An aliasing shared_ptr may retain the right control block while
         // pointing at the wrong heap. Ownership equality alone is insufficient.
         CHECK(frame.backings[0].aliasHeap.get() != nullptr);
         invalidSeal = frame;
-        invalidSeal.backings[0].aliasHeap = std::shared_ptr<const org::AliasHeapGeneration>(frame.backings[0].aliasHeap,nullptr);
+        invalidSeal.backings.Mutable()[0].aliasHeap = std::shared_ptr<const org::AliasHeapGeneration>(frame.backings[0].aliasHeap,nullptr);
         CHECK(rejectSeal(invalidSeal));
         CHECK(!invocations[0].IsConsumed() && !invocations[1].IsConsumed());
         invalidSeal = {};
@@ -1174,7 +1145,7 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         CHECK(timingProbe->cpuSamples == 0 && timingProbe->merges == 0);
         std::weak_ptr<const void> bindingLease = descriptorOwner;
         std::weak_ptr<const org::persistent::SelectedPublication> publicationLease = selected;
-        selected.reset(); clearExecutable.reset(); copyExecutable.reset();
+        selected.reset();
         gpu.reset(); cpu.reset(); backing.reset(); descriptorOwner.reset();
         auto execution = std::move(*recorded).Submit(admission);
         persistentAdmission.Commit(frame,*execution);
@@ -1247,7 +1218,7 @@ int TestAliasHeapOwnership(const rhi::DeviceCreateInfo& create) {
         // Use real heap ownership and placed resource identities to validate
         // the persistent publication contract, without renderer initialization.
         using namespace org::persistent;
-        using namespace org::experimental;
+        using namespace org::compiler;
         GraphProgram program;
         CompileWorkspace workspace;
         std::atomic_bool cancelled{false};
@@ -1263,6 +1234,7 @@ int TestAliasHeapOwnership(const rhi::DeviceCreateInfo& create) {
             state->aliasHeap = generation;
             state->aliasHeapIdentity = generation.get();
             state->aliasSize = info.sizeInBytes;
+            state->aliasPoolID = 1;  // as an ORG alias pool places it
             BindingVersion binding;
             binding.identity = (uint64_t{handle.generation} << 32) | handle.index;
             binding.backingRevision = 1;
@@ -1276,6 +1248,7 @@ int TestAliasHeapOwnership(const rhi::DeviceCreateInfo& create) {
             snapshot->allocationOwner = binding.owner;
             snapshot->aliasHeap = generation;
             snapshot->aliasSize = info.sizeInBytes;
+            snapshot->aliasPoolID = 1;
             binding.recording = snapshot;
             const auto slot = edit.AddResource(binding.shape,std::move(binding));
             CompilePass pass;
@@ -1379,13 +1352,21 @@ int main(int argc, char** argv) {
         graph.vt = &table;
         auto owner = std::make_shared<rhi::WorkGraphPtr>(rhi::Device{}, graph,
             +[](rhi::Device&, rhi::WorkGraph& value) noexcept { *static_cast<bool*>(value.impl) = true; });
-        org::PreparedDependencyCollector collector;
-        const auto reference = collector.CaptureWorkGraph(owner);
-        auto dependencies = std::move(collector).Freeze();
+        // A recording retains what it names until its retention is released.
+        rhi::CommandListVTable commandTable{};
+        commandTable.abi_version = rhi::RHI_CL_ABI_MIN;
+        rhi::CommandList commands{rhi::CommandListHandle{1,1}};
+        commands.impl = &commandTable; commands.vt = &commandTable;
+        auto retention = std::make_shared<org::RecordingRetention>();
+        {
+            org::RecordingContext recording(commands, std::make_shared<const org::FrozenExecutionBindings>(
+                std::vector<org::FrozenExecutionBindings::ResourceBinding>{}));
+            recording.SetRetention(retention);
+            recording.Retain(owner);
+        }
         owner.reset();
-        CHECK(dependencies && !dependencies->empty() && !destroyed);
-        CHECK(dependencies->Resolve(reference).index == 1);
-        dependencies.reset();
+        CHECK(!destroyed);
+        retention.reset();
         CHECK(destroyed);
     }
 	if (const auto failure = TestOwnedRenderFrameSnapshot()) return failure;
@@ -1407,11 +1388,10 @@ int main(int argc, char** argv) {
 	rhi::DeviceCreateInfo create{}; create.backend = rhi::Backend::D3D12; create.nativeAdapter = warp.Get(); create.framesInFlight = 2;
     if (const auto failure = TestDescriptorSnapshots(create)) return failure;
     if (const auto failure = TestOwnedDescriptorGpuExecution(create)) return failure;
-    if (const auto failure = TestDelayedFrameRecording(create)) return failure;
     if (const auto failure = TestAliasHeapOwnership(create)) return failure;
 	rhi::DevicePtr device; CHECK(!rhi::Failed(rhi::CreateD3D12Device(create, device)) && device);
 	auto* nativeDevice = rhi::dx12::get_device(device.Get()); CHECK(nativeDevice);
-	org::runtime::InitializeRuntimeDevice(device.Get());
+	auto orgRuntime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::D3D12});
 
     {
         auto api = device.Get();
@@ -1444,6 +1424,7 @@ int main(int argc, char** argv) {
     }
 	if (const auto failure = TestPreparedGpuSubmission(device.Get(), nativeDevice)) return failure;
 	if (const auto failure = TestEmptyResolverDeclarations(device.Get())) return failure;
+	if (const auto failure = TestDeclarationCapturesOneSet(device.Get())) return failure;
 
 	auto bufferA = MakeResource(nativeDevice, false, 4096), bufferB = MakeResource(nativeDevice, false, 4096);
     {
@@ -1494,8 +1475,6 @@ int main(int argc, char** argv) {
 		CHECK(registry.MakeHandle(bufferID).GetGeneration() == 0);
 	}
 	if (const auto failure = TestUnifiedDeclarations(device.Get(), buffer)) return failure;
-	if (const auto failure = TestEmptyResolverRefresh(device.Get(), buffer)) return failure;
-	if (const auto failure = TestMixedResolverCollision(device.Get(), buffer)) return failure;
 
 	org::TextureDescription description{}; description.imageDimensions = { { 64, 64 } };
 	description.channels = 4; description.format = rhi::Format::R8G8B8A8_UNorm; description.hasSRV = true;
@@ -1522,8 +1501,14 @@ int main(int argc, char** argv) {
 	buffer.reset(); texture.reset();
     if (const auto failure = TestSignalReservations(device.Get())) return failure;
     if (const auto failure = TestProgramVersions(device.Get())) return failure;
+    if (const auto failure = TestPipelineLibrary(device.Get())) return failure;
     if (const auto failure = TestReadbackCaptures(device.Get())) return failure;
     if (const auto failure = TestFrameRetirement(device.Get(), rhi::Backend::D3D12)) return failure;
-	org::runtime::ShutdownRuntimeDevice();
+    if (const auto failure = TestRuntimeRetirement(device.Get())) return failure;
+    if (const auto failure = TestAssignedTimelineRetirement(device.Get())) return failure;
+    if (const auto failure = TestStatisticsPoolRetirement(device.Get())) return failure;
+    if (const auto failure = TestExternalClient(device.Get())) return failure;
+    if (const auto failure = TestRebindingGpu(device.Get(), orgRuntime)) return failure;
+	orgRuntime.reset();
 	return 0;
 }

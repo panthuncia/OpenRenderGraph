@@ -14,6 +14,13 @@ DescriptorHeap::DescriptorHeap(rhi::Device& device, rhi::DescriptorHeapType type
 
     m_descriptorSize = device.GetDescriptorHandleIncrementSize(type);
     m_totalSize = numDescriptors;
+    // A shader-visible resource heap never hands out slot 0. A buffer view ref with slot 0 is null (rhi_shader_abi.h), and a
+    // shader that loads through one reads slot 0. Left as the heap was made (zeros: a null buffer on Vulkan), that load reads
+    // zeros instead of some resource's descriptor, whose memory would then be taken for refs and indices.
+    if (shaderVisible && type == rhi::DescriptorHeapType::CbvSrvUav && numDescriptors > 1) {
+        m_numDescriptorsAllocated = 1;
+        m_slots.emplace_back();
+    }
 }
 
 DescriptorHeap::~DescriptorHeap() {
@@ -52,8 +59,8 @@ std::shared_ptr<const void> DescriptorHeap::CaptureDescriptorLease(UINT index) {
         throw std::logic_error("Cannot capture an unallocated or retired descriptor slot");
     auto& slot = m_slots[index];
     if (auto existing = slot.lease.lock()) return existing;
-    // A distinct control block per slot; aliasing the heap's control block
-    // would make the lease live for the entire heap lifetime.
+    // Each slot gets its own control block. Aliasing the heap's control block
+    // would keep the lease alive for the whole lifetime of the heap.
     auto lease = std::make_shared<Lease>(shared_from_this(), index, ++slot.leaseGeneration);
     slot.lease = lease;
     return lease;

@@ -115,14 +115,33 @@ PublicationBindingBundle::Snapshot PublicationBindingBundle::Capture(Resource& r
         auto concrete = dynamic->GetResource();
         return concrete ? Capture(*concrete) : Snapshot{};
     }
-    if (auto* dynamic = dynamic_cast<DynamicGloballyIndexedResource*>(&resource)) {
-        auto concrete = dynamic->GetResource();
-        return concrete ? Capture(*concrete) : Snapshot{};
-    }
     auto result = std::make_shared<ResourceBindingSnapshot>();
+    std::unique_lock<std::recursive_mutex> backingLock;
     result->resourceID = resource.GetGlobalResourceID();
+    result->externallyImmutable = resource.GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource;
     resource.TryGetRHIResourceDesc(result->description);
-    if (auto* backed = dynamic_cast<BackedResource*>(&resource)) {
+    if (auto set = resource.AcquireAPIRepresentationSet();
+        set && !set->devices.empty() && set->devices.front() && set->devices.front()->resource) {
+        // Explicit per-device representations (multi-device) replace the backing. The primary device's representation is the
+        // resource. The published set owns every device's representation and is the allocation's identity: slots of one
+        // resource captured at different times must name the same owner. Representations placed in a shared alias pool are
+        // aliased like a placed backing: they enter every execution undefined, and the alias ledger orders their range.
+        const auto& devices = set->devices;
+        const auto& primary = devices.front();
+        result->representations.resize(devices.size());
+        for (size_t index = 0; index < devices.size(); ++index)
+            if (devices[index] && devices[index]->resource) result->representations[index] = devices[index]->resource.Get();
+        result->resource = primary->resource.Get();
+        result->backingGeneration = primary->backingGeneration;
+        result->aliasHeap = set->placement.heap;
+        result->aliasPoolID = set->placement.poolID;
+        result->aliasOffset = set->placement.offset;
+        result->aliasSize = set->placement.size;
+        result->allocationOwner = std::move(set);
+    } else if (auto* backed = dynamic_cast<BackedResource*>(&resource)) {
+        // Held until the views are captured: a re-placement between the two would pair this allocation with no views, or
+        // with the next backing's.
+        if (auto* mutex = backed->BackingMutex()) backingLock = std::unique_lock(*mutex);
         auto allocation = backed->CapturePublishedBackingAllocation();
         if (!allocation) return {};
         result->resource = allocation->resource;

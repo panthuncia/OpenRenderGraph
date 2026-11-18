@@ -35,9 +35,10 @@ template<class Data> struct OwnedDescriptorWrite::Model final : OwnedDescriptorW
     rhi::Result (*const write)(const Data&, rhi::Device, rhi::DescriptorSlot) noexcept;
 };
 
-// Persistent paged dirty-slot journal. Captures share unchanged pages; updates
-// copy only a dirty page. No history grows with publication count. Recipe object
-// identity is the content version (reuse it only for identical owned contents).
+// A persistent journal of dirty slots, stored in pages. Captures share
+// unchanged pages. An update copies only the dirty page. No history grows with
+// the number of publications. The identity of a recipe object is its content
+// version, so reuse a recipe object only for identical owned contents.
 class DescriptorContentJournal {
 public:
     static constexpr uint32_t PageSize = 64;

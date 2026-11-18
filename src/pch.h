@@ -19,6 +19,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 // Third-party - spdlog
@@ -27,5 +28,9 @@
 // RHI
 #include <rhi.h>
 #include <rhi_helpers.h>
+
+// Stable third-party headers most translation units parse.
+#include <boost/container_hash/hash.hpp>
+#include <flecs.h>
 
 

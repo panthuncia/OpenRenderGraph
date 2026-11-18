@@ -1,7 +1,7 @@
 #ifndef OPEN_RENDER_GRAPH_SHADER_COMPILER_SERVICE_H
 #define OPEN_RENDER_GRAPH_SHADER_COMPILER_SERVICE_H
 
-#include <OpenRenderGraph/ContributorAPI.h>
+#include <OpenRenderGraph/ORGTypes.h>
 
 #ifdef __cplusplus
 extern "C" {

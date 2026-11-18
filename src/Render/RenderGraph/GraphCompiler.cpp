@@ -1,0 +1,1266 @@
+#include "OpenRenderGraph/Trace.h"
+#include <cstdlib>
+#include "Render/PublicationBindingBundle.h"
+#include "Render/RenderGraph/GraphCompiler.h"
+#include "Render/RenderGraph/GraphReplay.h"
+#include "Render/RenderGraph/CompileTelemetry.h"
+
+#include <algorithm>
+#include <array>
+#include <numeric>
+#include <stdexcept>
+#include <tuple>
+#include <BasicTelemetry/Tracy.h>
+#include <spdlog/spdlog.h>
+
+namespace org::compiler {
+
+namespace {
+std::string_view DiagnosticPassName(const GraphCompileStructure& structure, uint32_t pass) {
+    return pass < structure.diagnosticPassNames.size()
+        ? std::string_view(structure.diagnosticPassNames[pass]) : std::string_view{};
+}
+std::string_view DiagnosticResourceName(const GraphCompileStructure& structure, uint32_t resource) {
+    return resource < structure.diagnosticResourceNames.size()
+        ? std::string_view(structure.diagnosticResourceNames[resource]) : std::string_view{};
+}
+}
+
+bool IsExecutionCompatible(const ScheduleBundle& bundle,
+    const GraphCompileInput& prepared) noexcept {
+    if (!bundle.graph || !bundle.input || !bundle.graph->structure
+        || !bundle.graph->scheduleValidated || !bundle.graph->scheduleValidationError.empty()
+        || bundle.input.get() != &prepared
+        || bundle.graph->structure.get() != &bundle.input->structure) return false;
+    size_t scheduledPasses = 0;
+    for (const auto& batch : bundle.graph->batches) scheduledPasses += batch.passes.size();
+    if (scheduledPasses != prepared.structure.passes.size()) return false;
+    std::vector<uint8_t> mapped(prepared.structure.passes.size());
+    for (const auto& pass : prepared.structure.passes) {
+        if (pass.preparedPassIndex >= mapped.size() || mapped[pass.preparedPassIndex]) return false;
+        mapped[pass.preparedPassIndex] = 1;
+    }
+    return std::find(mapped.begin(), mapped.end(), uint8_t{0}) == mapped.end();
+}
+
+std::shared_ptr<const GraphExecutionLayout> BuildExecutionLayout(
+    std::shared_ptr<const ScheduleBundle> bundle,
+    const GraphCompileInput& prepared) {
+    BT_ZONE_SCOPE("ORG.Execution.BuildLayout");
+    const bool exactDirect = bundle && bundle->graph && bundle->input.get() == &prepared
+        && bundle->graph->structure.get() == &prepared.structure && bundle->graph->scheduleValidated
+        && bundle->graph->stage == ScheduleStage::SymbolicSchedule && bundle->graph->scheduleValidationError.empty();
+    if (!bundle || !exactDirect)
+        throw std::invalid_argument("Compiled graph is incompatible with prepared frame");
+    auto result = std::make_shared<GraphExecutionLayout>();
+    result->bundle = std::move(bundle);
+    result->placements.resize(prepared.structure.passes.size());
+    std::vector<uint8_t> assigned(prepared.structure.passes.size());
+    for (uint32_t batch = 0; batch < result->bundle->graph->batches.size(); ++batch) {
+        const auto& symbolic = result->bundle->graph->batches[batch];
+        for (const auto pass : symbolic.passes) {
+            const auto preparedPass = prepared.structure.passes.at(pass).preparedPassIndex;
+            if (preparedPass >= assigned.size() || assigned[preparedPass])
+                throw std::invalid_argument("Compiled graph has duplicate prepared pass placement");
+            result->placements.at(preparedPass) = {preparedPass, batch, symbolic.queue};
+            assigned[preparedPass] = 1;
+        }
+    }
+    if (std::find(assigned.begin(), assigned.end(), uint8_t{0}) != assigned.end())
+        throw std::invalid_argument("Compiled graph has incomplete prepared pass placement");
+    return result;
+}
+
+
+ExecutionTimelineAdmission::ExecutionTimelineAdmission(std::vector<ExecutionTimelinePoint> queues,
+    size_t maximumInFlight)
+    : m_reserved(std::move(queues)), m_submitted(m_reserved), m_completed(m_reserved),
+      m_maximumInFlight(maximumInFlight) {
+    if (!maximumInFlight) throw std::invalid_argument("Invalid execution capacity");
+    m_retained.reserve(maximumInFlight); // Commit cannot allocate after submission.
+    for (auto& completed : m_completed) completed.value = 0;
+    for (size_t i = 0; i < m_reserved.size(); ++i) {
+        if (!m_reserved[i].timeline) throw std::invalid_argument("Missing queue timeline");
+        for (size_t j = 0; j < i; ++j)
+            if (m_reserved[i].timeline == m_reserved[j].timeline)
+                throw std::invalid_argument("Queue timelines must be exclusive");
+    }
+}
+
+std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Prepare(
+    std::shared_ptr<const ScheduleBundle> bundle,
+    const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
+    std::vector<std::shared_ptr<const void>> executionLeases,
+    std::vector<std::shared_ptr<const IPreparedExecutionBatch>> preparedBatches,
+    std::span<const ExecutionTimelinePoint> reservedSignals) {
+    BT_ZONE_SCOPE("ORG.Execution.PrepareTimelines");
+    if (m_failed || m_pending || InFlight() >= m_maximumInFlight)
+        throw std::logic_error("Admission unavailable");
+    if (!bundle || !bundle->graph || !bundle->input || !bundle->graph->structure
+        || bundle->graph->structure.get() != &bundle->input->structure)
+        throw std::invalid_argument("Incompatible execution bundle");
+    const auto& graph = *bundle->graph;
+    if (graph.structure->queues.size() != m_reserved.size()
+        || incomingWaits.size() != graph.batches.size() || graph.batches.empty())
+        throw std::invalid_argument("Invalid execution timeline dimensions");
+    if (!graph.scheduleValidated || !graph.scheduleValidationError.empty())
+        throw std::invalid_argument("Invalid execution schedule");
+    if (m_sequence == UINT64_MAX) throw std::overflow_error("Submission sequence exhausted");
+    auto reserved = m_reserved; // Transactional: errors never consume values.
+    // What the waits may reference. With signals given (assigned at submission, in submission order, the waits found then in the
+    // ledgers of work committed before), everything below an execution's first signal on a timeline was submitted before it, by
+    // this owner or by another on a shared timeline; and on a timeline it does not signal, whatever the ledgers named.
+    auto submittedFloor = m_submitted;
+    if (!reservedSignals.empty() && reservedSignals.size() == graph.batches.size()) {
+        for (auto& floor : submittedFloor) floor.value = UINT64_MAX;
+        std::vector<uint8_t> lifted(m_reserved.size());
+        for (size_t i = 0; i < graph.batches.size(); ++i) {
+            const auto queue = graph.batches[i].queue;
+            auto& floor = submittedFloor.at(queue);
+            if (lifted.at(queue) || reservedSignals[i].timeline != floor.timeline || !reservedSignals[i].value) continue;
+            lifted[queue] = 1;  // the queue's first batch here: everything below its signal is submitted
+            floor.value = reservedSignals[i].value - 1;
+            auto& point = reserved.at(queue);
+            point.value = (std::max)(point.value, reservedSignals[i].value - 1);
+        }
+    }
+    auto result = std::make_shared<GraphExecutionTimeline>();
+    result->submission = m_sequence + 1;
+    result->bundle = std::move(bundle);
+    result->executionLeases = std::move(executionLeases);
+    result->preparedBatches = std::move(preparedBatches);
+    result->batches.resize(graph.batches.size());
+    for (size_t i = 0; i < graph.batches.size(); ++i) {
+        auto& point = reserved.at(graph.batches[i].queue);
+        if (!reservedSignals.empty()) {
+            if (reservedSignals.size() != graph.batches.size()
+                || reservedSignals[i].timeline != point.timeline
+                || reservedSignals[i].value <= point.value)
+                throw std::invalid_argument("Invalid concrete queue-signal reservation: batch " + std::to_string(i) + " of "
+                    + std::to_string(graph.batches.size()) + " on queue " + std::to_string(graph.batches[i].queue) + ", signal "
+                    + std::to_string(reservedSignals[i].timeline) + "@" + std::to_string(reservedSignals[i].value) + " after "
+                    + std::to_string(point.timeline) + "@" + std::to_string(point.value));
+            point.value = reservedSignals[i].value;
+            result->batches[i].signal = reservedSignals[i];
+        } else {
+            if (point.value >= UINT64_MAX - 1) throw std::overflow_error("Queue timeline exhausted");
+            result->batches[i].signal = {point.timeline, ++point.value};
+        }
+        result->batches[i].waits = incomingWaits[i];
+        for (auto wait : incomingWaits[i]) {
+            if (!wait.timeline) throw std::invalid_argument("Missing wait timeline");
+            // Cross-frame waits on our exclusive timelines cannot reference
+            // reserved-but-unsubmitted work, including this execution itself.
+            for (auto submitted : submittedFloor)
+                if (wait.timeline == submitted.timeline && wait.value > submitted.value)
+                    throw std::invalid_argument("Incoming wait references unsubmitted work");
+        }
+    }
+    for (auto wait : graph.relativeWaits)
+        result->batches.at(wait.consumerBatch).waits.push_back(
+            result->batches.at(wait.producerBatch).signal);
+    for (auto& batch : result->batches) {
+        std::sort(batch.waits.begin(), batch.waits.end(), [](auto a, auto b) {
+            return a.timeline < b.timeline;
+        });
+        size_t count = 0;
+        for (auto wait : batch.waits) {
+            if (!wait.value) continue;
+            if (count && batch.waits[count - 1].timeline == wait.timeline)
+                batch.waits[count - 1].value = std::max(batch.waits[count - 1].value, wait.value);
+            else batch.waits[count++] = wait;
+        }
+        batch.waits.resize(count);
+    }
+    m_reserved = std::move(reserved);
+    m_sequence = result->submission;
+    m_nextBatch = 0;
+    m_pending = result;
+    return result;
+}
+
+std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::SubmitPrepared(
+    std::shared_ptr<const ScheduleBundle> bundle,
+    const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
+    const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
+    std::span<const ExecutionTimelinePoint> reservedSignals, std::span<const std::span<const rhi::CommandList>> leading,
+    std::vector<std::shared_ptr<const void>> leases, std::span<const PreparedTimelineBinding> extraTimelines) {
+    BT_ZONE_SCOPE("ORG.Execution.SubmitPrepared");
+    if (!bundle || !bundle->graph || packets.size() != bundle->graph->batches.size())
+        throw std::invalid_argument("Prepared packet count mismatch");
+    if (!leading.empty() && leading.size() != packets.size()) throw std::invalid_argument("Leading list count mismatch");
+    leases.reserve(leases.size() + packets.size());
+    for (size_t i = 0; i < packets.size(); ++i) {
+        const auto& packet = packets[i];
+        if (!packet) throw std::invalid_argument("Missing prepared packet");
+        if (packet->QueueSlot() != bundle->graph->batches[i].queue)
+            throw std::invalid_argument("Prepared packet queue mismatch");
+        leases.push_back(packet);
+    }
+    auto execution = Prepare(std::move(bundle), incomingWaits, std::move(leases), packets,
+        reservedSignals);
+    for (uint32_t i = 0; i < packets.size(); ++i) {
+        auto batch = execution->batches[i];
+        if (!leading.empty()) batch.leading = leading[i];
+        batch.extraTimelines = extraTimelines;
+        if (trace::Enabled(trace::Category::Submission)) {
+            std::string waits;
+            for (const auto point : batch.waits)
+                waits += (waits.empty() ? "" : ",") + std::to_string(point.timeline) + "@" + std::to_string(point.value);
+            ORG_TRACE(Submission, "batch-submitted").Add("submission", execution->submission).Add("batch", i)
+                .Add("queue", execution->bundle->graph->batches[i].queue)
+                .Add("signal", std::to_string(batch.signal.timeline) + "@" + std::to_string(batch.signal.value))
+                .Add("waits", waits).Add("leadingLists", static_cast<uint64_t>(batch.leading.size()))
+                .Add("extraTimelines", static_cast<uint64_t>(batch.extraTimelines.size()));
+        }
+        const auto receipt = packets[i]->Submit(batch);
+        if (!receipt) {
+            Fail(execution->submission, receipt);
+            throw std::runtime_error("Prepared GPU submission failed; recovery required: batch " + std::to_string(i) + " queue slot " +
+                std::to_string(packets[i]->QueueSlot()) + " state " + std::to_string(static_cast<uint32_t>(receipt.state)) + " stage " +
+                std::to_string(static_cast<uint32_t>(receipt.failureStage)) + " backend result " + std::to_string(receipt.backendResult));
+        }
+        CommitBatch(execution->submission, i);
+    }
+    return execution;
+}
+
+std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::RecordSubmitted(
+    std::shared_ptr<const ScheduleBundle> bundle,
+    const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
+    const std::vector<std::shared_ptr<const IPreparedExecutionBatch>>& packets,
+    std::span<const ExecutionTimelinePoint> signals) {
+    BT_ZONE_SCOPE("ORG.Execution.RecordSubmitted");
+    if (!bundle || !bundle->graph || packets.size() != bundle->graph->batches.size())
+        throw std::invalid_argument("Recorded packet count mismatch");
+    std::vector<std::shared_ptr<const void>> leases(packets.begin(), packets.end());
+    auto execution = Prepare(std::move(bundle), incomingWaits, std::move(leases), packets, signals);
+    for (uint32_t i = 0; i < packets.size(); ++i) CommitBatch(execution->submission, i);
+    return execution;
+}
+
+void ExecutionTimelineAdmission::AdvanceTo(uint32_t queue, uint64_t value) {
+    if (m_failed || m_pending) throw std::logic_error("Timeline advance during a submission");
+    auto& reserved = m_reserved.at(queue);
+    auto& submitted = m_submitted.at(queue);
+    reserved.value = (std::max)(reserved.value, value);
+    submitted.value = (std::max)(submitted.value, value);
+}
+
+ExecutionTimelinePoint ExecutionTimelineAdmission::SubmitOutside(uint32_t queue) {
+    if (m_failed || m_pending) throw std::logic_error("Submission between executions during one");
+    auto& reserved = m_reserved.at(queue);
+    if (reserved.value >= UINT64_MAX - 1) throw std::overflow_error("Queue timeline exhausted");
+    ++reserved.value;
+    m_submitted.at(queue) = reserved;
+    return reserved;
+}
+
+void ExecutionTimelineAdmission::CommitBatch(uint64_t submission, uint32_t batch) {
+    BT_ZONE_SCOPE("ORG.Execution.CommitTimeline");
+    if (m_failed || !m_pending || submission != m_pending->submission || batch != m_nextBatch)
+        throw std::logic_error("Out-of-order execution submission");
+    const auto queue = m_pending->bundle->graph->batches.at(batch).queue;
+    m_submitted.at(queue) = m_pending->batches.at(batch).signal;
+    if (++m_nextBatch == m_pending->batches.size()) {
+        TraceBindingHolderFromOwner(m_pending->bundle->input->executionPayload.get(), m_pending, "SubmittedExecution");
+        m_retained.push_back(std::move(m_pending));
+    }
+}
+
+void ExecutionTimelineAdmission::Fail(uint64_t submission, SubmissionReceipt receipt) {
+    if (m_failed || !m_pending || submission != m_pending->submission || receipt)
+        throw std::logic_error("Unknown failed execution");
+    m_failed = true;
+    m_failure = FailedExecutionBatch{submission, m_nextBatch, receipt};
+    basic_telemetry::AddCounter(receipt.state == SubmissionState::SubmittedWithoutSignal
+        ? "ORG.Execution.SubmittedWithoutSignal"
+        : receipt.state == SubmissionState::SubmissionUncertain
+            ? "ORG.Execution.SubmissionUncertain" : "ORG.Execution.FailedBeforeSubmit");
+    // Retain the pending bundle: it may own partially submitted GPU work. Only
+    // recovery/retirement can release the admission owner after GPU completion.
+}
+
+void ExecutionTimelineAdmission::ExtendSubmittedExecution(
+    uint64_t submission, ExecutionTimelinePoint completion) {
+    if (!submission || !completion.timeline || !completion.value)
+        throw std::invalid_argument("Invalid submitted-execution completion extension");
+    auto found = std::ranges::find_if(m_retained, [&](const auto& execution) {
+        return execution && execution->submission == submission;
+    });
+    if (found == m_retained.end())
+        throw std::logic_error("Submitted execution is no longer retained");
+    auto submitted = std::ranges::find(m_submitted, completion.timeline,
+        &ExecutionTimelinePoint::timeline);
+    auto reserved = std::ranges::find(m_reserved, completion.timeline,
+        &ExecutionTimelinePoint::timeline);
+    if (submitted == m_submitted.end() || reserved == m_reserved.end())
+        throw std::invalid_argument("Unknown submitted-frame completion timeline");
+    if (completion.value <= submitted->value)
+        throw std::logic_error("Presentation completion is not monotonic");
+    submitted->value = completion.value;
+    reserved->value = completion.value;
+    (*found)->tailCompletions.push_back(completion);
+}
+
+size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTimelinePoint> completed) {
+    BT_ZONE_SCOPE("ORG.Execution.RetireTimelines");
+    if (completed.size() != m_completed.size()) throw std::invalid_argument("Invalid completion dimensions");
+    for (size_t i = 0; i < completed.size(); ++i)
+        if (completed[i].timeline != m_completed[i].timeline
+            || completed[i].value < m_completed[i].value
+            || completed[i].value > m_submitted[i].value)
+            throw std::invalid_argument("Invalid completion observation");
+    std::copy(completed.begin(), completed.end(), m_completed.begin());
+    const auto before = m_retained.size();
+    for (auto iterator = m_retained.begin(); iterator != m_retained.end();) {
+        const auto& execution = *iterator;
+        bool complete = true;
+        for (size_t i = 0; i < execution->batches.size(); ++i)
+            if (execution->batches[i].signal.value > completed[execution->bundle->graph->batches[i].queue].value)
+                complete = false;
+        for (const auto completion : execution->tailCompletions) {
+            const auto observed = std::ranges::find(completed, completion.timeline,
+                &ExecutionTimelinePoint::timeline);
+            if (observed == completed.end() || completion.value > observed->value)
+                complete = false;
+        }
+        if (!complete) { ++iterator; continue; }
+        BT_ZONE_SCOPE("ORG.Frame.Retire");
+        for (const auto& packet : execution->preparedBatches)
+            if (packet) packet->Complete(execution->submission);
+        TraceBindingHolderFromOwner(execution->bundle->input->executionPayload.get(), execution, "RetiredExecution");
+        m_retiredGarbage.push_back(std::move(*iterator));
+        iterator = m_retained.erase(iterator);
+    }
+    // Failed partial packets remain recovery-owned: completion alone cannot
+    // establish that recording/backend error recovery has released its objects.
+    return before - m_retained.size();
+}
+
+bool ExecutionTimelineAdmission::LowestRetainedSignals(std::span<uint64_t> lowest) const {
+    if (lowest.size() != m_completed.size()) return false;
+    for (const auto& execution : m_retained) {
+        if (!execution || execution->batches.empty()) return false;
+        const auto& batches = execution->bundle->graph->batches;
+        for (size_t i = 0; i < execution->batches.size(); ++i) {
+            const auto queue = batches[i].queue;
+            if (queue >= lowest.size()) return false;
+            lowest[queue] = (std::min)(lowest[queue], execution->batches[i].signal.value);
+        }
+        for (const auto completion : execution->tailCompletions) {
+            const auto found = std::ranges::find(m_completed, completion.timeline, &ExecutionTimelinePoint::timeline);
+            if (found == m_completed.end()) return false;
+            auto& value = lowest[static_cast<size_t>(found - m_completed.begin())];
+            value = (std::min)(value, completion.value);
+        }
+    }
+    return true;
+}
+
+std::vector<std::shared_ptr<GraphExecutionTimeline>>
+ExecutionTimelineAdmission::TakeRetiredGarbage() {
+    // Explicit diagnostic reproduction of the old synchronous retention bug.
+    // Never enabled by normal tracing or normal execution.
+    static const bool holdRetired = [] {
+        const auto* value = std::getenv("ORG_RESOURCE_LIFETIME_TRACE_HOLD_RETIRED");
+        return BindingLifetimeTraceEnabled() && value && value[0] == '1';
+    }();
+    if (holdRetired) return {};
+    return std::exchange(m_retiredGarbage, {});
+}
+
+namespace {
+// A pass's uses of each resource it schedules, once per resource: whether any of them writes it.
+template<class Fn>
+void ForEachScheduledUse(const CompilePass& pass, Fn&& fn) {
+    std::vector<std::pair<uint32_t, bool>> uses;
+    const auto add = [&](uint32_t resource, bool write) {
+        for (auto& use : uses) if (use.first == resource) { use.second = use.second || write; return; }
+        uses.emplace_back(resource, write);
+    };
+    for (auto access : pass.accesses) add(access.resourceIndex, access.write);
+    for (const auto& use : pass.entryStates) add(use.resource, use.state.write);
+    for (const auto& use : pass.exitStates) add(use.resource, use.state.write);
+    for (const auto& [resource, write] : uses) fn(resource, write);
+}
+// One resource's uses in schedule order. A write is ordered after every use since the last write. A read of a buffer is ordered
+// after the last write alone: two reads of a buffer have nothing to see of each other and no state between them but their
+// access (graph buffers are QueueSharing::Concurrent, so even a change of queue needs no ownership transfer), so readers on
+// different queues need not wait for each other. A texture's uses stay serialized: its layout is state the plan transitions.
+struct ResourceUseOrder {
+    uint32_t lastWrite = UINT32_MAX;
+    std::vector<uint32_t> reads;
+};
+template<class Edge>
+void OrderUse(ResourceUseOrder& order, uint32_t pass, bool write, bool overlappingReads, Edge&& edge) {
+    if (order.lastWrite != UINT32_MAX && order.lastWrite != pass) edge(order.lastWrite, pass);
+    if (!write && overlappingReads) {
+        order.reads.push_back(pass);
+        return;
+    }
+    for (auto read : order.reads) if (read != pass) edge(read, pass);
+    order.reads.clear();
+    order.lastWrite = pass;
+}
+bool OverlappingReads(const GraphCompileStructure& s, uint32_t resource) {
+    return resource < s.resourceShapes.size() && !s.resourceShapes[resource].hasLayout;
+}
+bool ValidRange(CompileRange r, CompileResourceShape shape) {
+    return r.mips && r.slices && r.mip < shape.mips && r.slice < shape.slices
+        && r.mips <= shape.mips - r.mip && r.slices <= shape.slices - r.slice;
+}
+CompileResourceState StateForShape(CompileResourceState state, CompileResourceShape shape) {
+    // Buffer barriers have no layout field. Preserve all access/sync bits.
+    if (!shape.hasLayout) state.layout = 0;
+    // Simultaneous-access textures never leave COMMON (Vulkan: GENERAL); only access and sync change.
+    else if (shape.commonLayoutOnly) state.layout = static_cast<uint64_t>(rhi::ResourceLayout::Common);
+    return state;
+}
+CompileRange Intersection(CompileRange a, CompileRange b) {
+    const auto m = (std::max)(a.mip, b.mip), s = (std::max)(a.slice, b.slice);
+    const auto me = (std::min)(a.mip + a.mips, b.mip + b.mips);
+    const auto se = (std::min)(a.slice + a.slices, b.slice + b.slices);
+    return {m, me > m ? me - m : 0, s, se > s ? se - s : 0};
+}
+struct StateRegion {
+    CompileRange range;
+    CompileResourceState state;
+    uint32_t batch = UINT32_MAX;
+    uint32_t pass = UINT32_MAX;
+};
+
+SymbolicStatePlan BuildStatePlan(const GraphCompileStructure& s,
+    std::span<const SymbolicBatch> batches, const std::atomic_bool& cancelled) {
+    BT_ZONE_SCOPE("ORG.FreshCompile.SymbolicStates");
+    SymbolicStatePlan plan;
+    auto fallback = [&](const char* reason) {
+        BT_ZONE_SCOPE("ORG.FreshCompile.StateFallback");
+        plan.steps.clear(); plan.finalStates.clear(); plan.fallbackReason = reason;
+        BT_ZONE_TEXT(plan.fallbackReason.data(), plan.fallbackReason.size());
+        // A bounded set of literal reasons: diagnostic attempts include jobs
+        // later cancelled/coalesced, unlike the coordinator acceptance counts.
+        basic_telemetry::AddCounter(std::string("ORG.FreshCompile.StateFallback.") + reason);
+        return plan;
+    };
+    if (s.resourceShapes.size() != s.resourceIDs.size()) return fallback("Resource shapes not captured");
+    uint64_t cells = 0;
+    for (auto shape : s.resourceShapes) {
+        if (!shape.mips && !shape.slices && !shape.hasLayout) continue;
+        if (!shape.mips || !shape.slices) return fallback("Invalid resource dimensions");
+        cells += uint64_t{shape.mips} * shape.slices;
+        // Bound the independent full-cell validation oracle during migration.
+        if (cells > 2'000'000) return fallback("State oracle subresource budget exceeded");
+    }
+    uint64_t oracleWork = 0;
+    std::vector<bool> written(s.resourceIDs.size());
+    for (const auto& pass : s.passes) {
+        for (auto access : pass.accesses) if (access.resourceIndex < written.size())
+            written[access.resourceIndex] = written[access.resourceIndex] || access.write;
+        for (auto* uses : {&pass.entryStates, &pass.exitStates}) for (const auto& use : *uses) {
+            if (use.resource >= s.resourceShapes.size() || !ValidRange(use.range, s.resourceShapes[use.resource]))
+                return fallback("Invalid captured state range");
+            oracleWork += uint64_t{use.range.mips} * use.range.slices;
+            if (oracleWork > 2'000'000) return fallback("State oracle work budget exceeded");
+        }
+    }
+    std::vector<std::vector<StateRegion>> regions(s.resourceShapes.size());
+    for (size_t r = 0; r < regions.size(); ++r) if (s.resourceShapes[r].mips)
+        regions[r].push_back({{0, s.resourceShapes[r].mips, 0, s.resourceShapes[r].slices}, {}});
+    std::vector<StateRegion> next;
+    std::vector<uint32_t> accessEpoch(s.resourceIDs.size());
+    std::vector<uint8_t> accessFlags(s.resourceIDs.size());
+    for (uint32_t b = 0; b < batches.size(); ++b) {
+        if (cancelled.load(std::memory_order_relaxed)) return fallback("Cancelled");
+        for (const auto passIndex : batches[b].passes) {
+        if (passIndex >= s.passes.size()) return fallback("Invalid scheduled pass");
+        const auto& pass = s.passes[passIndex];
+        const auto epoch = passIndex + 1;
+        for (const auto& access : pass.accesses) {
+            if (access.resourceIndex >= accessEpoch.size()) return fallback("Invalid hazard resource");
+            auto& flags = accessFlags[access.resourceIndex];
+            if (accessEpoch[access.resourceIndex] != epoch) flags = 0;
+            accessEpoch[access.resourceIndex] = epoch;
+            flags |= access.write ? 3u : 1u;
+        }
+        static const basic_telemetry::Callsite callsite("ORG.FreshCompile.States.Pass");
+        CompileDetailScope trace(callsite, DiagnosticPassName(s, passIndex),
+            pass.entryStates.size() + pass.exitStates.size(), !s.diagnosticPassNames.empty());
+        auto apply = [&](const CompileStateUse& use, bool exit) -> const char* {
+            static const basic_telemetry::Callsite resourceCallsite("ORG.FreshCompile.States.Resource");
+            CompileDetailScope resourceTrace(resourceCallsite, DiagnosticResourceName(s, use.resource),
+                uint64_t{use.range.mips} * use.range.slices, !s.diagnosticResourceNames.empty());
+            if (use.resource >= regions.size() || !ValidRange(use.range, s.resourceShapes[use.resource]))
+                return "Invalid captured state range";
+            if ((written[use.resource] || use.state.write)
+                && (accessEpoch[use.resource] != epoch || !(accessFlags[use.resource] & (use.state.write ? 2u : 1u))))
+                return "State use missing required hazard access";
+            auto state = StateForShape(use.state, s.resourceShapes[use.resource]);
+            if (s.resourceShapes[use.resource].hasLayout && batches[b].queue < s.queues.size() && s.queues[batches[b].queue].copyLayoutsCommon
+                && (state.layout == static_cast<uint64_t>(rhi::ResourceLayout::CopySource)
+                    || state.layout == static_cast<uint64_t>(rhi::ResourceLayout::CopyDest)))
+                state.layout = static_cast<uint64_t>(rhi::ResourceLayout::Common);
+            next.clear();
+            for (const auto& previous : regions[use.resource]) {
+                const auto overlap = Intersection(previous.range, use.range);
+                if (!overlap.mips || !overlap.slices) { next.push_back(previous); continue; }
+                if (exit && (previous.batch != b || previous.pass != passIndex))
+                    return "Internal transition lacks matching entry declaration";
+                if (!exit && previous.batch == b && previous.pass == passIndex && previous.state != state)
+                    return "Conflicting overlapping entry states";
+                if (!exit && (previous.batch != b || previous.pass != passIndex))
+                    plan.steps.push_back({use.resource, b, previous.batch, overlap, previous.state, state,
+                        passIndex, previous.pass});
+                const auto old = previous.range;
+                auto keep = [&](CompileRange range) {
+                    if (range.mips && range.slices)
+                        next.push_back({range, previous.state, previous.batch, previous.pass});
+                };
+                keep({old.mip, overlap.mip - old.mip, old.slice, old.slices});
+                keep({overlap.mip + overlap.mips, old.mip + old.mips - overlap.mip - overlap.mips, old.slice, old.slices});
+                keep({overlap.mip, overlap.mips, old.slice, overlap.slice - old.slice});
+                keep({overlap.mip, overlap.mips, overlap.slice + overlap.slices, old.slice + old.slices - overlap.slice - overlap.slices});
+                next.push_back({overlap, state, b, passIndex});
+            }
+            regions[use.resource].swap(next);
+            return nullptr;
+        };
+        for (const auto& use : pass.entryStates) if (auto error = apply(use, false)) return fallback(error);
+        for (const auto& use : pass.exitStates) if (auto error = apply(use, true)) return fallback(error);
+        }
+    }
+    for (uint32_t r = 0; r < regions.size(); ++r) for (const auto& region : regions[r])
+        if (region.batch != UINT32_MAX) plan.finalStates.push_back({r, region.batch, region.range, region.state});
+    // The entry steps, and the exit steps: walking back, a step is the last of every cell of its range not yet seen.
+    std::vector<std::vector<uint8_t>> seen(s.resourceShapes.size());
+    for (uint32_t index = static_cast<uint32_t>(plan.steps.size()); index-- > 0;) {
+        const auto& step = plan.steps[index];
+        const auto& shape = s.resourceShapes[step.resource];
+        auto& cells = seen[step.resource];
+        if (cells.empty()) cells.assign(size_t{shape.mips} * shape.slices, 0);
+        bool last = false;
+        for (uint32_t slice = step.range.slice; slice < step.range.slice + step.range.slices; ++slice)
+            for (uint32_t mip = step.range.mip; mip < step.range.mip + step.range.mips; ++mip) {
+                auto& cell = cells[size_t{slice} * shape.mips + mip];
+                if (!cell) last = true;
+                cell = 1;
+            }
+        if (last) plan.exitSteps.push_back(index);
+    }
+    std::reverse(plan.exitSteps.begin(), plan.exitSteps.end());
+    for (uint32_t index = 0; index < plan.steps.size(); ++index)
+        if (plan.steps[index].previousBatch == UINT32_MAX) plan.entrySteps.push_back(index);
+    plan.complete = true;
+    return plan;
+}
+} // namespace
+
+void NormalizeCompileInput(GraphCompileInput& input) {
+    auto& s = input.structure;
+    if (s.resourceIDs.size() >= UINT32_MAX || s.passes.size() >= UINT32_MAX)
+        throw std::invalid_argument("Compile input exceeds index capacity");
+    std::vector<uint32_t> order(s.resourceIDs.size()), remap(order.size());
+    std::iota(order.begin(), order.end(), 0);
+    if (!s.resourceKeys.empty() && s.resourceKeys.size() != order.size())
+        throw std::invalid_argument("Captured resource key count mismatch");
+    auto keyAt = [&](uint32_t i) -> std::string_view {
+        return s.resourceKeys.empty() ? std::string_view{} : std::string_view{s.resourceKeys[i]};
+    };
+    std::sort(order.begin(), order.end(), [&](auto a, auto b) {
+        return std::tuple{s.resourceIDs[a], keyAt(a)} < std::tuple{s.resourceIDs[b], keyAt(b)};
+    });
+    std::vector<uint64_t> ids;
+    std::vector<std::string> keys;
+    std::vector<std::string> diagnosticNames;
+    std::vector<CompileResourceShape> shapes;
+    std::vector<uint64_t> backingGenerations;
+    if (!s.resourceShapes.empty() && s.resourceShapes.size() != order.size())
+        throw std::invalid_argument("Captured resource shape count mismatch");
+    if (!s.diagnosticResourceNames.empty() && s.diagnosticResourceNames.size() != order.size())
+        throw std::invalid_argument("Captured diagnostic resource name count mismatch");
+    if (!input.backingGenerations.empty() && input.backingGenerations.size() != order.size())
+        throw std::invalid_argument("Captured backing generation count mismatch");
+    ids.reserve(order.size());
+    if (!s.resourceKeys.empty()) keys.reserve(order.size());
+    for (uint32_t i = 0; i < order.size(); ++i) {
+        const auto id = s.resourceIDs[order[i]];
+        const auto key = keyAt(order[i]);
+        if (!ids.empty() && ids.back() == id
+            && (keys.empty() || keys.back() == key))
+            throw std::invalid_argument("Duplicate captured resource identity");
+        ids.push_back(id); remap[order[i]] = i;
+        if (!s.resourceKeys.empty()) keys.emplace_back(key);
+        if (!s.resourceShapes.empty()) shapes.push_back(s.resourceShapes[order[i]]);
+        if (!s.diagnosticResourceNames.empty()) diagnosticNames.push_back(s.diagnosticResourceNames[order[i]]);
+        if (!input.backingGenerations.empty()) backingGenerations.push_back(input.backingGenerations[order[i]]);
+    }
+    s.resourceIDs = std::move(ids);
+    s.resourceKeys = std::move(keys);
+    s.resourceShapes = std::move(shapes);
+    s.diagnosticResourceNames = std::move(diagnosticNames);
+    input.backingGenerations = std::move(backingGenerations);
+    for (auto& pass : s.passes) {
+        for (auto* uses : {&pass.entryStates, &pass.exitStates}) for (auto& use : *uses) {
+            if (use.resource >= remap.size()) throw std::invalid_argument("Invalid captured state resource index");
+            use.resource = remap[use.resource];
+            if (!s.resourceShapes.empty()) use.state = StateForShape(use.state, s.resourceShapes[use.resource]);
+        }
+        for (auto& access : pass.accesses) {
+            if (access.resourceIndex >= remap.size()) throw std::invalid_argument("Invalid captured resource index");
+            access.resourceIndex = remap[access.resourceIndex];
+        }
+        std::sort(pass.accesses.begin(), pass.accesses.end(), [](auto a, auto b) { return a.resourceIndex < b.resourceIndex; });
+        size_t used = 0;
+        for (auto access : pass.accesses) {
+            if (used && pass.accesses[used - 1].resourceIndex == access.resourceIndex)
+                pass.accesses[used - 1].write |= access.write;
+            else pass.accesses[used++] = access;
+        }
+        pass.accesses.resize(used);
+    }
+    auto normalizeEdges = [](DependencyEdges& edges) {
+        std::erase_if(edges, [](auto edge) { return edge.first == edge.second; });
+        std::sort(edges.begin(), edges.end());
+        edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+    };
+    normalizeEdges(s.explicitEdges);
+    normalizeEdges(s.placementEdges);
+}
+
+std::string ValidateSymbolicSchedule(const GraphCompileInput& input, const Schedule& graph) {
+    BT_ZONE_SCOPE("ORG.FreshCompile.ValidateSchedule");
+    const auto& s = input.structure;
+    const size_t count = s.passes.size(), batchCount = graph.batches.size();
+    const size_t words = (batchCount + 63) / 64;
+    if (graph.stage != ScheduleStage::SymbolicSchedule)
+        return "Missing complete symbolic schedule";
+    if (!count)
+        return graph.batches.empty() && graph.relativeWaits.empty() && graph.edges.empty() && graph.schedulingEdges.empty()
+            ? std::string{} : "Nonempty schedule for an empty graph";
+    if (graph.batches.empty()) return "Missing complete symbolic schedule";
+    std::vector<uint32_t> batchByPass(count, UINT32_MAX), positionByPass(count, UINT32_MAX);
+    std::vector<uint32_t> lastQueue(s.queues.size(), UINT32_MAX);
+    std::vector<std::vector<uint32_t>> waits(batchCount);
+    for (auto wait : graph.relativeWaits) {
+        if (wait.consumerBatch >= batchCount || wait.producerBatch >= wait.consumerBatch)
+            return "Relative wait targets an invalid or future batch";
+        waits[wait.consumerBatch].push_back(wait.producerBatch);
+    }
+    std::vector<std::vector<uint64_t>> ancestors(batchCount, std::vector<uint64_t>(words));
+    for (uint32_t b = 0; b < batchCount; ++b) {
+        const auto& batch = graph.batches[b];
+        if (batch.passes.empty()) return "Empty symbolic batch";
+        if (batch.queue >= s.queues.size() || !s.queues[batch.queue].active) return "Inactive schedule queue";
+        for (uint32_t position = 0; position < batch.passes.size(); ++position) {
+            const auto pass = batch.passes[position];
+            if (pass >= count || batchByPass[pass] != UINT32_MAX) return "Duplicate or invalid scheduled pass";
+            const auto& compatible = s.passes[pass].compatibleQueueSlots;
+            if (std::find(compatible.begin(), compatible.end(), batch.queue) == compatible.end()) return "Incompatible schedule queue";
+            batchByPass[pass] = b;
+            positionByPass[pass] = position;
+        }
+        auto inherit = [&](uint32_t pred) {
+            for (size_t w = 0; w < words; ++w) ancestors[b][w] |= ancestors[pred][w];
+            ancestors[b][pred / 64] |= uint64_t{1} << (pred % 64);
+        };
+        if (lastQueue[batch.queue] != UINT32_MAX) inherit(lastQueue[batch.queue]);
+        for (auto pred : waits[b]) inherit(pred);
+        lastQueue[batch.queue] = b;
+    }
+    auto ordered = [&](uint32_t from, uint32_t to) {
+        if (from >= count || to >= count) return false;
+        auto a = batchByPass[from], b = batchByPass[to];
+        if (a == UINT32_MAX || b == UINT32_MAX) return false;
+        if (a == b) return positionByPass[from] < positionByPass[to];
+        return a < b && (ancestors[b][a / 64] & (uint64_t{1} << (a % 64))) != 0;
+    };
+    auto checkEdges = [&](const DependencyEdges& edges) {
+        return std::all_of(edges.begin(), edges.end(), [&](auto e) { return e.first == e.second || ordered(e.first, e.second); });
+    };
+    if (!checkEdges(graph.edges) || !checkEdges(s.explicitEdges) || !checkEdges(s.placementEdges)
+        || (input.expectedSchedulingEdges && !checkEdges(*input.expectedSchedulingEdges)))
+        return "Schedule does not enforce a dependency or alias-placement edge";
+    // Every use of a resource is ordered after the last write, and a write after every use since (OrderUse): only a buffer's
+    // reads may overlap.
+    std::vector<ResourceUseOrder> useOrder(s.resourceIDs.size());
+    for (const auto& batch : graph.batches) {
+        for (const auto pass : batch.passes) {
+            bool invalid = false;
+            ForEachScheduledUse(s.passes[pass], [&](uint32_t resource, bool write) {
+                if (resource >= useOrder.size()) { invalid = true; return; }
+                OrderUse(useOrder[resource], pass, write, OverlappingReads(s, resource),
+                    [&](uint32_t from, uint32_t to) { if (!ordered(from, to)) invalid = true; });
+            });
+            if (invalid) return "Invalid or unordered resource accesses across queues";
+        }
+    }
+    if (std::find(batchByPass.begin(), batchByPass.end(), UINT32_MAX) != batchByPass.end())
+        return "Missing scheduled pass";
+    return {};
+}
+
+std::string ValidateSymbolicStates(const GraphCompileInput& input, const Schedule& graph) {
+    BT_ZONE_SCOPE("ORG.FreshCompile.ValidateStates");
+    // Independent dense-cell oracle; it does not share the planner's rectangle
+    // splitting algorithm. Only the worker invokes this on captured host inputs.
+    const auto& s = input.structure;
+    if (!graph.states.complete || s.resourceShapes.size() != s.resourceIDs.size()) return "Missing state plan";
+    struct Cell { CompileResourceState state; uint32_t batch = UINT32_MAX, pass = UINT32_MAX; };
+    std::vector<std::vector<Cell>> cells(s.resourceShapes.size());
+    uint64_t total = 0;
+    for (size_t r = 0; r < cells.size(); ++r) {
+        const auto shape = s.resourceShapes[r];
+        if (!shape.mips && !shape.slices && !shape.hasLayout) continue;
+        const auto size = uint64_t{shape.mips} * shape.slices;
+        total += size;
+        if (!size || total > 2'000'000) return "Invalid oracle dimensions";
+        cells[r].resize(static_cast<size_t>(size));
+    }
+    std::vector<SymbolicStateStep> expected, actual;
+    auto visit = [&](uint32_t r, CompileRange range, auto&& fn) {
+        if (r >= cells.size() || !ValidRange(range, s.resourceShapes[r])) return false;
+        for (uint32_t slice = range.slice; slice < range.slice + range.slices; ++slice)
+            for (uint32_t mip = range.mip; mip < range.mip + range.mips; ++mip)
+                fn(CompileRange{mip, 1, slice, 1}, cells[r][size_t{slice} * s.resourceShapes[r].mips + mip]);
+        return true;
+    };
+    std::vector<bool> seen(s.passes.size());
+    for (uint32_t b = 0; b < graph.batches.size(); ++b) {
+        for (const auto p : graph.batches[b].passes) {
+        if (p >= seen.size() || seen[p]) return "Invalid state-plan pass layout";
+        seen[p] = true;
+        const auto& pass = s.passes[p];
+        bool conflict = false;
+        for (const auto& use : pass.entryStates) {
+            if (!visit(use.resource, use.range, [&](CompileRange unit, Cell& cell) {
+                const auto state = StateForShape(use.state, s.resourceShapes[use.resource]);
+                if (cell.batch == b && cell.pass == p) { conflict |= cell.state != state; return; }
+                expected.push_back({use.resource, b, cell.batch, unit, cell.state, state, p, cell.pass});
+                cell = {state, b, p};
+            })) return "Invalid oracle entry range";
+        }
+        for (const auto& use : pass.exitStates) {
+            if (!visit(use.resource, use.range, [&](CompileRange, Cell& cell) {
+                conflict |= cell.batch != b || cell.pass != p;
+                cell = {StateForShape(use.state, s.resourceShapes[use.resource]), b, p};
+            })) return "Invalid oracle exit range";
+        }
+        if (conflict) return "Conflicting state declarations";
+        }
+    }
+    if (std::find(seen.begin(), seen.end(), false) != seen.end()) return "Missing state-plan pass";
+    for (const auto& step : graph.states.steps) {
+        if (!visit(step.resource, step.range, [&](CompileRange unit, Cell&) {
+            auto copy = step; copy.range = unit; actual.push_back(copy);
+        })) return "Invalid symbolic step range";
+    }
+    auto stateKey = [](CompileResourceState state) { return std::tuple{state.access, state.layout, state.sync, state.write}; };
+    auto key = [&](const SymbolicStateStep& step) {
+        return std::tuple{step.resource, step.batch, step.pass, step.range.slice, step.range.mip,
+            step.previousBatch, step.previousPass, stateKey(step.before), stateKey(step.after)};
+    };
+    auto order = [&](const auto& a, const auto& b) { return key(a) < key(b); };
+    std::sort(expected.begin(), expected.end(), order);
+    std::sort(actual.begin(), actual.end(), order);
+    if (expected != actual) return "Symbolic entry/transition state mismatch";
+    for (const auto& final : graph.states.finalStates) {
+        bool mismatch = false;
+        if (!visit(final.resource, final.range, [&](CompileRange, Cell& cell) {
+            mismatch |= cell.batch == UINT32_MAX || cell.batch != final.batch || cell.state != final.state;
+            cell.batch = UINT32_MAX; // Detect duplicate final-state coverage.
+        }) || mismatch) return "Symbolic final-state mismatch";
+    }
+    for (const auto& resource : cells) for (const auto& cell : resource)
+        if (cell.batch != UINT32_MAX) return "Missing symbolic final-state coverage";
+    return {};
+}
+
+std::shared_ptr<const DependencyEdges> CompileWorkspace::AnalyzeDependencies(
+    const GraphCompileStructure& structure, const std::atomic_bool& cancelled,
+    std::span<const uint32_t> accessOrder) {
+    const auto passCount = static_cast<uint32_t>(structure.passes.size());
+    if (!accessOrder.empty()) {
+        if (accessOrder.size() != passCount) throw std::invalid_argument("Invalid dependency access order size");
+        std::vector<uint8_t> seen(passCount);
+        for (auto index : accessOrder) {
+            if (index >= passCount || seen[index]) throw std::invalid_argument("Invalid dependency access order permutation");
+            seen[index] = 1;
+        }
+    }
+    // Without an explicit order, accesses follow the authored order. It equals
+    // the index for freshly compiled graphs; persistent programs can place a
+    // pass between two others without renumbering them.
+    std::vector<uint32_t> authoredOrder;
+    if (accessOrder.empty()) {
+        bool monotonic = true;
+        for (uint32_t index = 1; index < passCount && monotonic; ++index)
+            monotonic = structure.passes[index - 1].originalOrder <= structure.passes[index].originalOrder;
+        if (!monotonic) {
+            authoredOrder.resize(passCount);
+            std::iota(authoredOrder.begin(), authoredOrder.end(), 0u);
+            std::stable_sort(authoredOrder.begin(), authoredOrder.end(), [&](uint32_t l, uint32_t r) {
+                return structure.passes[l].originalOrder < structure.passes[r].originalOrder;
+            });
+            accessOrder = authoredOrder;
+        }
+    }
+    DependencyEdges edges;
+    m_resources.resize(structure.resourceIDs.size());
+    for (auto& state : m_resources) state.Reset();
+    auto edge = [&](uint32_t from, uint32_t to) {
+        if (from != UINT32_MAX && from != to) edges.emplace_back(from, to);
+    };
+    {
+        BT_ZONE_SCOPE("ORG.FreshCompile.BuildDependencies");
+        for (uint32_t ordinal = 0; ordinal < passCount; ++ordinal) {
+            const auto index = accessOrder.empty() ? ordinal : accessOrder[ordinal];
+            if (cancelled.load(std::memory_order_relaxed)) return {};
+            const auto& pass = structure.passes[index];
+            static const basic_telemetry::Callsite callsite("ORG.FreshCompile.Dependencies.Pass");
+            CompileDetailScope trace(callsite, DiagnosticPassName(structure, index),
+                pass.accesses.size(), !structure.diagnosticPassNames.empty());
+            for (const auto& access : pass.accesses) {
+                if (access.resourceIndex >= m_resources.size())
+                    throw std::invalid_argument("Invalid captured dependency resource index");
+                compiler::AppendDependencyAccess(m_resources[access.resourceIndex], index,
+                    access.write, pass.backend, edge);
+            }
+        }
+        for (auto [from, to] : structure.explicitEdges) {
+            if (from >= passCount || to >= passCount)
+                throw std::invalid_argument("Invalid captured explicit dependency edge");
+            edge(from, to);
+        }
+        BT_ZONE_VALUE(edges.size());
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.DependencyEdgeSort");
+        std::sort(edges.begin(), edges.end());
+        edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+        }
+    }
+    if (cancelled.load(std::memory_order_relaxed)) return {};
+    return std::make_shared<const DependencyEdges>(std::move(edges));
+}
+
+std::shared_ptr<const Schedule> CompileWorkspace::Compile(
+    std::shared_ptr<const GraphCompileInput> input, const std::atomic_bool& cancelled) {
+    BT_ZONE_SCOPE("ORG.FreshCompile.DependencyCompile");
+    basic_telemetry::AddCounter("ORG.FreshCompile.Compiles");
+    if (!input) throw std::invalid_argument("Null graph compile input");
+    const auto& structure = input->structure;
+    if (structure.passes.size() >= UINT32_MAX || structure.resourceIDs.size() >= UINT32_MAX)
+        throw std::invalid_argument("Graph exceeds dependency index capacity");
+    auto result = std::make_shared<Schedule>();
+    result->structure = std::shared_ptr<const GraphCompileStructure>(input, &input->structure);
+    const auto passCount = static_cast<uint32_t>(structure.passes.size());
+    const auto dependencies = input->analyzedDependencies
+        ? input->analyzedDependencies : AnalyzeDependencies(structure, cancelled);
+    if (!dependencies) return {};
+    for (const auto [from, to] : *dependencies)
+        if (from >= passCount || to >= passCount)
+            throw std::invalid_argument("Invalid analyzed dependency edge");
+    result->edges = *dependencies;
+    if (cancelled.load(std::memory_order_relaxed)) return {};
+    result->schedulingEdges = result->edges;
+    {
+    BT_ZONE_SCOPE("ORG.FreshCompile.PlacementEdges");
+    for (auto edge : structure.placementEdges) {
+        if (edge.first >= passCount || edge.second >= passCount) throw std::invalid_argument("Invalid alias placement edge");
+        if (edge.first != edge.second) result->schedulingEdges.push_back(edge);
+    }
+    std::sort(result->schedulingEdges.begin(), result->schedulingEdges.end());
+    result->schedulingEdges.erase(std::unique(result->schedulingEdges.begin(), result->schedulingEdges.end()), result->schedulingEdges.end());
+    }
+    {
+        BT_ZONE_SCOPE("ORG.FreshCompile.Topology");
+        m_successors.clear(); m_successors.resize(passCount);
+        m_indegrees.assign(passCount, 0);
+        for (auto [from, to] : result->schedulingEdges) {
+            m_successors[from].push_back(to);
+            ++m_indegrees[to];
+        }
+        // The kernel snapshots each indegree before mutating scratch, so this
+        // accessor may read the same vector supplied as remaining-indegree storage.
+        const auto topology = compiler::BuildTopologicalOrder<uint32_t>(passCount,
+            [&](uint32_t i) { return structure.passes[i].originalOrder; },
+            [&](uint32_t i) -> const auto& { return m_successors[i]; },
+            [&](uint32_t i) { return m_indegrees[i]; },
+            [&] { return cancelled.load(std::memory_order_relaxed); },
+            m_indegrees, m_ready, result->topologicalOrder);
+        if (topology == compiler::TopologyResult::Cancelled) return {};
+        if (topology == compiler::TopologyResult::Cycle)
+            throw std::runtime_error("Captured dependency graph contains a cycle");
+        result->criticality.assign(passCount, 0);
+        compiler::ComputeCriticality(result->topologicalOrder,
+            [&](uint32_t i) -> const auto& { return m_successors[i]; },
+            [&](uint32_t i) { return result->criticality[i]; },
+            [&](uint32_t i, uint32_t value) { result->criticality[i] = value; });
+    }
+    {
+        BT_ZONE_SCOPE("ORG.FreshCompile.SymbolicSchedule");
+        std::vector<uint32_t> batchByPass(passCount, UINT32_MAX);
+        std::vector<ResourceUseOrder> useOrder(structure.resourceIDs.size());
+        // A batch waits for another queue's batch at its start. The open batch's latest producer batch per queue: a pass needing a
+        // later one starts a batch of its own, so the passes before it run without that wait.
+        std::vector<std::vector<uint32_t>> predecessors(passCount);
+        for (auto [from, to] : result->schedulingEdges) predecessors[to].push_back(from);
+        std::vector<uint32_t> openWaits(structure.queues.size(), UINT32_MAX);
+        std::vector<uint32_t> passWaits(structure.queues.size(), UINT32_MAX);
+        std::vector<uint32_t> orderedFrom;
+        for (auto passIndex : result->topologicalOrder) {
+            if (cancelled.load(std::memory_order_relaxed)) return {};
+            const auto& pass = structure.passes[passIndex];
+            static const basic_telemetry::Callsite callsite("ORG.FreshCompile.Schedule.Pass");
+            CompileDetailScope trace(callsite, DiagnosticPassName(structure, passIndex),
+                pass.accesses.size(), !structure.diagnosticPassNames.empty());
+            auto usable = [&](uint32_t queue) {
+                return queue < structure.queues.size() && structure.queues[queue].active
+                    && std::find(pass.compatibleQueueSlots.begin(), pass.compatibleQueueSlots.end(), queue) != pass.compatibleQueueSlots.end();
+            };
+            const std::array ready{passIndex};
+            const auto selected = compiler::SelectFirstFitCandidate<uint32_t>(
+                std::span<const uint32_t>{ready},
+                [&](uint32_t node) -> std::span<const uint32_t> {
+                    return structure.passes[node].compatibleQueueSlots;
+                },
+                [&](uint32_t node) { return structure.passes[node].preferredQueueSlot; },
+                [](uint32_t) { return false; },
+                [&](uint32_t, uint32_t queue) { return usable(queue); });
+            if (!selected) throw std::runtime_error("Pass has no active compatible compile queue");
+            const auto queue = selected->second;
+            orderedFrom.clear();
+            ForEachScheduledUse(pass, [&](uint32_t resource, bool write) {
+                if (resource >= useOrder.size()) throw std::invalid_argument("Invalid scheduled state resource");
+                OrderUse(useOrder[resource], passIndex, write, OverlappingReads(structure, resource),
+                    [&](uint32_t from, uint32_t to) {
+                        result->schedulingEdges.emplace_back(from, to);
+                        orderedFrom.push_back(from);
+                    });
+            });
+            // The latest batch of each other queue this pass waits for (its predecessors are placed: topological order).
+            std::fill(passWaits.begin(), passWaits.end(), UINT32_MAX);
+            const auto needs = [&](uint32_t from) {
+                const auto producer = batchByPass[from];
+                if (producer == UINT32_MAX) return;
+                const auto producerQueue = result->batches[producer].queue;
+                if (producerQueue == queue) return;
+                auto& latest = passWaits[producerQueue];
+                if (latest == UINT32_MAX || producer > latest) latest = producer;
+            };
+            for (auto from : predecessors[passIndex]) needs(from);
+            for (auto from : orderedFrom) needs(from);
+            bool newWait = false;
+            for (size_t q = 0; q < passWaits.size(); ++q)
+                if (passWaits[q] != UINT32_MAX && (openWaits[q] == UINT32_MAX || passWaits[q] > openWaits[q])) newWait = true;
+            // A batch is recorded either ahead or at execution (recordAtExecution), so the two kinds never share one.
+            const bool extendPrevious = !pass.forceBatchIsolation && !result->batches.empty()
+                && result->batches.back().queue == queue
+                && !structure.passes[result->batches.back().passes.back()].forceBatchIsolation
+                && structure.passes[result->batches.back().passes.back()].recordAtExecution == pass.recordAtExecution
+                && !newWait;
+            if (!extendPrevious) {
+                result->batches.push_back({passIndex, queue});
+                std::fill(openWaits.begin(), openWaits.end(), UINT32_MAX);
+            } else {
+                result->batches.back().passes.push_back(passIndex);
+            }
+            for (size_t q = 0; q < passWaits.size(); ++q)
+                if (passWaits[q] != UINT32_MAX && (openWaits[q] == UINT32_MAX || passWaits[q] > openWaits[q])) openWaits[q] = passWaits[q];
+            batchByPass[passIndex] = static_cast<uint32_t>(result->batches.size() - 1);
+            if (trace::Enabled(trace::Category::Schedule)) {
+                std::string compatible, waits;
+                for (const auto slot : pass.compatibleQueueSlots) compatible += (compatible.empty() ? "" : ",") + std::to_string(slot);
+                for (size_t q = 0; q < passWaits.size(); ++q)
+                    if (passWaits[q] != UINT32_MAX) waits += (waits.empty() ? "" : ",") + std::to_string(q) + ":" + std::to_string(passWaits[q]);
+                const char* batching = extendPrevious ? "extends-previous"
+                    : result->batches.size() == 1 ? "first-batch"
+                    : pass.forceBatchIsolation ? "isolated"
+                    : result->batches[result->batches.size() - 2].queue != queue ? "queue-change"
+                    : structure.passes[result->batches[result->batches.size() - 2].passes.back()].forceBatchIsolation ? "after-isolated"
+                    : structure.passes[result->batches[result->batches.size() - 2].passes.back()].recordAtExecution != pass.recordAtExecution
+                        ? "recording-kind"
+                    : "new-wait";
+                ORG_TRACE(Schedule, "pass-scheduled").Add("pass", std::string(DiagnosticPassName(structure, passIndex)))
+                    .Add("passIndex", passIndex).Add("queue", queue).Add("preferredQueue", pass.preferredQueueSlot)
+                    .Add("compatibleQueues", compatible).Add("batch", batchByPass[passIndex]).Add("batching", batching)
+                    .Add("waitsOnBatches", waits);
+            }
+        }
+        result->batchByPass = batchByPass;
+        result->positionByPass.assign(passCount, UINT32_MAX);
+        for (uint32_t batch = 0; batch < result->batches.size(); ++batch)
+            for (uint32_t position = 0; position < result->batches[batch].passes.size(); ++position)
+                result->positionByPass[result->batches[batch].passes[position]] = position;
+        std::sort(result->schedulingEdges.begin(), result->schedulingEdges.end());
+        result->schedulingEdges.erase(std::unique(result->schedulingEdges.begin(), result->schedulingEdges.end()), result->schedulingEdges.end());
+        std::vector<std::vector<uint32_t>> latestProducer(result->batches.size(),
+            std::vector<uint32_t>(structure.queues.size(), UINT32_MAX));
+        for (auto [from, to] : result->schedulingEdges) {
+            auto source = batchByPass[from], destination = batchByPass[to];
+            auto sourceQueue = result->batches[source].queue;
+            if (sourceQueue == result->batches[destination].queue) continue;
+            auto& latest = latestProducer[destination][sourceQueue];
+            if (latest == UINT32_MAX || source > latest) latest = source;
+        }
+        for (uint32_t b = 0; b < result->batches.size(); ++b) for (auto producer : latestProducer[b])
+            if (producer != UINT32_MAX) result->relativeWaits.push_back({b, producer});
+        result->stage = ScheduleStage::SymbolicSchedule;
+    }
+    if (!structure.resourceShapes.empty() || structure.resourceIDs.empty()) {
+        result->states = BuildStatePlan(structure, result->batches, cancelled);
+        if (cancelled.load(std::memory_order_relaxed)) return {};
+        if (!result->states.complete) return result;
+        result->barrierCapacityByPass.resize(passCount);
+        // Diagnostic provenance only. The compiled boundary representation and
+        // normal runtime allocation path remain unchanged.
+        std::vector<std::vector<uint32_t>> diagnosticBoundaryOwners;
+        if (!structure.diagnosticPassNames.empty()) diagnosticBoundaryOwners.resize(result->batches.size());
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.BoundaryAccesses");
+        result->stateDeltaCapacityByBatch.assign(result->batches.size(), 0);
+        result->stateSeedCapacityByBatch.assign(result->batches.size(), 0);
+        result->boundaryAccessesByBatch.resize(result->batches.size());
+        for (uint32_t batch = 0; batch < result->batches.size(); ++batch) {
+            auto& accesses = result->boundaryAccessesByBatch[batch];
+            for (const auto passIndex : result->batches[batch].passes) {
+                const auto& pass = structure.passes[passIndex];
+                static const basic_telemetry::Callsite callsite("ORG.FreshCompile.Boundary.Pass");
+                CompileDetailScope trace(callsite, DiagnosticPassName(structure, passIndex),
+                    pass.entryStates.size(), !structure.diagnosticPassNames.empty());
+                const auto begin = accesses.size();
+                if (!pass.entryStates.empty()) {
+                    accesses.insert(accesses.end(), pass.entryStates.begin(), pass.entryStates.end());
+                } else for (const auto& access : pass.accesses) {
+                    const auto shape = structure.resourceShapes.at(access.resourceIndex);
+                    accesses.push_back({access.resourceIndex,
+                        {0, shape.mips, 0, shape.slices}, {0, 0, 0, access.write}});
+                }
+                if (!diagnosticBoundaryOwners.empty())
+                    diagnosticBoundaryOwners[batch].insert(diagnosticBoundaryOwners[batch].end(),
+                        accesses.size() - begin, passIndex);
+            }
+        }
+        }
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.IncomingBoundaryAccesses");
+        result->incomingBoundaryAccessesByBatch.resize(result->batches.size());
+        std::vector<size_t> cellOffsets(structure.resourceShapes.size() + 1);
+        for (size_t resource = 0; resource < structure.resourceShapes.size(); ++resource) {
+            const auto cells = size_t{structure.resourceShapes[resource].mips}
+                * structure.resourceShapes[resource].slices;
+            cellOffsets[resource + 1] = cellOffsets[resource] + cells;
+        }
+        // Bit zero is any access; bit one is a write. One contiguous allocation
+        // replaces two heap allocations for every resource on each compilation.
+        std::vector<uint8_t> seenCells(cellOffsets.back());
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.IncomingBoundaryCells");
+        for (uint32_t batch = 0; batch < result->boundaryAccessesByBatch.size(); ++batch) {
+            std::optional<CompileDetailScope> passTrace;
+            uint32_t previousPass = UINT32_MAX;
+            size_t accessIndex = 0;
+            for (const auto& access : result->boundaryAccessesByBatch[batch]) {
+                if (!diagnosticBoundaryOwners.empty()) {
+                    const auto passIndex = diagnosticBoundaryOwners[batch][accessIndex++];
+                    if (passIndex != previousPass) {
+                        passTrace.reset();
+                        static const basic_telemetry::Callsite callsite("ORG.FreshCompile.IncomingBoundary.Pass");
+                        passTrace.emplace(callsite, DiagnosticPassName(structure, passIndex),
+                            structure.passes[passIndex].entryStates.size(), true);
+                        previousPass = passIndex;
+                    }
+                }
+                const auto shape = structure.resourceShapes.at(access.resource);
+                for (uint32_t slice = access.range.slice;
+                    slice < access.range.slice + access.range.slices; ++slice)
+                    for (uint32_t mip = access.range.mip;
+                        mip < access.range.mip + access.range.mips; ++mip) {
+                        auto& seen = seenCells[cellOffsets[access.resource] + size_t{slice} * shape.mips + mip];
+                        const bool first = !(seen & 1u);
+                        const bool firstWrite = access.state.write
+                            && !(seen & 2u);
+                        if (first || firstWrite)
+                            result->incomingBoundaryAccessesByBatch[batch].push_back({
+                                access.resource, {mip, 1, slice, 1}, access.state});
+                        seen |= access.state.write ? 3u : 1u;
+                    }
+            }
+        }
+        }
+        }
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.AliasBoundaryAccesses");
+        result->aliasFirstResourcesByBatch.resize(result->batches.size());
+        result->aliasFinalResourcesByBatch.resize(result->batches.size());
+        const auto queueCount = structure.queues.size();
+        std::vector<uint32_t> aliasLast(structure.resourceShapes.size() * queueCount, UINT32_MAX);
+        for (uint32_t batch = 0; batch < result->boundaryAccessesByBatch.size(); ++batch) {
+            for (const auto& access : result->boundaryAccessesByBatch[batch]) {
+                const auto queue = result->batches[batch].queue;
+                auto& last = aliasLast[access.resource * queueCount + queue];
+                if (last == UINT32_MAX) {
+                    result->aliasFirstResourcesByBatch[batch].push_back(access.resource);
+                }
+                last = batch;
+            }
+        }
+        for (uint32_t resource = 0; resource < structure.resourceShapes.size(); ++resource)
+            for (size_t queue = 0; queue < queueCount; ++queue) {
+                const auto batch = aliasLast[resource * queueCount + queue];
+                if (batch != UINT32_MAX)
+                    result->aliasFinalResourcesByBatch[batch].push_back(resource);
+            }
+        }
+        {
+        BT_ZONE_SCOPE("ORG.FreshCompile.BarrierCapacities");
+        std::vector<uint8_t> seeded(structure.resourceIDs.size());
+        for (const auto& step : result->states.steps) {
+            const auto cells = step.range.mips * step.range.slices;
+            auto& capacity = result->barrierCapacityByPass.at(step.pass);
+            if (structure.resourceShapes.at(step.resource).hasLayout) {
+                capacity.beforeTextures += cells;
+                if (step.previousBatch != UINT32_MAX
+                    && result->batches[step.previousBatch].queue != result->batches[step.batch].queue)
+                    result->barrierCapacityByPass.at(step.previousPass).afterTextures += cells;
+            } else capacity.beforeBuffers += cells;
+            ++result->stateDeltaCapacityByBatch.at(step.batch);
+            if (step.previousBatch == UINT32_MAX && !seeded[step.resource]) {
+                seeded[step.resource] = 1;
+                ++result->stateSeedCapacityByBatch.at(step.batch);
+            }
+        }
+        }
+    }
+    // The renderer compiles a fresh graph every frame. Replaying the complete
+    // schedule and subresource state machine here made validation more costly
+    // than compilation itself. Construction above enforces its local
+    // invariants; the exhaustive independent validators remain public for
+    // focused tests and diagnostic tools, but are not part of production
+    // frame compilation.
+    result->scheduleValidated = true;
+    return cancelled.load(std::memory_order_relaxed) ? nullptr : result;
+}
+
+std::shared_ptr<const Schedule> CompileGraph(
+    std::shared_ptr<const GraphCompileInput> input,
+    CompileWorkspace& workspace,
+    const std::atomic_bool& cancelled) {
+    auto graph = workspace.Compile(std::move(input), cancelled);
+    if (graph) ObserveGraphReplay(graph->structure);
+    return graph;
+}
+
+namespace {
+// Hashes a structure for the schedule cache. Covers every field except the generation number.
+uint64_t HashCacheStructure(const GraphCompileStructure& s) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+    auto mixRange = [&](const CompileRange& r) { mix(r.mip); mix(r.mips); mix(r.slice); mix(r.slices); };
+    auto mixState = [&](const CompileResourceState& state) { mix(state.access); mix(state.layout); mix(state.sync); mix(state.write); };
+    auto mixUses = [&](const std::vector<CompileStateUse>& uses) {
+        mix(uses.size());
+        for (const auto& use : uses) {
+            mix(use.resource); mixRange(use.range); mixState(use.state);
+            mix(use.byteOffset); mix(use.byteSize); mix(use.aspects);
+        }
+    };
+    auto mixEdges = [&](const DependencyEdges& edges) {
+        mix(edges.size());
+        for (const auto [from, to] : edges) { mix(from); mix(to); }
+    };
+    mix(s.registryGeneration);
+    mix(s.resourceIDs.size());
+    for (const auto id : s.resourceIDs) mix(id);
+    mix(s.resourceKeys.size());
+    for (const auto& key : s.resourceKeys) mix(std::hash<std::string>{}(key));
+    mix(s.resourceShapes.size());
+    for (const auto& shape : s.resourceShapes) { mix(shape.mips); mix(shape.slices); mix(shape.hasLayout); mix(shape.commonLayoutOnly); }
+    mix(s.passes.size());
+    for (const auto& pass : s.passes) {
+        mix(pass.originalOrder); mix(pass.backend); mix(pass.preferredQueueSlot); mix(pass.preparedPassIndex);
+        mix(pass.forceBatchIsolation); mix(pass.recordAtExecution);
+        mix(pass.accesses.size());
+        for (const auto& access : pass.accesses) { mix(access.resourceIndex); mix(access.write); }
+        mix(pass.compatibleQueueSlots.size());
+        for (const auto slot : pass.compatibleQueueSlots) mix(slot);
+        mixUses(pass.entryStates);
+        mixUses(pass.exitStates);
+    }
+    mixEdges(s.explicitEdges);
+    mixEdges(s.placementEdges);
+    mix(s.queues.size());
+    for (const auto& queue : s.queues) { mix(queue.backendInstance); mix(queue.active); mix(queue.copyLayoutsCommon); }
+    return h;
+}
+bool SameCacheStructure(const GraphCompileStructure& a, const GraphCompileStructure& b) {
+    return a.registryGeneration == b.registryGeneration && a.resourceIDs == b.resourceIDs && a.resourceKeys == b.resourceKeys
+        && a.passes == b.passes && a.diagnosticPassNames == b.diagnosticPassNames
+        && a.diagnosticResourceNames == b.diagnosticResourceNames && a.explicitEdges == b.explicitEdges
+        && a.placementEdges == b.placementEdges && a.queues == b.queues && a.resourceShapes == b.resourceShapes;
+}
+bool SameAnalyzedDependencies(const std::shared_ptr<const DependencyEdges>& a, const std::shared_ptr<const DependencyEdges>& b) {
+    return a == b || (a && b && *a == *b);
+}
+}
+
+bool ScheduleCache::Cacheable(const GraphCompileInput& input) noexcept {
+    return input.leases.empty() && !input.executionPayload && !input.executionLifecycle
+        && !input.expectedEdges && !input.expectedSchedulingEdges;
+}
+
+std::optional<ScheduleCache::Hit> ScheduleCache::Find(const GraphCompileInput& input) {
+    BT_ZONE_SCOPE("ORG.Compile.ScheduleCacheFind");
+    const auto hash = HashCacheStructure(input.structure);
+    std::lock_guard lock(m_mutex);
+    for (auto& entry : m_entries) {
+        if (entry.hash != hash || !SameCacheStructure(entry.compiled.input->structure, input.structure)
+            || !SameAnalyzedDependencies(entry.compiled.input->analyzedDependencies, input.analyzedDependencies)) continue;
+        entry.lastUse = ++m_clock;
+        ++m_hits;
+        return entry.compiled;
+    }
+    ++m_misses;
+    return std::nullopt;
+}
+
+void ScheduleCache::Insert(std::shared_ptr<const GraphCompileInput> input, std::shared_ptr<const Schedule> schedule) {
+    if (!input || !schedule || !Cacheable(*input)) return;
+    const auto hash = HashCacheStructure(input->structure);
+    std::lock_guard lock(m_mutex);
+    for (const auto& entry : m_entries)
+        if (entry.hash == hash && SameCacheStructure(entry.compiled.input->structure, input->structure)
+            && SameAnalyzedDependencies(entry.compiled.input->analyzedDependencies, input->analyzedDependencies)) return;
+    if (m_capacity == 0) return;
+    if (m_entries.size() >= m_capacity)
+        m_entries.erase(std::ranges::min_element(m_entries, {}, &Entry::lastUse));
+    m_entries.push_back({hash, {std::move(input), std::move(schedule)}, ++m_clock});
+}
+
+void ScheduleCache::Clear() {
+    std::lock_guard lock(m_mutex);
+    m_entries.clear();
+}
+
+ScheduleCache::Stats ScheduleCache::GetStats() const {
+    std::lock_guard lock(m_mutex);
+    return {m_hits, m_misses, m_entries.size()};
+}
+
+std::shared_ptr<const Schedule> CompileGraphCached(
+    std::shared_ptr<const GraphCompileInput>& input,
+    CompileWorkspace& workspace,
+    const std::atomic_bool& cancelled) {
+    auto* cache = workspace.GetScheduleCache();
+    if (!cache || !input || !ScheduleCache::Cacheable(*input)) return CompileGraph(input, workspace, cancelled);
+    if (auto hit = cache->Find(*input)) {
+        basic_telemetry::AddCounter("ORG.Compile.ScheduleCacheHits");
+        input = std::move(hit->input);
+        return std::move(hit->schedule);
+    }
+    basic_telemetry::AddCounter("ORG.Compile.ScheduleCacheMisses");
+    auto graph = CompileGraph(input, workspace, cancelled);
+    if (graph) cache->Insert(input, graph);
+    return graph;
+}
+
+} // namespace org::compiler

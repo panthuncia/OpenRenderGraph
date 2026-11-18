@@ -1,12 +1,31 @@
+#include "OpenRenderGraph/Trace.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/PreparedPass.h"
 #include <stdexcept>
 #include <exception>
 #include <algorithm>
 #include <iterator>
+#include <atomic>
+#include <cstdlib>
+#include <unordered_map>
+#include <chrono>
+#include <string>
+#include <thread>
+#include <functional>
 #include <BasicTelemetry/Tracy.h>
 #include <spdlog/spdlog.h>
 #include <BasicTelemetry/Telemetry.h>
+
+namespace {
+// The OS thread id where there is one (the logs print it), for the pending admissions' owners.
+uint32_t CurrentThreadNumber() noexcept {
+#if defined(_MSC_VER)
+    return static_cast<uint32_t>(_Thrd_id());
+#else
+    return static_cast<uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+#endif
+}
+}
 
 namespace org::persistent {
 namespace {
@@ -48,7 +67,8 @@ void ValidateSharedBacking(const BindingVersion& a, const BindingVersion& b) {
             && x.heapType == y.heapType && x.aliasHeapIdentity == y.aliasHeapIdentity
             && x.aliasHeap.get() == y.aliasHeap.get() && !x.aliasHeap.owner_before(y.aliasHeap)
             && !y.aliasHeap.owner_before(x.aliasHeap) && x.aliasPoolID == y.aliasPoolID
-            && x.aliasOffset == y.aliasOffset && x.aliasSize == y.aliasSize,
+            && x.aliasOffset == y.aliasOffset && x.aliasSize == y.aliasSize && x.hostOwned == y.hostOwned
+            && x.exempt == y.exempt,
             "Shared physical slots disagree on placement");
         Require(x.regions && y.regions && x.regions->size() == y.regions->size(),
             "Shared physical slots disagree on incoming state");
@@ -57,7 +77,7 @@ void ValidateSharedBacking(const BindingVersion& a, const BindingVersion& b) {
                 "Shared physical slots disagree on incoming state");
     }
 }
-void CanonicalizeUses(experimental::GraphCompileStructure& structure, const std::vector<uint32_t>& canonical) {
+void CanonicalizeUses(compiler::GraphCompileStructure& structure, const std::vector<uint32_t>& canonical) {
     for (auto& pass : structure.passes) {
         for (auto& access : pass.accesses) access.resourceIndex = canonical.at(access.resourceIndex);
         for (auto* uses : {&pass.entryStates,&pass.exitStates}) {
@@ -96,15 +116,15 @@ void ValidateNativeView(const rhi::ResourceDesc& desc, BindlessViewKind kind) {
     default: throw std::invalid_argument("Unsupported published view kind");
     }
 }
-std::shared_ptr<const experimental::GraphExecutionLayout> BuildPersistentExecutionLayout(
-    uint64_t revision, std::shared_ptr<const experimental::CompiledGraph> graph,
-    std::shared_ptr<const experimental::GraphCompileInput> input, size_t passCapacity) {
+std::shared_ptr<const compiler::GraphExecutionLayout> BuildPersistentExecutionLayout(
+    uint64_t revision, std::shared_ptr<const compiler::Schedule> graph,
+    std::shared_ptr<const compiler::GraphCompileInput> input, size_t passCapacity) {
     BT_ZONE_SCOPE("ORG.Persistent.BuildExecutionLayout");
     Require(graph && input && graph->structure.get() == &input->structure
         && graph->scheduleValidated && graph->scheduleValidationError.empty(), "Invalid persistent execution layout");
-    auto layout = std::make_shared<experimental::GraphExecutionLayout>();
-    layout->bundle = std::make_shared<const experimental::CompiledGraphBundle>(
-        experimental::CompiledGraphBundle{revision,graph,std::move(input)});
+    auto layout = std::make_shared<compiler::GraphExecutionLayout>();
+    layout->bundle = std::make_shared<const compiler::ScheduleBundle>(
+        compiler::ScheduleBundle{revision,graph,std::move(input)});
     layout->placements.resize(passCapacity,{UINT32_MAX,UINT32_MAX,UINT32_MAX});
     size_t scheduled = 0;
     for (uint32_t batch = 0; batch != graph->batches.size(); ++batch) {
@@ -130,7 +150,7 @@ void RetireOwnership(const std::function<void(std::shared_ptr<const void>)>& sin
         basic_telemetry::AddCounter("ORG.Persistent.RetirementEnqueueFailures");
     }
 }
-void ValidateAliasOrder(const experimental::CompiledGraph& graph, const BindingTable& bindings) {
+void ValidateAliasOrder(const compiler::Schedule& graph, const BindingTable& bindings) {
     const auto count = graph.structure->passes.size();
     std::vector<uint8_t> ordered(count * count);
     for (auto [from,to] : graph.schedulingEdges) ordered[from * count + to] = 1;
@@ -166,7 +186,15 @@ void ValidateAliasOrder(const experimental::CompiledGraph& graph, const BindingT
                 before &= bool(ordered[u * count + v]);
                 after &= bool(ordered[v * count + u]);
             }
-            Require(before || after, "Alias placement has overlapping unordered lifetimes");
+            if (before || after) continue;
+            // Name the pair: their pool offsets match the alias plan's placement lines, and the
+            // users' prepared pass slots its rank lines.
+            std::string usersA, usersB;
+            for (auto u : users[a]) usersA += std::to_string(graph.structure->passes[u].preparedPassIndex) + " ";
+            for (auto v : users[b]) usersB += std::to_string(graph.structure->passes[v].preparedPassIndex) + " ";
+            throw std::invalid_argument("Alias placement has overlapping unordered lifetimes: offset " + std::to_string(x->aliasOffset) + " size "
+                + std::to_string(x->aliasSize) + " (pass slots " + usersA + ") and offset " + std::to_string(y->aliasOffset) + " size "
+                + std::to_string(y->aliasSize) + " (pass slots " + usersB + ")");
         }
     }
 }
@@ -195,7 +223,7 @@ NativeBindingContract NativeBindingContract::Capture(const rhi::ResourceDesc& de
     }
     return contract;
 }
-bool NativeBindingContract::Matches(const rhi::ResourceDesc& desc, experimental::CompileResourceShape shape) const {
+bool NativeBindingContract::Matches(const rhi::ResourceDesc& desc, compiler::CompileResourceShape shape) const {
     if (type == rhi::ResourceType::Unknown || desc.type != type || desc.heapType != heapType || desc.heapFlags != heapFlags
         || (static_cast<uint32_t>(desc.resourceFlags) & static_cast<uint32_t>(requiredFlags)) != static_cast<uint32_t>(requiredFlags)
         || (desc.castableFormats.size && !desc.castableFormats.data)) return false;
@@ -237,35 +265,171 @@ namespace {
 // merges them, and a placeholder admission entry so compiler resource order
 // is preserved. The invalid handle is what admission and recording skip on.
 constexpr uint64_t ReservedIdentityBit = uint64_t{1} << 63;
-BindingVersion PlaceholderBinding(uint32_t index, experimental::CompileResourceShape shape) {
+BindingVersion PlaceholderBinding(uint32_t index, compiler::CompileResourceShape shape) {
     BindingVersion binding;
     binding.identity = ReservedIdentityBit | index;
     binding.backingRevision = 1;
     binding.shape = shape;
     binding.owner = std::make_shared<const uint32_t>(index);
     binding.bound = false;
-    auto state = std::make_shared<experimental::PreparedBackingState>();
+    auto state = std::make_shared<compiler::PreparedBackingState>();
     state->graphResourceID = uint64_t{index} + 1;
     state->shape = shape;
-    state->regions = std::make_shared<const std::vector<experimental::PreparedStateRegion>>();
+    state->regions = std::make_shared<const std::vector<compiler::PreparedStateRegion>>();
     binding.admission = std::move(state);
     return binding;
 }
 }
 const BindingVersion& SelectedPublication::Resolve(BindingToken token) const {
-    Require(token.domain == logical->domain && token.pass.index < logical->passSlots.size(), "Foreign binding token");
-    const auto& pass = logical->passSlots[token.pass.index];
-    Require(pass.active && pass.generation == token.pass.generation && pass.layoutRevision == token.layoutRevision
-        && token.ordinal < pass.bindingSlots.size()
-        && pass.bindingSlots[token.ordinal].declarationId == token.declarationId, "Stale or undeclared binding token");
-    return bindings.At(pass.bindingSlots[token.ordinal].resource);
+    return bindings.At(SlotOf(token));
 }
 GraphEditTransaction::GraphEditTransaction(std::shared_ptr<const SelectedPublication> base)
     : m_base(std::move(base)), m_bindings(m_base ? m_base->bindings : BindingTable{}) {
     Require(m_base && m_base->executable && m_base->executable->graph, "Invalid transaction source");
 }
 uint64_t GraphEditTransaction::BaseRevision() const noexcept { return m_base->revision; }
-experimental::GraphCompileStructure& GraphEditTransaction::EditStructure() {
+std::vector<uint32_t> GraphEditTransaction::SharingChanges() const {
+    std::vector<uint32_t> changed;
+    if (m_structuralChanged) return changed;
+    // Only identities this transaction rebound can have a different set; each slot in them is compared with the
+    // set its base binding's identity had.
+    for (const auto& [index,bucket] : m_changedIdentities)
+        for (const auto& [identity,members] : *bucket)
+            for (const auto slot : members) {
+                const auto& old = m_base->bindings.At(m_base->bindings.CurrentSlot(slot));
+                const auto& previous = m_base->bindings.m_identities[old.identity % BindingTable::IdentityBuckets]->at(old.identity);
+                if (previous != members) changed.push_back(slot);
+            }
+    std::sort(changed.begin(),changed.end());
+    changed.erase(std::unique(changed.begin(),changed.end()),changed.end());
+    return changed;
+}
+std::optional<std::vector<std::pair<ResourceSlotId,BindingVersion>>> GraphEditTransaction::SplitSharingChanges() {
+    Require(!m_failed, "Publication transaction contains a failed edit");
+    if (m_structuralChanged) return std::nullopt;
+    std::vector<std::pair<ResourceSlotId,BindingVersion>> taken;
+    // Putting a slot back can change another slot's set: a slot that moved alone onto a backing the slot put back
+    // had. So repeat until no set differs. Each round puts back at least one slot, and with every slot put back the
+    // table is the base's, so it ends.
+    const auto restore = [&] {
+        // Puts back what was taken out, so a refused split leaves the transaction unchanged.
+        for (auto it = taken.rbegin(); it != taken.rend(); ++it) ReplaceBinding(it->first,it->second);
+    };
+    for (auto changed = SharingChanges(); !changed.empty(); changed = SharingChanges()) {
+        size_t putBack = 0;
+        for (const auto index : changed) {
+            const auto* base = index < m_base->bindings.Size() ? m_base->bindings.TryAt(index) : nullptr;
+            const auto slot = m_bindings.CurrentSlot(index);
+            const auto& current = m_bindings.At(slot);
+            // A slot this edit didn't rebind is in a changed set only because a partner moved.
+            if (base && base->slotGeneration == slot.generation && current.bound == base->bound
+                && current.identity == base->identity && current.backingRevision == base->backingRevision
+                && current.recording == base->recording && current.admission == base->admission) continue;
+            if (!base || !base->bound || base->slotGeneration != slot.generation) { restore(); return std::nullopt; }
+            taken.emplace_back(slot,current);
+            ReplaceBinding(slot,*base);
+            ++putBack;
+        }
+        if (!putBack) { restore(); return std::nullopt; }  // a set differs, yet no slot of it was rebound
+    }
+    return taken;
+}
+namespace {
+std::atomic<int> g_sharingValidation{-1};
+}
+void SetSharingValidation(bool enabled) noexcept { g_sharingValidation.store(enabled ? 1 : 0, std::memory_order_relaxed); }
+bool SharingValidationEnabled() noexcept {
+    auto value = g_sharingValidation.load(std::memory_order_relaxed);
+    if (value < 0) {
+#ifdef NDEBUG
+        const char* env = std::getenv("ORG_VALIDATE_SHARING");
+        value = env && env[0] == '1' ? 1 : 0;
+#else
+        value = 1;
+#endif
+        g_sharingValidation.store(value, std::memory_order_relaxed);
+    }
+    return value != 0;
+}
+namespace {
+// ORG_VALIDATE_ALIAS_ADMISSION=1: each commit checks that the alias ledger would still make the same backings enter from
+// Undefined as it did at admission (another graph's commit in between can add one).
+bool AliasAdmissionValidationEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* env = std::getenv("ORG_VALIDATE_ALIAS_ADMISSION");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
+void ValidateAliasAdmission(const ResourceSequencer& sequencer, const FrameAdmission& frame) {
+    const auto& ledger = sequencer.aliases;
+    const auto& graph = *frame.publication->executable->graph;
+    const auto now = ledger.ApplyInitialStates(graph, frame.backings);
+    std::string missed;
+    size_t count = 0;
+    for (const auto handle : now) {
+        if (std::ranges::any_of(frame.aliasActivations, [&](rhi::ResourceHandle admitted) {
+                return admitted.index == handle.index && admitted.generation == handle.generation; }))
+            continue;
+        ++count;
+        for (const auto& backing : frame.backings)
+            if (backing.resource.index == handle.index && backing.resource.generation == handle.generation) {
+                missed += (missed.empty() ? "" : ", ") + (backing.graphResourceKey.empty() ? std::to_string(handle.index) : backing.graphResourceKey);
+                break;
+            }
+    }
+    static std::atomic<uint32_t> logged{0};
+    if (count) {
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 50)
+            spdlog::error("ORG alias admission: {} aliased backing(s) of admission {} had another occupant commit into their memory "
+                "after admission, so they do not enter from Undefined: {}", count, frame.sequence, missed);
+        basic_telemetry::AddCounter("ORG.Persistent.AliasAdmissionMissed", static_cast<int64_t>(count));
+    }
+    // The waits: every previous occupant's latest access the ledger holds now, against the waits the admission recorded.
+    if (frame.queuePoints.size() != graph.structure->queues.size()) return;
+    std::vector<std::vector<compiler::ExecutionTimelinePoint>> fresh(graph.batches.size());
+    ledger.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, fresh);
+    for (uint32_t batch = 0; batch < fresh.size() && batch < frame.incomingWaits.size(); ++batch) {
+        for (const auto point : fresh[batch]) {
+            const bool covered = std::ranges::any_of(frame.incomingWaits[batch], [&](compiler::ExecutionTimelinePoint wait) {
+                return wait.timeline == point.timeline && wait.value >= point.value; });
+            if (covered || sequencer.Reached(point)) continue;
+            uint64_t had = 0;
+            for (const auto wait : frame.incomingWaits[batch]) if (wait.timeline == point.timeline) had = (std::max)(had, wait.value);
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 50)
+                spdlog::error("ORG alias admission: admission {} batch {} (queue timeline {}) needs timeline {} at {} for an aliased "
+                    "occupant's access committed after admission; it waits for {}", frame.sequence, batch,
+                    frame.queuePoints[graph.batches[batch].queue].timeline, point.timeline, point.value, had);
+            basic_telemetry::AddCounter("ORG.Persistent.AliasAdmissionStaleWait");
+        }
+    }
+}
+}
+
+void ValidateSharedBackings(const ExecutableGeneration& executable, const BindingTable& bindings) {
+    BT_ZONE_SCOPE("ORG.Persistent.ValidateSharedBackings");
+    // Compiled resource -> the identity of the first bound slot found for it, and identity -> its compiled resource.
+    std::unordered_map<uint32_t,std::pair<uint64_t,uint32_t>> identityByResource;
+    std::unordered_map<uint64_t,std::pair<uint32_t,uint32_t>> resourceByIdentity;
+    const auto& indices = executable.resourceIndexBySlot;
+    for (uint32_t slot = 0; slot < bindings.Size() && slot < indices.size(); ++slot) {
+        const auto* binding = bindings.TryAt(slot);
+        const auto resource = indices[slot];
+        if (!binding || !binding->bound || resource == UINT32_MAX) continue;
+        const auto [byIdentity,newIdentity] = resourceByIdentity.try_emplace(binding->identity,resource,slot);
+        if (!newIdentity && byIdentity->second.first != resource)
+            throw std::logic_error("Slots " + std::to_string(byIdentity->second.second) + " and " + std::to_string(slot)
+                + " share a backing but are different resources in the executable");
+        const auto [byResource,newResource] = identityByResource.try_emplace(resource,binding->identity,slot);
+        if (!newResource && byResource->second.first != binding->identity)
+            throw std::logic_error("Slots " + std::to_string(byResource->second.second) + " and " + std::to_string(slot)
+                + " are one resource in the executable but have different backings");
+    }
+    for (const auto& [epoch,split] : executable.epochs)
+        if (split) ValidateSharedBackings(*split,bindings);
+}
+compiler::GraphCompileStructure& GraphEditTransaction::EditStructure() {
     return EditLogical().declarations;
 }
 LogicalGraph& GraphEditTransaction::EditLogical(bool structural) {
@@ -273,7 +437,7 @@ LogicalGraph& GraphEditTransaction::EditLogical(bool structural) {
     if (!m_logical) m_logical = *m_base->logical;
     return *m_logical;
 }
-ResourceSlotId GraphEditTransaction::AddResource(experimental::CompileResourceShape shape, BindingVersion binding) {
+ResourceSlotId GraphEditTransaction::AddResource(compiler::CompileResourceShape shape, BindingVersion binding) {
     MutationGuard mutation{m_failed};
     Require(binding.shape == shape && ((shape.mips && shape.slices)
         || (!shape.mips && !shape.slices && !shape.hasLayout)), "Invalid resource shape");
@@ -310,7 +474,7 @@ ResourceSlotId GraphEditTransaction::AddResource(experimental::CompileResourceSh
     ReplaceBinding(slot, std::move(binding));
     return slot;
 }
-ResourceSlotId GraphEditTransaction::ReserveResource(experimental::CompileResourceShape shape,
+ResourceSlotId GraphEditTransaction::ReserveResource(compiler::CompileResourceShape shape,
     std::optional<NativeBindingContract> contract) {
     MutationGuard mutation{m_failed};
     Require(shape.mips && shape.slices, "Reserved slots require a stateful resource contract");
@@ -391,7 +555,7 @@ void GraphEditTransaction::ValidatePass(PassId pass) const {
     Require(pass.index < logical.passSlots.size() && logical.passSlots[pass.index].active
         && pass.generation == logical.passSlots[pass.index].generation, "Stale pass");
 }
-PassId GraphEditTransaction::AddPass(experimental::CompilePass pass, std::optional<uint32_t> authoredOrder) {
+PassId GraphEditTransaction::AddPass(compiler::CompilePass pass, std::optional<uint32_t> authoredOrder) {
     MutationGuard mutation{m_failed};
     auto& logical = EditLogical();
     auto& structure = logical.declarations;
@@ -426,6 +590,13 @@ void GraphEditTransaction::SetPassEpoch(PassId pass, uint32_t epoch) {
     if (logical.passSlots[pass.index].epoch == epoch) return;
     EditLogical().passSlots[pass.index].epoch = epoch;
 }
+void GraphEditTransaction::SetPassDebugName(PassId pass, std::string name) {
+    MutationGuard guard{m_failed};
+    ValidatePass(pass);
+    const auto& logical = m_logical ? *m_logical : *m_base->logical;
+    if (logical.passSlots[pass.index].debugName == name) return;
+    EditLogical().passSlots[pass.index].debugName = std::move(name);
+}
 void GraphEditTransaction::SetEpochOrder(std::vector<uint32_t> order) {
     MutationGuard guard{m_failed};
     const auto& logical = m_logical ? *m_logical : *m_base->logical;
@@ -454,7 +625,7 @@ void GraphEditTransaction::RemovePass(PassId pass) {
     for (auto& group : logical.groups)
         std::erase_if(group.subscribers,[&](const auto& subscription) { return subscription.pass == pass; });
 }
-void GraphEditTransaction::ReplacePass(PassId pass, experimental::CompilePass declaration) {
+void GraphEditTransaction::ReplacePass(PassId pass, compiler::CompilePass declaration) {
     MutationGuard mutation{m_failed};
     auto& structure = EditStructure();
     ValidatePass(pass);
@@ -475,7 +646,7 @@ rhi::Resource SelectedPublication::ResolveNative(BindingToken token) const {
     return version.recording->resource;
 }
 BindingToken GraphEditTransaction::Declare(PassId pass, ResourceSlotId resource,
-    experimental::CompileRange range, experimental::CompileResourceState state) {
+    compiler::CompileRange range, compiler::CompileResourceState state) {
     MutationGuard mutation{m_failed};
     ValidatePass(pass);
     const auto shape = m_bindings.At(resource).shape;
@@ -493,6 +664,42 @@ rhi::DescriptorSlot SelectedPublication::Resolve(ViewToken token) const {
     Require(bool(version.preparedViews), "Binding has no prepared descriptor layout");
     return version.preparedViews->at(token.binding.declarationId).at(token.ordinal);
 }
+ResourceSlotId SelectedPublication::SlotOf(BindingToken token) const {
+    Require(token.domain == logical->domain && token.pass.index < logical->passSlots.size(), "Foreign binding token");
+    const auto& pass = logical->passSlots[token.pass.index];
+    Require(pass.active && pass.generation == token.pass.generation && pass.layoutRevision == token.layoutRevision
+        && token.ordinal < pass.bindingSlots.size()
+        && pass.bindingSlots[token.ordinal].declarationId == token.declarationId, "Stale or undeclared binding token");
+    return pass.bindingSlots[token.ordinal].resource;
+}
+BindlessViewRequest SelectedPublication::RequestOf(ViewToken token) const {
+    SlotOf(token.binding);
+    const auto& required = logical->passSlots[token.binding.pass.index].bindingSlots[token.binding.ordinal].requiredViews;
+    Require(token.ordinal < required.size() && required[token.ordinal].declarationId == token.declarationId,
+        "Stale or undeclared descriptor token");
+    return required[token.ordinal].request;
+}
+std::optional<std::pair<BindingToken, std::vector<ViewToken>>> SelectedPublication::FindBinding(PassId pass,
+    ResourceSlotId resource, std::span<const BindlessViewRequest> views) const {
+    if (!logical || pass.index >= logical->passSlots.size()) return std::nullopt;
+    const auto& layout = logical->passSlots[pass.index];
+    if (!layout.active || layout.generation != pass.generation) return std::nullopt;
+    for (uint32_t ordinal = 0; ordinal < layout.bindingSlots.size(); ++ordinal) {
+        const auto& entry = layout.bindingSlots[ordinal];
+        if (!(entry.resource == resource)) continue;
+        const BindingToken token(logical->domain, layout.layoutRevision, pass, ordinal, entry.declarationId);
+        std::vector<ViewToken> found;
+        for (const auto view : views) {
+            const auto required = std::find_if(entry.requiredViews.begin(), entry.requiredViews.end(),
+                [&](const auto& candidate) { return SameView(candidate.request, view); });
+            if (required == entry.requiredViews.end()) break;
+            found.push_back(ViewToken(token, static_cast<uint32_t>(required - entry.requiredViews.begin()), required->declarationId));
+        }
+        if (found.size() == views.size()) return std::pair{token, std::move(found)};
+    }
+    return std::nullopt;
+}
+
 BindingToken GraphEditTransaction::DeclareDependency(PassId pass, ResourceSlotId resource, bool write) {
     return DeclareBinding(pass, resource, write);
 }
@@ -568,8 +775,8 @@ ViewToken GraphEditTransaction::RequireView(BindingToken token, BindlessViewRequ
     ReplaceBinding(resource,std::move(replacement));
     return ViewToken(token,ordinal,id);
 }
-void GraphEditTransaction::DeclarePostcondition(BindingToken token, experimental::CompileRange range,
-    experimental::CompileResourceState state) {
+void GraphEditTransaction::DeclarePostcondition(BindingToken token, compiler::CompileRange range,
+    compiler::CompileResourceState state) {
     MutationGuard mutation{m_failed};
     const auto& logical = m_logical ? *m_logical : *m_base->logical;
     Require(token.domain == logical.domain, "Foreign postcondition binding");
@@ -594,7 +801,7 @@ void GraphEditTransaction::AddOrdering(PassId before, PassId after) {
     Require(before != after, "Self ordering cycle");
     structure.explicitEdges.emplace_back(before.index, after.index);
 }
-void GraphEditTransaction::SetQueues(std::vector<experimental::CompileQueue> queues) {
+void GraphEditTransaction::SetQueues(std::vector<compiler::CompileQueue> queues) {
     MutationGuard mutation{m_failed};
     Require(!queues.empty(), "Graph has no queues");
     EditStructure().queues = std::move(queues);
@@ -611,7 +818,7 @@ void GraphEditTransaction::ClearPlacementOrderings() {
     EditStructure().placementEdges.clear();
 }
 void GraphEditTransaction::ReplaceResourceContract(ResourceSlotId slot,
-    experimental::CompileResourceShape shape, BindingVersion binding) {
+    compiler::CompileResourceShape shape, BindingVersion binding) {
     MutationGuard mutation{m_failed};
     m_bindings.At(slot);
     Require(binding.shape == shape, "Replacement contract shape mismatch");
@@ -624,12 +831,12 @@ void GraphEditTransaction::ReplaceResourceContract(ResourceSlotId slot,
     ReplaceBinding(slot,std::move(binding));
 }
 ResourceSlotId GraphEditTransaction::AddSnapshot(std::shared_ptr<const ResourceBindingSnapshot> snapshot,
-    const experimental::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
+    const compiler::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
     MutationGuard guard{m_failed};
     return AddResource(initial.shape,BindingVersion::FromSnapshot(std::move(snapshot),initial,descriptorRevision,contentRevision));
 }
 void GraphEditTransaction::ReplaceSnapshot(ResourceSlotId slot, std::shared_ptr<const ResourceBindingSnapshot> snapshot,
-    const experimental::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
+    const compiler::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
     MutationGuard guard{m_failed};
     ReplaceBinding(slot,BindingVersion::FromSnapshot(std::move(snapshot),initial,descriptorRevision,contentRevision));
 }
@@ -727,6 +934,9 @@ void GraphEditTransaction::ReplaceBinding(ResourceSlotId slot, BindingVersion bi
         if (binding.admission->aliasSize) {
             Require(binding.admission->aliasHeap && binding.admission->aliasHeapIdentity == binding.admission->aliasHeap.get(),
                 "Alias placement has no exact heap owner");
+            // Only ORG's alias pools place resources into shared memory: their overlaps are planned and ordered. A
+            // backing placed by anyone else may overlap another backing the graph knows nothing about.
+            Require(binding.admission->aliasPoolID != 0, "Aliased backing was not placed by an ORG alias pool");
             Require(binding.admission->aliasOffset <= UINT64_MAX - binding.admission->aliasSize, "Alias range overflow");
         }
     }
@@ -772,7 +982,7 @@ void GraphEditTransaction::ReplaceBinding(ResourceSlotId slot, BindingVersion bi
     page->at(slot.index % BindingTable::PageSize) = std::move(binding);
     m_bindings.m_pages[pageIndex] = page;
 }
-ResourceGroupId GraphEditTransaction::AddGroup(experimental::CompileResourceShape shape,
+ResourceGroupId GraphEditTransaction::AddGroup(compiler::CompileResourceShape shape,
     std::vector<ResourceSlotId> members) {
     MutationGuard mutation{m_failed};
     Require(shape.mips && shape.slices, "Group requires a stateful resource contract");
@@ -856,7 +1066,7 @@ void GraphEditTransaction::SetGroupResourceClass(ResourceGroupId id, rhi::Resour
     if (group.memberType != type) EditLogical().groups[id.index].memberType = type;
 }
 void GraphEditTransaction::DeclareGroupAccess(PassId pass, ResourceGroupId id,
-    experimental::CompileResourceState state, uint32_t phase, std::optional<experimental::CompileRange> range) {
+    compiler::CompileResourceState state, uint32_t phase, std::optional<compiler::CompileRange> range) {
     MutationGuard mutation{m_failed};
     auto& logical = EditLogical();
     Require(id.index < logical.groups.size() && logical.groups[id.index].active
@@ -870,10 +1080,10 @@ void GraphEditTransaction::DeclareGroupAccess(PassId pass, ResourceGroupId id,
     }
     auto& subscribers = logical.groups[id.index].subscribers;
     const auto shape = logical.groups[id.index].memberShape;
-    const auto requested = range.value_or(experimental::CompileRange{0,shape.mips,0,shape.slices});
+    const auto requested = range.value_or(compiler::CompileRange{0,shape.mips,0,shape.slices});
     for (const auto& value : subscribers) {
         if (value.pass != pass) continue;
-        const auto previous = value.range.value_or(experimental::CompileRange{0,shape.mips,0,shape.slices});
+        const auto previous = value.range.value_or(compiler::CompileRange{0,shape.mips,0,shape.slices});
         Require(uint64_t{requested.mip} + requested.mips <= previous.mip
             || uint64_t{previous.mip} + previous.mips <= requested.mip
             || uint64_t{requested.slice} + requested.slices <= previous.slice
@@ -904,24 +1114,20 @@ void GraphEditTransaction::RemoveGroup(ResourceGroupId id) {
     group.subscribers.clear();
 }
 std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
-    experimental::CompileWorkspace& workspace, const std::atomic_bool& cancelled, bool validateAliasOrder) {
+    compiler::CompileWorkspace& workspace, const std::atomic_bool& cancelled, bool validateAliasOrder) {
     Require(!m_failed, "Publication transaction contains a failed edit");
     Require(m_base->revision != UINT64_MAX, "Publication revision exhausted");
     if (cancelled.load(std::memory_order_relaxed)) return {};
-    // Inspect final equivalence classes, not transient intermediate replacements.
-    // Rotating every slot of a shared backing atomically preserves the executable.
-    if (!m_structuralChanged) for (const auto& [index,bucket] : m_changedIdentities) {
-        for (const auto& [identity,members] : *bucket) for (const auto slot : members) {
-            const auto& old = m_base->bindings.At(m_base->bindings.CurrentSlot(slot));
-            const auto& previous = m_base->bindings.m_identities[old.identity % BindingTable::IdentityBuckets]->at(old.identity);
-            if (previous != members) {
-                basic_telemetry::AddCounter("ORG.Persistent.EquivalenceClassRebuilds");
-                static std::atomic<uint32_t> reported{0};
-                if (reported.fetch_add(1) < 8)
-                    spdlog::info("Persistent binding edit changed an equivalence class: slot={} identity={:#x} oldIdentity={:#x} previousMembers={} members={}",
-                        slot, identity, old.identity, previous.size(), members.size());
-                EditLogical(); break;
-            }
+    // A binding-only edit that changes which slots share a backing changes which passes use the same memory, so it
+    // compiles a new schedule. Rotating every slot of a shared backing together keeps the sets, and the executable.
+    if (!m_structuralChanged) {
+        if (const auto changed = SharingChanges(); !changed.empty()) {
+            basic_telemetry::AddCounter("ORG.Persistent.EquivalenceClassRebuilds");
+            static std::atomic<uint32_t> reported{0};
+            if (reported.fetch_add(1) < 8)
+                spdlog::info("Persistent binding edit changed which slots share a backing: slots={} (first {})",
+                    changed.size(), changed.front());
+            EditLogical();
         }
     }
     // Validate only changed identity buckets on a binding-only publication.
@@ -936,8 +1142,20 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
     if (m_structuralChanged) {
         Require(executable->structuralRevision != UINT64_MAX, "Executable revision exhausted");
         BT_ZONE_SCOPE("ORG.Persistent.BuildExecutable");
-        experimental::GraphCompileInput input;
+        compiler::GraphCompileInput input;
         input.structure = m_logical->declarations;
+        // The decision trace names passes and resources by these labels (OpenRenderGraph/Trace.h), and so does BasicRHI's command
+        // census (a handoff list is labelled with its batch's first pass).
+        if (trace::Any() || rhi::census::Enabled()) {
+            auto& structure = input.structure;
+            structure.diagnosticPassNames.assign(structure.passes.size(), {});
+            for (size_t i = 0; i < structure.passes.size() && i < m_logical->passSlots.size(); ++i)
+                structure.diagnosticPassNames[i] = m_logical->passSlots[i].debugName;
+            structure.diagnosticResourceNames.assign(structure.resourceIDs.size(), {});
+            for (size_t i = 0; i < structure.resourceIDs.size(); ++i)
+                if (const auto* binding = m_bindings.TryAt(static_cast<uint32_t>(i)); binding && binding->admission)
+                    structure.diagnosticResourceNames[i] = binding->admission->debugName;
+        }
         // Epochs execute in their declared order, so the whole-frame schedule (and the
         // alias placement planned over it) orders every pass of an epoch before every
         // pass of the next one that has passes. Untagged passes are left free.
@@ -987,6 +1205,7 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             const auto& binding = m_bindings.At(m_bindings.CurrentSlot(i));
             canonical[i] = m_bindings.m_identities[binding.identity % BindingTable::IdentityBuckets]->at(binding.identity).front();
         }
+        size_t groupEdgesFrom = SIZE_MAX;  // explicitEdges from here on are the group phases
         {
             BT_ZONE_SCOPE("ORG.Persistent.PrepareGroups");
             for (const auto& group : m_logical->groups) {
@@ -999,12 +1218,13 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
                     for (const auto member : group.members) {
                         pass.accesses.push_back({member.index,subscription.state.write});
                         pass.entryStates.push_back({member.index,
-                            subscription.range.value_or(experimental::CompileRange{0,group.memberShape.mips,0,group.memberShape.slices}),subscription.state});
+                            subscription.range.value_or(compiler::CompileRange{0,group.memberShape.mips,0,group.memberShape.slices}),subscription.state});
                     }
                 }
             }
             // Phase contracts order overlapping groups as well as each group's
             // own producer/consumer phases. Equal-phase writes are ambiguous.
+            groupEdgesFrom = input.structure.explicitEdges.size();
             auto explicitlyOrdered = [&](uint32_t from, uint32_t to) {
                 std::vector<uint8_t> visited(input.structure.passes.size());
                 std::vector<uint32_t> pending{from};
@@ -1031,8 +1251,13 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
                     if (!overlap) continue;
                     for (const auto& u : x.subscribers) for (const auto& v : y.subscribers) {
                         if (u.pass == v.pass || (!u.state.write && !v.state.write)) continue;
-                        const auto ur = u.range.value_or(experimental::CompileRange{0,x.memberShape.mips,0,x.memberShape.slices});
-                        const auto vr = v.range.value_or(experimental::CompileRange{0,y.memberShape.mips,0,y.memberShape.slices});
+                        // Passes of different epochs are ordered by their epochs (the explicit edges between consecutive
+                        // epochs above), which need not follow the phases (registration order): a phase edge against the
+                        // epoch order would be a cycle. An untagged pass (AllEpochs) is in every epoch: its phases stand.
+                        if (const auto eu = m_logical->passSlots.at(u.pass.index).epoch, ev = m_logical->passSlots.at(v.pass.index).epoch;
+                            eu != ev && eu != AllEpochs && ev != AllEpochs) continue;
+                        const auto ur = u.range.value_or(compiler::CompileRange{0,x.memberShape.mips,0,x.memberShape.slices});
+                        const auto vr = v.range.value_or(compiler::CompileRange{0,y.memberShape.mips,0,y.memberShape.slices});
                         if (uint64_t{ur.mip} + ur.mips <= vr.mip || uint64_t{vr.mip} + vr.mips <= ur.mip
                             || uint64_t{ur.slice} + ur.slices <= vr.slice || uint64_t{vr.slice} + vr.slices <= ur.slice) continue;
                         if (u.phase == v.phase) {
@@ -1053,6 +1278,10 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             // lowered access hazards in a legal authored order without changing
             // stable pass indices or frame recording associations.
             auto directStructure = m_logical->declarations;
+            // In the authored order as ranked by epoch above: the declarations' own order is registration order, and a hazard
+            // derived in it between passes of two epochs could run against the epoch order (a cycle with the epoch edges).
+            for (size_t i = 0; i < directStructure.passes.size() && i < input.structure.passes.size(); ++i)
+                directStructure.passes[i].originalOrder = input.structure.passes[i].originalOrder;
             CanonicalizeUses(directStructure,canonical);
             const auto direct = workspace.AnalyzeDependencies(directStructure,cancelled);
             if (!direct) return {};
@@ -1063,9 +1292,15 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
                 Require(from < count && to < count && from != to, "Invalid group phase ordering");
                 successors[from].push_back(to); ++incoming[to];
             };
-            for (auto [from,to] : *direct) append(from,to);
-            for (auto [from,to] : input.structure.explicitEdges) append(from,to);
-            for (auto [from,to] : input.structure.placementEdges) append(from,to);
+            // Kinds, for the diagnostics of a cycle: direct access, explicit (authored, epochs, group phases), placement.
+            std::vector<std::vector<std::pair<uint32_t,char>>> predecessors(count);
+            for (auto [from,to] : *direct) { append(from,to); predecessors[to].emplace_back(from,'d'); }
+            for (size_t e = 0; e < input.structure.explicitEdges.size(); ++e) {
+                const auto [from,to] = input.structure.explicitEdges[e];
+                append(from,to);
+                predecessors[to].emplace_back(from, e >= groupEdgesFrom ? 'g' : 'x');
+            }
+            for (auto [from,to] : input.structure.placementEdges) { append(from,to); predecessors[to].emplace_back(from,'p'); }
             std::vector<uint32_t> order;
             order.reserve(count);
             std::vector<uint8_t> selected(count);
@@ -1074,7 +1309,25 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
                 for (uint32_t i = 0; i < count; ++i)
                     if (!selected[i] && !incoming[i] && (next == UINT32_MAX
                         || input.structure.passes[i].originalOrder < input.structure.passes[next].originalOrder)) next = i;
-                Require(next != UINT32_MAX, "Cyclic group phase ordering");
+                if (next == UINT32_MAX) {
+                    // Every pass left has a predecessor left: name them, with the edges between them.
+                    auto name = [&](uint32_t pass) {
+                        const auto& slot = m_logical->passSlots[pass];
+                        return (slot.debugName.empty() ? "#" + std::to_string(pass) : slot.debugName)
+                            + "(e" + (slot.epoch == AllEpochs ? std::string("*") : std::to_string(slot.epoch)) + ")";
+                    };
+                    std::string message = "Cyclic group phase ordering (edges d: access, x: authored or epoch, g: group phase, p: placement):";
+                    size_t listed = 0;
+                    for (uint32_t i = 0; i < count && listed < 24; ++i) {
+                        if (selected[i]) continue;
+                        ++listed;
+                        message += " " + name(i) + " after";
+                        for (const auto& [from,kind] : predecessors[i])
+                            if (!selected[from]) message += std::string(" ") + kind + ":" + name(from);
+                        message += ";";
+                    }
+                    Require(false, message.c_str());
+                }
                 selected[next] = 1; order.push_back(next);
                 for (auto to : successors[next]) --incoming[to];
             }
@@ -1085,14 +1338,14 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
         {
             BT_ZONE_SCOPE("ORG.Persistent.LowerPassSlots");
             std::vector<uint32_t> dense(input.structure.passes.size(),UINT32_MAX);
-            std::vector<experimental::CompilePass> active;
+            std::vector<compiler::CompilePass> active;
             for (uint32_t i = 0; i < dense.size(); ++i) {
                 if (!m_logical->passSlots.at(i).active) continue;
                 dense[i] = static_cast<uint32_t>(active.size());
                 active.push_back(std::move(input.structure.passes[i]));
                 denseEpochs.push_back(m_logical->passSlots[i].epoch);
             }
-            auto lowerEdges = [&](experimental::DependencyEdges& edges) {
+            auto lowerEdges = [&](compiler::DependencyEdges& edges) {
                 for (auto& [from,to] : edges) {
                     Require(from < dense.size() && to < dense.size()
                         && dense[from] != UINT32_MAX && dense[to] != UINT32_MAX, "Ordering references retired pass");
@@ -1102,18 +1355,24 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             lowerEdges(input.structure.explicitEdges);
             lowerEdges(input.structure.placementEdges);
             if (input.analyzedDependencies) {
-                auto edges = std::make_shared<experimental::DependencyEdges>(*input.analyzedDependencies);
+                auto edges = std::make_shared<compiler::DependencyEdges>(*input.analyzedDependencies);
                 lowerEdges(*edges);
                 input.analyzedDependencies = std::move(edges);
             }
             input.structure.passes = std::move(active);
-            input.structure.diagnosticPassNames.clear();
+            // The names follow their passes to the dense indices.
+            if (!input.structure.diagnosticPassNames.empty()) {
+                std::vector<std::string> names(input.structure.passes.size());
+                for (uint32_t i = 0; i < dense.size() && i < input.structure.diagnosticPassNames.size(); ++i)
+                    if (dense[i] != UINT32_MAX) names[dense[i]] = std::move(input.structure.diagnosticPassNames[i]);
+                input.structure.diagnosticPassNames = std::move(names);
+            }
         }
         {
             BT_ZONE_SCOPE("ORG.Persistent.LowerResourceSlots");
             std::vector<uint32_t> dense(input.structure.resourceIDs.size(),UINT32_MAX);
             std::vector<uint64_t> identities;
-            std::vector<experimental::CompileResourceShape> shapes;
+            std::vector<compiler::CompileResourceShape> shapes;
             for (uint32_t i = 0; i < dense.size(); ++i) {
                 if (!m_logical->resourceActive.at(i) || canonical[i] != i) continue;
                 dense[i] = static_cast<uint32_t>(identities.size());
@@ -1134,17 +1393,17 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             input.structure.diagnosticResourceNames.clear();
         }
         input.structure.generation = executable->structuralRevision + 1;
-        experimental::NormalizeCompileInput(input);
-        auto compileInput = std::make_shared<const experimental::GraphCompileInput>(std::move(input));
-        auto graph = experimental::CompileGraph(compileInput, workspace, cancelled);
+        compiler::NormalizeCompileInput(input);
+        auto compileInput = std::make_shared<const compiler::GraphCompileInput>(std::move(input));
+        auto graph = compiler::CompileGraphCached(compileInput, workspace, cancelled);
         if (!graph) return {};
         Require(graph->states.complete, "Incomplete persistent state plan");
         if (validateAliasOrder && std::ranges::any_of(m_bindings.m_pages, [](const auto& page) {
             return std::ranges::any_of(*page, [](const auto& binding) { return binding.admission && binding.admission->aliasSize; });
         })) ValidateAliasOrder(*graph, m_bindings);
         const auto revision = executable->structuralRevision + 1;
-        auto generationOf = [&](std::shared_ptr<const experimental::CompiledGraph> compiled,
-                                std::shared_ptr<const experimental::GraphCompileInput> compiledInput) {
+        auto generationOf = [&](std::shared_ptr<const compiler::Schedule> compiled,
+                                std::shared_ptr<const compiler::GraphCompileInput> compiledInput) {
             std::vector<ResourceSlotId> resourceSlots;
             resourceSlots.reserve(compiled->structure->resourceIDs.size());
             for (auto identity : compiled->structure->resourceIDs) {
@@ -1172,20 +1431,21 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
         // Per epoch: the same compile input restricted to the epoch's passes (and the
         // untagged ones), over the same resources, bindings and alias placements. Its
         // first use of each resource is an admission boundary, so an epoch's entry
-        // state comes from the ledger - whatever ran before it, or did not.
-        for (const auto epoch : epochSequence) {
+        // state comes from the ledger - whatever ran before it, or did not. A graph of a
+        // single epoch (RenderGraph::SetPassEpochFilter) runs its whole executable.
+        if (epochSequence.size() > 1) for (const auto epoch : epochSequence) {
             BT_ZONE_SCOPE("ORG.Persistent.BuildEpochExecutable");
-            experimental::GraphCompileInput split = *compileInput;
+            compiler::GraphCompileInput split = *compileInput;
             std::vector<uint32_t> remap(split.structure.passes.size(),UINT32_MAX);
-            std::vector<experimental::CompilePass> passes;
+            std::vector<compiler::CompilePass> passes;
             for (uint32_t i = 0; i < remap.size(); ++i) {
                 if (denseEpochs[i] != epoch && denseEpochs[i] != AllEpochs) continue;
                 remap[i] = static_cast<uint32_t>(passes.size());
                 passes.push_back(split.structure.passes[i]);
             }
             if (passes.empty()) continue;
-            auto keep = [&](const experimental::DependencyEdges& edges) {
-                experimental::DependencyEdges kept;
+            auto keep = [&](const compiler::DependencyEdges& edges) {
+                compiler::DependencyEdges kept;
                 for (auto [from,to] : edges)
                     if (remap[from] != UINT32_MAX && remap[to] != UINT32_MAX) kept.emplace_back(remap[from],remap[to]);
                 return kept;
@@ -1194,11 +1454,11 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
             split.structure.explicitEdges = keep(split.structure.explicitEdges);
             split.structure.placementEdges = keep(split.structure.placementEdges);
             if (split.analyzedDependencies)
-                split.analyzedDependencies = std::make_shared<const experimental::DependencyEdges>(keep(*split.analyzedDependencies));
+                split.analyzedDependencies = std::make_shared<const compiler::DependencyEdges>(keep(*split.analyzedDependencies));
             split.expectedEdges.reset();
             split.expectedSchedulingEdges.reset();
-            auto splitInput = std::make_shared<const experimental::GraphCompileInput>(std::move(split));
-            auto splitGraph = experimental::CompileGraph(splitInput, workspace, cancelled);
+            auto splitInput = std::make_shared<const compiler::GraphCompileInput>(std::move(split));
+            auto splitGraph = compiler::CompileGraphCached(splitInput, workspace, cancelled);
             if (!splitGraph) return {};
             Require(splitGraph->states.complete, "Incomplete persistent epoch state plan");
             if (validateAliasOrder && std::ranges::any_of(m_bindings.m_pages, [](const auto& page) {
@@ -1222,11 +1482,11 @@ std::shared_ptr<const SelectedPublication> GraphEditTransaction::Build(
 }
 GraphProgram::GraphProgram(std::function<void(std::shared_ptr<const void>)> retireOwnership)
     : m_retireOwnership(std::move(retireOwnership)) {
-    experimental::GraphCompileInput input;
-    experimental::CompileWorkspace workspace;
+    compiler::GraphCompileInput input;
+    compiler::CompileWorkspace workspace;
     std::atomic_bool cancelled{false};
-    auto compileInput = std::make_shared<const experimental::GraphCompileInput>(std::move(input));
-    auto graph = experimental::CompileGraph(compileInput, workspace, cancelled);
+    auto compileInput = std::make_shared<const compiler::GraphCompileInput>(std::move(input));
+    auto graph = compiler::CompileGraphCached(compileInput, workspace, cancelled);
     auto logical = std::make_shared<LogicalGraph>();
     logical->domain = TakeIdentity(nextProgramDomain);
     auto layout = BuildPersistentExecutionLayout(0,graph,compileInput,0);
@@ -1234,6 +1494,40 @@ GraphProgram::GraphProgram(std::function<void(std::shared_ptr<const void>)> reti
         std::make_shared<const ExecutableGeneration>(ExecutableGeneration{0, std::move(graph),{},std::move(compileInput),std::move(layout)}), {},
         std::move(logical)));
 }
+std::shared_ptr<const SelectedPublication> BuildExternalPublication(const GraphProgram& base,
+    std::span<const compiler::CompileQueue> queues, uint32_t queue, std::span<const ExternalAccess> accesses,
+    compiler::CompileWorkspace& workspace) {
+    BT_ZONE_SCOPE("ORG.Persistent.BuildExternalPublication");
+    Require(queue < queues.size(), "External client queue is not one of the graph's");
+    auto edit = base.BeginEdit();
+    edit.SetQueues({queues.begin(), queues.end()});
+    compiler::CompilePass pass;
+    pass.compatibleQueueSlots = {queue};
+    pass.preferredQueueSlot = queue;
+    pass.backend = queues[queue].backendInstance;
+    const auto id = edit.AddPass(std::move(pass));
+    // One slot per backing: several ranges of one backing are several declarations of its slot.
+    std::vector<std::pair<uint64_t, ResourceSlotId>> slots;
+    for (const auto& access : accesses) {
+        auto found = std::ranges::find(slots, access.binding.identity, &std::pair<uint64_t, ResourceSlotId>::first);
+        if (found == slots.end()) {
+            // Slots are numbered in order of first use, and a binding's admission state must carry its slot's ID.
+            auto binding = access.binding;
+            const uint64_t id = slots.size() + 1;
+            if (binding.admission && binding.admission->graphResourceID != id) {
+                auto admission = std::make_shared<compiler::PreparedBackingState>(*binding.admission);
+                admission->graphResourceID = id;
+                binding.admission = std::move(admission);
+            }
+            slots.emplace_back(access.binding.identity, edit.AddResource(binding.shape, std::move(binding)));
+            found = std::prev(slots.end());
+        }
+        edit.Declare(id, found->second, access.range, access.state);
+    }
+    const std::atomic_bool cancelled{false};
+    return edit.Build(workspace, cancelled);
+}
+
 std::shared_ptr<const SelectedPublication> SelectedPublication::ForEpoch(uint32_t epoch) const {
     if (!HasEpochs()) return {};
     std::lock_guard lock(m_epochMutex);
@@ -1294,24 +1588,38 @@ SynchronousAdmission::RetirementTicket SynchronousAdmission::CaptureRetirement(c
         "Retired alias heap lacks exact ownership");
     return ticket;
 }
+void ResourceSequencer::RetireTimeline(uint64_t identity) {
+    std::lock_guard lock(mutex);
+    completed[identity] = UINT64_MAX;
+}
+bool ResourceSequencer::Reached(compiler::ExecutionTimelinePoint point) const {
+    const auto found = completed.find(point.timeline);
+    return found != completed.end() && found->second >= point.value;
+}
+size_t SynchronousAdmission::StateBackingCount() const { std::lock_guard lock(m_sequencer->mutex); return m_sequencer->states.BackingCount(); }
+size_t SynchronousAdmission::HazardBackingCount() const { std::lock_guard lock(m_sequencer->mutex); return m_sequencer->accesses.BackingCount(); }
+size_t SynchronousAdmission::AliasHeapCount() const { std::lock_guard lock(m_sequencer->mutex); return m_sequencer->aliases.HeapCount(); }
+size_t SynchronousAdmission::IncomingRevisionCount() const { std::lock_guard lock(m_sequencer->mutex); return m_sequencer->incomingRevisions.size(); }
 bool SynchronousAdmission::RetireBackingMetadata(const RetirementTicket& ticket) {
     Require(ticket.resource.valid(), "Invalid backing retirement ticket");
     Require(m_pending.empty(), "Metadata retirement during pending admission");
     if (!ticket.owner.expired() || !ticket.allocation.expired()) return false;
-    if (!m_accesses.RetireCompleted(ticket.resource, m_completed)) return false;
+    std::lock_guard lock(m_sequencer->mutex);
+    if (!m_sequencer->accesses.RetireCompleted(ticket.resource, m_sequencer->completed)) return false;
     const std::array resources{ticket.resource};
-    m_states.Invalidate(resources);
-    m_incomingRevisions.erase((uint64_t{ticket.resource.generation} << 32) | ticket.resource.index);
+    m_sequencer->states.Invalidate(resources);
+    m_sequencer->incomingRevisions.erase((uint64_t{ticket.resource.generation} << 32) | ticket.resource.index);
     return true;
 }
 bool SynchronousAdmission::RetireAliasMetadata(const RetirementTicket& ticket) {
     Require(m_pending.empty(), "Metadata retirement during pending admission");
     if (!ticket.heapIdentity) return true;
     if (!ticket.heap.expired()) return false;
-    return m_aliases.RetireCompleted(ticket.heapIdentity, ticket.heap, m_completed);
+    std::lock_guard lock(m_sequencer->mutex);
+    return m_sequencer->aliases.RetireCompleted(ticket.heapIdentity, ticket.heap, m_sequencer->completed);
 }
 BindingVersion BindingVersion::FromSnapshot(std::shared_ptr<const ResourceBindingSnapshot> snapshot,
-    const experimental::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
+    const compiler::PreparedBackingState& initial, uint64_t descriptorRevision, uint64_t contentRevision) {
     Require(snapshot && snapshot->allocationOwner && snapshot->backingGeneration, "Incomplete publication snapshot");
     const auto handle = snapshot->resource.GetHandle();
     Require(handle.valid() && handle.index == initial.resource.index && handle.generation == initial.resource.generation,
@@ -1322,8 +1630,17 @@ BindingVersion BindingVersion::FromSnapshot(std::shared_ptr<const ResourceBindin
         && snapshot->aliasSize == initial.aliasSize, "Publication snapshot placement disagrees with admission");
     Require(bool(initial.regions), "Publication snapshot has no initial state regions");
     if (snapshot->description.type != rhi::ResourceType::Unknown) {
-        Require(NativeBindingContract::Capture(snapshot->description).Matches(snapshot->description,initial.shape),
-            "Publication snapshot shape disagrees with admission");
+        if (!NativeBindingContract::Capture(snapshot->description).Matches(snapshot->description, initial.shape)) {
+            const auto& desc = snapshot->description;
+            const bool texture = desc.type != rhi::ResourceType::Buffer && desc.type != rhi::ResourceType::AccelerationStructure;
+            throw std::logic_error(std::string("Publication snapshot shape disagrees with admission: resource=")
+                + (desc.debugName ? desc.debugName : "<unnamed>") + " id=" + std::to_string(snapshot->resourceID)
+                + " type=" + std::to_string(static_cast<uint32_t>(desc.type))
+                + (texture ? " mips=" + std::to_string(desc.texture.mipLevels) + " layers=" + std::to_string(desc.texture.depthOrLayers)
+                    : " bytes=" + std::to_string(desc.buffer.sizeBytes))
+                + " admitted(mips=" + std::to_string(initial.shape.mips) + " slices=" + std::to_string(initial.shape.slices)
+                + " layout=" + std::to_string(initial.shape.hasLayout) + ")");
+        }
         Require(snapshot->description.heapType == initial.heapType, "Publication snapshot heap disagrees with admission");
     }
     BindingVersion result;
@@ -1334,17 +1651,53 @@ BindingVersion BindingVersion::FromSnapshot(std::shared_ptr<const ResourceBindin
     result.shape = initial.shape;
     result.owner = snapshot;
     result.recording = std::move(snapshot);
-    result.admission = std::make_shared<const experimental::PreparedBackingState>(initial);
+    result.admission = std::make_shared<const compiler::PreparedBackingState>(initial);
     return result;
 }
 FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPublication> publication,
-    std::span<const experimental::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
+    std::span<const compiler::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
     std::span<const FrameIncomingState> incomingStates, std::span<const FrameRebinding> rebindings) {
+    return PrepareFrame(std::move(publication), queues, producerWaits, incomingStates, rebindings, true);
+}
+FrameAdmission SynchronousAdmission::PreparePlan(std::shared_ptr<const SelectedPublication> publication,
+    std::span<const compiler::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
+    std::span<const FrameRebinding> rebindings) {
+    return PrepareFrame(std::move(publication), queues, producerWaits, {}, rebindings, false);
+}
+FrameAdmission SynchronousAdmission::PrepareAtSubmission(std::shared_ptr<const SelectedPublication> publication,
+    std::span<const compiler::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
+    std::span<const FrameRebinding> rebindings) {
+    return PrepareFrame(std::move(publication), queues, producerWaits, {}, rebindings, true, true);
+}
+std::pair<std::shared_ptr<const std::vector<compiler::PreparedBackingState>>, uint64_t> SelectedPublication::AdmissionBackings() const {
+    std::lock_guard lock(m_epochMutex);
+    if (m_admissionBackings) return {m_admissionBackings, m_admissionBackingSet};
+    Require(executable && executable->graph && executable->graph->structure, "No executable publication");
+    auto backings = std::make_shared<std::vector<compiler::PreparedBackingState>>();
+    backings->reserve(executable->resourceSlots.size());
+    for (auto slot : executable->resourceSlots) {
+        const auto& binding = bindings.At(slot);
+        Require(bool(binding.admission), "Binding has no prepared admission state");
+        backings->push_back(*binding.admission);
+    }
+    compiler::ValidatePreparedBackingOrder(*executable->graph->structure, *backings);
+    m_admissionBackings = std::move(backings);
+    m_admissionBackingSet = AdmissionBackingSet::NewId();
+    return {m_admissionBackings, m_admissionBackingSet};
+}
+FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const SelectedPublication> publication,
+    std::span<const compiler::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
+    std::span<const FrameIncomingState> incomingStates, std::span<const FrameRebinding> rebindings, bool pending, bool entryOnly) {
     BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
+    std::lock_guard lock(m_sequencer->mutex);
     Require(publication && publication->executable && publication->executable->graph, "No executable publication");
-    Require(m_pending.empty() || (m_closed && m_pending.size() < m_capacity), "Previous synchronous admission has not terminated");
+    if (pending && !m_pending.empty() && !(m_closed && m_pending.size() < m_capacity))
+        throw std::logic_error("Previous synchronous admission has not terminated (" + PendingOwners() + "; this one on thread "
+            + std::to_string(CurrentThreadNumber()) + (entryOnly ? ", at submission" : "")
+            + ", closed " + (m_closed ? "true" : "false") + ")");
     Require(m_nextSequence != UINT64_MAX, "Admission sequence exhausted");
     Require(m_retained.size() < m_capacity, "Synchronous frame capacity exhausted");
+    if (SharingValidationEnabled()) ValidateSharedBackings(*publication->executable, publication->bindings);
     FrameAdmission frame;
     frame.publication = std::move(publication);
     const auto& graph = *frame.publication->executable->graph;
@@ -1356,14 +1709,17 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
     }
     Require(frame.publication->executable->resourceSlots.size() == graph.structure->resourceIDs.size(),
         "Invalid executable resource slot map");
-    frame.backings.reserve(frame.publication->executable->resourceSlots.size());
-    for (auto slot : frame.publication->executable->resourceSlots) {
-        const auto& binding = frame.publication->bindings.At(slot);
-        Require(bool(binding.admission), "Binding has no prepared admission state");
-        frame.backings.push_back(*binding.admission);
+    // The publication's backings, shared by its admissions; a frame that changes one has a copy of its own.
+    {
+        auto [backings, id] = frame.publication->AdmissionBackings();
+        frame.backings = AdmissionBackingSet(std::move(backings), true, id);
     }
+    frame.entryOnly = entryOnly;
+    bool perFrame = false;
     if (!rebindings.empty()) {
         BT_ZONE_SCOPE("ORG.Persistent.ApplyFrameRebindings");
+        std::vector<std::pair<uint32_t, rhi::ResourceHandle>> rebound;
+        rebound.reserve(rebindings.size());
         for (const auto& rebinding : rebindings) {
             const auto& binding = frame.publication->bindings.At(rebinding.slot);
             Require(!binding.bound, "Frame rebinding targets a publication-owned slot");
@@ -1376,20 +1732,53 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
             Require(rebinding.recording && rebinding.recording->resource.GetHandle().index == rebinding.backing.resource.index
                 && rebinding.recording->resource.GetHandle().generation == rebinding.backing.resource.generation,
                 "Frame rebinding recording disagrees with admission");
-            frame.backings[index] = rebinding.backing;
             frame.rebound.push_back(index);
+            rebound.emplace_back(index, rebinding.backing.resource);
+            perFrame = perFrame || rebinding.perFrame;
+        }
+        const auto base = frame.backings.Id();
+        const auto same = [&](const ReboundSet& entry) {
+            if (entry.base != base || entry.rebound.size() != rebound.size()) return false;
+            for (size_t i = 0; i < rebound.size(); ++i)
+                if (entry.rebound[i].first != rebound[i].first || entry.rebound[i].second.index != rebound[i].second.index
+                    || entry.rebound[i].second.generation != rebound[i].second.generation) return false;
+            return true;
+        };
+        const auto found = perFrame ? m_reboundSets.end() : std::ranges::find_if(m_reboundSets, same);
+        if (found != m_reboundSets.end()) {
+            // These backings were rebound into this set before, and checked then.
+            frame.backings = AdmissionBackingSet(found->backings, false, found->id);
+        } else {
+            auto& backings = frame.backings.Mutable();
+            for (size_t i = 0; i < rebindings.size(); ++i) {
+                const auto index = rebound[i].first;
+                const auto& rebinding = rebindings[i];
+                // A frame rebinding names its own resource. A backing another resource already has would be two resources
+                // to the schedule, with no ordering between their users.
+                for (uint32_t other = 0; other < backings.size(); ++other)
+                    Require(other == index || backings[other].resource.index != rebinding.backing.resource.index
+                        || backings[other].resource.generation != rebinding.backing.resource.generation,
+                        "Frame rebinding uses a backing another resource of the graph is bound to");
+                backings[index] = rebinding.backing;
+            }
+            if (!perFrame) {
+                if (m_reboundSets.size() >= 16) m_reboundSets.erase(m_reboundSets.begin());
+                m_reboundSets.push_back({base, std::move(rebound), frame.backings.Shared(), frame.backings.Id()});
+            }
         }
     }
     frame.incomingWaits.resize(graph.batches.size());
-    const auto appendProducerWait = [&](uint32_t batch, experimental::ExecutionTimelinePoint completion) {
+    const auto appendProducerWait = [&](uint32_t batch, compiler::ExecutionTimelinePoint completion) {
         Require(completion.timeline && completion.value, "Invalid frame producer completion");
         const auto consumerQueue = graph.batches.at(batch).queue;
-        const auto producerQueue = std::ranges::find(queues,completion.timeline,&experimental::ExecutionTimelinePoint::timeline);
-        if (producerQueue != queues.end())
-            Require(completion.value <= producerQueue->value, "Frame producer wait depends on future graph-queue work");
+        const auto producerQueue = std::ranges::find(queues,completion.timeline,&compiler::ExecutionTimelinePoint::timeline);
+        if (producerQueue != queues.end() && completion.value > producerQueue->value)
+            throw std::logic_error("Frame producer wait depends on future graph-queue work: timeline="
+                + std::to_string(completion.timeline) + " value=" + std::to_string(completion.value)
+                + " queueValue=" + std::to_string(producerQueue->value));
         if (completion.timeline == queues[consumerQueue].timeline) return;
         auto& waits = frame.incomingWaits[batch];
-        const auto found = std::ranges::find(waits,completion.timeline,&experimental::ExecutionTimelinePoint::timeline);
+        const auto found = std::ranges::find(waits,completion.timeline,&compiler::ExecutionTimelinePoint::timeline);
         if (found == waits.end()) waits.push_back(completion);
         else found->value = std::max(found->value,completion.value);
     };
@@ -1425,7 +1814,7 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
             Require(report.revision && report.producerCompletion.timeline && report.producerCompletion.value,
                 "Incoming state has no producer revision/completion");
             const auto key = (uint64_t{report.backing.generation} << 32) | report.backing.index;
-            if (const auto previous = m_incomingRevisions.find(key); previous != m_incomingRevisions.end()) {
+            if (const auto previous = m_sequencer->incomingRevisions.find(key); previous != m_sequencer->incomingRevisions.end()) {
                 Require(report.revision >= previous->second.revision, "Incoming producer revision regressed");
                 if (report.revision == previous->second.revision) {
                     Require(report.producerCompletion == previous->second.completion, "Incoming revision has inconsistent completion");
@@ -1440,16 +1829,114 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
             const auto stateBatch = executable.incomingStateBatchByResource.at(index);
             Require(stateBatch != UINT32_MAX, "Incoming state has no state consumer");
             frame.incomingEffects.push_back({report.backing,report.revision,report.producerCompletion,stateBatch});
-            frame.backings[index].regions = report.regions;
-            frame.backings[index].authoritativeIncoming = true;
+            auto& backing = frame.backings.Mutable()[index];
+            backing.regions = report.regions;
+            backing.authoritativeIncoming = true;
             for (const auto batch : consumers) appendProducerWait(batch,report.producerCompletion);
         }
     }
-    const auto invalidated = m_aliases.ApplyInitialStates(graph, frame.backings);
+    frame.queuePoints.assign(queues.begin(), queues.end());
+    frame.ownWaits = frame.incomingWaits;
+    // Interned rebound sets (m_reboundSets) are as stable as the publication's own set, so only per-frame rebindings and incoming
+    // states keep the frame's plan its own.
+    AdmitLedger(frame, !perFrame && incomingStates.empty(), !pending);
+    frame.domain = m_domain;
+    // A plan (PreparePlan) has no sequence: Commit and Readmit refuse it, Abandon ignores it.
+    if (!pending) return frame;
+    frame.sequence = m_nextSequence++;
+    m_pending.push_back(frame.sequence);
+    m_pendingOwners.push_back({frame.sequence, CurrentThreadNumber(), entryOnly,
+        std::chrono::steady_clock::now()});
+    return frame;
+}
+std::string SynchronousAdmission::PendingOwners() const {
+    std::string text;
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& owner : m_pendingOwners) {
+        if (!text.empty()) text += "; ";
+        text += "pending " + std::to_string(owner.sequence) + " prepared on thread " + std::to_string(owner.thread)
+            + (owner.atSubmission ? " at submission" : " for an immediate execution") + " "
+            + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(now - owner.prepared).count()) + " ms ago";
+    }
+    return text.empty() ? std::string("no owner recorded") : text;
+}
+void SynchronousAdmission::ErasePendingOwner(uint64_t sequence) {
+    std::erase_if(m_pendingOwners, [sequence](const PendingOwner& owner) { return owner.sequence == sequence; });
+}
+void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible, bool plan) {
+    BT_ZONE_SCOPE("ORG.Persistent.AdmitLedger");
+    const auto& graph = *frame.publication->executable->graph;
+    frame.incomingWaits = frame.ownWaits;
+    frame.boundaryAccessWaits.clear();
+    frame.cachedPlan = false;
+    const auto invalidated = m_sequencer->aliases.ApplyInitialStates(graph, frame.backings);
+    frame.aliasActivations = invalidated;
     frame.closed = m_closed;
+    frame.sharedBarriers.reset();
+    frame.prediction.reset();
+    frame.stream = 0;
+    // An entry-only admission of an executable admitted before: its plan stands while the ledger holds what that one found (a frame
+    // repeats). Otherwise planned below and kept as the prediction for the next.
+    PredictionSlot* predictionSlot = nullptr;
+    using Census = diagnostics::SubmissionCensus;
+    auto& census = diagnostics::Census();
+    if (!frame.entryOnly) census.Admitted(Census::Admission::NotEntryOnly);
+    else if (!invalidated.empty()) census.Admitted(Census::Admission::AliasInvalidated);
+    // A plan stands only for the activations it was made with: an executable whose transients share memory activates the same
+    // backings at every execution, which its prediction then covers.
+    const auto sameActivations = [&](const compiler::StatePrediction& a_prediction) {
+        return a_prediction.activations.size() == invalidated.size()
+            && std::ranges::equal(a_prediction.activations, invalidated, [](rhi::ResourceHandle a, rhi::ResourceHandle b) {
+                   return a.index == b.index && a.generation == b.generation; });
+    };
+    if (frame.entryOnly) {
+        const auto& executable = frame.publication->executable;
+        if (m_predictions.size() > 256 && !m_predictions.contains(executable.get()))
+            std::erase_if(m_predictions, [&](auto& entry) {
+                if (!entry.second.executable.expired()) return false;
+                ClosePrediction(entry.second);
+                return true;
+            });
+        auto& slot = m_predictions[executable.get()];
+        if (slot.executable.lock() != executable || slot.backings != frame.backings.Id() || slot.closed != m_closed
+            || !slot.prediction) {
+            census.Admitted(Census::Admission::NewSlot);
+            ClosePrediction(slot);
+            slot = {executable, frame.backings.Id(), m_closed, std::make_shared<compiler::StatePrediction>()};
+        }
+        predictionSlot = &slot;
+        // The publication's own backings (none of the frame's): the same accesses to the same backings each time, an access stream.
+        if (cacheEligible) {
+            if (!slot.stream) slot.stream = m_sequencer->accesses.OpenStream(static_cast<uint32_t>(graph.batches.size()));
+            frame.stream = slot.stream;
+        }
+        // The last plan first, then the earlier ones the slot keeps: a frame whose states alternate (an executable that runs
+        // after different work on alternate frames) finds its plan again.
+        auto& states = m_sequencer->states;
+        if (sameActivations(*slot.prediction) && states.Predicts(*slot.prediction, frame.backings, frame.backings.Id())) {
+            frame.sharedBarriers = slot.prediction->plan;
+            frame.prediction = slot.prediction;
+            frame.predicted = true;
+            ++m_predicted;
+            census.Admitted(Census::Admission::Predicted);
+        } else {
+            for (auto& earlier : slot.earlier) {
+                if (!sameActivations(*earlier) || !states.Predicts(*earlier, frame.backings, frame.backings.Id())) continue;
+                std::swap(earlier, slot.prediction);
+                frame.sharedBarriers = slot.prediction->plan;
+                frame.prediction = slot.prediction;
+                frame.predicted = true;
+                ++m_predicted;
+                census.Admitted(Census::Admission::PredictedEarlier);
+                break;
+            }
+            if (!frame.sharedBarriers && slot.prediction->plan) census.Admitted(Census::Admission::StatesDiffer);
+        }
+    }
     // A closed execution's plan is a function of its executable and backings alone, unless the frame brings
-    // states of its own (rebindings, incoming states, alias invalidation).
-    const bool cacheable = m_closed && rebindings.empty() && incomingStates.empty() && invalidated.empty();
+    // states of its own (rebindings, incoming states, alias invalidation). An entry-only admission never takes a cached plan (it has the
+    // body's barriers): none is looked for.
+    const bool cacheable = m_closed && !m_restAtLastUse && cacheEligible && invalidated.empty() && !frame.entryOnly;
     CachedPlan* cached = nullptr;
     if (cacheable) {
         std::erase_if(m_planCache, [](const CachedPlan& entry) { return entry.executable.expired(); });
@@ -1463,12 +1950,53 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
             if (same) { cached = &entry; break; }
         }
     }
-    if (cached) {
+    if (frame.sharedBarriers) {
+        // The prediction's plan.
+    } else if (cached) {
         frame.barriers = cached->barriers;
         frame.cachedPlan = true;
         ++m_planCacheHits;
+    } else if (predictionSlot) {
+        // Planned against the ledger, and kept as the prediction for the next admission of this executable.
+        // The last plan is kept among the earlier ones (PredictionSlot::earlier).
+        if (predictionSlot->prediction->plan) {
+            auto& earlier = predictionSlot->earlier;
+            earlier.insert(earlier.begin(), std::move(predictionSlot->prediction));
+            if (earlier.size() > PredictionSlot::kEarlier) earlier.pop_back();
+            predictionSlot->prediction = std::make_shared<compiler::StatePrediction>();
+        }
+        auto& prediction = *predictionSlot->prediction;
+        prediction.plan = std::make_shared<const compiler::PreparedExecutionBarrierPlan>(m_sequencer->states.Prepare(graph, frame.backings,
+            invalidated, m_closed, true, frame.backings.Validated(), frame.backings.Id(), m_externalHome, m_restAtLastUse));
+        m_sequencer->states.Capture(prediction, graph, frame.backings, frame.backings.Id());
+        prediction.activations = invalidated;
+        frame.sharedBarriers = prediction.plan;
+        frame.prediction = predictionSlot->prediction;
+        ++m_planned;
+    } else if (plan && !m_closed && cacheEligible) {
+        // An open ticket's body plan: shared by every plan of the same backings (CachedBody).
+        BT_ZONE_SCOPE("ORG.Persistent.BodyPlan");
+        const auto& executable = frame.publication->executable;
+        const auto id = frame.backings.Id();
+        const CachedBody* found = nullptr;
+        for (const auto& entry : m_bodyCache)
+            if (entry.backings == id && entry.externalHome == m_externalHome && entry.executable.lock() == executable) {
+                found = &entry;
+                break;
+            }
+        if (found) {
+            frame.sharedBarriers = found->plan;
+        } else {
+            std::erase_if(m_bodyCache, [](const CachedBody& entry) { return entry.executable.expired(); });
+            if (m_bodyCache.size() >= 64) m_bodyCache.erase(m_bodyCache.begin());
+            auto made = std::make_shared<const compiler::PreparedExecutionBarrierPlan>(m_sequencer->states.Prepare(graph, frame.backings,
+                invalidated, m_closed, false, frame.backings.Validated(), id, m_externalHome, m_restAtLastUse));
+            m_bodyCache.push_back({executable, id, m_externalHome, made});
+            frame.sharedBarriers = std::move(made);
+        }
     } else {
-        frame.barriers = m_states.Prepare(graph, frame.backings, invalidated, m_closed);
+        frame.barriers = m_sequencer->states.Prepare(graph, frame.backings, invalidated, m_closed, frame.entryOnly, frame.backings.Validated(),
+            frame.backings.Id(), m_externalHome, m_restAtLastUse);
         if (cacheable) {
             ++m_planCacheMisses;
             if (m_planCache.size() >= 64) m_planCache.erase(m_planCache.begin());
@@ -1482,31 +2010,110 @@ FrameAdmission SynchronousAdmission::Prepare(std::shared_ptr<const SelectedPubli
             m_planCache.push_back(std::move(entry));
         }
     }
-    m_accesses.AppendIncomingWaits(graph, frame.backings, queues, frame.incomingWaits);
-    m_aliases.AppendIncomingWaits(graph, frame.backings, queues, frame.incomingWaits);
-    frame.sequence = m_nextSequence++;
-    frame.domain = m_domain;
-    m_pending.push_back(frame.sequence);
-    return frame;
+    // The access waits: an access stream's, from its last capture while the ledger holds what that one found (a frame repeats).
+    if (!frame.stream || !m_sequencer->accesses.PredictedWaits(predictionSlot->access, graph, frame.backings, frame.queuePoints,
+            frame.incomingWaits, frame.backings.Id()))
+        m_sequencer->accesses.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, frame.incomingWaits, frame.backings.Id(),
+            frame.stream ? &predictionSlot->access : nullptr);
+    m_sequencer->aliases.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, frame.incomingWaits);
+    // Points already reached (a retired timeline's among them: another graph's, destroyed since) need no wait.
+    for (auto& waits : frame.incomingWaits)
+        std::erase_if(waits, [&](compiler::ExecutionTimelinePoint point) { return m_sequencer->Reached(point); });
+    if (trace::Enabled(trace::Category::Admission)) {
+        trace::Builder admitted(trace::Category::Admission, "admitted");
+        admitted.Add("sequence", frame.sequence).Add("closed", frame.closed).Add("cachedPlan", frame.cachedPlan)
+            .Add("invalidatedBackings", static_cast<uint64_t>(invalidated.size())).Add("batches", static_cast<uint64_t>(graph.batches.size()));
+        for (uint32_t batch = 0; batch < frame.incomingWaits.size(); ++batch) {
+            std::string waits;
+            for (const auto point : frame.incomingWaits[batch])
+                waits += (waits.empty() ? "" : ",") + std::to_string(point.timeline) + "@" + std::to_string(point.value);
+            ORG_TRACE(Admission, "incoming-waits").Add("sequence", frame.sequence).Add("batch", batch)
+                .Add("queue", batch < graph.batches.size() ? graph.batches[batch].queue : UINT32_MAX).Add("waits", waits);
+        }
+    }
+    // The resources a batch off the upload queue uses: what a host may record an upload into on that batch's queue.
+    // A function of the compiled graph and the upload queue: found once per prediction slot.
+    if (m_uploadQueue != UINT32_MAX
+        && std::ranges::any_of(graph.batches, [&](const auto& batch) { return batch.queue != m_uploadQueue; })
+        && graph.boundaryAccessesByBatch.size() == graph.batches.size()) {
+        std::vector<uint8_t> local;
+        auto& selected = predictionSlot ? predictionSlot->offUploadQueue : local;
+        if (!predictionSlot || predictionSlot->uploadQueue != m_uploadQueue) {
+            selected.clear();
+            std::vector<uint8_t> found(frame.backings.size());
+            bool any = false;
+            for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
+                if (graph.batches[batch].queue == m_uploadQueue) continue;
+                for (const auto& access : graph.boundaryAccessesByBatch[batch])
+                    if (access.resource < found.size()) {
+                        found[access.resource] = 1;
+                        any = true;
+                    }
+            }
+            if (any) selected = std::move(found);
+            if (predictionSlot) predictionSlot->uploadQueue = m_uploadQueue;
+        }
+        if (!selected.empty()) {
+            frame.boundaryAccessWaits.resize(graph.batches.size());
+            m_sequencer->accesses.AppendBoundaryAccessWaits(graph, frame.backings, selected, frame.boundaryAccessWaits, frame.backings.Id());
+        }
+    }
+}
+void SynchronousAdmission::Readmit(FrameAdmission& frame) {
+    BT_ZONE_SCOPE("ORG.Persistent.Readmit");
+    std::lock_guard lock(m_sequencer->mutex);
+    Require(frame.domain == m_domain && frame.sequence && std::ranges::find(m_pending, frame.sequence) != m_pending.end()
+        && !frame.closed, "Readmission of a stale or closed admission");
+    AdmitLedger(frame, false);
 }
 void SynchronousAdmission::SetClosedExecutions(bool closed) {
+    std::lock_guard lock(m_sequencer->mutex);
     Require(m_pending.empty(), "Closed executions changed during a pending admission");
     if (m_closed != closed) m_planCache.clear();
     m_closed = closed;
 }
+void SynchronousAdmission::SetRestAtLastUse(bool rest) {
+    std::lock_guard lock(m_sequencer->mutex);
+    if (m_restAtLastUse != rest) {
+        m_planCache.clear();
+        m_bodyCache.clear();
+    }
+    m_restAtLastUse = rest;
+}
+
+void SynchronousAdmission::SetExternalHomeStates(bool externalHome) {
+    std::lock_guard lock(m_sequencer->mutex);
+    Require(m_pending.empty(), "External home states changed during a pending admission");
+    if (m_externalHome != externalHome) {
+        m_planCache.clear();
+        m_predictions.clear();
+    }
+    m_externalHome = externalHome;
+}
 SynchronousAdmission::SynchronousAdmission(size_t frameCapacity,
-    std::function<void(std::shared_ptr<const void>)> retireOwnership)
-    : m_capacity(frameCapacity), m_retireOwnership(std::move(retireOwnership)) {
-    Require(frameCapacity && frameCapacity <= 64, "Invalid synchronous frame capacity");
+    std::function<void(std::shared_ptr<const void>)> retireOwnership, std::shared_ptr<ResourceSequencer> sequencer)
+    : m_sequencer(sequencer ? std::move(sequencer) : std::make_shared<ResourceSequencer>()), m_capacity(frameCapacity),
+      m_retireOwnership(std::move(retireOwnership)) {
+    Require(frameCapacity, "Invalid synchronous frame capacity");
     m_retained.reserve(frameCapacity);
     static std::atomic_uint64_t nextDomain{1};
     m_domain = nextDomain.fetch_add(1,std::memory_order_relaxed);
 }
-void SynchronousAdmission::Commit(const FrameAdmission& frame, const experimental::GraphExecutionTimeline& receipt,
+SynchronousAdmission::~SynchronousAdmission() {
+    std::lock_guard lock(m_sequencer->mutex);
+    for (auto& [_, slot] : m_predictions) ClosePrediction(slot);
+}
+void SynchronousAdmission::ClosePrediction(PredictionSlot& slot) {
+    if (slot.stream) m_sequencer->accesses.CloseStream(slot.stream);
+    slot.stream = 0;
+}
+void SynchronousAdmission::Commit(const FrameAdmission& frame, const compiler::GraphExecutionTimeline& receipt,
     uint32_t signaledBatches) {
     // Open admissions commit in the order they were prepared. Closed ones depend on nothing prepared around
     // them, so they commit in the order they were submitted, whatever order they were prepared in (the
     // receipt's signals must still rise on every timeline, below).
+    BT_ZONE_SCOPE("ORG.Persistent.Commit");
+    std::lock_guard lock(m_sequencer->mutex);
     const auto pending = std::ranges::find(m_pending, frame.sequence);
     Require(frame.domain == m_domain && frame.sequence && pending != m_pending.end()
         && (m_closed || pending == m_pending.begin()), "Stale synchronous admission");
@@ -1524,9 +2131,9 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const experimenta
         previous = batch.signal.value;
     }
     RetainedFrame retained{frame.publication,{}};
-    auto appendCompletion = [&](experimental::ExecutionTimelinePoint point) {
+    auto appendCompletion = [&](compiler::ExecutionTimelinePoint point) {
         Require(point.timeline && point.value, "Invalid frame completion");
-        auto found = std::ranges::find(retained.completions,point.timeline,&experimental::ExecutionTimelinePoint::timeline);
+        auto found = std::ranges::find(retained.completions,point.timeline,&compiler::ExecutionTimelinePoint::timeline);
         if (found == retained.completions.end()) retained.completions.push_back(point);
         else found->value = (std::max)(found->value,point.value);
     };
@@ -1536,55 +2143,83 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const experimenta
         submitted[point.timeline] = (std::max)(submitted[point.timeline],point.value);
     // Allocate retention before mutating submission-backed ledgers.
     if (!retained.completions.empty()) m_retained.push_back(std::move(retained));
-    for (uint32_t i = 0; i < count; ++i) m_states.CommitBatch(frame.barriers.batches[i]);
+    const auto& barriers = frame.Barriers();
+    for (uint32_t i = 0; i < count; ++i) m_sequencer->states.CommitBatch(barriers.batches[i], frame.backings, frame.backings.Id(), frame.unmoved);
     for (const auto& effect : frame.incomingEffects) if (effect.firstBatch < count)
-        m_incomingRevisions.insert_or_assign((uint64_t{effect.resource.generation} << 32) | effect.resource.index,
-            IncomingRevision{effect.revision,effect.completion});
-    m_accesses.Commit(graph, frame.backings, receipt, count);
-    m_aliases.Commit(graph, frame.backings, receipt, count);
+        m_sequencer->incomingRevisions.insert_or_assign((uint64_t{effect.resource.generation} << 32) | effect.resource.index,
+            ResourceSequencer::IncomingRevision{effect.revision,effect.completion});
+    m_sequencer->accesses.Commit(graph, frame.backings, receipt, count, frame.backings.Id(), frame.stream);
+    if (AliasAdmissionValidationEnabled()) ValidateAliasAdmission(*m_sequencer, frame);
+    m_sequencer->aliases.Commit(graph, frame.backings, receipt, count);
     m_submitted = std::move(submitted);
+    ErasePendingOwner(frame.sequence);
     m_pending.erase(pending);
 }
 void SynchronousAdmission::Abandon(const FrameAdmission& frame) {
+    if (!frame.sequence) return;  // a plan (PreparePlan), or never prepared
+    std::lock_guard lock(m_sequencer->mutex);
     const auto found = std::ranges::find(m_pending, frame.sequence);
     Require(frame.domain == m_domain && frame.sequence && found != m_pending.end(), "Stale synchronous abandonment");
     // Only a closed admission can be abandoned out of order: nothing prepared after it depended on it.
     Require(m_closed || found == m_pending.begin(), "Out-of-order abandonment of an open admission");
+    ErasePendingOwner(frame.sequence);
     m_pending.erase(found);
 }
-void SynchronousAdmission::ExtendSubmitted(experimental::ExecutionTimelinePoint point) {
+void SynchronousAdmission::ExtendSubmitted(compiler::ExecutionTimelinePoint point) {
     Require(point.timeline && point.value, "Invalid submitted extension");
+    std::lock_guard lock(m_sequencer->mutex);
     auto& submitted = m_submitted[point.timeline];
     Require(point.value >= submitted, "Submitted extension is not monotonic");
     submitted = point.value;
 }
 uint64_t SynchronousAdmission::Submitted(uint64_t timeline) const noexcept {
+    std::lock_guard lock(m_sequencer->mutex);
     const auto found = m_submitted.find(timeline);
     return found == m_submitted.end() ? 0 : found->second;
 }
-size_t SynchronousAdmission::RetireCompleted(std::span<const experimental::ExecutionTimelinePoint> completed) {
-    auto observations = m_completed;
-    std::map<uint64_t,bool> seen;
-    for (const auto point : completed) {
-        Require(point.timeline && !seen[point.timeline], "Invalid duplicate completion timeline");
-        seen[point.timeline] = true;
+size_t SynchronousAdmission::RetireCompleted(std::span<const compiler::ExecutionTimelinePoint> completed) {
+    std::unique_lock lock(m_sequencer->mutex);
+    // Every observation is checked before any is applied, so a bad one changes nothing. There are a few timelines (one per
+    // queue), so the duplicate check is a scan.
+    for (size_t index = 0; index < completed.size(); ++index) {
+        const auto point = completed[index];
+        bool duplicate = !point.timeline;
+        for (size_t earlier = 0; earlier < index && !duplicate; ++earlier) duplicate = completed[earlier].timeline == point.timeline;
+        Require(!duplicate, "Invalid duplicate completion timeline");
         const auto submitted = m_submitted.find(point.timeline);
         Require((submitted != m_submitted.end() && point.value <= submitted->second) || !point.value,
             "Completion exceeds submitted work");
-        Require(point.value >= observations[point.timeline], "Completion moved backwards");
-        observations[point.timeline] = point.value;
     }
-    m_completed = std::move(observations);
-    const auto before = m_retained.size();
-    std::erase_if(m_retained,[&](const RetainedFrame& frame) {
-        const bool done = std::ranges::all_of(frame.completions,[&](auto point) {
-            const auto found = m_completed.find(point.timeline);
-            return found != m_completed.end() && found->second >= point.value;
-        });
-        if (done) RetireOwnership(m_retireOwnership,frame.publication);
+    // Completion only advances, but the sequencer is shared: a graph built later (after a resize, say) can report a timeline
+    // it sampled before another graph's newer observation. Keep the furthest.
+    for (const auto point : completed) {
+        auto& observed = m_sequencer->completed[point.timeline];
+        observed = (std::max)(observed, point.value);
+    }
+    if (m_retained.empty()) return 0;
+    std::vector<std::shared_ptr<const SelectedPublication>> retired;
+    std::erase_if(m_retained,[&](RetainedFrame& frame) {
+        const bool done = std::ranges::all_of(frame.completions,[&](auto point) { return m_sequencer->Reached(point); });
+        if (done) retired.push_back(std::move(frame.publication));
         return done;
     });
-    return before - m_retained.size();
+    lock.unlock();  // nothing is called back under the sequencer's lock
+    for (auto& publication : retired) RetireOwnership(m_retireOwnership,publication);
+    return retired.size();
+}
+bool SynchronousAdmission::LowestRetainedCompletions(std::span<const uint64_t> timelines, std::span<uint64_t> lowest) const {
+    if (timelines.size() != lowest.size()) return false;
+    std::lock_guard lock(m_sequencer->mutex);
+    for (const auto& frame : m_retained) {
+        if (frame.completions.empty()) return false;
+        for (const auto point : frame.completions) {
+            const auto found = std::ranges::find(timelines, point.timeline);
+            if (found == timelines.end()) return false;
+            auto& value = lowest[static_cast<size_t>(found - timelines.begin())];
+            value = (std::min)(value, point.value);
+        }
+    }
+    return true;
 }
 struct PublicationCoordinator::Job {
     explicit Job(GraphEditTransaction value) : transaction(std::move(value)) {}
@@ -1614,7 +2249,7 @@ void PublicationCoordinator::Start(const std::shared_ptr<Job>& job) {
     job->state = PublicationState::Pending;
     if (!m_tasks->Submit(m_scope,runtime::TaskPriority::Streaming,"ORG.Publication.Build",[job,&program = m_program] {
         try {
-            experimental::CompileWorkspace workspace;
+            compiler::CompileWorkspace workspace;
             if (job->author) job->transaction.emplace(program.BeginEdit());
             if (job->author) job->author(*job->transaction);
             job->ready = job->transaction->Build(workspace,job->cancelled);

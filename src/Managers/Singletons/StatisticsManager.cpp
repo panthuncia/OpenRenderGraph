@@ -1,7 +1,7 @@
 #include "Managers/Singletons/StatisticsManager.h"
-#include "Utilities/EnvironmentFlag.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <rhi_helpers.h>
@@ -19,14 +19,33 @@ StatisticsManager& StatisticsManager::GetInstance() {
     return inst;
 }
 
+StatisticsManager::SharedQueryObjects::~SharedQueryObjects() {
+    // The last list that named these objects is released, so its submissions are complete. The deletion queue still
+    // defers them past what ORG's own queues were given meanwhile.
+    auto& deletion = DeletionManager::GetInstance();
+    for (auto& object : replaced) deletion.MarkForDelete(std::move(object));
+}
+
 namespace {
+// A list's queries go to one set of shared query objects: the one current at its first query, which its context holds
+// from then on. When passes registered since and the set was replaced, the list writes and resolves nothing more: its
+// queries would mix two pools, and a resolve (which waits for availability) of queries the new pool never wrote would
+// wait on the GPU forever.
+bool UseSharedQueries(QueryRecordingContext& ctx, std::shared_ptr<const void> current) {
+    if (!current) return false;
+    if (!ctx.sharedQueries) {
+        ctx.sharedQueries = std::move(current);
+        return true;
+    }
+    return ctx.sharedQueries == current;
+}
+
 void UpdateEma(double& value, double sample) {
     value = value * (1.0 - PassStats::alpha) + sample * PassStats::alpha;
 }
 
 bool MemoryIntrospectionLoggingEnabled() {
-    static const bool enabled = org::detail::EnvironmentFlagEnabled("SARP_MEMORY_INTROSPECTION_LOG");
-    return enabled;
+    return org::runtime::DiagnosticLogEnabled(org::runtime::DiagnosticLog::MemoryIntrospection);
 }
 
 void LogMemoryIntrospectionAccounting(
@@ -134,9 +153,16 @@ void StatisticsManager::BeginFrame() {
     memoryBudgetStats.sampleFrameSerial = m_frameSerial;
     if (auto* allocator = DeviceManager::GetInstance().GetAllocator()) {
         rhi::ma::Budget localBudget{};
-        allocator->GetBudget(&localBudget, nullptr);
+        rhi::ma::Budget nonLocalBudget{};
+        allocator->GetBudget(&localBudget, &nonLocalBudget);
         memoryBudgetStats.usageBytes = localBudget.usageBytes;
         memoryBudgetStats.budgetBytes = localBudget.budgetBytes;
+        memoryBudgetStats.localBlockBytes = localBudget.stats.blockBytes;
+        memoryBudgetStats.localAllocationBytes = localBudget.stats.allocationBytes;
+        memoryBudgetStats.localBlockCount = localBudget.stats.blockCount;
+        memoryBudgetStats.localAllocationCount = localBudget.stats.allocationCount;
+        memoryBudgetStats.nonLocalBlockBytes = nonLocalBudget.stats.blockBytes;
+        memoryBudgetStats.nonLocalAllocationBytes = nonLocalBudget.stats.allocationBytes;
         memoryBudgetStats.valid = true;
         LogMemoryIntrospectionAccounting(m_frameSerial, localBudget);
     }
@@ -252,6 +278,20 @@ void StatisticsManager::EnsureQueueBuffers(rhi::QueueKind queueKind) {
     (void)result;
 }
 
+void StatisticsManager::EnsureFrameCapacity(unsigned frames) {
+    if (frames <= m_numFramesInFlight) return;
+    // Doubled, so a host whose runs in flight climb makes a few pools, not one per run.
+    unsigned grown = (std::max)(m_numFramesInFlight, 1u);
+    while (grown < frames) grown *= 2;
+    spdlog::info("StatisticsManager: query ranges for {} runs in flight (was {})", grown, m_numFramesInFlight);
+    m_numFramesInFlight = grown;
+    // Made again at the new size, the old ones handed to the lists that still name them (SetupQueryHeap). Without pools yet,
+    // the first SetupQueryHeap makes them at this size.
+    if (!m_timestampPool) return;
+    m_queryPoolPassCapacity = 0;
+    SetupQueryHeap();
+}
+
 void StatisticsManager::SetupQueryHeap() {
     auto device = DeviceManager::GetInstance().GetDevice();
     if (!m_collectPassStatistics) {
@@ -268,26 +308,21 @@ void StatisticsManager::SetupQueryHeap() {
 
     m_queryPoolPassCapacity = m_numPasses;
 
-    // Defer destruction of old pools/buffers so the GPU can finish in-flight work.
-    auto& deletionMgr = DeletionManager::GetInstance();
-    if (m_timestampPool) {
-        deletionMgr.MarkForDelete(std::move(m_timestampPool));
-    }
-    if (m_pipelineStatsPool) {
-        deletionMgr.MarkForDelete(std::move(m_pipelineStatsPool));
-    }
-    for (auto& kv : m_timestampBuffers) {
-        if (kv.second) {
-            deletionMgr.MarkForDelete(std::move(kv.second));
-        }
-    }
-    for (auto& kv : m_meshStatsBuffers) {
-        if (kv.second) {
-            deletionMgr.MarkForDelete(std::move(kv.second));
-        }
+    // The old pools and buffers go to the set the lists recorded with them hold. Lists recorded ahead (another epoch's
+    // ticket) or in a host's stream that has not reached the GPU yet still name them. The set hands them to the
+    // deletion queue when the last of those lists is released, after its submissions completed. A new set takes the
+    // new objects.
+    {
+        auto replaced = m_sharedQueries.exchange(std::make_shared<SharedQueryObjects>(), std::memory_order_acq_rel);
+        if (m_timestampPool) replaced->replaced.emplace_back(std::move(m_timestampPool));
+        if (m_pipelineStatsPool) replaced->replaced.emplace_back(std::move(m_pipelineStatsPool));
+        for (auto& kv : m_timestampBuffers)
+            if (kv.second) replaced->replaced.emplace_back(std::move(kv.second));
+        for (auto& kv : m_meshStatsBuffers)
+            if (kv.second) replaced->replaced.emplace_back(std::move(kv.second));
     }
 
-    // Timestamp heap: 2 queries/pass/frame. The pass timings need nothing else.
+    // The timestamp heap holds 2 queries per pass per frame. The pass timings need nothing else.
     rhi::QueryPoolDesc tq;
     tq.type = rhi::QueryType::Timestamp;
     tq.count = m_queryPoolPassCapacity * 2 * m_numFramesInFlight;
@@ -298,9 +333,9 @@ void StatisticsManager::SetupQueryHeap() {
         return;
     }
 
-    // Mesh-shader pipeline statistics are optional. A device without mesh-shader queries (or an adopted
-    // device that did not enable them) fails this pool, and until now the null pool was dereferenced right
-    // after; the timestamps must not go down with it.
+    // Mesh-shader pipeline statistics are optional. Creating this pool fails on a device without mesh-shader
+    // queries, or on an adopted device that did not enable them. Older code dereferenced the null pool right
+    // after that. A failure here must not turn off the timestamps too.
     if (m_collectPipelineStatistics) {
         rhi::QueryPoolDesc sq;
         sq.type = rhi::QueryType::PipelineStatistics;
@@ -480,11 +515,17 @@ void StatisticsManager::BeginQuery(
     QueryRecordingContext& ctx)
 {
     if (!m_collectPassStatistics) return;
+    if (ctx.owned) {
+        if (passIndex < m_passNames.size())
+            BeginOwnedRange(*ctx.owned, m_passNames[passIndex], static_cast<int>(passIndex), org::runtime::TimestampRangeKind::Pass, cmd);
+        return;
+    }
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
     auto queueKind = queue.GetKind();
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+    if (!UseSharedQueries(ctx, CurrentSharedQueries())) return;
 
     const uint32_t frameBase = (frameIndex % (std::max)(1u, m_numFramesInFlight)) * m_queryPoolPassCapacity;
     const uint32_t tsIdx = (frameBase + passIndex) * 2u;
@@ -507,11 +548,16 @@ void StatisticsManager::EndQuery(
     QueryRecordingContext& ctx)
 {
     if (!m_collectPassStatistics) return;
+    if (ctx.owned) {
+        EndOwnedRange(*ctx.owned, cmd);
+        return;
+    }
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
     auto queueKind = queue.GetKind();
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+    if (!UseSharedQueries(ctx, CurrentSharedQueries())) return;
 
     const uint32_t frameBase = (frameIndex % (std::max)(1u, m_numFramesInFlight)) * m_queryPoolPassCapacity;
     const uint32_t tsIdx = (frameBase + passIndex) * 2u + 1u;
@@ -532,11 +578,21 @@ void StatisticsManager::ResolveQueries(
     QueryRecordingContext& ctx)
 {
     if (!m_collectPassStatistics) return;
+    if (ctx.owned) {
+        // Resolve every range the list recorded into the recording's own buffer. Each submission resolves them again.
+        auto& owned = *ctx.owned;
+        EndOwnedRange(owned, cmd, true);
+        if (!owned.resolved && !owned.entries.empty())
+            cmd.ResolveQueryData(owned.pool->GetHandle(), 0, static_cast<uint32_t>(owned.entries.size() * 2u), owned.readback->GetHandle(), 0);
+        owned.resolved = true;
+        return;
+    }
     if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
 
     auto queueKind = queue.GetKind();
     auto tsIt = m_timestampBuffers.find(queueKind);
     if (tsIt == m_timestampBuffers.end() || !tsIt->second) return;
+    if (!UseSharedQueries(ctx, CurrentSharedQueries())) return;
     auto psIt = m_meshStatsBuffers.find(queueKind);
     const bool havePipelineStats = m_collectPipelineStatistics && psIt != m_meshStatsBuffers.end() && psIt->second;
 
@@ -600,15 +656,46 @@ void StatisticsManager::MergePendingResolves(
     unsigned frameIndex,
     QueryRecordingContext& ctx)
 {
+    if (ctx.owned) {
+        // This is a submission of a kept recording. The completion of its frame slot reads what this submission
+        // wrote. The recording is never cleared from the context. Each slot's pending list has a size limit, in case
+        // a build stopped the slot's completion from ever arriving.
+        if (ctx.owned->resolved && !ctx.owned->entries.empty()) {
+            auto& pending = m_pendingOwned[frameIndex];
+            if (std::ranges::find(pending, ctx.owned) == pending.end() && pending.size() < 256)
+                pending.push_back(ctx.owned);
+        }
+        return;
+    }
+    // Resolved into a readback buffer replaced since: the completion reads the current one, which holds none of them.
+    if (ctx.sharedQueries && ctx.sharedQueries != CurrentSharedQueries()) {
+        ctx.pendingRanges.clear();
+        return;
+    }
     auto& dest = m_pendingResolves[queueKind][frameIndex];
     dest.insert(dest.end(), ctx.pendingRanges.begin(), ctx.pendingRanges.end());
     ctx.pendingRanges.clear();
+}
+
+void StatisticsManager::PublishAtCompletion(unsigned frameIndex, std::function<void()> publish) {
+    auto& pending = m_publishAtCompletion[frameIndex];
+    if (publish && pending.size() < 256) pending.push_back(std::move(publish));
 }
 
 void StatisticsManager::OnFrameComplete(
     unsigned frameIndex,
     rhi::Queue& queue)
 {
+    // Some of the slot's recordings were made after their submission, for late batches. They merge their queries
+    // first, before the slot's queries are read.
+    if (const auto found = m_publishAtCompletion.find(frameIndex); found != m_publishAtCompletion.end()) {
+        auto publications = std::move(found->second);
+        m_publishAtCompletion.erase(found);
+        for (auto& publish : publications) publish();
+    }
+    m_completedTimestamps.clear();
+    m_completedOwned.clear();
+    ReadOwnedTimestamps(frameIndex);
 	if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
 
 	if (!m_collectPassStatistics) return;
@@ -699,6 +786,8 @@ void StatisticsManager::OnFrameComplete(
             if (pi < m_passLastExecutionFrame.size()) {
                 m_passLastExecutionFrame[pi] = m_frameSerial;
             }
+            m_completedTimestamps.push_back({m_passNames[pi], static_cast<int>(pi), 0, queueKind,
+                org::runtime::TimestampRangeKind::Pass, false, t0, t1, ms});
 
             if (!havePipelineStats || !m_isGeometryPass[pi]) continue;
             auto& psBuf = psIt->second;
@@ -742,6 +831,127 @@ void StatisticsManager::OnFrameComplete(
     m_pendingResolves[queueKind].erase(frameIndex);
 }
 
+std::shared_ptr<OwnedTimestampQueries> StatisticsManager::CreateOwnedTimestamps(rhi::QueueKind queueKind, uint32_t ranges) {
+    if (!m_collectPassStatistics || ranges == 0) return nullptr;
+    auto device = DeviceManager::GetInstance().GetDevice();
+    auto owned = std::make_shared<OwnedTimestampQueries>();
+    rhi::QueryPoolDesc desc;
+    desc.type = rhi::QueryType::Timestamp;
+    desc.count = ranges * 2u;
+    if (device.CreateQueryPool(desc, owned->pool) != rhi::Result::Ok || !owned->pool) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            spdlog::warn("StatisticsManager: could not create a kept recording's timestamp pool ({} ranges); its passes are not timed", ranges);
+        return nullptr;
+    }
+    owned->stride = owned->pool->GetQueryResultInfo().elementSize;
+    const auto readback = rhi::helpers::ResourceDesc::Buffer(owned->stride * desc.count, rhi::HeapType::Readback);
+    if (owned->stride == 0 || device.CreateCommittedResource(readback, owned->readback) != rhi::Result::Ok || !owned->readback)
+        return nullptr;
+    const auto ticksPerSecond = device.GetTimestampCalibration(queueKind).ticksPerSecond;
+    owned->ticksToMilliseconds = ticksPerSecond ? 1000.0 / double(ticksPerSecond) : GetGpuTicksToMilliseconds();
+    owned->queueKind = queueKind;
+    owned->capacity = ranges;
+    owned->entries.reserve(ranges);
+    return owned;
+}
+
+bool StatisticsManager::BeginOwnedRange(OwnedTimestampQueries& owned, std::string_view name, int passIndex,
+    org::runtime::TimestampRangeKind kind, rhi::CommandList& cmd) {
+    // Ranges nest. A pass's sub-ranges sit inside the pass range. A pass range or barrier range opens only at the
+    // top level.
+    if (owned.resolved || (kind != org::runtime::TimestampRangeKind::Sub && !owned.open.empty())) return false;
+    // List mode times the list alone.
+    if (owned.listOnly != (kind == org::runtime::TimestampRangeKind::List)) return false;
+    if (owned.entries.size() >= owned.capacity) {
+        ++owned.overflow;
+        return false;
+    }
+    // The list's first range resets all the queries. That gives one reset per submission, outside any render pass.
+    if (owned.entries.empty()) cmd.ResetQueries(owned.pool->GetHandle(), 0, owned.capacity * 2u);
+    uint32_t occurrence = 0;
+    for (const auto& entry : owned.entries) occurrence += entry.name == name;
+    owned.entries.push_back({std::string(name), passIndex, kind, occurrence});
+    const auto index = static_cast<uint32_t>(owned.entries.size() - 1);
+    cmd.WriteTimestamp(owned.pool->GetHandle(), index * 2u, rhi::Stage::Top);
+    owned.open.push_back(static_cast<int>(index));
+    return true;
+}
+
+void StatisticsManager::EndOwnedRange(OwnedTimestampQueries& owned, rhi::CommandList& cmd, bool closingList) {
+    if (owned.open.empty()) return;
+    // In list mode a pass's or barrier batch's end has no range of its own: only the resolve closes the list's range.
+    if (owned.listOnly && !closingList) return;
+    // The end of a pass range or barrier-batch range waits for that work to finish. The reasons:
+    // - NVIDIA's Blackwell driver writes a bottom-of-pipe or all-commands timestamp before a preceding
+    //   generated-commands execution (ExecuteIndirect) has run.
+    // - An execution-only or writes-only barrier does not wait for that execution either.
+    // - A barrier whose second scope reads indirect arguments does wait for it.
+    // Without this barrier, the time of that work lands in a later range.
+    // The wait costs about 4 us per range, and the epoch loses its overlap between passes. So only the own queries of
+    // kept recordings use it. Those are a trace's recording timestamps.
+    // Sub-ranges get no barrier. A sub-range may be inside a render pass, and a barrier would end that render pass.
+    if (owned.entries[static_cast<size_t>(owned.open.back())].kind != org::runtime::TimestampRangeKind::Sub) {
+        const rhi::GlobalBarrier wait{ rhi::ResourceSyncState::All, rhi::ResourceSyncState::All, rhi::FullMemoryBarrier().beforeAccess,
+            rhi::ResourceAccessType::IndirectArgument };
+        cmd.Barriers(rhi::BarrierBatch{ {}, {}, { &wait, 1u } });
+    }
+    cmd.WriteTimestamp(owned.pool->GetHandle(), static_cast<uint32_t>(owned.open.back()) * 2u + 1u, rhi::Stage::Bottom);
+    owned.open.pop_back();
+}
+
+void StatisticsManager::BeginRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) {
+    if (m_collectPassStatistics && ctx.owned)
+        BeginOwnedRange(*ctx.owned, name, -1, org::runtime::TimestampRangeKind::Barrier, cmdList);
+}
+
+bool StatisticsManager::BeginSubRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) {
+    return m_collectPassStatistics && ctx.owned && !ctx.owned->open.empty() &&
+           BeginOwnedRange(*ctx.owned, name, -1, org::runtime::TimestampRangeKind::Sub, cmdList);
+}
+
+void StatisticsManager::BeginListRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx) {
+    if (m_collectPassStatistics && ctx.owned && ctx.owned->listOnly)
+        BeginOwnedRange(*ctx.owned, name, -1, org::runtime::TimestampRangeKind::List, cmdList);
+}
+
+void StatisticsManager::EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx) {
+    if (ctx.owned) EndOwnedRange(*ctx.owned, cmdList);
+}
+
+void StatisticsManager::ReadOwnedTimestamps(unsigned frameIndex) {
+    const auto found = m_pendingOwned.find(frameIndex);
+    if (found == m_pendingOwned.end()) return;
+    auto submitted = std::move(found->second);
+    m_pendingOwned.erase(found);
+    for (auto& owned : submitted) {
+        const auto queries = static_cast<uint64_t>(owned->entries.size()) * 2u;
+        void* mapped = nullptr;
+        owned->readback->Map(&mapped, 0, owned->stride * queries);
+        if (!mapped) continue;
+        const auto* base = static_cast<const uint8_t*>(mapped);
+        for (size_t i = 0; i < owned->entries.size(); ++i) {
+            uint64_t t0 = 0, t1 = 0;
+            std::memcpy(&t0, base + owned->stride * (2u * i), sizeof(uint64_t));
+            std::memcpy(&t1, base + owned->stride * (2u * i + 1u), sizeof(uint64_t));
+            if (!t0 || t1 < t0) continue;
+            const auto& entry = owned->entries[i];
+            const double ms = double(t1 - t0) * owned->ticksToMilliseconds;
+            m_completedTimestamps.push_back({entry.name, entry.passIndex, entry.occurrence, owned->queueKind, entry.kind, true, t0, t1, ms});
+            if (entry.passIndex < 0 || static_cast<size_t>(entry.passIndex) >= m_stats.size()) continue;
+            auto& stats = m_stats[entry.passIndex];
+            UpdateEma(stats.gpuTimeEma, ms);
+            stats.gpuTimeMs = ms;
+            stats.gpuSampleSerial = m_frameSerial;
+            stats.gpuBeginTick = t0;
+            stats.gpuEndTick = t1;
+            if (static_cast<size_t>(entry.passIndex) < m_passLastExecutionFrame.size())
+                m_passLastExecutionFrame[entry.passIndex] = m_frameSerial;
+        }
+        owned->readback->Unmap(0, 0);
+        m_completedOwned.push_back(std::move(owned));
+    }
+}
 
 void StatisticsManager::ClearAll() {
     m_timestampPool.Reset();
@@ -760,6 +970,10 @@ void StatisticsManager::ClearAll() {
     m_visiblePassIndices.clear();
     m_recordedQueries.clear();
     m_pendingResolves.clear();
+    m_pendingOwned.clear();
+    m_publishAtCompletion.clear();
+    m_completedOwned.clear();
+    m_completedTimestamps.clear();
     m_numPasses=0;
     m_queryPoolPassCapacity = 0;
     m_unnamedPassCounter = 0;
@@ -773,3 +987,15 @@ void StatisticsManager::ClearAll() {
 
 
 } // namespace org
+
+namespace org::runtime {
+
+OwnedTimestampQueries::~OwnedTimestampQueries() {
+    // A recording is released once its submissions are complete. Deferred deletion keeps the destruction off the thread
+    // that drops the recording. The shared pool is handled the same way.
+    auto& deletion = org::DeletionManager::GetInstance();
+    if (pool) deletion.MarkForDelete(std::move(pool));
+    if (readback) deletion.MarkForDelete(std::move(readback));
+}
+
+} // namespace org::runtime

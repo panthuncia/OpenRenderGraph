@@ -91,13 +91,7 @@ public:
         AddOrMergeDirtyRange(offset, offset + size, nullptr, 0);
     }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-    bool StageWrite(const void* data, size_t size, size_t offset, size_t currentBufferSize, const char* file, int line) {
-#else
-    bool StageWrite(const void* data, size_t size, size_t offset, size_t currentBufferSize) {
-        const char* file = nullptr;
-        int line = 0;
-#endif
+    bool StageWrite(const void* data, size_t size, size_t offset, size_t currentBufferSize, const char* file = nullptr, int line = 0) {
         if (size == 0) {
             return true;
         }
@@ -152,11 +146,7 @@ public:
             stats.flushedBytes += static_cast<uint64_t>(uploadSize);
         }
         if (!regions.empty()) {
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
             uploadService.UploadDataBatch(target, regions, firstFile, firstLine);
-#else
-            uploadService.UploadDataBatch(target, regions);
-#endif
         }
 
         stats.mergedWrites = stats.stagedWrites > stats.flushedWrites ? (stats.stagedWrites - stats.flushedWrites) : 0;

@@ -10,7 +10,7 @@
 #include <string>
 
 using namespace org::persistent;
-using namespace org::experimental;
+using namespace org::compiler;
 void SetAdmission(BindingVersion& binding, uint32_t index, uint32_t generation) {
     auto state = std::make_shared<PreparedBackingState>();
     state->graphResourceID = index + 1;

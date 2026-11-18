@@ -1,5 +1,7 @@
 #include "Managers/Singletons/DeviceManager.h"
 
+#include <cstdlib>
+
 #include <spdlog/spdlog.h>
 #include <flecs.h>
 #include <rhi_interop_dx12.h>
@@ -103,6 +105,33 @@ rhi::Result DeviceManager::CreateAliasingResourceTracked(
     return result;
 }
 
+void DeviceManager::SetResidencyPriority(TrackedHandle& allocation, rhi::ResidencyPriority priority) const noexcept {
+    if (!m_device) return;
+    rhi::HeapHandle heap{};
+    if (auto* placed = allocation.GetAllocation()) heap = placed->GetHeap();
+    if (heap.valid()) {
+        rhi::PageableRef pageable(heap);
+        (void)m_device.Get().SetResidencyPriority(rhi::Span<rhi::PageableRef>{ &pageable, 1u }, priority);
+        return;
+    }
+    auto& resource = allocation.GetResource();
+    if (!resource) return;
+    rhi::PageableRef pageable(resource.GetHandle());
+    (void)m_device.Get().SetResidencyPriority(rhi::Span<rhi::PageableRef>{ &pageable, 1u }, priority);
+}
+
+rhi::Result DeviceManager::CreateResourceUntracked(
+    const rhi::ma::AllocationDesc& allocDesc,
+    const rhi::ResourceDesc& resourceDesc,
+    rhi::ma::AllocationPtr& outAllocation) const noexcept
+{
+    std::scoped_lock lock(m_resourceCreationMutex);
+    if (!m_allocator) {
+        return rhi::Result::InvalidCall;
+    }
+    return m_allocator->CreateResource(&allocDesc, &resourceDesc, 0, nullptr, outAllocation);
+}
+
 rhi::Result DeviceManager::AllocateMemoryTracked(
     const rhi::ma::AllocationDesc& allocDesc,
     const rhi::ResourceAllocationInfo& allocationInfo,
@@ -144,12 +173,8 @@ void DeviceManager::Initialize(rhi::Device device) {
                 return token;
             }
 
-            auto& world = ECSManager::GetInstance().GetWorld();
-            flecs::entity entity = existing;
-            if (!entity.is_alive()) {
-                entity = world.entity();
-            }
-            return TrackedEntityToken(world, entity);
+            // Never create the entity in the world directly. The world has one owner at a time (see ECSManager).
+            return ECSManager::GetInstance().CreateTrackedToken(existing.id());
         };
     }
 
@@ -175,6 +200,12 @@ void DeviceManager::Initialize(rhi::Device device) {
 
     rhi::ma::AllocatorDesc desc;
     desc.device = m_device.Get();
+#ifdef _WIN32
+    // ORG_BLOCK_MIB sets the allocator's block size, for tests. GetEnvironmentVariable, because a host can set it in-process.
+    char blockMib[16] = {};
+    if (GetEnvironmentVariableA("ORG_BLOCK_MIB", blockMib, sizeof(blockMib)) > 0)
+        desc.preferredBlockSize = static_cast<uint64_t>(std::atoi(blockMib)) << 20u;
+#endif
     rhi::ma::CreateAllocator(&desc, &m_allocator);
 }
 

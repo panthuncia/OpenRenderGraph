@@ -1,10 +1,10 @@
 #include <Render/PreparedPass.h>
+#include "TestSupport.h"
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <cstring>
 #include <cstdio>
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Program version check failed at %d: %s\n", __LINE__, #x); return __LINE__; } } while (false)
 
 int TestProgramVersions(rhi::Device device) {
     Microsoft::WRL::ComPtr<ID3DBlob> code, errors;
@@ -33,38 +33,34 @@ int TestProgramVersions(rhi::Device device) {
         rhi::CommandSignatureDesc{rhi::Span<rhi::IndirectArg>(dispatchArgs, 1), 12},
         oldHandle, *signature) == rhi::Result::Ok);
     std::weak_ptr<const rhi::CommandSignaturePtr> oldSignature = signature;
-    org::FramePreparationContext preparation;
-    preparation.dependencyCollector = std::make_shared<org::PreparedDependencyCollector>();
-    const auto signatureHandle = preparation.CaptureCommandSignature(signature);
-    CHECK(rhi::HandleEqual<rhi::CommandSignatureHandle>{}(signatureHandle, signature->Get().GetHandle()));
-    signature.reset();
-    CHECK(!oldSignature.expired());
-    auto& collector = *preparation.dependencyCollector;
-    auto program = collector.Capture(active);
-    auto dependencies = std::move(collector).Freeze();
-    active.ReplacePayload(replacement.GetPayload());
-    CHECK(!oldProgram.expired() && !oldLayout.expired());
-    CHECK(!rhi::HandleEqual<rhi::PipelineLayoutHandle>{}(active.GetPayload()->layout, oldHandle));
 
+    // A recording retains the pipeline payload it bound, and everything else it names, until its retention is
+    // released. So replacing the pipeline's payload while the recording is in flight leaves the recorded program alive.
     rhi::CommandAllocatorPtr allocator;
     rhi::CommandListPtr list;
     CHECK(device.CreateCommandAllocator(rhi::QueueKind::Graphics, allocator) == rhi::Result::Ok);
     CHECK(device.CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), list) == rhi::Result::Ok);
     auto bindings = std::make_shared<const org::FrozenExecutionBindings>(
         std::vector<org::FrozenExecutionBindings::ResourceBinding>{});
-    org::RecordingContext recording(list.Get(), bindings);
-    recording.SetPreparedDependencies(dependencies);
-    CHECK(rhi::HandleEqual<rhi::PipelineLayoutHandle>{}(recording.ResolveLayout(program), oldHandle));
-    recording.Commands().BindLayout(recording.ResolveLayout(program));
-    recording.Commands().BindPipeline(recording.Resolve(program));
-    recording.Commands().Dispatch(1, 1, 1);
-    CHECK(recording.Commands().EndChecked() == rhi::Result::Ok);
+    auto retention = std::make_shared<org::RecordingRetention>();
+    {
+        org::RecordingContext recording(list.Get(), bindings);
+        recording.SetRetention(retention);
+        recording.BindComputePipeline(active);
+        recording.Retain(signature);
+        signature.reset();
+        CHECK(!oldSignature.expired());
+        active.ReplacePayload(replacement.GetPayload());
+        CHECK(!oldProgram.expired() && !oldLayout.expired());
+        CHECK(!rhi::HandleEqual<rhi::PipelineLayoutHandle>{}(active.GetPayload()->layout, oldHandle));
+        recording.Commands().Dispatch(1, 1, 1);
+        CHECK(recording.Commands().EndChecked() == rhi::Result::Ok);
+    }
     auto commands = list.Get();
     CHECK(device.GetQueue(rhi::QueueKind::Graphics).Submit({&commands, 1}) == rhi::Result::Ok);
     CHECK(device.WaitIdle() == rhi::Result::Ok);
-    CHECK(!oldProgram.expired() && !oldLayout.expired());
-    recording.SetPreparedDependencies({});
-    dependencies.reset();
+    CHECK(!oldProgram.expired() && !oldLayout.expired() && !oldSignature.expired());
+    retention.reset();
     CHECK(oldProgram.expired() && oldLayout.expired() && oldSignature.expired());
     return 0;
 }

@@ -240,22 +240,24 @@ struct TrackedEntityToken {
     }
 
     void Reset() noexcept {
-        flecs::world* resolvedWorld = nullptr;
-        flecs::entity_t resolvedId = 0;
-        const bool hasResolvedEntity = TryGetResolved(resolvedWorld, resolvedId);
-        if (hasResolvedEntity || deferredState) {
-            if (s_hooks.isRuntimeAlive && !s_hooks.isRuntimeAlive()) {
-                Disarm();
-                return;
-            }
-
-            RequestDestroy();
-            if (hasResolvedEntity) {
-                if (s_hooks.destroyEntity) {
-					s_hooks.destroyEntity(*resolvedWorld, resolvedId);
-                }
-            }
+        if (!deferredState && !(world && id)) return;
+        if (s_hooks.isRuntimeAlive && !s_hooks.isRuntimeAlive()) {
+            Disarm();
+            return;
         }
+        // Whether the entity exists is read under the lock that requests its destruction. A creation applied before
+        // that has an entity, which is destroyed here; one applied after sees the request and makes none.
+        flecs::world* resolvedWorld = world;
+        flecs::entity_t resolvedId = id;
+        if (deferredState) {
+            std::scoped_lock lock(deferredState->mutex);
+            deferredState->destroyRequested = true;
+            deferredState->pendingOps.clear();
+            const bool resolved = deferredState->world && deferredState->id && !deferredState->destroyed;
+            resolvedWorld = resolved ? deferredState->world : nullptr;
+            resolvedId = resolved ? deferredState->id : 0;
+        }
+        if (resolvedWorld && resolvedId && s_hooks.destroyEntity) s_hooks.destroyEntity(*resolvedWorld, resolvedId);
         Disarm();
     }
 
@@ -268,17 +270,11 @@ public:
     TrackedHandle() = default;
 
     static TrackedHandle FromAllocation(rhi::ma::AllocationPtr a, TrackedEntityToken t) noexcept {
-        TrackedHandle h;
-        h.h_ = std::move(a);
-        h.tok_ = std::move(t);
-        return h;
+        return Holding(std::move(a), std::move(t));
     }
 
     static TrackedHandle FromResource(rhi::ResourcePtr r, TrackedEntityToken t) noexcept {
-        TrackedHandle h;
-        h.h_ = std::move(r);
-        h.tok_ = std::move(t);
-        return h;
+        return Holding(std::move(r), std::move(t));
     }
 
     TrackedHandle(TrackedHandle&&) noexcept = default;
@@ -298,21 +294,22 @@ public:
 
     ~TrackedHandle() { Reset(); }
 
-    // Preparation-owner only. Lazily move concrete ownership (including its
-    // tracking token) into a stable holder; logical Reset no longer invalidates
-    // captured command packets. This does not lease descriptors or alias ranges.
+    // Concrete ownership (including the tracking token) lives in a stable holder from
+    // construction, so logical Reset does not invalidate captured command packets. The
+    // holder never changes while the handle is alive, so any thread may capture a lease or
+    // read the resource; only Reset and assignment need the owner. This does not lease
+    // descriptors or alias ranges.
     std::shared_ptr<const TrackedHandle> CaptureAllocationLease() {
         if (!*this) return {};
-        if (!leaseOwner_) leaseOwner_ = std::make_shared<TrackedHandle>(std::move(*this));
         return leaseOwner_;
     }
 
     // Set during realization, before publishing/capturing this backing. For a
     // placed resource this retains its heap generation, not an exclusive range.
     void RetainLifetimeOwner(std::shared_ptr<const void> owner) {
-        if (!owner || !*this || leaseOwner_ || lifetimeOwner_)
+        if (!owner || !*this || leaseOwner_.use_count() != 1 || leaseOwner_->lifetimeOwner_)
             throw std::logic_error("Invalid or already published backing ownership");
-        lifetimeOwner_ = std::move(owner);
+        leaseOwner_->lifetimeOwner_ = std::move(owner);
     }
 
     void ApplyComponentBundle(const EntityComponentBundle& bundle) noexcept {
@@ -383,6 +380,16 @@ public:
     }
 
 private:
+    template<class Native>
+    static TrackedHandle Holding(Native native, TrackedEntityToken token) {
+        auto holder = std::make_shared<TrackedHandle>();
+        holder->h_ = std::move(native);
+        holder->tok_ = std::move(token);
+        TrackedHandle handle;
+        handle.leaseOwner_ = std::move(holder);
+        return handle;
+    }
+
     std::shared_ptr<const void> lifetimeOwner_;
     std::shared_ptr<TrackedHandle> leaseOwner_;
     std::variant<std::monostate, rhi::ma::AllocationPtr, rhi::ResourcePtr> h_;

@@ -1,0 +1,12 @@
+passes 2 resources 1 queues 2
+stage 1
+schedule-error 
+state-error 
+order 0 1
+batch 0 q0: 0
+batch 1 q1: 1
+wait 1 <- 0
+states complete 1 fallback 
+step r0 b0 p0 from b4294967295 p4294967295 m0+1s0+1 0/0/0r -> 32/0/1w
+step r0 b1 p1 from b0 p0 m0+1s0+1 32/0/1w -> 256/0/1r
+final r0 b1 m0+1s0+1 256/0/1r

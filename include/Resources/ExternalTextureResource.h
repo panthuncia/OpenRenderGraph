@@ -54,6 +54,7 @@ public:
     bool TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const override;
     rhi::Format GetFormat() const { return m_description.format; }
     bool CommonLayoutOnly() const noexcept override { return m_commonLayoutOnly; }
+    bool HostOwned() const noexcept override { return true; }
     unsigned int GetWidth() const { return m_width; }
     unsigned int GetHeight() const { return m_height; }
 
@@ -67,6 +68,8 @@ public:
 
     void ResetToUndefined();
     void ResetToCommon();
+    // Seeds the state tracker with TextureDescription::initialLayout (CreateShared, RefreshShared).
+    void SeedInitialLayout(rhi::ResourceLayout layout);
 	void ResetState(ResourceState state);
 
 private:

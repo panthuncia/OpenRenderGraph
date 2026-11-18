@@ -3,7 +3,11 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
+#include <string>
+
+#include <spdlog/spdlog.h>
 
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include "Resources/GPUBacking/GPUTextureBacking.h"
@@ -13,35 +17,6 @@
 namespace org {
 
 namespace {
-uint16_t ResolveTextureMipLevels(const TextureDescription& desc)
-{
-    if (desc.imageDimensions.empty()) {
-        return 1;
-    }
-
-    const uint32_t totalArraySlices = desc.isCubemap
-        ? 6u * desc.arraySize
-        : (desc.isArray ? desc.arraySize : 1u);
-
-    if (totalArraySlices > 0 &&
-        desc.imageDimensions.size() > totalArraySlices &&
-        (desc.imageDimensions.size() % totalArraySlices) == 0)
-    {
-        return static_cast<uint16_t>(desc.imageDimensions.size() / totalArraySlices);
-    }
-
-    if (desc.generateMipMaps) {
-        uint32_t width = desc.imageDimensions[0].width;
-        uint32_t height = desc.imageDimensions[0].height;
-        if (desc.padInternalResolution) {
-            width = (std::max)(1u, static_cast<uint32_t>(std::pow(2, std::ceil(std::log2(width)))));
-            height = (std::max)(1u, static_cast<uint32_t>(std::pow(2, std::ceil(std::log2(height)))));
-        }
-        return org::util::CalculateMipLevels(width, height);
-    }
-
-    return 1;
-}
 
 DescriptorHeapManager::ViewRequirements::TextureViews BuildTextureViewRequirements(
     const TextureDescription& desc,
@@ -52,6 +27,8 @@ DescriptorHeapManager::ViewRequirements::TextureViews BuildTextureViewRequiremen
     texViews.mipLevels = mipLevels;
     texViews.isCubemap = desc.isCubemap;
     texViews.isArray = desc.isArray;
+    texViews.is3D = desc.type == rhi::ResourceType::Texture3D;
+    texViews.depth = desc.depth;
     texViews.arraySize = desc.arraySize;
     texViews.totalArraySlices = totalArraySlices;
 
@@ -85,8 +62,8 @@ PixelBuffer::PixelBuffer(const TextureDescription& desc, bool materialize)
 {
     m_hasLayout = true;
     m_desc = desc;
-    // Graph declarations can precede backing allocation. Keep range validation
-    // tied to the logical texture description from construction onward.
+    // Graph declarations can come before the backing is allocated. So from
+    // construction on, range validation uses the logical texture description.
     m_mipLevels = ResolveTextureMipLevels(desc);
     m_arraySize = desc.isCubemap ? 6u * desc.arraySize : (desc.isArray ? desc.arraySize : 1u);
     if (materialize) {
@@ -188,11 +165,11 @@ bool PixelBuffer::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 	outDesc.texture.width = width;
 	outDesc.texture.height = height;
 	outDesc.texture.depthOrLayers = static_cast<uint16_t>(arraySize);
-	outDesc.texture.mipLevels = static_cast<uint16_t>(m_desc.generateMipMaps
-		? org::util::CalculateMipLevels(width, height)
-		: (m_desc.imageDimensions.size() > arraySize ? m_desc.imageDimensions.size() / arraySize : 1));
+	// Use the same mip count as the backing. ResolveTextureMipLevels prefers authored levels over generateMipMaps.
+	outDesc.texture.mipLevels = static_cast<uint16_t>(m_mipLevels);
 	outDesc.texture.sampleCount = 1;
 	outDesc.texture.initialLayout = rhi::ResourceLayout::Undefined;
+	outDesc.queueSharing = m_desc.queueSharing; // As GpuTextureBacking creates it: representations share queues the same way.
 	if (m_desc.hasRTV) outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowRenderTarget;
 	if (m_desc.hasUAV) outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
 	return outDesc.texture.format != rhi::Format::Unknown;
@@ -207,9 +184,9 @@ void PixelBuffer::RefreshAPIRepresentationDescriptors(BackendInstanceId backendI
 	// render passes continue to access the superseded primary-only backing.
 	auto resource = Resource::GetAPIResource(backendInstance);
 	if (!resource) return;
-	// An attached representation replaces (and may be created before) the normal
-	// GpuTextureBacking.  Do not inherit cached dimensions from that superseded
-	// backing: the logical description is authoritative for every representation.
+	// An attached representation replaces the normal GpuTextureBacking, and may
+	// be created before it. Do not take cached dimensions from that replaced
+	// backing. The logical description sets the dimensions of every representation.
 	const uint16_t resolvedMipLevels = ResolveTextureMipLevels(m_desc);
 	const uint32_t resolvedArraySize = m_desc.isCubemap
 		? 6u * m_desc.arraySize : (m_desc.isArray ? m_desc.arraySize : 1u);
@@ -222,6 +199,17 @@ void PixelBuffer::RefreshAPIRepresentationDescriptors(BackendInstanceId backendI
 	DescriptorHeapManager::ViewRequirements views;
 	views.views = BuildTextureViewRequirements(m_desc, resolvedMipLevels, resolvedArraySize);
 	DescriptorHeapManager::GetInstance().UpdateDescriptorContents(*this, resource, views, backendInstance);
+}
+
+namespace {
+// ORG_TRACE_STANDALONE=<name part>: each backing a matching texture takes or gives back is logged (a diagnostic).
+bool TraceBacking(const std::string& name) {
+	static const std::string trace = [] {
+		const char* value = std::getenv("ORG_TRACE_STANDALONE");
+		return std::string(value ? value : "");
+	}();
+	return !trace.empty() && (trace == "*" || name.find(trace) != std::string::npos);
+}
 }
 
 void PixelBuffer::Materialize(const MaterializeOptions* options) {
@@ -268,6 +256,8 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
     }
 
     ++m_backingGeneration;
+    if (TraceBacking(name))
+        spdlog::info("Texture backing taken: '{}' ({}, generation {})", name, options && options->aliasPlacement ? "alias placement" : "own memory", m_backingGeneration);
 }
 
 BackingAllocationSnapshot PixelBuffer::CaptureBackingAllocation(bool retain) {
@@ -299,6 +289,9 @@ void PixelBuffer::Dematerialize() {
 	RotateDescriptorSlotsForPublication();
     m_backing.reset();
     ++m_backingGeneration;
+    ForgetPublishedAllocation();
+    if (TraceBacking(name))
+        spdlog::info("Texture backing given back: '{}' (generation {})", name, m_backingGeneration);
 }
 
 void PixelBuffer::EnsureVirtualDescriptorSlotsAllocated() {

@@ -12,6 +12,9 @@ struct DescriptorViewRequirements {
         uint32_t mipLevels = 1;
         bool isCubemap = false;
         bool isArray = false;
+        // A 3D texture: its views are Texture3D views of every depth slice, in the Texture2D view slots.
+        bool is3D = false;
+        uint32_t depth = 1;
         uint32_t arraySize = 1;
         uint32_t totalArraySlices = 1;
 

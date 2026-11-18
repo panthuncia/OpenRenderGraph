@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <concepts>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -14,11 +16,13 @@
 #include <rhi.h>
 #include "RenderPasses/Base/PassReturn.h"
 #include "Render/ExternalBindings.h"
+#include "Render/PipelineDesc.h"
 #include "Render/PipelineState.h"
 #include "Render/BindlessResourceViews.h"
 #include "Render/ResourceUseDeclaration.h"
 #include "Render/PreparedInvocationArena.h"
 #include "Render/PublicationBindingBundle.h"
+#include "Render/RunRef.h"
 #include "Render/RenderGraph/CompileTelemetry.h"
 #include "Resources/ResourceIdentifier.h"
 
@@ -30,70 +34,6 @@ struct SubmissionContext { uint64_t submissionID = 0; };
 struct CompletionContext { uint64_t submissionID = 0; };
 enum class AbandonReason : uint8_t { Shutdown, GenerationInvalidated, PreparationFailed, AdmissionFailed };
 struct PreparedResourceReference { uint32_t slot = 0; };
-// Stable declaration-time token retained by the pass. It carries no resource
-// ownership and is resolved to the request's frozen backing during Prepare.
-
-struct PreparedDescriptorReference { uint32_t slot = 0; };
-struct PreparedProgramReference { uint32_t slot = 0; };
-struct PreparedWorkGraphReference { uint32_t slot = 0; };
-struct PreparedProgramBinding {
-    PreparedProgramReference program;
-    std::vector<unsigned int> descriptorIndices;
-};
-
-// Registry descriptor indices embedded in a recording recipe change whenever a
-// registered backing is replaced (publications rotate versioned buffers every
-// few frames). A recipe type that can relocate every embedded index through
-// RemapDescriptorIndices(Recipe&, const DescriptorIndexRemap&) is patched in
-// place of a full rebuild when nothing else about it changed.
-using DescriptorIndexRemap = std::unordered_map<uint32_t, uint32_t>;
-inline void RemapDescriptorIndices(std::vector<unsigned int>& indices, const DescriptorIndexRemap& remap) {
-    for (auto& index : indices)
-        if (const auto found = remap.find(index); found != remap.end()) index = found->second;
-}
-inline void RemapDescriptorIndices(PreparedProgramBinding& binding, const DescriptorIndexRemap& remap) {
-    RemapDescriptorIndices(binding.descriptorIndices, remap);
-}
-
-// One preparation call may capture many programs sharing the same descriptor
-// registrations. Resolve each successful registration once against that
-// call's selected publication; never carry numeric results into another frame.
-// Per-preparation memo of registry descriptor indices. A pass captures a few
-// dozen at most, so flat storage that keeps its capacity across frames beats
-// hash maps allocated per pass per frame.
-class PreparedDescriptorIndexCache {
-public:
-    template<class Resolver>
-    uint32_t Resolve(const ResourceIdentifier& resource, bool optional, Resolver&& resolver) {
-        for (const auto& [hash, index] : m_indices) if (hash == resource.hash) return index;
-        const auto index = resolver(resource, optional);
-        // An optional miss must not hide a subsequent mandatory failure.
-        if (index != UINT32_MAX) {
-            m_indices.emplace_back(resource.hash, index);
-            if (m_names.size() < m_indices.size()) m_names.emplace_back();
-            m_names[m_indices.size() - 1].assign(resource.name);
-        }
-        return index;
-    }
-    void Clear() noexcept { m_indices.clear(); }
-    const std::vector<std::pair<size_t, uint32_t>>& Indices() const noexcept { return m_indices; }
-    std::string_view Name(size_t hash) const noexcept {
-        for (size_t i = 0; i < m_indices.size(); ++i) if (m_indices[i].first == hash) return m_names[i];
-        return {};
-    }
-private:
-    std::vector<std::pair<size_t, uint32_t>> m_indices;
-    std::vector<std::string> m_names; // parallel; strings keep their buffers across frames (diagnostics)
-};
-struct CapturedPipeline {
-    rhi::PipelineHandle pipeline{};
-    // Pipelines created outside PipelineState use the same dependency slot.
-    // Recording only needs an immutable handle plus lifetime ownership; pass
-    // authors should not need a separate frame-data lifecycle for custom PSOs.
-    std::shared_ptr<const void> owner;
-    rhi::PipelineLayoutHandle layout{};
-    explicit operator bool() const noexcept { return pipeline.valid() && static_cast<bool>(owner); }
-};
 
 class PreparedLifecycleEffect {
 public:
@@ -137,40 +77,22 @@ private:
     AbandonedFn m_abandoned;
 };
 
+// What a packet keeps alive and commits with its lifecycle:
+// - ownership of what its recording names (Retain),
+// - framework reservations (Reserve).
 class PreparedDependencySnapshot {
 public:
     bool HasLifecycleEffects() const noexcept { return !m_effects.empty(); }
-    struct DescriptorBinding {
-        rhi::DescriptorSlot descriptor;
-        std::shared_ptr<const void> owner;
-    };
-    PreparedDependencySnapshot(std::vector<CapturedPipeline> programs,
-        std::vector<std::shared_ptr<const rhi::WorkGraphPtr>> workGraphs,
-        std::vector<DescriptorBinding> descriptors,
-        std::vector<std::shared_ptr<const void>> owners,
+    PreparedDependencySnapshot(std::vector<std::shared_ptr<const void>> owners,
         std::vector<std::shared_ptr<const PreparedLifecycleEffect>> effects)
-        : m_programs(std::move(programs)), m_workGraphs(std::move(workGraphs)),
-          m_descriptors(std::move(descriptors)),
-          m_owners(std::move(owners)),
-          m_effects(std::move(effects)) {
+        : m_owners(std::move(owners)), m_effects(std::move(effects)) {
         for (const auto& effect : m_effects) {
             const auto signals = effect->SignalsAfterCompletion();
             m_signals.insert(m_signals.end(), signals.begin(), signals.end());
         }
     }
     const std::vector<ExternalTimelinePoint>& SignalsAfterCompletion() const { return m_signals; }
-    const CapturedPipeline& Resolve(PreparedProgramReference ref) const {
-        return m_programs.at(ref.slot);
-    }
-    rhi::WorkGraphHandle Resolve(PreparedWorkGraphReference ref) const {
-        return m_workGraphs.at(ref.slot)->Get().GetHandle();
-    }
-    rhi::DescriptorSlot Resolve(PreparedDescriptorReference ref) const {
-        return m_descriptors.at(ref.slot).descriptor;
-    }
-    size_t DescriptorCount() const noexcept { return m_descriptors.size(); }
-    bool empty() const noexcept { return m_programs.empty() && m_workGraphs.empty() && m_descriptors.empty()
-        && m_owners.empty() && m_effects.empty(); }
+    bool empty() const noexcept { return m_owners.empty() && m_effects.empty(); }
     void Submitted(SubmissionContext context) const {
         for (const auto& effect : m_effects) effect->Submitted(context);
     }
@@ -181,9 +103,6 @@ public:
         for (const auto& effect : m_effects) effect->Abandoned(reason);
     }
 private:
-    std::vector<CapturedPipeline> m_programs;
-    std::vector<std::shared_ptr<const rhi::WorkGraphPtr>> m_workGraphs;
-    std::vector<DescriptorBinding> m_descriptors;
     std::vector<std::shared_ptr<const void>> m_owners;
     std::vector<std::shared_ptr<const PreparedLifecycleEffect>> m_effects;
     std::vector<ExternalTimelinePoint> m_signals;
@@ -191,36 +110,6 @@ private:
 
 class PreparedDependencyCollector {
 public:
-    explicit PreparedDependencyCollector(bool borrowed = false) : m_borrowed(borrowed) {}
-    PreparedProgramReference Capture(std::shared_ptr<const PipelineStatePayload> owner) {
-        if (!owner || !owner->pso) throw std::invalid_argument("Pipeline has no immutable payload");
-        const auto slot = static_cast<uint32_t>(m_programs.size());
-        const auto layout = owner->layout;
-        auto retained = m_borrowed ? std::shared_ptr<const void>{}
-                                   : std::shared_ptr<const void>{owner};
-        m_programs.push_back({owner->pso.Get().GetHandle(), std::move(retained), layout});
-        return {slot};
-    }
-    PreparedProgramReference Capture(const PipelineState& pipeline,
-        BackendInstanceId backend = BackendInstanceId::Primary) {
-        return Capture(pipeline.GetPayload(backend));
-    }
-    PreparedProgramReference Capture(std::shared_ptr<const rhi::PipelinePtr> owner) {
-        if (!owner || !*owner) throw std::invalid_argument("Cannot capture an empty pipeline");
-        const auto slot = static_cast<uint32_t>(m_programs.size());
-        auto retained = m_borrowed ? std::shared_ptr<const void>{}
-                                   : std::shared_ptr<const void>{owner};
-        m_programs.push_back({owner->Get().GetHandle(), std::move(retained)});
-        return {slot};
-    }
-    PreparedWorkGraphReference CaptureWorkGraph(
-        std::shared_ptr<const rhi::WorkGraphPtr> owner) {
-        if (!owner || !*owner)
-            throw std::invalid_argument("Cannot capture an empty work graph");
-        const auto slot = static_cast<uint32_t>(m_workGraphs.size());
-        m_workGraphs.push_back(std::move(owner));
-        return {slot};
-    }
     template<class T>
     void Retain(std::shared_ptr<T> owner) {
         if (!owner) throw std::invalid_argument("Cannot retain an empty prepared owner");
@@ -234,26 +123,11 @@ public:
         if (!effect) throw std::invalid_argument("Cannot retain an empty prepared lifecycle effect");
         m_effects.push_back(std::move(effect));
     }
-    PreparedDescriptorReference CaptureDescriptor(rhi::DescriptorSlot descriptor,
-        std::shared_ptr<const void> owner) {
-        if (!descriptor.heap.valid() || (!m_borrowed && !owner))
-            throw std::invalid_argument("Cannot capture an unowned descriptor");
-        const auto slot = static_cast<uint32_t>(m_descriptors.size());
-        m_descriptors.push_back({descriptor, std::move(owner)});
-        return {slot};
-    }
     std::shared_ptr<const PreparedDependencySnapshot> Freeze() && {
-        if (m_programs.empty() && m_workGraphs.empty() && m_descriptors.empty()
-            && m_owners.empty() && m_effects.empty()) return {};
-        return std::make_shared<const PreparedDependencySnapshot>(
-            std::move(m_programs), std::move(m_workGraphs), std::move(m_descriptors),
-            std::move(m_owners), std::move(m_effects));
+        if (m_owners.empty() && m_effects.empty()) return {};
+        return std::make_shared<const PreparedDependencySnapshot>(std::move(m_owners), std::move(m_effects));
     }
 private:
-    bool m_borrowed = false;
-    std::vector<CapturedPipeline> m_programs;
-    std::vector<std::shared_ptr<const rhi::WorkGraphPtr>> m_workGraphs;
-    std::vector<PreparedDependencySnapshot::DescriptorBinding> m_descriptors;
     std::vector<std::shared_ptr<const void>> m_owners;
     std::vector<std::shared_ptr<const PreparedLifecycleEffect>> m_effects;
 };
@@ -301,39 +175,49 @@ public:
         result->m_resources = std::move(resources);
         return result;
     }
-    // Touch tracking: while a flag vector is installed, every resolution marks
-    // its slot (1 = handle/ownership, 2 = bindless views). Recipe builders use
-    // this to learn which bindings a recording recipe actually embedded.
-    enum : uint8_t { TouchHandle = 1, TouchViews = 2, TouchSlot = 4 };
-    void TrackTouches(std::vector<uint8_t>* flags) const noexcept { m_touched = flags; }
-    void NoteCapturedSlot(PreparedResourceReference ref) const noexcept { Touch(ref, TouchSlot); }
+    // One preparation's bindings: `base`, with `overrides` in place of the base's bindings at those slots. The overrides are
+    // the frame-bound slots, such as a versioned resource's version for this preparation. Nothing of the base is copied.
+    static std::shared_ptr<const FrozenExecutionBindings> Overlay(std::shared_ptr<const FrozenExecutionBindings> base,
+        std::vector<std::pair<uint32_t, ResourceBinding>> overrides) {
+        if (!base) throw std::invalid_argument("An overlay needs base bindings");
+        if (overrides.empty()) return base;
+        std::sort(overrides.begin(), overrides.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        for (size_t i = 0; i < overrides.size(); ++i) {
+            const auto& [slot, binding] = overrides[i];
+            if (slot >= base->Size() || (i && overrides[i - 1].first == slot)) throw std::invalid_argument("Invalid overlay slot");
+            if (binding.resource.GetHandle().valid() && !binding.owner) throw std::invalid_argument("Unowned overlay resource");
+        }
+        auto result = std::make_shared<FrozenExecutionBindings>(std::vector<ResourceBinding>{});
+        result->m_descriptors = base->m_descriptors;
+        result->m_publicationRoot = base->m_publicationRoot;
+        result->m_overrides = std::move(overrides);
+        result->m_base = std::move(base);
+        return result;
+    }
+    // The binding at `slot`.
+    const ResourceBinding& Binding(uint32_t slot) const {
+        if (!m_base) return m_resources.at(slot);
+        const auto found = std::lower_bound(m_overrides.begin(), m_overrides.end(), slot,
+            [](const auto& entry, uint32_t key) { return entry.first < key; });
+        return found != m_overrides.end() && found->first == slot ? found->second : m_base->Binding(slot);
+    }
+    // How many slots there are.
+    uint32_t Size() const noexcept { return m_base ? m_base->Size() : static_cast<uint32_t>(m_resources.size()); }
     rhi::Resource Resolve(PreparedResourceReference ref) const {
-        Touch(ref, TouchHandle);
-        if (m_source) return m_source->Resolve(MappedReference(ref));
-        const auto& resource = m_resources.at(ref.slot).resource;
+        const auto& resource = Binding(ref.slot).resource;
         if (!resource.GetHandle().valid()) throw std::logic_error("Recording resolved an unbound persistent slot");
         return resource;
     }
-    // Reverse lookup by native handle; never counts as a touch.
+    // Reverse lookup by native handle.
     std::optional<PreparedResourceReference> FindByHandle(rhi::ResourceHandle handle) const {
-        if (m_source) {
-            for (uint32_t slot = 0; slot < m_resourceMap.size(); ++slot) {
-                if (m_resourceMap[slot] == UINT32_MAX) continue;
-                const auto candidate = m_source->Resources().at(m_resourceMap[slot]).resource.GetHandle();
-                if (candidate.index == handle.index && candidate.generation == handle.generation) return PreparedResourceReference{slot};
-            }
-            return std::nullopt;
-        }
-        for (uint32_t slot = 0; slot < m_resources.size(); ++slot) {
-            const auto candidate = m_resources[slot].resource.GetHandle();
+        for (uint32_t slot = 0; slot < Size(); ++slot) {
+            const auto candidate = Binding(slot).resource.GetHandle();
             if (candidate.index == handle.index && candidate.generation == handle.generation) return PreparedResourceReference{slot};
         }
         return std::nullopt;
     }
     std::shared_ptr<const void> Owner(PreparedResourceReference ref) const {
-        Touch(ref, TouchHandle);
-        if (m_source) return m_source->Owner(MappedReference(ref));
-        const auto& binding = m_resources.at(ref.slot);
+        const auto& binding = Binding(ref.slot);
         if (binding.publicationBinding)
             return binding.publicationBinding->recordingOwner
                 ? binding.publicationBinding->recordingOwner : binding.publicationBinding->allocationOwner;
@@ -343,57 +227,51 @@ public:
         return binding.descriptorOwner ? binding.descriptorOwner : binding.owner ? binding.owner : m_publicationRoot;
     }
     const BindlessResourceViews& Views(PreparedResourceReference ref) const {
-        Touch(ref, TouchViews);
-        if (m_source) return m_source->Views(MappedReference(ref));
-        const auto& views = m_resources.at(ref.slot).views;
+        const auto& views = Binding(ref.slot).views;
         if (!views) throw std::out_of_range("Resource has no captured bindless views");
         return *views;
     }
-    rhi::DescriptorSlot Resolve(PreparedDescriptorReference ref) const { return m_descriptors.at(ref.slot).descriptor; }
-    const std::vector<ResourceBinding>& Resources() const { return m_resources; }
+    // The flat binding list. An overlay has none: read Binding(slot) instead.
+    const std::vector<ResourceBinding>& Resources() const {
+        if (m_base) throw std::logic_error("Overlay bindings have no flat list");
+        return m_resources;
+    }
     const std::vector<DescriptorBinding>& Descriptors() const { return m_descriptors; }
     const std::shared_ptr<const PublicationBindingBundle>& PublicationRoot() const noexcept { return m_publicationRoot; }
-    std::span<const uint32_t> FrameResourceMap() const noexcept { return m_resourceMap; }
-    // UINT32_MAX map entries are pass-local slots with no binding this frame;
-    // resolving one fails like an unbound persistent slot.
-    static std::shared_ptr<const FrozenExecutionBindings> WithResourceMap(
-        std::shared_ptr<const FrozenExecutionBindings> source, std::vector<uint32_t> map) {
-        if (!source) throw std::invalid_argument("Missing recipe binding source");
-        auto result = std::make_shared<FrozenExecutionBindings>(std::vector<ResourceBinding>{});
-        for (auto slot : map) if (slot != UINT32_MAX) (void)source->Resolve(PreparedResourceReference{slot});
-        result->m_source = std::move(source);
-        result->m_resourceMap = std::move(map);
-        return result;
-    }
 private:
-    void Touch(PreparedResourceReference ref, uint8_t kind) const noexcept {
-        if (m_touched && ref.slot < m_touched->size()) (*m_touched)[ref.slot] |= kind;
-    }
-    PreparedResourceReference MappedReference(PreparedResourceReference ref) const {
-        const auto mapped = m_resourceMap.at(ref.slot);
-        if (mapped == UINT32_MAX) throw std::logic_error("Recording resolved a pass slot with no binding this frame");
-        return PreparedResourceReference{mapped};
-    }
     std::vector<ResourceBinding> m_resources;
     std::vector<DescriptorBinding> m_descriptors;
     std::shared_ptr<const PublicationBindingBundle> m_publicationRoot;
-    std::shared_ptr<const FrozenExecutionBindings> m_source;
-    std::vector<uint32_t> m_resourceMap;
-    mutable std::vector<uint8_t>* m_touched = nullptr;
+    // An overlay's (Overlay): the bindings it overrides, and its own bindings by slot, sorted.
+    std::shared_ptr<const FrozenExecutionBindings> m_base;
+    std::vector<std::pair<uint32_t, ResourceBinding>> m_overrides;
 };
 
 struct FramePreparationContext {
     std::shared_ptr<const ResourceUseLayout> resourceUses;
+    // The declaration to prepare against. In a persistent graph, this is the declaration the selected executable was
+    // built from. A pending structural build's relowering takes effect only when that build installs.
+    // When unset, the pass's latest declaration is used.
+    std::shared_ptr<const ResourceUseLayout> preparedResourceUses;
+    std::shared_ptr<const void> preparedBindings;
     std::function<rhi::DescriptorSlot(uint32_t, uint32_t)> resolveDeclaredView;
     std::function<rhi::Resource(uint32_t)> resolveDeclaredResource;
+    // Returns the view of a resolver group's first bound member this frame. The group is a
+    // ResourceUseLayout::resolverViews ordinal. Returns an invalid slot when the group has no bound member.
+    std::function<rhi::DescriptorSlot(uint32_t resolverGroup, BindlessViewRequest)> resolveResolverView;
     std::shared_ptr<PreparedInvocationArena> invocationArena;
     std::function<void(std::shared_ptr<const void>)> retireOwnership;
     rhi::Device device; // Host-owned device; valid through frame retirement.
+    // The device the pass runs on. Recording binds its builds of pipelines and command signatures.
+    BackendInstanceId backendInstance = BackendInstanceId::Primary;
+    // The ring slot this execution prepares into. Not a count: use executionIndex for that.
     uint32_t frameIndex = 0;
     // Stable CPU frame-data slot retained by this prepared request. The
     // swapchain image and execution slot are intentionally late-bound.
     uint32_t preparationSlot = 0;
-    uint64_t frameNumber = 0;
+    // The graph's count of its executions, from 1; this one's. ExecutionHandle::Index of the execution it prepares.
+    uint64_t executionIndex = 0;
+    uint64_t frameNumber = 0; // The same value, under its old name.
     float deltaTime = 0;
     std::shared_ptr<const FrozenExecutionBindings> bindings;
     // Valid only for the duration of PrepareFrame. Implementations copy the
@@ -406,13 +284,9 @@ struct FramePreparationContext {
     // Preparation-only access. Providers must contain owned/value snapshots,
     // not legacy RenderContext wrappers with mutable manager pointers.
     std::shared_ptr<const IHostExecutionData> frameData;
-    // Installed automatically by TypedRenderGraphPass for this one packet.
-    // Authors receive compact slot references; PreparedPass owns the captured
-    // immutable program generations until terminal lifecycle state.
+    // Installed by TypedRenderGraphPass for this one packet. It holds the ownership the packet keeps (Retain) and the
+    // lifecycle reservations the packet commits (Reserve).
     std::shared_ptr<PreparedDependencyCollector> dependencyCollector;
-    // BorrowedSynchronous records before the live dependency publishers may
-    // rotate, so handles are captured without retaining their version owners.
-    bool borrowedDependencies = false;
     // Per-pass permission map assembled from that pass's declarations. This
     // lets preparation capture a stable binding slot without retaining a
     // Resource wrapper or knowing anything about graph indices.
@@ -428,87 +302,6 @@ struct FramePreparationContext {
         }
     };
     std::shared_ptr<const ResourceSlots> resourceSlots;
-    // Installed by TypedRenderGraphPass for the duration of Prepare. This
-    // hides the legacy registry-view descriptor helper from pass authors and
-    // keeps descriptor indices coherent with the captured pipeline payload.
-    std::function<std::vector<unsigned int>(const PipelineResources&)>
-        captureDescriptorIndices;
-    // Single-binding form of the same capture. Passes that need per-binding
-    // optionality must resolve through this rather than the registry helper,
-    // so the captured index participates in the recipe revision.
-    std::function<unsigned int(const ResourceIdentifier&, bool optional)> captureDescriptorIndex;
-
-    CapturedPipeline CapturePipeline(const PipelineState& pipeline,
-        BackendInstanceId backend = BackendInstanceId::Primary) const {
-        auto owner = pipeline.GetPayload(backend);
-        if (!owner || !owner->pso) throw std::invalid_argument("Pipeline has no immutable payload");
-        const auto layout = owner->layout;
-        return {owner->pso.Get().GetHandle(), std::move(owner), layout};
-    }
-
-    PreparedProgramReference CaptureProgram(const PipelineState& pipeline,
-        BackendInstanceId backend = BackendInstanceId::Primary) const {
-        if (!dependencyCollector) throw std::logic_error("Program capture is unavailable outside typed preparation");
-        return dependencyCollector->Capture(pipeline, backend);
-    }
-
-    PreparedProgramReference CaptureProgram(
-        std::shared_ptr<const rhi::PipelinePtr> pipeline) const {
-        if (!dependencyCollector) throw std::logic_error("Program capture is unavailable outside typed preparation");
-        return dependencyCollector->Capture(std::move(pipeline));
-    }
-
-    PreparedProgramBinding CaptureProgramBinding(
-        std::shared_ptr<const rhi::PipelinePtr> pipeline,
-        const PipelineResources& resources) const {
-        if (!dependencyCollector || !captureDescriptorIndices)
-            throw std::logic_error("Program binding capture is unavailable outside typed preparation");
-        auto indices = captureDescriptorIndices(resources);
-        return {dependencyCollector->Capture(std::move(pipeline)), std::move(indices)};
-    }
-
-    PreparedProgramBinding CaptureProgramBinding(const PipelineState& pipeline,
-        BackendInstanceId backend = BackendInstanceId::Primary) const {
-        if (!dependencyCollector || !captureDescriptorIndices)
-            throw std::logic_error("Program binding capture is unavailable outside typed preparation");
-        auto payload = pipeline.GetPayload(backend);
-        if (!payload || !payload->pso)
-            throw std::invalid_argument("Pipeline has no immutable payload");
-        return CaptureProgramBinding(std::move(payload));
-    }
-
-    PreparedProgramBinding CaptureProgramBinding(
-        std::shared_ptr<const PipelineStatePayload> payload) const {
-        if (!dependencyCollector || !captureDescriptorIndices)
-            throw std::logic_error("Program binding capture is unavailable outside typed preparation");
-        if (!payload || !payload->pso)
-            throw std::invalid_argument("Pipeline has no immutable payload");
-        static const basic_telemetry::Callsite callsite("ORG.Execution.CaptureProgramBindings");
-        CompileDetailScope trace(callsite, payload->label,
-            payload->pipelineResources.mandatoryResourceDescriptorSlots.size()
-                + payload->pipelineResources.optionalResourceDescriptorSlots.size());
-        auto indices = captureDescriptorIndices(payload->pipelineResources);
-        return {dependencyCollector->Capture(std::move(payload)), std::move(indices)};
-    }
-
-    rhi::CommandSignatureHandle CaptureCommandSignature(
-        std::shared_ptr<const rhi::CommandSignaturePtr> owner) const {
-        if (!dependencyCollector)
-            throw std::logic_error("Command-signature capture is unavailable outside typed preparation");
-        if (!owner || !*owner)
-            throw std::invalid_argument("Cannot capture an empty command signature");
-        const auto handle = owner->Get().GetHandle();
-        dependencyCollector->Retain(std::move(owner));
-        return handle;
-    }
-
-    PreparedWorkGraphReference CaptureWorkGraph(
-        std::shared_ptr<const rhi::WorkGraphPtr> owner) const {
-        if (!dependencyCollector)
-            throw std::logic_error("Work-graph capture is unavailable outside typed preparation");
-        return dependencyCollector->CaptureWorkGraph(std::move(owner));
-    }
-
     PreparedResourceReference CaptureResource(uint64_t globalResourceID) const {
         if (!resourceSlots) throw std::logic_error("Resource capture is unavailable outside owned preparation");
         const auto found = resourceSlots->Find(globalResourceID);
@@ -526,7 +319,6 @@ struct FramePreparationContext {
             }
             throw std::invalid_argument(std::move(message));
         }
-        if (bindings) bindings->NoteCapturedSlot({found->second});
         return {found->second};
     }
 
@@ -534,24 +326,14 @@ struct FramePreparationContext {
         if (resourceSlots) {
             const auto registry = resourceSlots->Find(binding.registryResourceID);
             if (registry != resourceSlots->end()) {
-                if (bindings) bindings->NoteCapturedSlot({registry->second});
                 return {registry->second};
             }
             const auto global = resourceSlots->Find(binding.globalResourceID);
             if (global != resourceSlots->end()) {
-                if (bindings) bindings->NoteCapturedSlot({global->second});
                 return {global->second};
             }
         }
         return CaptureResource(binding.registryResourceID);
-    }
-
-    PreparedDescriptorReference CaptureDescriptor(ResourceBindingToken binding,
-        rhi::DescriptorSlot descriptor) const {
-        if (!dependencyCollector || !bindings)
-            throw std::logic_error("Descriptor capture is unavailable outside typed preparation");
-        const auto resource = CaptureResource(binding);
-        return dependencyCollector->CaptureDescriptor(descriptor, bindings->Owner(resource));
     }
 
     const ResourceUseDeclaration& DeclaredUse(const DeclaredViewToken& token) const {
@@ -579,11 +361,6 @@ struct FramePreparationContext {
                 + " mip=" + std::to_string(request.mip) + " slice=" + std::to_string(request.slice));
         }
     }
-    PreparedDescriptorReference Capture(const DeclaredViewToken& token) const {
-        (void)DeclaredUse(token);
-        if (!dependencyCollector || !bindings) throw std::logic_error("Declared view capture requires owned preparation");
-        return dependencyCollector->CaptureDescriptor(Resolve(token), bindings->Owner(DeclaredReference(token)));
-    }
     PreparedResourceReference DeclaredReference(const DeclaredViewToken& token) const {
         const auto& use = DeclaredUse(token);
         if (!resolveDeclaredResource) return CaptureResource(use.binding);
@@ -592,15 +369,36 @@ struct FramePreparationContext {
         if (!reference) throw std::invalid_argument("Declared view backing is absent from frozen pass bindings");
         return *reference;
     }
-    void ValidateDeclaredViews() const {
-        // Persistent requirements are validated for every occupied group slot on
-        // binding edits, including members that joined since Declare ran.
-        if (!resourceUses || resolveDeclaredView) return;
+    // Every declared view of the pass, resolved once against this frame's bindings. They are in
+    // ResourceUseLayout::FlatView order. RecordingContext::Index reads from here. A view that cannot be resolved is left
+    // invalid, and fails when a recording asks for it.
+    std::vector<rhi::DescriptorSlot> ResolveDeclaredViewTable() const {
+        std::vector<rhi::DescriptorSlot> table;
+        if (!resourceUses) return table;
+        table.reserve(resourceUses->ViewCount());
         for (uint32_t use = 0; use < resourceUses->uses.size(); ++use)
             for (uint32_t view = 0; view < resourceUses->uses[use].requiredViews.size(); ++view) {
-                const auto slot = Resolve({resourceUses, use, view});
-                if (!slot.heap.valid()) throw std::invalid_argument("Declared view has no descriptor heap");
+                rhi::DescriptorSlot slot{};
+                try {
+                    slot = resolveDeclaredView ? resolveDeclaredView(use, view) : Resolve(DeclaredViewToken{resourceUses, use, view});
+                } catch (const std::exception&) { basic_telemetry::AddCounter("ORG.Execution.UnresolvedDeclaredViews"); }
+                table.push_back(slot);
             }
+        return table;
+    }
+    // The views of the pass's names that were declared through a resolver group, parallel to
+    // ResourceUseLayout::namedViews. An entry is invalid for the other names, and for a group without a bound member.
+    std::vector<rhi::DescriptorSlot> ResolveNamedGroupViews() const {
+        std::vector<rhi::DescriptorSlot> views;
+        if (!resourceUses || !resolveResolverView) return views;
+        views.resize(resourceUses->namedViews.size());
+        for (size_t i = 0; i < views.size(); ++i) {
+            const auto& named = resourceUses->namedViews[i];
+            if (named.resolverGroup == UINT32_MAX) continue;
+            try { views[i] = resolveResolverView(named.resolverGroup, named.request); }
+            catch (const std::exception&) { basic_telemetry::AddCounter("ORG.Execution.UnresolvedDeclaredViews"); }
+        }
+        return views;
     }
 
     const rhi::ResourceDesc& Describe(ResourceBindingToken binding) const {
@@ -656,16 +454,63 @@ struct FramePreparationContext {
 
 };
 
+// Ownership of the objects one recording's commands name: the pipelines it bound, and the command signatures and
+// work graphs it used. It is kept until the recording's GPU work retires, including every resubmission of a kept
+// recording. A late batch that is recorded again appends to the same retention, unless its list's last submission is
+// done: an inline late batch releases it before it records again (see Release).
+class RecordingRetention {
+public:
+    void Retain(std::shared_ptr<const void> owner) {
+        if (!owner) throw std::invalid_argument("Cannot retain an empty recording owner");
+        std::lock_guard lock(m_mutex);
+        for (const auto& existing : m_owners) if (existing == owner) return;
+        m_owners.push_back(std::move(owner));
+    }
+    // Lets go of everything retained so far. Only for a list whose every submission is done and that is about to be
+    // recorded again: the new recording retains what its commands name. Without this, a late batch recorded every frame
+    // kept each frame's owners (staging buffers, frame data) until the batch itself went away.
+    void Release() {
+        std::vector<std::shared_ptr<const void>> released;
+        {
+            std::lock_guard lock(m_mutex);
+            released.swap(m_owners);
+        }
+    }
+private:
+    std::mutex m_mutex;
+    std::vector<std::shared_ptr<const void>> m_owners;
+};
+
+// A pass's declarations as its recording sees them: the declared-view layout and the views the frame
+// resolved for it.
+struct DeclaredRecordingScope {
+    std::shared_ptr<const ResourceUseLayout> layout;
+    std::vector<rhi::DescriptorSlot> views;  // ResourceUseLayout::FlatView order
+    std::vector<rhi::DescriptorSlot> namedGroupViews;  // parallel to ResourceUseLayout::namedViews
+    BackendInstanceId backendInstance = BackendInstanceId::Primary;
+};
+
+// Options for RecordingContext::Bind*Pipeline. absentPrefixes lists ResourceDescriptorIndex name prefixes that may be
+// undeclared. Their slots read UINT32_MAX.
+struct PipelineBindOptions { std::span<const std::string_view> absentPrefixes{}; };
+
 class RecordingContext {
 public:
     static RecordingContext FromPersistentBindings(rhi::CommandList commands,
         std::shared_ptr<const persistent::SelectedPublication> publication);
     RecordingContext WithPersistentBindings(std::shared_ptr<const persistent::SelectedPublication> publication) const;
     const persistent::SelectedPublication* PersistentPublication() const noexcept { return m_persistentPublication.get(); }
-    // The frame slot of the execution being recorded (the host's frames-in-flight index). A recording
-    // may depend on it - a LatchBlock region is per slot - but on nothing else about the frame.
-    uint32_t FrameSlot() const noexcept { return m_frameSlot; }
-    void SetFrameSlot(uint32_t slot) noexcept { m_frameSlot = slot; }
+    // The run being recorded (GraphHost's run lease, or a published copy's run). A recording may depend on it, because a
+    // LatchBlock region and a run's CPU payload are per run. It must not depend on anything else about the frame.
+    const RunRef& Run() const noexcept { return m_run; }
+    void SetRun(const RunRef& run) noexcept { m_run = run; }
+    // A context to ask passes whether they skip a run (PreparedPass::SkipsAtExecution) before their list is begun. It has the
+    // run and nothing else: a SkipsAtExecution may read only Run().
+    static RecordingContext ForSkipQuestions(const RunRef& run) {
+        RecordingContext context{SkipQuestionsTag{}};
+        context.m_run = run;
+        return context;
+    }
     rhi::Resource Resolve(persistent::BindingToken token) const;
     rhi::DescriptorSlot Resolve(persistent::ViewToken token) const;
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const FrozenExecutionBindings> bindings,
@@ -678,71 +523,124 @@ public:
         if (!m_bindings) throw std::logic_error("Legacy reference requires frozen recording bindings");
         return m_bindings->Resolve(ref);
     }
-    rhi::Resource Resolve(ResourceBindingToken token) const {
-        if (!m_declaredResourceSlots)
-            throw std::logic_error("Declaration tokens require a declared recording scope");
-        auto found = std::find_if(m_declaredResourceSlots->begin(), m_declaredResourceSlots->end(),
-            [token](const auto& entry) { return entry.first == token.globalResourceID; });
-        if (found == m_declaredResourceSlots->end())
-            found = std::find_if(m_declaredResourceSlots->begin(), m_declaredResourceSlots->end(),
-                [token](const auto& entry) { return entry.first == token.registryResourceID; });
-        if (found == m_declaredResourceSlots->end())
-            throw std::invalid_argument("Recording attempted to resolve an undeclared resource");
-        return m_bindings->Resolve(PreparedResourceReference{found->second});
-    }
-    // The framework creates a pass-local copy of the recording context. Its
-    // permissions and concrete allocation table travel with the prepared frame;
-    // declaration tokens never consult the current graph or a resource wrapper.
-    RecordingContext WithDeclaredResources(
-        std::shared_ptr<const FrozenExecutionBindings> bindings,
-        std::shared_ptr<const FramePreparationContext::ResourceSlots> slots) const {
-        if (!bindings || !slots) throw std::invalid_argument("Incomplete declared recording scope");
-        auto result = *this;
-        result.m_bindings = std::move(bindings);
-        result.m_declaredResourceSlots = std::move(slots);
-        return result;
-    }
-    rhi::DescriptorSlot Resolve(PreparedDescriptorReference ref) const {
-        if (m_dependencies && ref.slot < m_dependencies->DescriptorCount())
-            return m_dependencies->Resolve(ref);
-        if (!m_bindings) throw std::logic_error("Legacy descriptor requires frozen recording bindings");
-        return m_bindings->Resolve(ref);
-    }
+    // The frame's backing of a declared resource.
+    rhi::Resource Resolve(ResourceBindingToken token) const;
+    rhi::Resource Resolve(const DeclaredViewToken& token) const { return Resolve(token.Resource()); }
+    // The frame's descriptor of a declared view, and its bindless index.
+    rhi::DescriptorSlot View(const DeclaredViewToken& token) const;
+    uint32_t Index(const DeclaredViewToken& token) const { return View(token).index; }
+    // Any bindless view of a declared resource. This is for a pass that moves the resource between access kinds with its
+    // own barriers. For example, the pass declares it for unordered access, then reads it through its shader-resource
+    // view after an in-pass barrier.
+    rhi::DescriptorSlot View(ResourceBindingToken resource, BindlessViewRequest request) const;
+    uint32_t Index(ResourceBindingToken resource, BindlessViewRequest request) const { return View(resource, request).index; }
     rhi::DescriptorSlot Resolve(ExternalBindingKey key) const {
         if (!m_externalBindings) throw std::out_of_range("Missing external binding table");
         for (const auto& binding : *m_externalBindings)
             if (binding.key == key && binding.descriptor.heap.valid()) return binding.descriptor;
         throw std::out_of_range("Missing external descriptor binding");
     }
-    rhi::PipelineHandle Resolve(PreparedProgramReference ref) const {
-        if (!m_dependencies) throw std::out_of_range("Missing prepared dependency snapshot");
-        return m_dependencies->Resolve(ref).pipeline;
+
+    // Keeps `owner` alive until this recording's GPU work retires.
+    void Retain(std::shared_ptr<const void> owner);
+
+    // Binds the pipeline's current payload and its layout. The recording retains the payload. Then fills the pipeline's
+    // ResourceDescriptorIndex slots from the pass's declarations, by resource name. A slot whose name the pass did not
+    // declare gets UINT32_MAX when:
+    // - the slot is optional,
+    // - it belongs to a feature domain that the pass names no resource of,
+    // - or its name starts with one of `absentPrefixes`.
+    // Otherwise binding throws.
+    using BindOptions = PipelineBindOptions;
+    void BindComputePipeline(const PipelineState& pipeline, BindOptions options = {});
+    void BindGraphicsPipeline(const PipelineState& pipeline, BindOptions options = {});
+    void BindComputePipeline(std::shared_ptr<const PipelineStatePayload> payload, BindOptions options = {});
+    void BindGraphicsPipeline(std::shared_ptr<const PipelineStatePayload> payload, BindOptions options = {});
+    // A DXR state object and its global layout. PushConstants then reach the ray stages. A shader table only works with the
+    // state object it was built from, so a pass with a table binds the table's payload rather than the pipeline's current one.
+    void BindRayTracingPipeline(const PipelineState& pipeline, BindOptions options = {});
+    void BindRayTracingPipeline(std::shared_ptr<const PipelineStatePayload> payload, BindOptions options = {});
+    // A pipeline made outside PipelineState: no descriptor slots.
+    void BindComputePipeline(std::shared_ptr<const rhi::PipelinePtr> pipeline, rhi::PipelineLayoutHandle layout);
+    void BindGraphicsPipeline(std::shared_ptr<const rhi::PipelinePtr> pipeline, rhi::PipelineLayoutHandle layout);
+    // Root constants for the stages of the last bound pipeline.
+    void PushConstants(uint32_t rootParameter, std::span<const uint32_t> values, uint32_t destinationOffset = 0);
+    // The indices that a pipeline's ResourceDescriptorIndex slots resolve to. This is what binding the pipeline pushes.
+    std::vector<uint32_t> DescriptorSlotIndices(const PipelineStatePayload& payload, BindOptions options = {}) const;
+
+    // Buffer barriers on declared resources, as one batch. The defaults are for compute dispatches: around ray dispatches,
+    // pass rhi::ResourceSyncState::Raytracing, because COMPUTE_SHADING doesn't cover DispatchRays.
+    void BufferBarriers(std::initializer_list<ResourceBindingToken> buffers,
+        rhi::ResourceAccessType beforeAccess, rhi::ResourceAccessType afterAccess,
+        rhi::ResourceSyncState beforeSync = rhi::ResourceSyncState::ComputeShading,
+        rhi::ResourceSyncState afterSync = rhi::ResourceSyncState::ComputeShading);
+    // A full unordered-access barrier between dispatches of the bound kind: ray dispatches after BindRayTracingPipeline,
+    // otherwise compute dispatches.
+    void UavBarrier();
+    // The signature's creation on the pass's device, retained by the recording. Throws when it has none there.
+    std::shared_ptr<const rhi::CommandSignaturePtr> Resolve(const CommandSignatureState& signature);
+    // The signature's creation on the pass's device.
+    void ExecuteIndirect(const CommandSignatureState& signature,
+        ResourceBindingToken arguments, uint64_t argumentOffset = 0, uint32_t maxCommandCount = 1,
+        std::optional<ResourceBindingToken> count = std::nullopt, uint64_t countOffset = 0);
+    // The same barrier between work of different kinds, such as a compute step whose output rays read.
+    void UavBarrier(rhi::ResourceSyncState beforeSync, rhi::ResourceSyncState afterSync);
+    // Launches rays from dispatch arguments in a declared buffer. Declare it with IndirectArguments. `tables` is
+    // CLodRtShaderTable::IndirectDesc or equivalent; the bound pipeline must be the state object those tables came from.
+    void TraceRaysIndirect(rhi::RayTracingDispatchIndirectDesc tables, ResourceBindingToken arguments, uint64_t argumentOffset = 0);
+    void ExecuteIndirect(const std::shared_ptr<const rhi::CommandSignaturePtr>& signature,
+        ResourceBindingToken arguments, uint64_t argumentOffset = 0, uint32_t maxCommandCount = 1,
+        std::optional<ResourceBindingToken> count = std::nullopt, uint64_t countOffset = 0);
+    void SetWorkGraph(const std::shared_ptr<const rhi::WorkGraphPtr>& workGraph, ResourceBindingToken backing,
+        bool initializeBacking);
+
+    // The framework creates a pass-local copy of the recording context. Its
+    // permissions and concrete allocation table travel with the prepared frame;
+    // declaration tokens never consult the current graph or a resource wrapper.
+    RecordingContext WithDeclaredResources(
+        std::shared_ptr<const FrozenExecutionBindings> bindings,
+        std::shared_ptr<const FramePreparationContext::ResourceSlots> slots,
+        std::shared_ptr<const DeclaredRecordingScope> scope = {}) const {
+        if (!bindings || !slots) throw std::invalid_argument("Incomplete declared recording scope");
+        auto result = *this;
+        result.m_bindings = std::move(bindings);
+        result.m_declaredResourceSlots = std::move(slots);
+        result.m_declaredScope = std::move(scope);
+        return result;
     }
-    rhi::PipelineLayoutHandle ResolveLayout(PreparedProgramReference ref,
-        rhi::PipelineLayoutHandle transitionalLayout = {}) const {
-        if (!m_dependencies) throw std::out_of_range("Missing prepared dependency snapshot");
-        const auto layout = m_dependencies->Resolve(ref).layout;
-        if (layout.valid()) return layout;
-        if (transitionalLayout.valid()) return transitionalLayout;
-        throw std::logic_error("Prepared program has no captured layout");
+    void SetRetention(std::shared_ptr<RecordingRetention> retention) noexcept { m_retention = std::move(retention); }
+    // The descriptor heaps the list binds before its first pass. These are the admitted frame's heaps. Some passes hand
+    // the list to code that binds heaps of its own, such as a vendor SDK or an overlay. Such a pass calls
+    // RestoreDescriptorHeaps afterwards, so the passes after it read the frame's heaps again.
+    void SetDescriptorHeaps(rhi::DescriptorHeapHandle resources, rhi::DescriptorHeapHandle samplers) noexcept {
+        m_resourceHeap = resources;
+        m_samplerHeap = samplers;
     }
-    rhi::WorkGraphHandle Resolve(PreparedWorkGraphReference ref) const {
-        if (!m_dependencies) throw std::out_of_range("Missing prepared dependency snapshot");
-        return m_dependencies->Resolve(ref);
+    void RestoreDescriptorHeaps() {
+        if (!m_resourceHeap.valid()) return;
+        m_commands.SetDescriptorHeaps(m_resourceHeap,
+            m_samplerHeap.valid() ? std::optional<rhi::DescriptorHeapHandle>{m_samplerHeap} : std::nullopt);
     }
     void SetPreparedDependencies(std::shared_ptr<const PreparedDependencySnapshot> dependencies) {
         m_dependencies = std::move(dependencies);
     }
 private:
+    void BindPayload(std::shared_ptr<const PipelineStatePayload> payload, rhi::ShaderStage stages, BindOptions options);
     struct PersistentTag {};
     RecordingContext(rhi::CommandList commands, std::shared_ptr<const persistent::SelectedPublication> publication, PersistentTag);
+    struct SkipQuestionsTag {};
+    explicit RecordingContext(SkipQuestionsTag) {}
     std::shared_ptr<const persistent::SelectedPublication> m_persistentPublication;
-    uint32_t m_frameSlot = 0;
+    RunRef m_run{};
     rhi::CommandList m_commands;
     std::shared_ptr<const FrozenExecutionBindings> m_bindings;
     std::shared_ptr<const std::vector<ExternalDescriptorBindingValue>> m_externalBindings;
     std::shared_ptr<const PreparedDependencySnapshot> m_dependencies;
     std::shared_ptr<const FramePreparationContext::ResourceSlots> m_declaredResourceSlots;
+    std::shared_ptr<const DeclaredRecordingScope> m_declaredScope;
+    std::shared_ptr<RecordingRetention> m_retention;
+    rhi::ShaderStage m_boundStages = rhi::ShaderStage::Compute;
+    rhi::DescriptorHeapHandle m_resourceHeap{}, m_samplerHeap{};
 };
 
 // One owned packet per submitted frame. Copies share the single-consumption
@@ -867,9 +765,40 @@ public:
         result.m_storage = std::move(storage);
         return result;
     }
+    // Combines the packet with extra commands and extra lifecycle effects into one packet. An example is a readback
+    // capture: a copy of a resource the pass wrote, recorded right after the pass in the same executable, with no new
+    // pass to schedule. The trailer records into the pass's list after the pass. Its effects commit after the pass's
+    // own. The result is never replayable.
+    static PreparedPass WithTrailer(PreparedPass inner, std::function<void(RecordingContext&)> trailer,
+        std::vector<std::shared_ptr<const PreparedLifecycleEffect>> effects, std::shared_ptr<const void> keepAlive = {}) {
+        if (!inner.m_storage || inner.IsConsumed()) throw std::invalid_argument("A trailer needs an unconsumed packet");
+        if (!trailer) throw std::invalid_argument("Missing trailer recording");
+        auto storage = std::make_shared<TrailerStorage>();
+        storage->inner = inner.m_storage;
+        storage->trailer = std::move(trailer);
+        storage->effects = std::move(effects);
+        storage->keepAlive = std::move(keepAlive);
+        storage->dependencies = std::move(inner.m_storage->dependencies);
+        storage->externalSignals = inner.m_storage->externalSignals;
+        for (const auto& effect : storage->effects)
+            for (const auto& signal : effect->SignalsAfterCompletion()) storage->externalSignals.push_back(signal);
+        storage->debugName = inner.m_storage->debugName;
+        storage->workerSafe = inner.m_storage->workerSafe;
+        PreparedPass result;
+        result.m_storage = std::move(storage);
+        return result;
+    }
     explicit operator bool() const { return static_cast<bool>(m_storage); }
     bool IsConsumed() const { return m_storage && m_storage->state.load(std::memory_order_acquire) != LifecycleState::Prepared; }
     bool IsWorkerSafe() const noexcept { return m_storage && m_storage->workerSafe; }
+    // Whether its recording may be submitted again and again (a replayable packet, see OwnedRecordingList::replayable).
+    // That is the case when it has no submission, completion or abandonment callback, no external signal and no
+    // dependency lifecycle effect. Then a submission has nothing to commit but the commands themselves. A replayed pass
+    // is recorded once and never transitions further. Its data lives as long as the recording.
+    bool IsReplayable() const noexcept {
+        return m_storage && !m_storage->HasCallbacks() && m_storage->externalSignals.empty()
+            && (!m_storage->dependencies || !m_storage->dependencies->HasLifecycleEffects());
+    }
     void SetDebugName(std::string name) const { if (m_storage) m_storage->debugName = std::move(name); }
     std::string_view DebugName() const { return m_storage ? std::string_view{m_storage->debugName} : std::string_view{}; }
     const std::vector<ExternalTimelinePoint>& ExternalSignalsAfterCompletion() const {
@@ -883,6 +812,50 @@ public:
             throw std::logic_error("Prepared pass already consumed");
         // A failed recording is not replayable: preparation must produce a new
         // packet and the work owner decides whether its commands may be retried.
+        context.SetPreparedDependencies(m_storage->dependencies);
+        try {
+            m_storage->Record(context);
+            context.SetPreparedDependencies({});
+        }
+        catch (...) {
+            context.SetPreparedDependencies({});
+            throw;
+        }
+    }
+    // For a pass recorded at execution (ExternalPassDesc::recordAtExecution), asked just before its recording: whether it has
+    // nothing to do this run. Its recorder then records only the barriers around it and calls RecordNothing instead of Record.
+    // A pass decides from what the run's commit wrote by then (a typed pass's static SkipsAtExecution). It is never asked when
+    // recorded ahead, before the commit.
+    bool SkipsAtExecution(const RecordingContext& context) const {
+        return m_storage && m_storage->state.load(std::memory_order_acquire) == LifecycleState::Prepared && m_storage->SkipsAtExecution(context);
+    }
+    // The same question for a kept recording's pass recorded again at a later submission (RecordAgain). The pass was recorded
+    // (or skipped) once already, and it decides from what this run's commit wrote.
+    bool SkipsAgain(const RecordingContext& context) const {
+        return m_storage && m_storage->state.load(std::memory_order_acquire) == LifecycleState::Recorded && m_storage->SkipsAtExecution(context);
+    }
+    // A pass its host turned off for this execution (RenderGraphPass::SetSkipWhen, asked at preparation). Its recorder records
+    // only the barriers around it and calls RecordNothing instead of Record, whether it is recorded ahead or at execution.
+    void MarkSkippedAhead() const noexcept { if (m_storage) m_storage->skippedAhead = true; }
+    bool SkippedAhead() const noexcept { return m_storage && m_storage->skippedAhead; }
+    // Whether the pass's commands for a run depend on the run only through SkipsAtExecution's answer (a typed pass's
+    // kRecordKeyedBySkip). Then a list recorded for one answer can be submitted again for a run with the same answer.
+    bool KeyedBySkip() const noexcept { return m_storage && m_storage->KeyedBySkip(); }
+    // Consumes the packet as Record does, recording nothing (SkipsAtExecution). Its submission and completion follow as usual.
+    void RecordNothing() const {
+        if (!m_storage) throw std::logic_error("Legacy pass has no owned recording packet");
+        auto expected = LifecycleState::Prepared;
+        if (!m_storage->state.compare_exchange_strong(expected, LifecycleState::Recorded))
+            throw std::logic_error("Prepared pass already consumed");
+    }
+    // Records a replayable pass again, after Record, into another list and with the same data. This is for a late batch
+    // of a kept recording. Each execution records that batch into its host's list
+    // (PreparedRhiExecutionBatch::RecordDeferred). There is no state transition, because a replayable pass has no
+    // lifecycle to advance.
+    void RecordAgain(RecordingContext& context) const {
+        if (!m_storage) throw std::logic_error("Legacy pass has no owned recording packet");
+        if (!IsReplayable() || m_storage->state.load(std::memory_order_acquire) != LifecycleState::Recorded)
+            throw std::logic_error("Only a recorded replayable pass is recorded again");
         context.SetPreparedDependencies(m_storage->dependencies);
         try {
             m_storage->Record(context);
@@ -931,11 +904,15 @@ private:
         virtual void CommitSubmitted(SubmissionContext) const = 0;
         virtual void CommitCompleted(CompletionContext) const {}
         virtual void Abandon(AbandonReason) const {}
+        virtual bool HasCallbacks() const noexcept { return false; }
+        virtual bool SkipsAtExecution(const RecordingContext&) const { return false; }
+        virtual bool KeyedBySkip() const noexcept { return false; }
         mutable std::atomic<LifecycleState> state{LifecycleState::Prepared};
         mutable std::shared_ptr<const PreparedDependencySnapshot> dependencies;
         std::vector<ExternalTimelinePoint> externalSignals;
         mutable std::string debugName;
         bool workerSafe = false;
+        mutable bool skippedAhead = false;
     };
     template<class Data> struct Storage final : StorageBase {
         Storage(Data value, void (*fn)(const Data&, RecordingContext&), void (*onSubmitted)(const Data&) = nullptr)
@@ -944,6 +921,7 @@ private:
 		void CommitSubmitted(SubmissionContext) const override { if (submitted) submitted(*data); }
 		void CommitCompleted(CompletionContext) const override { data.reset(); }
 		void Abandon(AbandonReason) const override { data.reset(); }
+		bool HasCallbacks() const noexcept override { return submitted != nullptr; }
 		mutable std::optional<Data> data;
         void (*const record)(const Data&, RecordingContext&);
         void (*const submitted)(const Data&);
@@ -962,7 +940,49 @@ private:
 			if constexpr (requires { Derived::Abandoned(*data, reason); }) Derived::Abandoned(*data, reason);
 			data.reset();
         }
+        bool HasCallbacks() const noexcept override {
+            return requires(const Data& value, SubmissionContext submitted) { Derived::Submitted(value, submitted); }
+                || requires(const Data& value, CompletionContext completed) { Derived::Completed(value, completed); }
+                || requires(const Data& value, AbandonReason reason) { Derived::Abandoned(value, reason); };
+        }
+        bool SkipsAtExecution(const RecordingContext& context) const override {
+            if constexpr (requires(const Data& value, const RecordingContext& recording) {
+                { Derived::SkipsAtExecution(value, recording) } -> std::convertible_to<bool>;
+            }) return data && Derived::SkipsAtExecution(*data, context);
+            else return false;
+        }
+        bool KeyedBySkip() const noexcept override {
+            if constexpr (requires { Derived::kKeyedBySkip; }) return Derived::kKeyedBySkip;
+            else return false;
+        }
 		mutable std::optional<Data> data;
+    };
+    // The inner packet's storage is driven directly: the outer packet owns the lifecycle state and the dependencies.
+    struct TrailerStorage final : StorageBase {
+        void Record(RecordingContext& context) const override {
+            inner->Record(context);
+            trailer(context);
+        }
+        void CommitSubmitted(SubmissionContext context) const override {
+            inner->CommitSubmitted(context);
+            for (const auto& effect : effects) effect->Submitted(context);
+        }
+        void CommitCompleted(CompletionContext context) const override {
+            inner->CommitCompleted(context);
+            for (const auto& effect : effects) effect->Completed(context);
+            Release();
+        }
+        void Abandon(AbandonReason reason) const override {
+            inner->Abandon(reason);
+            for (const auto& effect : effects) effect->Abandoned(reason);
+            Release();
+        }
+        bool HasCallbacks() const noexcept override { return true; }
+        void Release() const { effects.clear(); keepAlive.reset(); }
+        std::shared_ptr<const StorageBase> inner;
+        std::function<void(RecordingContext&)> trailer;
+        mutable std::vector<std::shared_ptr<const PreparedLifecycleEffect>> effects;
+        mutable std::shared_ptr<const void> keepAlive;
     };
     std::shared_ptr<const StorageBase> m_storage;
 };

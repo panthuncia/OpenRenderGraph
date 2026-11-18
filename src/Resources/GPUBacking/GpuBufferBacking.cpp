@@ -19,20 +19,22 @@ GpuBufferBacking::GpuBufferBacking(
 	const bool unorderedAccess,
     const char* name,
     const BufferAliasPlacement* aliasPlacement,
-    const bool shared) {
+    const bool shared,
+    const rhi::ResourceFlags extraFlags) {
     m_accessType = accessType;
     if (aliasPlacement && !aliasPlacement->heap) throw std::invalid_argument("Missing alias heap owner");
 
     rhi::ResourceDesc desc = rhi::helpers::ResourceDesc::Buffer(bufferSize);
-    // Buffers are routinely touched from more than one queue (frame uploads,
-    // copy-queue streaming, readbacks) and carry no compression metadata that
-    // concurrent sharing could cost, so every graph buffer is concurrent: no
-    // Vulkan queue-family ownership transfers are needed for buffers, and D3D12
-    // ignores the flag.
+    // Buffers are often used from more than one queue, for example by frame
+    // uploads, copy-queue streaming and readbacks. They carry no compression
+    // metadata that concurrent sharing could cost. So every graph buffer is
+    // concurrent, and buffers need no Vulkan queue-family ownership transfers.
+    // D3D12 ignores the flag.
     desc.queueSharing = rhi::QueueSharing::Concurrent;
     if (unorderedAccess) {
         desc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
     }
+    desc.resourceFlags |= extraFlags;
     desc.heapType = accessType;
 	if (shared) {
 		desc.heapFlags = rhi::HeapFlags::Shared;
@@ -51,9 +53,13 @@ GpuBufferBacking::GpuBufferBacking(
     allocationBundle
         .Set<MemoryStatisticsComponents::MemSizeBytes>({ allocInfo.sizeInBytes })
         .Set<MemoryStatisticsComponents::ResourceType>({ rhi::ResourceType::Buffer })
+        .Set<MemoryStatisticsComponents::HeapKind>({ accessType })
         .Set<MemoryStatisticsComponents::ResourceID>({ owningResourceID });
     if (aliasPlacement && aliasPlacement->poolID.has_value()) {
         allocationBundle.Set<MemoryStatisticsComponents::AliasingPool>({ aliasPlacement->poolID });
+    }
+    if (aliasPlacement) {
+        allocationBundle.Set<MemoryStatisticsComponents::PlacedInAliasPool>({ aliasPlacement->poolID.value_or(0) });
     }
     trackDesc.attach = allocationBundle;
 
@@ -106,9 +112,9 @@ GpuBufferBacking::GpuBufferBacking(
 }
 
 GpuBufferBacking::~GpuBufferBacking() {
-    UnregisterLiveAlloc();
+    auto name = UnregisterLiveAlloc();
     if (m_bufferAllocation) {
-        DeletionManager::GetInstance().MarkForDelete(std::move(m_bufferAllocation));
+        DeletionManager::GetInstance().MarkForDelete(std::move(m_bufferAllocation), std::move(name));
     }
 }
 
@@ -156,10 +162,15 @@ void GpuBufferBacking::RegisterLiveAlloc() {
     liveAllocs[this] = info;
 }
 
-void GpuBufferBacking::UnregisterLiveAlloc() {
+std::string GpuBufferBacking::UnregisterLiveAlloc() {
     auto& liveAllocs = LiveAllocs();
     std::scoped_lock lock(LiveAllocMutex());
-	liveAllocs.erase(this);
+    std::string name;
+    if (auto it = liveAllocs.find(this); it != liveAllocs.end()) {
+        name = std::move(it->second.name);
+        liveAllocs.erase(it);
+    }
+    return name;
 }
 
 void GpuBufferBacking::UpdateLiveAllocName(const char* name) {

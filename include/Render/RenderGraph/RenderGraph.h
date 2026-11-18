@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Render/RenderGraph/FrameAliasArena.h"
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -8,17 +9,18 @@
 #include <memory>
 #include <optional>
 #include <variant>
+#include <functional>
 #include <span>
 #include <utility>
 #include <array>
+#include <atomic>
+#include <mutex>
 #include <algorithm>
 #include <spdlog/spdlog.h>
 #include <rhi.h>
 #include <BasicTelemetry/Tracy.h>
 
 #include "RenderPasses/Base/RenderPass.h"
-#include "RenderPasses/Base/ComputePass.h"
-#include "RenderPasses/Base/CopyPass.h"
 #include "Resources/ResourceStateTracker.h"
 #include "Interfaces/IResourceProvider.h"
 #include "Render/ResourceRegistry.h"
@@ -31,27 +33,32 @@
 #include "Render/Runtime/IDescriptorService.h"
 #include "Render/Runtime/IRenderGraphSettingsService.h"
 #include "Render/Runtime/ITaskService.h"
+#include "OpenRenderGraph/ExecutionHandle.h"
 #include "Render/Runtime/TaskServiceAccess.h"
 #include "Render/QueueKind.h"
+#include "Render/RunRef.h"
 #include "Render/QueueRegistry.h"
-#include "Render/RenderGraph/SharedAliasPoolManager.h"
 #include "Render/DeviceRegistry.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/TrackedAllocation.h"
 #include "Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.h"
-#include "Render/RenderGraph/ExecutionSchedule.h"
-#include "Render/RenderGraph/RenderGraphCompileProfile.h"
+#include "Render/RenderGraph/ScheduleTrace.h"
 #include "Interfaces/IResourceResolver.h"
+#include "Render/RenderGraph/RenderGraphExtension.h"
+
+namespace org::compiler { struct ExecutionTimelinePoint; struct PreparedTimelineBinding; }
 
 namespace org {
 
+class Runtime;
 class Resource;
 class RenderPassBuilder;
-class ComputePassBuilder;
-class CopyPassBuilder;
-class CommandRecordingManager;
-class FrameContext;
+class ExternalEpochExecution;
+class ExternalClient;
+class PersistentAliasArena;
+class AliasHeapGeneration;
+class IVersionedResource;
 struct IPassBuilder;
 struct IDynamicDeclaredResources;
 
@@ -96,289 +103,29 @@ constexpr PassRunMask& operator&=(PassRunMask& a, PassRunMask b) noexcept { retu
 constexpr PassRunMask& operator|=(PassRunMask& a, PassRunMask b) noexcept { return a = (a | b); }
 constexpr PassRunMask& operator^=(PassRunMask& a, PassRunMask b) noexcept { return a = (a ^ b); }
 
-enum class AutoAliasMode : uint8_t {
-	Off = 0,
-	Conservative = 1,
-	Balanced = 2,
-	Aggressive = 3
-};
-
-enum class AutoAliasPackingStrategy : uint8_t {
-	GreedySweepLine = 0,
-	BranchAndBound = 1,
-};
-
-namespace persistent { class GraphEditTransaction; class SelectedPublication; }
+namespace persistent { class GraphEditTransaction; class SelectedPublication; struct ExecutableGeneration; }
 
 class RenderGraph {
 public:
-	enum class ExternalInsertKind : uint8_t { Begin, End, Before, After };
-
-	struct ExternalInsertPoint {
-		int priority = 0;
-
-		// default: preserve extension-local emission order
-		bool keepExtensionOrder = true;
-
-		std::vector<std::string> after;   // anchor keys that must precede this pass
-		std::vector<std::string> before;  // anchor keys that must follow this pass
-
-		static ExternalInsertPoint Begin(int prio = 0) { ExternalInsertPoint p; p.priority = prio; p.before.push_back("__rg_begin__"); return p; }
-		static ExternalInsertPoint End(int prio = 0) { ExternalInsertPoint p; p.priority = prio; p.after.push_back("__rg_end__");   return p; }
-
-		static ExternalInsertPoint After(std::string a, int prio = 0) { ExternalInsertPoint p; p.priority = prio; p.after.push_back(std::move(a)); return p; }
-		static ExternalInsertPoint Before(std::string a, int prio = 0) { ExternalInsertPoint p; p.priority = prio; p.before.push_back(std::move(a)); return p; }
-
-		static ExternalInsertPoint Between(std::string a, std::string b, int prio = 0) {
-			ExternalInsertPoint p; p.priority = prio;
-			p.after.push_back(std::move(a));
-			p.before.push_back(std::move(b));
-			return p;
-		}
-
-		ExternalInsertPoint& AlsoAfter(std::string a) { after.push_back(std::move(a)); return *this; }
-		ExternalInsertPoint& AlsoBefore(std::string a) { before.push_back(std::move(a)); return *this; }
-	};
-
-	enum class PassType {
-		Unknown,
-		Render,
-		Compute,
-		Copy
-	};
-
-	struct ExternalPassDesc {
-		PassType type = PassType::Unknown;
-		std::string name;
-		std::string techniquePath;
-		std::optional<ExternalInsertPoint> where;
-		std::variant<std::monostate, std::shared_ptr<RenderPass>, std::shared_ptr<ComputePass>, std::shared_ptr<CopyPass>> pass;
-		std::shared_ptr<RenderGraphPass> unifiedPass;
-		std::optional<QueueKind> preferredQueueKind;
-		std::optional<QueueAssignmentPolicy> queueAssignmentPolicy;
-		std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot, bypassing queue preference
-
-		// Optional: if true, the pass will be registered in Get*PassByName().
-		bool registerName = true;
-		bool isGeometryPass = false; // Optional: opts pass into statistics tracking for rasterization
-		bool collectStatistics = true;
-		// Persistent execution: the host epoch the pass runs in (persistent::AllEpochs:
-		// every one). See SetPersistentEpochOrder.
-		uint32_t epoch = UINT32_MAX;
-		// Per-frame passes only. A frame-interrupting pass must run at its insert
-		// point even under the persistent graph, which hosts it in the main
-		// executable at the cost of a structural rebuild when it appears and when
-		// it goes away. Meant for rare debugging work (mid-frame readbacks); other
-		// per-frame passes run after the persistent main executable.
-		bool interruptsFrame = false;
-
-		static ExternalPassDesc Render(std::string name, std::shared_ptr<RenderPass> renderPass) {
-			ExternalPassDesc desc{};
-			desc.type = PassType::Render;
-			desc.name = std::move(name);
-			desc.pass = std::move(renderPass);
-			return desc;
-		}
-
-		static ExternalPassDesc Compute(std::string name, std::shared_ptr<ComputePass> computePass) {
-			ExternalPassDesc desc{};
-			desc.type = PassType::Compute;
-			desc.name = std::move(name);
-			desc.pass = std::move(computePass);
-			return desc;
-		}
-
-		// Queue semantics are declaration data, not inheritance. This overload lets
-		// unified/typed passes request compute without entering the legacy compute
-		// pass container or deriving from ComputePass.
-		static ExternalPassDesc Compute(std::string name, std::shared_ptr<RenderPass> computePass) {
-			ExternalPassDesc desc{};
-			// PassType remains an ingestion/compiler shape tag during the migration;
-			// actual execution queue is selected independently below.
-			desc.type = PassType::Render;
-			desc.name = std::move(name);
-			desc.unifiedPass = std::move(computePass);
-			desc.preferredQueueKind = QueueKind::Compute;
-			return desc;
-		}
-
-		static ExternalPassDesc Copy(std::string name, std::shared_ptr<CopyPass> copyPass) {
-			ExternalPassDesc desc{};
-			desc.type = PassType::Copy;
-			desc.name = std::move(name);
-			desc.pass = std::move(copyPass);
-			return desc;
-		}
-
-		static ExternalPassDesc Copy(std::string name, std::shared_ptr<RenderPass> copyPass) {
-			ExternalPassDesc desc{};
-			desc.type = PassType::Render;
-			desc.name = std::move(name);
-			desc.unifiedPass = std::move(copyPass);
-			desc.preferredQueueKind = QueueKind::Copy;
-			return desc;
-		}
-
-		ExternalPassDesc& At(ExternalInsertPoint insertPoint) & {
-			where = std::move(insertPoint);
-			return *this;
-		}
-
-		ExternalPassDesc At(ExternalInsertPoint insertPoint) && {
-			where = std::move(insertPoint);
-			return std::move(*this);
-		}
-
-		ExternalPassDesc& PreferQueue(QueueKind queueKind) & {
-			preferredQueueKind = queueKind;
-			queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-			return *this;
-		}
-
-		ExternalPassDesc PreferQueue(QueueKind queueKind) && {
-			preferredQueueKind = queueKind;
-			queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-			return std::move(*this);
-		}
-
-		ExternalPassDesc& AutomaticQueueAssignment() & {
-			queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
-			return *this;
-		}
-
-		ExternalPassDesc AutomaticQueueAssignment() && {
-			queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
-			return std::move(*this);
-		}
-
-		ExternalPassDesc& PinToQueue(QueueSlotIndex queueSlot) & {
-			pinnedQueueSlot = queueSlot;
-			return *this;
-		}
-
-		ExternalPassDesc PinToQueue(QueueSlotIndex queueSlot) && {
-			pinnedQueueSlot = queueSlot;
-			return std::move(*this);
-		}
-
-		ExternalPassDesc& RegisterByName(bool enabled = true) & {
-			registerName = enabled;
-			return *this;
-		}
-
-		ExternalPassDesc RegisterByName(bool enabled = true) && {
-			registerName = enabled;
-			return std::move(*this);
-		}
-
-		ExternalPassDesc& GeometryPass(bool enabled = true) & {
-			isGeometryPass = enabled;
-			return *this;
-		}
-
-		ExternalPassDesc GeometryPass(bool enabled = true) && {
-			isGeometryPass = enabled;
-			return std::move(*this);
-		}
-
-		ExternalPassDesc& Technique(std::string path) & {
-			techniquePath = std::move(path);
-			return *this;
-		}
-
-		ExternalPassDesc Technique(std::string path) && {
-			techniquePath = std::move(path);
-			return std::move(*this);
-		}
-
-		ExternalPassDesc& CollectStatistics(bool enabled = true) & {
-			collectStatistics = enabled;
-			return *this;
-		}
-
-		ExternalPassDesc CollectStatistics(bool enabled = true) && {
-			collectStatistics = enabled;
-			return std::move(*this);
-		}
-
-		ExternalPassDesc& Epoch(uint32_t value) & {
-			epoch = value;
-			return *this;
-		}
-
-		ExternalPassDesc Epoch(uint32_t value) && {
-			epoch = value;
-			return std::move(*this);
-		}
-
-		ExternalPassDesc& InterruptsFrame(bool enabled = true) & {
-			interruptsFrame = enabled;
-			return *this;
-		}
-
-		ExternalPassDesc InterruptsFrame(bool enabled = true) && {
-			interruptsFrame = enabled;
-			return std::move(*this);
-		}
-	};
-
-	struct IRenderGraphExtension {
-		virtual ~IRenderGraphExtension() = default;
-		virtual void PrepareForBuild(RenderGraph& rg) { (void)rg; }
-
-		// Called once from RenderGraph::Setup() after queue registry is populated.
-		// Extensions can create queues, allocate upload instances, etc.
-		virtual void Initialize(RenderGraph& rg) { (void)rg; }
-
-		// Called before renderer teardown waits on/destroys graph-owned work.
-		virtual void Shutdown(RenderGraph& rg) { (void)rg; }
-
-		// lets systems react to registry recreation without RenderGraph including them
-		virtual void OnRegistryReset(ResourceRegistry* /*registry*/) {}
-
-		// main hook: inject passes
-		virtual void GatherStructuralPasses(RenderGraph& rg, std::vector<ExternalPassDesc>& out) = 0;
-
-		// per-frame hook: inject ephemeral passes (e.g. readback captures)
-		// Default: no per-frame passes.
-		virtual void GatherFramePasses(RenderGraph& rg, std::vector<ExternalPassDesc>& out) { (void)rg; (void)out; }
-	};
+	// Timestamps in recordings kept for resubmission (SetPersistentRecordingTimestampMode).
+	enum class RecordingTimestampMode : uint8_t { Off, Passes, Lists };
+	// Declared at namespace scope (RenderGraphExtension.h), so extension headers need not include the graph.
+	using ExternalInsertKind = org::ExternalInsertKind;
+	using ExternalInsertPoint = org::ExternalInsertPoint;
+	using PassType = org::PassType;
+	using ExternalPassDesc = org::ExternalPassDesc;
+	using IRenderGraphExtension = org::IRenderGraphExtension;
 
 	inline bool Has(PassRunMask m, PassRunMask f) {
 		return (uint8_t(m) & uint8_t(f)) != 0;
 	}
 
-	struct RetainedDeclarationCache {
-		struct AnonymousSlotValidationEntry {
-			uint32_t anonymousSlot = 0;
-			uint32_t handleIndex = 0;
-		};
-
-		bool hasDynamicDeclaredResources = false;
-		IDynamicDeclaredResources* dynamicInterface = nullptr;
-
-		bool containsEphemeralOrAnonymousHandles = false;
-		bool requiresStaleHandleValidation = false;
-		std::vector<AnonymousSlotValidationEntry> staleHandleValidationStaticRequirementAnonymousEntries;
-		std::vector<AnonymousSlotValidationEntry> staleHandleValidationInternalTransitionAnonymousEntries;
-
-		uint64_t resolverSnapshotHash = 0;
-		uint64_t declarationGeneration = 0;
-		uint64_t declarationFingerprint = 0;
-		uint64_t synchronizationFingerprint = 0;
-		uint64_t staticAccessCacheKey = 0;
-		uint64_t retainedAccessCacheKey = 0;
-		bool incrementalResolverPatchable = false;
-		std::vector<ResourceRequirement> resolverIndependentRequirements;
-	};
-
-	struct ExternalOwnershipBarrier {
-		Resource* resource = nullptr;
-		ResourceState state{};
-		RangeSpec range{};
-		// Imported Vulkan images begin in UNDEFINED until their first ownership
-		// acquire. Later API handoffs are released through COMMON/GENERAL.
-		bool initialFromUndefined = false;
+	// How a pass's resolvers lower as persistent groups, decided when the pass declares (while its resolver snapshots
+	// still list their declared members): one requirement template list per resolver snapshot, and the declared members
+	// the groups cover. Absent when one of the resolvers is not patchable; they then lower as direct entries.
+	struct ResolverGroupPlan {
+		std::vector<std::vector<ResolverSnapshot::RequirementTemplate>> templates;
+		std::unordered_set<uint64_t> memberIDs;
 	};
 
 	struct PassAndResources {
@@ -390,6 +137,7 @@ public:
 		int statisticsIndex = -1;
 		bool collectStatistics = true;
 		uint32_t epoch = UINT32_MAX; // persistent::AllEpochs
+		bool recordAtExecution = false; // ExternalPassDesc::recordAtExecution
 
 		PassRunMask run = PassRunMask::Both; // default behavior
 		std::vector<std::byte> immediateBytecode; // Stores the immediate execution bytecode
@@ -397,310 +145,13 @@ public:
 		std::vector<std::shared_ptr<Resource>> retainedAnonymousKeepAlive; // Keeps retained anonymous handles alive across frames
 		std::vector<ResolverSnapshot> resolverSnapshots; // Versioned resolver snapshots for auto-invalidation
 		std::vector<ExternalTimelinePoint> explicitExternalWaitsBeforeTransitions;
-		RetainedDeclarationCache declarationCache;
-		std::vector<ResourceTransition> backendPreTransitions;
-		std::vector<ResourceTransition> backendPostTransitions;
-		std::vector<ExternalOwnershipBarrier> externalAcquires;
-		std::vector<ExternalOwnershipBarrier> externalReleases;
+		std::optional<ResolverGroupPlan> resolverGroupPlan;
 		std::shared_ptr<const org::imm::PreparedBufferCopies> preparedBufferCopies;
 	};
 
 	// Transitional tags preserve the current compiler variant while all three
 	// ingestion paths now share one queue-agnostic stored representation.
 	struct RenderPassAndResources : PassAndResources {};
-	struct ComputePassAndResources : PassAndResources {};
-	struct CopyPassAndResources : PassAndResources {};
-
-	enum class BatchWaitPhase : uint8_t {
-		BeforeTransitions = 0,
-		BeforeExecution = 1,
-		BeforeAfterPasses = 2,
-		Count
-	};
-
-	enum class BatchSignalPhase : uint8_t {
-		AfterTransitions = 0,
-		AfterExecution = 1,
-		AfterCompletion = 2,
-		Count
-	};
-
-	enum class BatchTransitionPhase : uint8_t {
-		BeforePasses = 0,
-		AfterPasses = 1,
-		Count
-	};
-
-	struct PassBatch {
-		static constexpr size_t kQueueCount = static_cast<size_t>(QueueKind::Count); // Legacy; prefer QueueCount()
-		static constexpr size_t kWaitPhaseCount = static_cast<size_t>(BatchWaitPhase::Count);
-		static constexpr size_t kSignalPhaseCount = static_cast<size_t>(BatchSignalPhase::Count);
-		static constexpr size_t kTransitionPhaseCount = static_cast<size_t>(BatchTransitionPhase::Count);
-		using QueuedPass = std::variant<RenderPassAndResources*, ComputePassAndResources*, CopyPassAndResources*>;
-
-		PassBatch(size_t queueCount = kQueueCount)
-			: queuePasses(queueCount) {
-			for (auto& v : queueTransitions) v.resize(queueCount);
-			externalWaitsBeforeTransitions.resize(queueCount);
-			externalWaitBindingsBeforeTransitions.resize(queueCount);
-			for (auto& p : queueWaitEnabled) p.assign(queueCount, std::vector<uint8_t>(queueCount, 0));
-			for (auto& p : queueWaitFenceValue) p.assign(queueCount, std::vector<UINT64>(queueCount, 0));
-			for (auto& p : queueSignalEnabled) p.assign(queueCount, 0);
-			for (auto& p : queueSignalFenceValue) p.assign(queueCount, 0);
-		}
-
-		void Reset(size_t queueCount = kQueueCount) {
-			queuePasses.resize(queueCount);
-			for (auto& passes : queuePasses) {
-				passes.clear();
-			}
-			for (auto& transitionsByQueue : queueTransitions) {
-				transitionsByQueue.resize(queueCount);
-				for (auto& transitions : transitionsByQueue) {
-					transitions.clear();
-				}
-			}
-			externalWaitsBeforeTransitions.resize(queueCount);
-			for (auto& waits : externalWaitsBeforeTransitions) {
-				waits.clear();
-			}
-			externalWaitBindingsBeforeTransitions.resize(queueCount);
-			for (auto& bindings : externalWaitBindingsBeforeTransitions) bindings.clear();
-			for (auto& waitsByDestination : queueWaitEnabled) {
-				waitsByDestination.resize(queueCount);
-				for (auto& waitsBySource : waitsByDestination) {
-					waitsBySource.resize(queueCount);
-					std::fill(waitsBySource.begin(), waitsBySource.end(), uint8_t{ 0 });
-				}
-			}
-			for (auto& waitsByDestination : queueWaitFenceValue) {
-				waitsByDestination.resize(queueCount);
-				for (auto& waitsBySource : waitsByDestination) {
-					waitsBySource.resize(queueCount);
-					std::fill(waitsBySource.begin(), waitsBySource.end(), UINT64{ 0 });
-				}
-			}
-			for (auto& signalEnabled : queueSignalEnabled) {
-				signalEnabled.resize(queueCount);
-				std::fill(signalEnabled.begin(), signalEnabled.end(), uint8_t{ 0 });
-			}
-			for (auto& signalFenceValue : queueSignalFenceValue) {
-				signalFenceValue.resize(queueCount);
-				std::fill(signalFenceValue.begin(), signalFenceValue.end(), UINT64{ 0 });
-			}
-			internallyTransitionedResources.clear();
-			allResources.clear();
-			if (passBatchTrackerEpoch == std::numeric_limits<uint32_t>::max()) {
-				std::fill(passBatchTrackerEpochsByResourceIndex.begin(), passBatchTrackerEpochsByResourceIndex.end(), 0);
-				passBatchTrackerEpoch = 1;
-			}
-			else {
-				++passBatchTrackerEpoch;
-			}
-		}
-
-		size_t QueueCount() const noexcept { return queuePasses.size(); }
-
-		std::vector<std::vector<QueuedPass>> queuePasses;
-		std::array<std::vector<std::vector<ResourceTransition>>, kTransitionPhaseCount> queueTransitions;
-		std::vector<std::vector<ExternalTimelinePoint>> externalWaitsBeforeTransitions;
-		std::vector<std::vector<ExternalTimelineBinding>> externalWaitBindingsBeforeTransitions;
-
-		// Resources that passes in this batch transition internally
-		// Cannot be batched with other passes which use these resources
-		// Ideally, would be tracked per-subresource, but that sounds hard to implement
-		// Kept sorted for O(log N) lookup via binary_search.
-		std::vector<uint64_t> internallyTransitionedResources;
-		std::vector<uint64_t> allResources; // All resources used in this batch, including those that are not transitioned internally
-
-		// Queue dependencies and signals are modeled as queue-to-queue edges per phase.
-		// queueWaitEnabled[phase][dstQueue][srcQueue] + queueWaitFenceValue[phase][dstQueue][srcQueue]
-		std::array<std::vector<std::vector<uint8_t>>, kWaitPhaseCount> queueWaitEnabled;
-		std::array<std::vector<std::vector<UINT64>>, kWaitPhaseCount> queueWaitFenceValue;
-
-		// queueSignalEnabled[phase][queue] + queueSignalFenceValue[phase][queue]
-		std::array<std::vector<uint8_t>, kSignalPhaseCount> queueSignalEnabled;
-		std::array<std::vector<UINT64>, kSignalPhaseCount> queueSignalFenceValue;
-
-		static constexpr size_t QueueIndex(QueueKind queue) noexcept {
-			return static_cast<size_t>(queue);
-		}
-
-		static constexpr size_t WaitPhaseIndex(BatchWaitPhase phase) noexcept {
-			return static_cast<size_t>(phase);
-		}
-
-		static constexpr size_t SignalPhaseIndex(BatchSignalPhase phase) noexcept {
-			return static_cast<size_t>(phase);
-		}
-
-		static constexpr size_t TransitionPhaseIndex(BatchTransitionPhase phase) noexcept {
-			return static_cast<size_t>(phase);
-		}
-
-		std::vector<QueuedPass>& Passes(QueueKind queue) {
-			return queuePasses[QueueIndex(queue)];
-		}
-
-		const std::vector<QueuedPass>& Passes(QueueKind queue) const {
-			return queuePasses[QueueIndex(queue)];
-		}
-
-		bool HasPasses(QueueKind queue) const {
-			return !Passes(queue).empty();
-		}
-
-		std::vector<ResourceTransition>& Transitions(QueueKind queue, BatchTransitionPhase phase) {
-			return queueTransitions[TransitionPhaseIndex(phase)][QueueIndex(queue)];
-		}
-
-		const std::vector<ResourceTransition>& Transitions(QueueKind queue, BatchTransitionPhase phase) const {
-			return queueTransitions[TransitionPhaseIndex(phase)][QueueIndex(queue)];
-		}
-
-		bool HasTransitions(QueueKind queue, BatchTransitionPhase phase) const {
-			return !Transitions(queue, phase).empty();
-		}
-
-		void SetQueueSignalFenceValue(BatchSignalPhase phase, QueueKind queue, UINT64 fenceValue) {
-			queueSignalFenceValue[SignalPhaseIndex(phase)][QueueIndex(queue)] = fenceValue;
-		}
-
-		UINT64 GetQueueSignalFenceValue(BatchSignalPhase phase, QueueKind queue) const {
-			return queueSignalFenceValue[SignalPhaseIndex(phase)][QueueIndex(queue)];
-		}
-
-		void MarkQueueSignal(BatchSignalPhase phase, QueueKind queue) {
-			queueSignalEnabled[SignalPhaseIndex(phase)][QueueIndex(queue)] = true;
-		}
-
-		void ClearQueueSignal(BatchSignalPhase phase, QueueKind queue) {
-			queueSignalEnabled[SignalPhaseIndex(phase)][QueueIndex(queue)] = false;
-		}
-
-		bool HasQueueSignal(BatchSignalPhase phase, QueueKind queue) const {
-			return queueSignalEnabled[SignalPhaseIndex(phase)][QueueIndex(queue)];
-		}
-
-		void AddQueueWait(BatchWaitPhase phase, QueueKind dstQueue, QueueKind srcQueue, UINT64 fenceValue) {
-			if (dstQueue == srcQueue) {
-				return;
-			}
-
-			auto& enabled = queueWaitEnabled[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)];
-			auto& maxFence = queueWaitFenceValue[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)];
-			enabled = true;
-			if (fenceValue > maxFence) {
-				maxFence = fenceValue;
-			}
-		}
-
-		void ClearQueueWait(BatchWaitPhase phase, QueueKind dstQueue, QueueKind srcQueue) {
-			queueWaitEnabled[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)] = false;
-			queueWaitFenceValue[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)] = 0;
-		}
-
-		bool HasQueueWait(BatchWaitPhase phase, QueueKind dstQueue, QueueKind srcQueue) const {
-			return queueWaitEnabled[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)];
-		}
-
-		UINT64 GetQueueWaitFenceValue(BatchWaitPhase phase, QueueKind dstQueue, QueueKind srcQueue) const {
-			return queueWaitFenceValue[WaitPhaseIndex(phase)][QueueIndex(dstQueue)][QueueIndex(srcQueue)];
-		}
-
-		// ---- Index-based overloads for N-queue support ----
-
-		std::vector<QueuedPass>& Passes(size_t qi) { return queuePasses[qi]; }
-		const std::vector<QueuedPass>& Passes(size_t qi) const { return queuePasses[qi]; }
-		bool HasPasses(size_t qi) const { return !queuePasses[qi].empty(); }
-
-		void AddExternalWaitBeforeTransitions(size_t qi, ExternalTimelinePoint wait) {
-			if (qi >= externalWaitsBeforeTransitions.size()) {
-				externalWaitsBeforeTransitions.resize(qi + 1);
-			}
-			externalWaitsBeforeTransitions[qi].push_back(wait);
-		}
-
-		const std::vector<ExternalTimelinePoint>& ExternalWaitsBeforeTransitions(size_t qi) const {
-			static const std::vector<ExternalTimelinePoint> empty;
-			return qi < externalWaitsBeforeTransitions.size() ? externalWaitsBeforeTransitions[qi] : empty;
-		}
-
-		void AddExternalWaitBindingBeforeTransitions(size_t qi, ExternalTimelineBinding binding) {
-			if (binding == InvalidExternalTimelineBinding) throw std::invalid_argument("Invalid external timeline binding");
-			if (qi >= externalWaitBindingsBeforeTransitions.size()) externalWaitBindingsBeforeTransitions.resize(qi + 1);
-			auto& bindings = externalWaitBindingsBeforeTransitions[qi];
-			if (std::find(bindings.begin(), bindings.end(), binding) == bindings.end()) bindings.push_back(binding);
-		}
-		const std::vector<ExternalTimelineBinding>& ExternalWaitBindingsBeforeTransitions(size_t qi) const {
-			static const std::vector<ExternalTimelineBinding> empty;
-			return qi < externalWaitBindingsBeforeTransitions.size() ? externalWaitBindingsBeforeTransitions[qi] : empty;
-		}
-
-		std::vector<ResourceTransition>& Transitions(size_t qi, BatchTransitionPhase phase) {
-			return queueTransitions[TransitionPhaseIndex(phase)][qi];
-		}
-		const std::vector<ResourceTransition>& Transitions(size_t qi, BatchTransitionPhase phase) const {
-			return queueTransitions[TransitionPhaseIndex(phase)][qi];
-		}
-		bool HasTransitions(size_t qi, BatchTransitionPhase phase) const {
-			return !queueTransitions[TransitionPhaseIndex(phase)][qi].empty();
-		}
-
-		void SetQueueSignalFenceValue(BatchSignalPhase phase, size_t qi, UINT64 fenceValue) {
-			queueSignalFenceValue[SignalPhaseIndex(phase)][qi] = fenceValue;
-		}
-		UINT64 GetQueueSignalFenceValue(BatchSignalPhase phase, size_t qi) const {
-			return queueSignalFenceValue[SignalPhaseIndex(phase)][qi];
-		}
-		void MarkQueueSignal(BatchSignalPhase phase, size_t qi) {
-			queueSignalEnabled[SignalPhaseIndex(phase)][qi] = 1;
-		}
-		void ClearQueueSignal(BatchSignalPhase phase, size_t qi) {
-			queueSignalEnabled[SignalPhaseIndex(phase)][qi] = 0;
-		}
-		bool HasQueueSignal(BatchSignalPhase phase, size_t qi) const {
-			return queueSignalEnabled[SignalPhaseIndex(phase)][qi] != 0;
-		}
-
-		void AddQueueWait(BatchWaitPhase phase, size_t dst, size_t src, UINT64 fenceValue) {
-			if (dst == src) return;
-			auto& enabled = queueWaitEnabled[WaitPhaseIndex(phase)][dst][src];
-			auto& maxFence = queueWaitFenceValue[WaitPhaseIndex(phase)][dst][src];
-			enabled = 1;
-			if (fenceValue > maxFence) maxFence = fenceValue;
-		}
-		void ClearQueueWait(BatchWaitPhase phase, size_t dst, size_t src) {
-			queueWaitEnabled[WaitPhaseIndex(phase)][dst][src] = 0;
-			queueWaitFenceValue[WaitPhaseIndex(phase)][dst][src] = 0;
-		}
-		bool HasQueueWait(BatchWaitPhase phase, size_t dst, size_t src) const {
-			return queueWaitEnabled[WaitPhaseIndex(phase)][dst][src] != 0;
-		}
-		UINT64 GetQueueWaitFenceValue(BatchWaitPhase phase, size_t dst, size_t src) const {
-			return queueWaitFenceValue[WaitPhaseIndex(phase)][dst][src];
-		}
-
-		void SetPassBatchTracker(size_t resourceIndex, size_t resourceCount, SymbolicTracker* tracker) {
-			if (passBatchTrackersByResourceIndex.size() < resourceCount) {
-				passBatchTrackersByResourceIndex.resize(resourceCount);
-				passBatchTrackerEpochsByResourceIndex.resize(resourceCount, 0);
-			}
-			passBatchTrackersByResourceIndex[resourceIndex] = tracker;
-			passBatchTrackerEpochsByResourceIndex[resourceIndex] = passBatchTrackerEpoch;
-		}
-
-		SymbolicTracker* GetPassBatchTracker(size_t resourceIndex) const {
-			return resourceIndex < passBatchTrackerEpochsByResourceIndex.size()
-				&& passBatchTrackerEpochsByResourceIndex[resourceIndex] == passBatchTrackerEpoch
-				? passBatchTrackersByResourceIndex[resourceIndex]
-				: nullptr;
-		}
-
-		std::vector<SymbolicTracker*> passBatchTrackersByResourceIndex; // Trackers for the resources in this batch
-		std::vector<uint32_t> passBatchTrackerEpochsByResourceIndex;
-		uint32_t passBatchTrackerEpoch = 1;
-	};
 
 	struct PresentDependency {
 		rhi::Queue queue;
@@ -710,12 +161,13 @@ public:
 		bool valid = false;
 	};
 
-	RenderGraph(rhi::Device device, rhi::Backend primaryBackend = rhi::Backend::Null);
+	// A graph on `runtime`'s device, using its services (until replaced with the Set*Service calls).
+	explicit RenderGraph(std::shared_ptr<Runtime> runtime);
+	Runtime& GetRuntime() const noexcept { return *m_runtime; }
 	DeviceInstanceId RegisterBackendDevice(rhi::Backend backend, rhi::Device device);
 	const DeviceRegistry& GetDeviceRegistry() const noexcept { return m_backendDevices; }
 	DeviceInstanceId GetPrimaryDeviceInstance() const noexcept { return m_backendDevices.PrimaryId(); }
 	~RenderGraph();
-	static void ShutdownRuntime();
 	using AutoAliasReasonCount = org::alias::AutoAliasReasonCount;
 	using AutoAliasExcludedResourceDebug = org::alias::AutoAliasExcludedResourceDebug;
 	using AutoAliasPoolRangeDebug = org::alias::AutoAliasPoolRangeDebug;
@@ -726,29 +178,22 @@ public:
 		ui::FrameGraphSnapshot& out,
 		const std::vector<org::memory::ResourceMemoryRecord>& memoryRecords) const;
 	void AddRenderPass(std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
-	void AddComputePass(std::shared_ptr<ComputePass> pass, ComputePassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
-	void AddCopyPass(std::shared_ptr<CopyPass> pass, CopyPassParameters& resources, std::string name = "", std::vector<ResolverSnapshot> resolverSnapshots = {});
-	void Update(const UpdateExecutionContext& context, rhi::Device device);
-	// Joins the single mutable preparation owner before host code touches
-	// transitional renderer state. Submission also performs this join.
-	void WaitForPreparation();
-	void Execute(PassExecutionContext& context);
 	// GPU ranges around every pass this graph records (a GPU profiler's, e.g. Telemetry/NvPerfCapture): used by an
 	// execution whose context brings none of its own, which is how a host that builds the context itself
-	// (PersistentGraphHost, persistent tickets) gets them. Set before executions that should carry them.
+	// (GraphHost, persistent tickets) gets them. Set before executions that should carry them.
 	using GpuPassRangeBegin = std::function<void(rhi::CommandList, rhi::Queue, const char* queueName, const char* passName)>;
 	using GpuPassRangeEnd = std::function<void(rhi::CommandList, rhi::Queue)>;
 	void SetGpuPassRangeCallbacks(GpuPassRangeBegin begin, GpuPassRangeEnd end) {
 		m_gpuPassRangeBegin = std::move(begin);
 		m_gpuPassRangeEnd = std::move(end);
 	}
-	// Persistent execution: the main graph runs from a selected persistent
-	// publication rebuilt only by explicit structural edits; truly dynamic passes
-	// run in per-frame Pre/Tail segments admitted through the same ledgers.
-	// Requires synchronous scheduling during migration.
-	enum class PersistentSegmentKind : uint8_t { Main, Pre, Tail };
-	struct PersistentExecutionState; // Defined in RenderGraphPersistent.cpp; opaque elsewhere.
-	void SetPersistentExecutionEnabled(bool enabled) noexcept { m_persistentExecution = enabled; }
+	// Persistent execution: the graph runs from a selected persistent publication, rebuilt only by structural edits.
+	// Upload passes (immediate-mode commands) are submitted through the external client before it.
+	// Its state (RenderGraphPersistentState.h, opaque elsewhere): the instance, the layout and the executions.
+	struct PersistentInstanceState;
+	struct PersistentLayoutState;
+	struct PersistentExecutionsState;
+	struct PersistentExecutionState;
 
 	// The calling thread's CPU time in the last persistent Execute, by phase. Diagnostics: a host that
 	// reports where an epoch's time goes reads it after Execute returns.
@@ -764,10 +209,64 @@ public:
 		uint32_t batches = 0;
 	};
 	const PersistentExecuteTimings& LastPersistentExecuteTimings() const noexcept { return m_lastPersistentExecuteTimings; }
-	bool PersistentExecutionEnabled() const noexcept { return m_persistentExecution; }
-	void SetPersistentSegment(std::string passName, PersistentSegmentKind kind) {
-		m_persistentSegmentKinds[std::move(passName)] = kind;
-	}
+	// Schedule introspection (ScheduleTrace.h), off by default. While on, the owner thread traces each executable it selects
+	// (the whole-frame one and each epoch's, once per executable: a steady frame builds nothing) and records what each execution
+	// waits for at submission beyond its batches' own waits, publishing snapshots of both. Off costs one relaxed load per
+	// preparation, execution and ticket completion. Any thread.
+	void SetScheduleTraceEnabled(bool enabled) noexcept;
+	bool ScheduleTraceEnabled() const noexcept;
+	// Any thread: the latest published snapshot; null while off, or before anything executed with it on.
+	std::shared_ptr<const PersistentScheduleSnapshot> GetPersistentScheduleSnapshot() const;
+	// The schedule of one epoch of the selected executable (UINT32_MAX: the whole frame's), traced now whether introspection is on
+	// or not: its passes in order with what each reads and writes. Null before the graph selected an executable, or for an epoch it
+	// has no split for. For an application that checks what its graphs read and write against each other once a graph is built
+	// (a graph from GraphHost::BuildEpochGraph has its first schedule). Any thread that owns the graph or holds it unattached.
+	std::shared_ptr<const ScheduleTrace> TraceSelectedSchedule(uint32_t epoch) const;
+	// What happens when a frame's binding edits change which slots share a backing (a resource swapped onto a backing
+	// another slot already uses, say). The compiler treats slots that share a backing as one resource, so this needs a
+	// new schedule, with the passes of both slots ordered and transitioned against each other.
+	// - Inline (default): the frame builds the new schedule before it prepares. The swap takes effect this frame.
+	// - Deferred: the frame keeps those slots' current bindings, and a worker builds the new schedule with the new ones.
+	//   They take effect when it installs, a frame or more later. Until then the graph still binds and orders the old
+	//   backings: a pass that reads its resources through declared views sees the old ones, consistently. A pass that
+	//   reads a resource's live descriptors directly would see the new backing without its barriers, and data written
+	//   into the new backing on the CPU isn't read until the install.
+	// Either way, edits replayed onto a worker build at its install that change these sets build inline.
+	enum class SharingChangePolicy : uint8_t { Inline, Deferred };
+	void SetSharingChangePolicy(SharingChangePolicy policy) noexcept { m_sharingChangePolicy = policy; }
+	SharingChangePolicy GetSharingChangePolicy() const noexcept { return m_sharingChangePolicy; }
+	// The frame-wait timeline: a timeline a host's producer of per-frame values signals, once per frame, after the values it
+	// wrote for that frame; every batch of an execution waits for the value set for it (SetFrameWaitValue here, or
+	// SubmitPersistentTicket's frameWait), so a late producer costs GPU idle, never a CPU wait. Set before the first execution:
+	// every packet prepared from then on can wait on it.
+	static constexpr uint64_t kFrameWaitTimelineIdentity = UINT64_MAX - 1;
+	void SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline) { m_frameWaitTimeline = std::move(timeline); }
+	bool HasFrameWaitTimeline() const noexcept { return m_frameWaitTimeline && *m_frameWaitTimeline; }
+	// The synchronous executions' wait (Execute): until changed. 0: none.
+	void SetFrameWaitValue(uint64_t value) noexcept { m_frameWaitValue = value; }
+	// Only the batches that declare a late-bound buffer ready at the frame wait (VersionedBuffer::LateReady::FrameWait) wait for
+	// it (GraphHost::Desc::scopedFrameWait). Off: every batch does.
+	void SetScopedFrameWait(bool scoped) noexcept { m_scopedFrameWait = scoped; }
+	bool ScopedFrameWait() const noexcept { return m_scopedFrameWait; }
+
+	// Tickets (GraphHost's async epochs) and their recordings, which the host's private calls below take and return.
+	struct PersistentTicket;
+	// A segment's recorded packets and what they were recorded for (the publication, bindings, heaps, host tag and every pass's
+	// revision). Shared, immutable once made.
+	struct PersistentRecording;
+	struct PersistentTicketSubmission {
+		bool submitted = false;
+		std::vector<uint64_t> signals;  // per batch of every segment, in order: the value it signalled
+		// The handoff and release lists the submission recorded: the host keeps them until its slot completes.
+		std::vector<std::shared_ptr<const void>> leases;
+		// An external epoch's ticket (SetExternalPersistentEpochs): its graphics batches were not submitted; they are the host's
+		// to execute, segment by segment, with their waits and signals (the values above among them).
+		std::shared_ptr<ExternalEpochExecution> external;
+	};
+
+	// Host-only (GraphHost, a friend): epochs, tickets, kept recordings and the settings they run under. An application
+	// drives graphs through GraphHost or GraphInstance, never through these.
+private:
 	// Host epochs (persistent execution). A host that submits the graph at several
 	// points of its own frame tags each pass with its epoch (ExternalPassDesc::Epoch)
 	// and names the execution order once. The graph compiles over the whole frame, so
@@ -780,48 +279,309 @@ public:
 	// its admission does not depend on what ran before. Set before the first frame.
 	void SetPersistentClosedExecutions(bool closed) noexcept { m_persistentClosedExecutions = closed; }
 	bool PersistentClosedExecutions() const noexcept { return m_persistentClosedExecutions; }
+	// Resting at last use (persistent::SynchronousAdmission::SetRestAtLastUse), for closed executions: each resource rests in the
+	// state its last use left it, not at home. Set before the first persistent preparation.
+	void SetPersistentRestAtLastUse(bool rest) noexcept { m_persistentRestAtLastUse = rest; }
+	bool PersistentRestAtLastUse() const noexcept { return m_persistentRestAtLastUse; }
+	// External home states (persistent::SynchronousAdmission::SetExternalHomeStates), an interop option: every execution gives
+	// each host-owned texture it touches (Resource::HostOwned) back in its home state on the graphics queue. Set before the first
+	// frame.
+	void SetPersistentExternalHomeStates(bool externalHome) noexcept { m_persistentExternalHomeStates = externalHome; }
+	bool PersistentExternalHomeStates() const noexcept { return m_persistentExternalHomeStates; }
+	// The alias pools the graph places its transients into (PersistentAliasArena), shared with the other graphs given the same
+	// arena. Without one the graph has pools of its own. Set before the first frame.
+	void SetPersistentAliasArena(std::shared_ptr<PersistentAliasArena> arena) noexcept { m_persistentAliasArena = std::move(arena); }
+	// The graph's transients go in ranges of a frame alias arena reserved for span (FrameAliasArena), one range per pool, instead
+	// of the persistent alias arena's pools. lane: the graph's epoch, so its builds may share bytes. Set before the first frame.
+	void SetFrameAliasRegion(std::shared_ptr<FrameAliasArena> arena, AliasSpan span, uint32_t lane) noexcept {
+		m_frameAliasArena = std::move(arena);
+		m_frameAliasSpan = span;
+		m_frameAliasLane = lane;
+	}
+	// Frame transients (GraphHost::AddFrameTransients): called at each alias plan with every resource the graph's passes use,
+	// before the plan places or binds anything, so before the graph executes. The host derives the frame transients' spans from
+	// it. It may throw: the plan fails then. Set before the first frame.
+	using FrameTransientObserver = std::function<void(std::span<Resource* const>)>;
+	void SetFrameTransientObserver(FrameTransientObserver observer) { m_frameTransientObserver = std::move(observer); }
+	// False while some of its placements are in a pool generation another graph has replaced (the pool grew): placed again, by a
+	// rebuild, they share the pool's memory again.
+	bool PersistentAliasPlacementsCurrent() const;
+	// From now on the graph keeps the backings it bound for the transients it placed, even when a resource now points at another backing.
+	// For a graph about to be replaced while its successor is recorded (GraphHost::StageEpochGraph): the successor's alias placement
+	// may move those transients, and this graph's kept recordings still bind the old backings. Its new preparations would read the
+	// moved resources' descriptors, so it records nothing new after this. Any thread that does not prepare the graph meanwhile.
+	void FreezeAliasedBindings();
+	// Owner thread: whether RecordPendingUploads would record anything now (IUploadService::HasPendingUploads). A host that
+	// gets false skips its upload lists and RecordPendingUploads for the ticket.
+	bool HasPendingUploads() const;
 
-	// Tickets (async epochs, PersistentGraphHost::EnableAsyncEpochs). The graph's owner thread prepares an
-	// epoch's main execution ahead of its epoch point - Update, invocations, admission, recording - into a
-	// ticket, for a frame slot it has waited for. The host's submitting thread later checks the ticket is
-	// still current, records the uploads queued since (RecordPendingUploads) and submits the ticket's
-	// packets, assigning their timeline values then, in submission order. The owner completes every ticket
-	// in that order, with those values, or abandons it. Requires closed executions (a ticket's admission
-	// must not depend on the executions around it) and no Pre/Tail passes other than the host's uploads.
-	struct PersistentTicket;
-	struct PersistentTicketSubmission {
-		bool submitted = false;
-		std::vector<uint64_t> signals;  // per batch of every segment, in order: the value it signalled
+	// Tickets (async epochs, GraphHost::EnableAsyncEpochs). The graph's owner thread prepares an
+	// epoch's main execution ahead of its epoch point - Update, invocations, recording - into a ticket, for a
+	// frame slot it has waited for; its body is recorded from a plan (SynchronousAdmission::PreparePlan), not an
+	// admission. The host's submitting thread later checks the ticket is still current, admits it
+	// (AdmitPersistentTicket: against the ledgers as they are then, under the sequencer, which it holds through
+	// the submission), records the uploads queued since (RecordPendingUploads) and submits the ticket
+	// (SubmitPersistentTicket: an open execution's handoff and release lists, then its packets, then the commit),
+	// assigning timeline values in submission order. The owner then completes the ticket (its statistics and
+	// retirement). Closed and open executions both work; no upload pass but the host's.
+	/**
+	 * @brief Owner thread, while no ticket is prepared (the host's async epochs stopped): the persistent epochs whose graphics
+	 * work the host executes itself, in its own command buffers (ExternalEpochExecution). Their tickets record their graphics
+	 * batches into secondary lists, and a pass of theirs recorded at execution (ExternalPassDesc::recordAtExecution) is recorded by
+	 * the host's execution; it must run on the graphics queue. Their batches on other queues are recorded and submitted as any
+	 * other ticket's. A recording of one with a pass recorded at execution is never kept for reuse.
+	 */
+	void SetExternalPersistentEpochs(std::vector<uint32_t> epochs);
+	bool IsExternalPersistentEpoch(uint32_t epoch) const noexcept;
+	/**
+	 * @brief Before CompileStructural: a pass recorded at execution (ExternalPassDesc::recordAtExecution) of an epoch that is not
+	 * external is recorded inline. Its late batch is recorded when the execution submits it, on the submitting thread (a ticket's:
+	 * after the run's commit), into a primary list of its queue's shared pool, with the admission's barriers before and after it,
+	 * and that list is submitted in the batch's place, with the batch's waits and signals. No secondary list, no extra submission,
+	 * any queue. For a host that owns its queues (no DXVK stream to run external epochs in). A kept recording's late batch is
+	 * recorded again at each submission (PreparedPass::RecordAgain), into the same list. Off (the default): such a pass must be an
+	 * external epoch's. GraphHost::SetInlineAtExecution sets it on every graph it builds.
+	 */
+	void SetInlineAtExecution(bool enabled) noexcept;
+	/**
+	 * @brief A ticket's consecutive batches on one queue go to that queue in one submission. The submission waits for all
+	 * their waits and signals the last batch's value. Their order in the queue and the barriers between them are unchanged.
+	 * GraphHost::Desc::coalesceSubmissions sets it on every graph it builds.
+	 */
+	void SetCoalescedSubmissions(bool enabled) noexcept { m_coalesceSubmissions = enabled; }
+	/**
+	 * @brief With coalesced submissions: the entry barriers of a queue submission's batches go into one handoff list, ahead of the
+	 * submission's first batch, instead of one list ahead of each batch. A batch's entry barriers touch only resources the batches
+	 * before it in the ticket do not use, and every wait of the submission comes before all of its lists, so moving them ahead is
+	 * safe. Barriers for a queue-family transfer, and those that discard or start from Undefined, stay ahead of their own batch.
+	 * GraphHost::Desc::mergeHandoffs sets it on every graph it builds.
+	 */
+	void SetMergedHandoffs(bool enabled) noexcept { m_mergeHandoffs = enabled; }
+	/**
+	 * @brief With coalesced submissions: a ticket's upload lists (SubmitPersistentTicket's TicketUploads) go in the ticket's first
+	 * queue submission when every batch of the ticket is on the uploads' queue, instead of in a submission of their own.
+	 * GraphHost::Desc::uploadsWithBatches sets it on every graph it builds.
+	 */
+	void SetUploadsWithBatches(bool enabled) noexcept { m_uploadsWithBatches = enabled; }
+	/**
+	 * @brief Under SetInlineAtExecution: a kept recording's late batch whose passes are all keyed by their skip answers
+	 * (PreparedPass::KeyedBySkip: gated copies and clears) submits its list again while those answers are unchanged, instead of
+	 * recording it at each submission. GraphHost::Desc::keepGatedInline sets it on every graph it builds.
+	 */
+	void SetKeptGatedInline(bool enabled) noexcept { m_keepGatedInline = enabled; }
+	bool InlineAtExecution() const noexcept { return m_inlineAtExecution; }
+	// A queue slot the host's stream runs: the graphics queue's, or one on the same native queue (a kind the device aliases to it).
+	// An external epoch's batches on it are the host's to execute, in its stream's order.
+	bool InHostStream(uint32_t slot) const noexcept;
+	// The secondary lists an external epoch's batches on that slot record into.
+	std::shared_ptr<CommandListPool> ExternalSecondaryPool(uint32_t slot);
+	// Owner thread. run: the run it is prepared for (GraphHost's run lease, or a published copy's run). Its lease index is the
+	// frame index of the run's statistics range, upload pages and preparation data, and the run is what its recording's
+	// RecordingContext::Run names. hostFrame numbers the execution (its statistics and lifecycle). hostTag: the host's currency
+	// tag the ticket is prepared under (SetPersistentTicketHostTag). hostData: what the passes prepare for
+	// (FramePreparationContext::preparationData), e.g. a scene revision; retained while it records. admissionOnly: the ticket
+	// carries the admission alone, and its recording is bound before submission (BindPersistentTicketRecording) - an epoch
+	// recorded ahead, for a revision (GraphHost::RequestEpochRecording).
+	std::shared_ptr<PersistentTicket> PreparePersistentTicket(rhi::Device device, uint32_t epoch, RunRef run, uint64_t hostFrame,
+		uint64_t hostTag = 0, std::shared_ptr<const IHostExecutionData> hostData = {}, bool admissionOnly = false);
+	// The ticket's recording (one segment), or null; the ticket keeps it.
+	static std::shared_ptr<const PersistentRecording> PersistentTicketRecording(const PersistentTicket& ticket) noexcept;
+	// Whether it may be submitted again and again (every pass replayable, recorded for resubmission).
+	static bool PersistentRecordingReplayable(const PersistentRecording& recording) noexcept;
+	// Any thread: whether every versioned slot it bound still has the version it was recorded with as its current one.
+	static bool PersistentRecordingVersionsCurrent(const PersistentRecording& recording) noexcept;
+	// Submitting thread: binds a recording made ahead (PreparePersistentTicket for the same epoch and slot) to an admission-only
+	// ticket. It must have been recorded for the ticket's publication, bindings, descriptor heaps and hostTag (the host's backing
+	// version now); otherwise false, with why, and the ticket unchanged. A revision ticket (PrepareRevisionTicket) instead takes the
+	// candidate admitted for exactly this recording, which needs no tag: the recording holds every backing it was recorded with.
+	static bool BindPersistentTicketRecording(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording, uint64_t hostTag,
+		std::string* why = nullptr);
+	// Whether BindPersistentTicketRecording would bind it, the ticket unchanged (the same rules; why, when not).
+	static bool CanBindPersistentTicketRecording(const PersistentTicket& ticket, const PersistentRecording& recording, uint64_t hostTag,
+		std::string* why = nullptr);
+	// Revision-driven epochs (immutable inputs). A recording made for host data (a revision) resolves the graph's resolvers through
+	// it (ResolverCaptureContext of IHostExecutionData), so its publication and bindings are the revision's own, and it holds them.
+	// Owner thread: a ticket for a published copy's run that prepares nothing from live state: its admissions are its candidates',
+	// one per recording it may be submitted with (AddPersistentTicketCandidate); the bind takes one, completion abandons the rest.
+	// retire: release the executions the GPU has finished first. A host whose own loop retires them already passes false.
+	std::shared_ptr<PersistentTicket> PrepareRevisionTicket(uint32_t epoch, RunRef run, uint64_t hostFrame, bool retire = true);
+	// Owner thread: admits the recording's publication as a candidate of the revision ticket. Lock-free against a bind on the
+	// submitting thread (an append-only list); a recording published to that thread after this call is always found.
+	void AddPersistentTicketCandidate(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording);
+	// Replayable recordings. A ticket's recording, when every pass of it is replayable (PreparedPass::IsReplayable) and its
+	// execution closed with nothing late-bound, is recorded for resubmission. Only a recording made for host data (a revision's
+	// published copy, GraphHost::RequestEpochRecording) is submitted again. A live ticket's recording is used once, and nothing
+	// keeps it. Replayable recordings have no profiler GPU zones, and no GPU statistics queries in the shared pool (recreated
+	// as passes register, and indexed by run): with SetPersistentRecordingTimestamps, each records into queries of its own.
+	void SetPersistentRecordingReuse(bool reuse) noexcept { m_persistentRecordingReuse = reuse; }
+	bool PersistentRecordingReuse() const noexcept { return m_persistentRecordingReuse; }
+	// Pass and barrier-batch timestamps in recordings kept for resubmission (off by default): each such list records into
+	// queries it owns (IStatisticsService::CreateOwnedTimestamps), resolved by every submission and read when its frame slot
+	// completes (IStatisticsService::GetCompletedTimestamps). Read when a list is recorded: set it before the graph records
+	// (GraphHost::SetRecordingTimestamps rebuilds the graph for it).
+	// Lists: one range per kept list (its entry barriers to its exit), no pass or barrier ranges: a stage's GPU time at about
+	// one drain per list instead of one per range.
+	void SetPersistentRecordingTimestamps(bool enabled) noexcept {
+		m_persistentRecordingTimestamps = enabled ? RecordingTimestampMode::Passes : RecordingTimestampMode::Off;
+	}
+	void SetPersistentRecordingTimestampMode(RecordingTimestampMode mode) noexcept { m_persistentRecordingTimestamps = mode; }
+	bool PersistentRecordingTimestamps() const noexcept { return m_persistentRecordingTimestamps != RecordingTimestampMode::Off; }
+	RecordingTimestampMode PersistentRecordingTimestampMode() const noexcept { return m_persistentRecordingTimestamps; }
+	struct PersistentRecordingStats {
+		uint64_t recorded = 0;    // tickets recorded (owner thread)
+		// Tickets admitted at submission with their prediction's plan (the ledger held what the executable found last), and those
+		// planned against the ledger (SynchronousAdmission::TakePredictionCounts).
+		uint64_t predicted = 0, planned = 0;
 	};
-	// Owner thread. hostFrame numbers the execution (its statistics and lifecycle).
-	std::shared_ptr<PersistentTicket> PreparePersistentTicket(rhi::Device device, uint32_t epoch, uint8_t slot, uint64_t hostFrame);
+	// Since the last call (any thread).
+	PersistentRecordingStats TakePersistentRecordingStats() noexcept;
 	// Returns the last value the submission signals on each queue slot it used (empty when abandoned).
 	std::vector<std::pair<uint32_t, uint64_t>> CompletePersistentTicket(PersistentTicket& ticket, const PersistentTicketSubmission& submission);
-	// Owner thread: releases executions the GPU has finished (the retirement Execute does before submitting).
-	void RetirePersistentExecutions();
+	// GPU completion values for one pass of retirement over several graphs. Each value is read once per timeline, because
+	// each read is a driver call and the host's graphs share their queue timelines. Clear it before each pass.
+	class CompletedTimelineValues {
+	public:
+		uint64_t Of(rhi::Timeline& timeline) {
+			for (const auto& [known, value] : m_values)
+				if (known == &timeline) return value;
+			const uint64_t value = timeline.GetCompletedValue();
+			m_values.emplace_back(&timeline, value);
+			return value;
+		}
+		void Clear() noexcept { m_values.clear(); }
+	private:
+		std::vector<std::pair<const rhi::Timeline*, uint64_t>> m_values;
+	};
+	// Owner thread: releases executions the GPU has finished (the retirement Execute does before submitting). A graph none of
+	// whose executions the GPU has reached returns at once. completed: the values read already in this pass, or null.
+	void RetirePersistentExecutions(CompletedTimelineValues* completed = nullptr);
 	// Submitting thread; they touch nothing the owner thread uses.
 	static uint32_t PersistentTicketEpoch(const PersistentTicket& ticket) noexcept;
-	static uint8_t PersistentTicketSlot(const PersistentTicket& ticket) noexcept;
+	// The run it was prepared for (PreparePersistentTicket, PrepareRevisionTicket).
+	static RunRef PersistentTicketRun(const PersistentTicket& ticket) noexcept;
 	static uint64_t PersistentTicketHostFrame(const PersistentTicket& ticket) noexcept;
-	// Every pass it prepared would still prepare the same invocation (RenderGraphPass::InvocationRevisionHash).
+	// The execution the ticket prepared. It is submitted, or poisoned, when the ticket completes (CompletePersistentTicket).
+	static ExecutionHandle PersistentTicketExecution(const PersistentTicket& ticket) noexcept;
+	// A value the host keeps with the ticket for its own currency checks (GraphHost: the backing version it was
+	// prepared under). Set by the owner thread before the ticket is published.
+	static uint64_t PersistentTicketHostTag(const PersistentTicket& ticket) noexcept;
+	static void SetPersistentTicketHostTag(PersistentTicket& ticket, uint64_t tag) noexcept;
+	// After RecordPendingUploads planned the ticket's uploads by queue: its batches off the graphics queue that will not wait for
+	// the graphics queue's uploads (statistics); 0 when not planned.
+	static uint32_t PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept;
+	// After RecordPendingUploads planned the ticket's uploads by queue (statistics; zeros when not planned):
+	// - lateRouted, lateWaits: its destinations that are a late-bound version's backing (VersionedBuffer::CreateLateBound) that went to a
+	//   declaring batch's queue, and those a batch off the graphics queue waits for;
+	// - undeclared: its destinations no batch declares. Each one made every batch off the graphics queue wait.
+	struct TicketUploadStats {
+		uint32_t lateRouted = 0, lateWaits = 0, undeclared = 0;
+	};
+	static TicketUploadStats PersistentTicketUploadStats(const PersistentTicket& ticket) noexcept;
+	// Every pass it prepared would still prepare the same invocation (RenderGraphPass::RevisionHash).
 	static bool PersistentTicketCurrent(const PersistentTicket& ticket);
+	// What a segment list's signature would take from an admitted ticket: its recordings (each a kept or new recording's
+	// identity) and its admission plans. planned is false when a segment of it was admitted against the ledgers, not by a plan
+	// it predicted: such a ticket's barriers would differ from a kept segment list's.
+	struct PersistentTicketKey {
+		uint64_t recordings = 0;
+		uint64_t plans = 0;
+		bool planned = true;
+		// Barriers (diagnostics): the entry barriers its admission planned (handoffs, releases and acquires), and the barriers its
+		// recordings' bodies record (PersistentRecording::bodyBarriers, bodyFullBarriers).
+		uint64_t entryBarriers = 0, bodyBarriers = 0, bodyFullBarriers = 0;
+	};
+	static PersistentTicketKey PersistentTicketKeyOf(const PersistentTicket& ticket) noexcept;
+	// Why a ticket is not current (diagnostics): the first unchecked pass, or the first pass whose revision changed.
+	static std::string PersistentTicketStaleReason(const PersistentTicket& ticket);
 	// Submits the packets with values from nextQueueValues (the last value assigned per queue slot, advanced
 	// here). Returns false when a packet failed.
-	static bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out);
+	// uploadsDone: the queue slot and value that signal the uploads recorded ahead of the ticket (RecordPendingUploads), when
+	// there are any. They precede the ticket on their own queue only, so a batch on another queue waits for them: every such
+	// batch, unless RecordPendingUploads planned the ticket's uploads by queue (queueLists), and then only a batch that uses
+	// what they write. The uploads it recorded on another queue go to that queue just ahead of its first batch there.
+	// frameWait: the frame-wait timeline's value (SetFrameWaitTimeline) every batch waits for; 0 for none.
+	// An external epoch's ticket (out.external) submits its batches off the graphics queue here and gives the rest to its host
+	// (ExternalEpochExecution). streamUploads: its graphics-queue uploads were recorded for the host's stream, ahead of its first
+	// segment. A batch off the graphics queue that uses them waits for a segment of their own (the first).
+	// carry (coalesced submissions only): several tickets submitted back to back, holding the sequencer across them, share queue
+	// submissions. This ticket's first group of batches joins the group the carry holds when both are on one queue and the new group
+	// waits for nothing the held one does not. Any other submission of this ticket submits the held group first. carryOut: this
+	// ticket's last group is held in the carry instead of submitted, for the next ticket to join. FlushSubmitCarry submits it.
+	struct SubmitCarry;
+	// The ticket's upload lists, recorded by the caller, for SubmitPersistentTicket to submit before its batches. They signal `signal`
+	// on their queue's timeline. With SetUploadsWithBatches they go in the ticket's first queue submission when they can; otherwise
+	// in a submission of their own, before anything else of the ticket.
+	struct TicketUploads {
+		std::span<const rhi::CommandList> lists;
+		rhi::Queue queue{};
+		uint32_t queueSlot = UINT32_MAX;
+		rhi::TimelinePoint signal{};
+		bool withBatches = false;  // set when they went in the ticket's first submission
+	};
+	bool SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
+		std::pair<uint32_t, uint64_t> uploadsDone = {UINT32_MAX, 0}, uint64_t frameWait = 0, bool streamUploads = false,
+		SubmitCarry* carry = nullptr, bool carryOut = false, TicketUploads* uploads = nullptr);
+	// A carry for SubmitPersistentTicket, and its submission. FlushSubmitCarry submits the group the carry holds (nothing when it
+	// holds none). Its batches were committed as submitted when they were held. False when the queue refused it. merged: how many
+	// tickets' groups it held.
+	static std::shared_ptr<SubmitCarry> MakeSubmitCarry();
+	static bool FlushSubmitCarry(SubmitCarry& carry, uint32_t* merged = nullptr);
+	// The tickets whose held group the next ticket's joined, since the last call.
+	static uint64_t TakeSubmitCarryJoins(SubmitCarry& carry) noexcept;
+	// Submitting thread, holding the sequencer (HoldPersistentSequencer) until the ticket is submitted: admits each of the
+	// ticket's segments against the ledgers as they are now. queueValues: what the host has submitted on each queue slot.
+	void AdmitPersistentTicket(PersistentTicket& ticket, std::span<const uint64_t> queueValues);
+	// An admitted ticket that will not be submitted: its admissions go (holding the sequencer).
+	void AbandonPersistentTicketAdmission(PersistentTicket& ticket);
+	std::unique_lock<std::recursive_mutex> HoldPersistentSequencer() const;
 	// Submitting thread (the upload service's owner): records the uploads queued since the last call into
 	// `list` as plain buffer copies, without the graph's registry or admission: a full barrier (against the
 	// work before them), then the copies, whose destinations are left for the next execution's entry
-	// barrier - so the list must precede a closed execution on its queue.
+	// barrier. The list ends with a full barrier, so the execution after it on its queue sees the copies.
 	// keepAlive owns the staging they read until the GPU is done with the slot. False when an upload is not
 	// a pointer-targeted buffer copy (the caller must use the synchronous path).
-	bool RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint8_t slot, std::shared_ptr<void>& keepAlive, bool& recorded);
+	// recordedLists receives, first, the lists of batches their producers recorded (IUploadService::SubmitRecordedUploads),
+	// which go to the queue ahead of `list`, as they are: each starts with its own full barrier, and `list` starts with one
+	// whenever it records a copy.
+	// Queue-scoped uploads (ticket and queueLists given): queueLists holds, per queue slot, an open list of that queue (an empty
+	// handle for none; the graphics slot's is ignored). A staged upload whose destination the ticket first uses on another queue -
+	// with every batch that uses it ordered after that queue's first batch, and nothing in `list` or the recorded lists touching it -
+	// is recorded into that queue's list instead (after a full barrier against the work before it on that queue), which
+	// SubmitPersistentTicket submits just ahead of the queue's first batch, with the waits a write into the destination needs
+	// against earlier executions. The plan also records which batches on other queues use what `list` and the recorded lists
+	// write: only they wait for uploadsDone (all of them when a destination there is not known). `recorded` then means that
+	// `list` itself took a copy; queueCopies, when given, receives the copies recorded into queueLists. Without a ticket or
+	// queueLists, everything goes into `list` and every batch on another queue waits, as before.
+	bool RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint32_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
+		std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket = nullptr, std::span<rhi::CommandList> queueLists = {},
+		size_t* queueCopies = nullptr);
+	// RecordPendingUploads in two parts, for a host whose submissions run on another thread than the commits that queue uploads.
+	// TakePendingUploads runs on the upload service's owner thread, right after the commit: it takes everything the service holds
+	// for the next submission. Uploads queued later wait for the next take. RecordTakenUploads records what was taken, later and
+	// on any thread, by RecordPendingUploads' rules.
+	struct TakenUploads {
+		std::vector<rhi::CommandList> recordedLists;       // the producers' recorded lists
+		std::vector<rhi::ResourceHandle> graphicsBuffers;  // what those lists and the upload pass's copies write
+		bool graphicsKnown = true;                         // false: those lists may write anything
+		std::function<void(rhi::CommandList&)> recordCopies;  // records the upload pass's copies; null when it queued none
+		std::shared_ptr<void> keepAlive;                      // the staging those copies read
+		std::vector<std::shared_ptr<runtime::StagedUploadBatch>> staged;  // the staged batches, in order
+		bool supported = true;  // false: an upload is not a pointer-targeted buffer copy
+		bool Any() const noexcept { return !recordedLists.empty() || recordCopies || !staged.empty(); }
+	};
+	TakenUploads TakePendingUploads(rhi::Device device, uint32_t slot);
+	bool RecordTakenUploads(TakenUploads& taken, rhi::CommandList& list, std::shared_ptr<void>& keepAlive, bool& recorded,
+		std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket = nullptr, std::span<rhi::CommandList> queueLists = {},
+		size_t* queueCopies = nullptr);
 	// The epoch the next Update/Execute runs; persistent::AllEpochs runs every pass.
 	void SetPersistentEpoch(uint32_t epoch) noexcept { m_persistentEpoch = epoch; }
 	uint32_t PersistentEpoch() const noexcept { return m_persistentEpoch; }
 	// Whether a pass of that epoch takes part in the current execution.
 	bool RunsInPersistentEpoch(uint32_t passEpoch) const noexcept {
-		return !m_persistentExecution || m_persistentEpoch == UINT32_MAX || passEpoch == UINT32_MAX || passEpoch == m_persistentEpoch;
+		return m_persistentEpoch == UINT32_MAX || passEpoch == UINT32_MAX || passEpoch == m_persistentEpoch;
 	}
+
+public:
 	// Hosts that share a queue with another API (for example an adopted DXVK
 	// VkQueue whose translated D3D11 work is submitted before and after the graph)
 	// order that work against the graph with full memory barriers: `entry` at the
@@ -838,14 +598,8 @@ public:
 	};
 	void SetExternalQueueBoundary(ExternalQueueBoundary boundary) noexcept { m_externalQueueBoundary = boundary; }
 	ExternalQueueBoundary GetExternalQueueBoundary() const noexcept { return m_externalQueueBoundary; }
-	// Async producer/admission handshake. True asks the host to prepare another
-	// logical frame before blocking for the exact queue head.
-	bool ShouldDeferAsyncAdmission();
 	std::optional<uint32_t> GetLastExecutedPreparationSlot() const noexcept;
 	std::shared_ptr<const IHostExecutionData> GetLastSubmittedFrameData() const noexcept;
-	void CompileStructural();
-	void ResetForFrame();
-	void ResetForRebuild();
 	void PrepareExtensionsForBuild();
 	void ShutdownExtensions();
 	// Serialized producer boundary. Joins CPU frame work without releasing
@@ -853,18 +607,38 @@ public:
 	void StopFrameProduction();
 	// Requires GPU idle. Releases frame ownership after CPU production stopped.
 	void ShutdownTaskWorkers();
+	// The runtime's services for those this graph has none of (never set, or dropped by a rebuild).
+	void UseRuntimeServices();
 	void ClearExtensions();
-	void Setup();
-	// Registers every compiled pass that collects statistics and has no index yet (names dedupe).
-	void RegisterFramePassStatistics();
 	void RegisterExtension(std::unique_ptr<IRenderGraphExtension> ext, std::optional<std::string_view> id = std::nullopt);
-	const std::vector<PassBatch>& GetBatches() const { return batches; }
 	std::optional<PresentDependency> GetLastPresentDependency() const noexcept { return m_lastPresentDependency; }
-	void ConfirmPresentationTailSubmission();
+	// The latest execution (Execute, or the one a ticket prepared). Empty before the first. Owner thread.
+	ExecutionHandle LastExecution() const;
+	// The pass that leaves the swapchain image ready to present. The signal of its batch is the present dependency
+	// (GetLastPresentDependency). Passes that must run after it anchor on GetPresentPass(). Work after the graph that
+	// reads its output (a presentation copy) submits through GetExternalClient(), which orders it after the frame.
+	void SetPresentPass(std::string name) { m_presentPass = std::move(name); }
+	const std::string& GetPresentPass() const noexcept { return m_presentPass; }
+	// The swapchain image. It must be a DynamicResource that points at the image being rendered. The graph treats it as a
+	// versioned resource whose version for each preparation is the image the wrapper points at then (SwapchainVersions).
+	// Recordings that bind it are never kept for reuse (IVersionedResource::PerFrame).
+	void SetSwapchainResource(std::shared_ptr<Resource> resource);
+	bool IsSwapchainResource(const Resource* resource) const noexcept { return resource && resource == m_swapchain.get(); }
+	// The swapchain as a versioned resource. Null without one.
+	const std::shared_ptr<const IVersionedResource>& SwapchainVersions() const noexcept { return m_swapchainVersions; }
 	org::memory::SnapshotProvider& GetMemorySnapshotProvider() { return m_memorySnapshotProvider; }
 	const org::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
-	void WriteVramUsageDebugDumpNow(uint8_t frameIndex) const { WriteVramUsageDebugDump(frameIndex); }
+	void WriteVramUsageDebugDumpNow(uint32_t frameIndex) const { WriteVramUsageDebugDump(frameIndex); }
 	void SetStatisticsService(std::shared_ptr<org::runtime::IStatisticsService> service) { m_statisticsService = std::move(service); }
+	// Whether the graph drives the runtime's frame-indexed services: statistics query slots, persistent readback captures and
+	// readback completion polling. One graph on a runtime does (the per-frame one) until those services are per execution
+	// (docs/job-graphs.md, Phase 3); a graph executing alongside it (a job graph, on another thread) does not: it records no
+	// statistics, places no captures and leaves readback completions to that graph. Set before Setup.
+	void SetDrivesFrameServices(bool drives) {
+		m_drivesFrameServices = drives;
+		if (!drives) m_statisticsService.reset();
+	}
+	bool DrivesFrameServices() const noexcept { return m_drivesFrameServices; }
 	org::runtime::IStatisticsService* GetStatisticsService() { return m_statisticsService.get(); }
 	const org::runtime::IStatisticsService* GetStatisticsService() const { return m_statisticsService.get(); }
 	void SetUploadService(std::shared_ptr<org::runtime::IUploadService> service) { m_uploadService = std::move(service); }
@@ -885,12 +659,9 @@ public:
 	const org::runtime::IRenderGraphSettingsService* GetRenderGraphSettingsService() const { return m_renderGraphSettingsService.get(); }
 	void SetTaskService(std::shared_ptr<org::runtime::ITaskService> service) {
 		m_taskService = std::move(service);
-		org::runtime::SetDefaultTaskService(m_taskService);
 	}
 	org::runtime::ITaskService* GetTaskService() { return m_taskService.get(); }
 	const org::runtime::ITaskService* GetTaskService() const { return m_taskService.get(); }
-	void SetCompileProfileEnabled(bool enabled) noexcept;
-	bool GetCompileProfileEnabled() const noexcept { return m_compileProfileEnabled; }
 	void SetStructuralMaterializeCheckpointCallback(std::function<void(std::string_view)> callback) {
 		m_structuralMaterializeCheckpointCallback = std::move(callback);
 	}
@@ -901,8 +672,10 @@ public:
 	//void CreateResource(std::wstring name);
 	std::shared_ptr<Resource> GetResourceByName(const std::string& name);
 	std::shared_ptr<Resource> GetResourceByID(const uint64_t id);
+	// The resource a persistent executable schedules under this identity (ScheduleTrace::Resource::id), for a debug capture;
+	// null when none does.
+	std::shared_ptr<Resource> GetScheduledResource(uint64_t schedulingID) const;
 	std::shared_ptr<RenderPass> GetRenderPassByName(const std::string& name);
-	std::shared_ptr<ComputePass> GetComputePassByName(const std::string& name);
 
 	void RegisterProvider(IResourceProvider* prov);
 	void EnsureProviderRegistered(IResourceProvider* prov);
@@ -925,15 +698,19 @@ public:
 	std::shared_ptr<Resource> RequestResourcePtr(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(Resource* const& pResource, bool allowFailure = false);
+	/**
+	 * @brief Any thread: whether this graph looked rid up by name (RequestResourcePtr, RequestResourceHandle), found or not. A host
+	 * that changes what a name means rebuilds only the graphs that looked it up (GraphHost::RequestRebuildFor).
+	 */
+	bool LookedUp(ResourceIdentifier const& rid) const;
 	// Intern the concrete resources from one coherent resolver snapshot once per
 	// resource set.  Retained passes commonly share the same resolver and would
 	// otherwise repeat thousands of registry lookups during a loading frame.
 	std::shared_ptr<const std::vector<ResourceHandleAndRange>>
 		RequestResolverResourceHandles(const ResolverDeclarationState& state);
-    std::shared_ptr<const ResolverDeclarationState> CaptureResolverDeclarationState(const IResourceResolver& resolver) const {
-        return m_resolverCaptureContext ? resolver.CaptureDeclarationState(*m_resolverCaptureContext)
-            : resolver.CaptureDeclarationState();
-    }
+    // Within a ResolverCaptureScope, every capture of one resolver (by dependency identity) returns the scope's first.
+    std::shared_ptr<const ResolverDeclarationState> CaptureResolverDeclarationState(const IResourceResolver& resolver) const;
+    using ResolverCaptureScope = org::ResolverCaptureScope;
 
 	//void RegisterECSRenderPhaseEntities(const std::unordered_map<RenderPhase, flecs::entity, RenderPhase::Hasher>& phaseEntities);
 
@@ -964,12 +741,6 @@ public:
 	}
 
 	template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-	ComputePassBuilder& BuildComputePass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
-
-	template<typename PassT, typename... StableCtorArgs>
-	ComputePassBuilder& BuildComputePass(std::string const& name, StableCtorArgs&&... ctorArgs);
-
-	template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
 	RenderPassBuilder& BuildRenderPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
 
 	template<typename PassT, typename... StableCtorArgs>
@@ -987,12 +758,8 @@ public:
 	RenderPassBuilder& BuildPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
 		return BuildRenderPass<PassT>(name, std::forward<StableCtorArgs>(ctorArgs)...);
 	}
-
-	template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-	CopyPassBuilder& BuildCopyPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs);
-
-	template<typename PassT, typename... StableCtorArgs>
-	CopyPassBuilder& BuildCopyPass(std::string const& name, StableCtorArgs&&... ctorArgs);
+	// The builder of a pass built since the last reset, for settings applied after the fact (placement). Null if none.
+	RenderPassBuilder* FindPassBuilder(std::string const& name);
 
 	/// Create a new queue of the given kind and register it with the render graph.
 	/// Must be called after Setup() and before the first Execute().
@@ -1008,20 +775,82 @@ public:
 	/// Access the queue registry (read-only).
 	const QueueRegistry& GetQueueRegistry() const noexcept { return m_queueRegistry; }
 	QueueRegistry& GetQueueRegistry() noexcept { return m_queueRegistry; }
+	// Before Setup: the primary queues' timelines (graphics, compute, copy, in that order) come from another registry
+	// (QueueRegistry::SharedTimelineOf), so this graph's work and the other graph's share them. Executions of graphs on one
+	// queue's timeline need no waits on each other there; the ledger drops a wait on the consumer's own timeline. The graph
+	// neither waits on nor retires shared timelines when it goes. Empty: timelines of its own.
+	void SetSharedQueueTimelines(std::vector<SharedQueueTimeline> timelines) { m_sharedQueueTimelines = std::move(timelines); }
+	// Before CompileStructural: the graph takes only the passes of this host epoch (ExternalPassDesc::epoch) and the untagged
+	// ones from its extensions, so it compiles, admits and executes that epoch alone (GraphHost: one graph per epoch).
+	// persistent::AllEpochs (the default) takes every pass.
+	void SetPassEpochFilter(uint32_t epoch) noexcept { m_passEpochFilter = epoch; }
+	uint32_t PassEpochFilter() const noexcept { return m_passEpochFilter; }
+	// Whether the graph's epoch (PassEpochFilter) is an external one, whose graphics work the host runs in its own stream. Its
+	// extensions may then declare passes recorded at execution (ExternalPassDesc::RecordAtExecution). GraphHost sets this before
+	// it builds the graph, so an extension can read it while it gathers its passes.
+	bool PassEpochInHostStream() const noexcept { return IsExternalPersistentEpoch(m_passEpochFilter); }
+	// Whether a pass of the graph's epoch declared RecordAtExecution is recorded at execution: in the host's stream (an external
+	// epoch) or inline at submission (SetInlineAtExecution). Otherwise an extension records it ahead, as any other pass.
+	bool PassEpochRecordsAtExecution() const noexcept { return PassEpochInHostStream() || m_inlineAtExecution; }
+
+	/// The graph's external client (OpenRenderGraph/ExternalClient.h). Use it to submit GPU work recorded outside the
+	/// graph, such as uploads and readbacks. It uses this graph's queue slots, and its work is ordered with the graph's
+	/// executions in submission order. The graph's own uploads go through it too.
+	/// Created on first use. Call it after Setup. Any thread.
+	ExternalClient& GetExternalClient();
 
 private:
+	// Driving the graph is GraphHost's: its declared-graph calls (Build, PrepareFrame, ExecuteFrame)
+	// or its own frames.
+	friend class GraphHost;
+	friend class GraphInstance;
+	// The executable of the selected publication. Null before the first preparation. Owner thread.
+	std::shared_ptr<const persistent::ExecutableGeneration> SelectedExecutable() const;
+	void CompileStructural();
+	void ResetForFrame();
+	void ResetForRebuild();
+	void Setup();
+	// Builds off the owner thread (GraphHost::BuildEpochGraph). Setup leaves out the steps that touch objects other graphs share
+	// while those graphs run:
+	// - sizing the shared statistics query heap,
+	// - setting up the named passes, whose pass objects every graph of the runtime shares (the host's upload pass).
+	// FinishSharedSetup runs them later, on the owner thread, while nothing else uses those objects. Call before Setup.
+	void DeferSharedSetup(std::vector<std::string> sharedPasses) {
+		m_sharedSetupDeferred = true;
+		m_sharedSetupPasses = std::move(sharedPasses);
+	}
+	void FinishSharedSetup();
+	// The work the first preparation would otherwise do inline: lower every pass, request its pipelines and wait for them, and
+	// build and install the first publication (its schedule). After Setup, before the first preparation. Any thread that owns the
+	// graph alone. A graph already prepared is left as it is.
+	// The alias placement is left to the first preparation (PlaceDeferredPersistentAliases): placing re-materializes the transients,
+	// and those resource objects are shared with the graph the epoch still runs (and with any other build of it in flight), whose
+	// next preparation would then find its bindings moved under it.
+	void PrepareFirstPersistentBuild();
+	// How the next execution runs (RenderGraphPersistentState.h, PersistentExecution::Options). Plain executions use the
+	// defaults; a ticket's set its ticket.
+	struct PersistentExecutionOptions {
+		PersistentTicket* ticket = nullptr;
+		uint64_t hostTag = 0;
+		bool admissionOnly = false;
+		bool hostData = false;
+		// What the recording's RecordingContext::Run names. Without one: UpdateExecutionContext::run, else the execution's frame
+		// index outside a lease (RunRef::Unleased).
+		std::optional<RunRef> run;
+	};
+	void Update(const UpdateExecutionContext& context, rhi::Device device) { Update(context, device, PersistentExecutionOptions{}); }
+	void Update(const UpdateExecutionContext& context, rhi::Device device, const PersistentExecutionOptions& options);
+	void Execute(PassExecutionContext& context);
 	GpuPassRangeBegin m_gpuPassRangeBegin;
 	GpuPassRangeEnd m_gpuPassRangeEnd;
+	// Update: the passes' own updates, then the next execution's preparation (PreparePersistentFrame).
 	void UpdateOnPreparationOwner(const UpdateExecutionContext& context, rhi::Device device,
-		bool asynchronousScheduling, const std::shared_ptr<FrameContext>& acceptedFrame);
-	std::shared_ptr<FrameContext> TryAcceptFrame(uint32_t preparationSlot,
-		bool asynchronousScheduling);
-	void JoinPreparationOwner();
+		const PersistentExecutionOptions& options);
 	std::string GetTechniquePathForPassName(std::string_view passName) const;
 
 	struct AnyPassAndResources {
 		PassType type = PassType::Unknown;
-		std::variant<std::monostate, RenderPassAndResources, ComputePassAndResources, CopyPassAndResources> pass;
+		std::variant<std::monostate, RenderPassAndResources> pass;
 		std::string name;
 
 		AnyPassAndResources() = default;
@@ -1031,412 +860,76 @@ private:
 		explicit AnyPassAndResources(RenderPassAndResources&& rp)
 			: type(PassType::Render), pass(std::move(rp)) {}
 
-		explicit AnyPassAndResources(ComputePassAndResources const& cp)
-			: type(PassType::Compute), pass(cp) {}
-		explicit AnyPassAndResources(ComputePassAndResources&& cp)
-			: type(PassType::Compute), pass(std::move(cp)) {}
-
-		explicit AnyPassAndResources(CopyPassAndResources const& cp)
-			: type(PassType::Copy), pass(cp) {}
-		explicit AnyPassAndResources(CopyPassAndResources&& cp)
-			: type(PassType::Copy), pass(std::move(cp)) {}
 	};
+	// Sets up one render pass: its runtime services, its registry view, then its own Setup.
+	void SetupRenderPass(AnyPassAndResources& pass);
 
-	struct FramePassList {
-		struct iterator {
-			using base_iterator = std::vector<AnyPassAndResources*>::iterator;
-			using iterator_category = std::random_access_iterator_tag;
-			using difference_type = base_iterator::difference_type;
-			using value_type = AnyPassAndResources;
-			using reference = AnyPassAndResources&;
-			using pointer = AnyPassAndResources*;
-
-			base_iterator it{};
-			reference operator*() const { return **it; }
-			pointer operator->() const { return *it; }
-			iterator& operator++() { ++it; return *this; }
-			iterator operator++(int) { iterator tmp = *this; ++it; return tmp; }
-			bool operator==(const iterator& other) const { return it == other.it; }
-			bool operator!=(const iterator& other) const { return it != other.it; }
-		};
-
-		struct const_iterator {
-			using base_iterator = std::vector<AnyPassAndResources*>::const_iterator;
-			using iterator_category = std::random_access_iterator_tag;
-			using difference_type = base_iterator::difference_type;
-			using value_type = const AnyPassAndResources;
-			using reference = const AnyPassAndResources&;
-			using pointer = const AnyPassAndResources*;
-
-			base_iterator it{};
-			reference operator*() const { return **it; }
-			pointer operator->() const { return *it; }
-			const_iterator& operator++() { ++it; return *this; }
-			const_iterator operator++(int) { const_iterator tmp = *this; ++it; return tmp; }
-			bool operator==(const const_iterator& other) const { return it == other.it; }
-			bool operator!=(const const_iterator& other) const { return it != other.it; }
-		};
-
-		void clear() noexcept { entries.clear(); }
-		void reserve(size_t count) { entries.reserve(count); }
-		size_t capacity() const noexcept { return entries.capacity(); }
-		size_t size() const noexcept { return entries.size(); }
-		bool empty() const noexcept { return entries.empty(); }
-		void push_back(AnyPassAndResources& pass) { entries.push_back(std::addressof(pass)); }
-		void push_back(AnyPassAndResources* pass) { entries.push_back(pass); }
-		AnyPassAndResources& operator[](size_t index) noexcept { return *entries[index]; }
-		const AnyPassAndResources& operator[](size_t index) const noexcept { return *entries[index]; }
-		iterator begin() noexcept { return iterator{ entries.begin() }; }
-		iterator end() noexcept { return iterator{ entries.end() }; }
-		const_iterator begin() const noexcept { return const_iterator{ entries.begin() }; }
-		const_iterator end() const noexcept { return const_iterator{ entries.end() }; }
-		const_iterator cbegin() const noexcept { return const_iterator{ entries.cbegin() }; }
-		const_iterator cend() const noexcept { return const_iterator{ entries.cend() }; }
-
-		std::vector<AnyPassAndResources*> entries;
-	};
-
-	struct CompileContext {
-		std::unordered_map<uint64_t, unsigned int> usageHistCompute;
-		std::unordered_map<uint64_t, unsigned int> usageHistRender;
-	};
-
-	struct LastProducerAcrossFrames {
-		size_t queueSlot = 0;
-		uint64_t fenceValue = 0;
-		uint64_t publishSerial = 0;
-		bool anonymous = false;
-	};
-
-	struct LastAliasPlacementProducerAcrossFrames {
-		uint64_t resourceID = 0;
-		uint64_t poolID = 0;
-		uint64_t poolGeneration = 0;
-		uint64_t startByte = 0;
-		uint64_t endByte = 0;
-		LastProducerAcrossFrames producer{};
-	};
 	
-	enum class AccessKind : uint8_t { Read, Write };
 
-	struct NodeAccess {
-		uint32_t resourceIndex = 0;
-		AccessKind kind = AccessKind::Read;
-	};
-
-	struct DenseEquivalentResourceSummary {
-		uint64_t resourceID = 0;
-		size_t resourceIndex = 0;
-		const std::vector<size_t>* equivalentResourceIndices = nullptr;
-	};
-
-	struct DenseRequirementSummary {
-		ResourceRegistry::RegistryHandle resource;
-		uint64_t resourceID = 0;
-		size_t resourceIndex = 0;
-		RangeSpec range{};
-		ResourceState state{};
-		bool isUAV = false;
-		bool isWholeResource = false;
-		const std::vector<size_t>* equivalentResourceIndices = nullptr;
-	};
-
-	struct FramePassSchedulingSummary {
-		std::vector<DenseRequirementSummary> requirements;
-		std::vector<DenseEquivalentResourceSummary> internalTransitions;
-		std::vector<size_t> requiredResourceIndices;
-		std::vector<size_t> waitDependencyResourceIndices;
-		std::vector<size_t> touchedResourceIndices;
-		std::vector<size_t> writtenResourceIndices;
-		std::vector<size_t> uavResourceIndices;
-	};
-
-	struct FramePassRequirementStaticSummary {
-		ResourceRegistry::RegistryHandle resource;
-		Resource* resolvedResource = nullptr;
-		uint64_t resourceID = 0;
-		uint32_t dagResourceIndex = UINT32_MAX;
-		RangeSpec range{};
-		ResourceState state{};
-		bool isUAV = false;
-		bool isWrite = false;
-	};
-
-	struct FramePassInternalTransitionStaticSummary {
-		ResourceRegistry::RegistryHandle resource;
-		Resource* resolvedResource = nullptr;
-		uint64_t resourceID = 0;
-		uint32_t dagResourceIndex = UINT32_MAX;
-	};
-
-	struct FramePassStaticAccessSummary {
-		std::vector<FramePassRequirementStaticSummary> requirementSummaries;
-		std::vector<FramePassInternalTransitionStaticSummary> internalTransitionSummaries;
-		std::vector<uint64_t> touchedResourceIDs;
-		std::vector<uint64_t> uavResourceIDs;
-		std::vector<NodeAccess> dagAccesses;
-		PassType type = PassType::Unknown;
-		QueueKind preferredQueueKind = QueueKind::Graphics;
-		QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-		std::optional<QueueSlotIndex> pinnedQueueSlot;
-		BackendAffinity backendAffinity{};
-	};
-
-	struct CachedFramePassAccessSummary {
-		uint64_t key = 0;
-		FramePassStaticAccessSummary summary;
-		std::vector<uint64_t> usedResourceIDs;
-	};
-
-	struct FrameResourceEventSummary {
-		unsigned int latestBatch = 0;
-		unsigned int previousBatch = 0;
-		uint64_t latestQueueMask = 0;
-		uint64_t previousQueueMask = 0;
-	};
-
-	struct FrameCompileResourceState {
-		struct FastStateShadow {
-			bool valid = false;
-			bool wholeResourceOnly = false;
-			ResourceState state{};
-		};
-
-		uint64_t resourceID = 0;
-		Resource* resource = nullptr;
-		std::optional<SymbolicTracker> tracker;
-		bool trackerInitialized = false;
-		bool readOnlyUniformTransitionChecked = false;
-		FastStateShadow fastState{};
-	};
-
-	struct FrameResourceAccessSummary {
-		bool hasWrite = false;
-		bool hasUAV = false;
-		bool hasInternalTransition = false;
-		bool hasAliasActivation = false;
-		bool hasMultipleRequiredStates = false;
-		bool hasNonWholeResourceRange = false;
-		bool readOnlyUniform = false;
-		bool uniformStateInitialized = false;
-		ResourceState uniformState{};
-	};
-
-	struct MaterializeGenerationResult {
-		uint64_t id = 0;
-		uint64_t generation = 0;
-		bool valid = false;
-	};
-
-
-	struct SchedulingDecisionTrace {
-		uint32_t nodeIndex = 0;
-		uint32_t passIndex = 0;
-		uint32_t batchIndex = 0;
-		uint16_t assignedQueueSlot = 0;
-		bool closedBatchBefore = false;
-		uint32_t readySetSize = 0;
-		uint32_t candidateChecks = 0;
-		uint32_t isNewBatchNeededChecks = 0;
-		bool fallbackCommit = false;
-	};
-
-	struct TransitionPlacementCandidate {
-		uint32_t transitionId = 0;
-		uint32_t consumerBatch = 0;
-		uint16_t consumerQueueSlot = 0;
-		uint16_t transitionQueueSlot = 0;
-		size_t resourceIndex = 0;
-		uint64_t resourceID = 0;
-		uint32_t lastUseBatch = 0;
-		uint64_t lastUseQueueMask = 0;
-		bool isAliasActivation = false;
-		bool needsGraphicsFallback = false;
-		bool requiresCrossQueuePlacementCoordination = false;
-		ResourceTransition transition;
-	};
-
-	struct TransitionPlacementStats {
-		uint64_t candidateCount = 0;
-		uint64_t emittedTransitionCount = 0;
-		uint64_t canonicalBeforePassCount = 0;
-		uint64_t inlineEarlyPlacedCount = 0;
-		uint64_t graphicsFallbackCount = 0;
-		uint64_t aliasActivationCount = 0;
-		uint64_t oldInlineEarlyEligibleCount = 0;
-		uint64_t crossQueueCoordinationBlockedCount = 0;
-	};
-
-	struct FrameEpochSet {
-		uint32_t epoch = 1;
-		std::vector<uint32_t> epochs;
-		std::vector<size_t> values;
-
-		void Initialize(size_t count) {
-			epoch = 1;
-			if (epochs.size() != count) {
-				epochs.assign(count, 0);
-			}
-			else {
-				std::fill(epochs.begin(), epochs.end(), 0);
-			}
-			values.clear();
-		}
-
-		void Clear() {
-			values.clear();
-			++epoch;
-			if (epoch == 0) {
-				std::fill(epochs.begin(), epochs.end(), 0);
-				epoch = 1;
-			}
-		}
-
-		void Reserve(size_t count) {
-			values.reserve(count);
-		}
-
-		bool Empty() const noexcept {
-			return values.empty();
-		}
-
-		bool Insert(size_t index) {
-			if (index >= epochs.size()) {
-				return false;
-			}
-			if (epochs[index] == epoch) {
-				return false;
-			}
-			epochs[index] = epoch;
-			values.push_back(index);
-			return true;
-		}
-
-		bool Contains(size_t index) const {
-			return index < epochs.size() && epochs[index] == epoch;
-		}
-
-		const std::vector<size_t>& Values() const noexcept {
-			return values;
-		}
-	};
-
-	struct FrameResourceIndexLookupEntry {
-		uint64_t resourceID = 0;
-		size_t resourceIndex = 0;
-		uint8_t occupied = 0;
-	};
-
-	struct BatchBuildState {
-		size_t queueCount = 0;
-		size_t resourceCount = 0;
-		uint32_t nodeEpoch = 1;
-		uint32_t resourceEpoch = 1;
-		uint32_t internalTransitionEpoch = 1;
-		uint32_t otherQueueUAVEpoch = 1;
-		std::vector<uint32_t> nodeEpochByIndex;
-		std::vector<uint32_t> resourceEpochByIndex;
-		std::vector<uint32_t> internalTransitionEpochByIndex;
-		std::vector<uint32_t> otherQueueUAVEpochByOffset;
-
-		void Initialize(size_t nodeCount, size_t inQueueCount, size_t inResourceCount) {
-			queueCount = inQueueCount;
-			resourceCount = inResourceCount;
-			nodeEpoch = 1;
-			resourceEpoch = 1;
-			internalTransitionEpoch = 1;
-			otherQueueUAVEpoch = 1;
-			AssignOrClear(nodeEpochByIndex, nodeCount);
-			AssignOrClear(resourceEpochByIndex, resourceCount);
-			AssignOrClear(internalTransitionEpochByIndex, resourceCount);
-			AssignOrClear(otherQueueUAVEpochByOffset, queueCount * resourceCount);
-		}
-
-		void ResetForNewBatch() {
-			AdvanceEpoch(nodeEpochByIndex, nodeEpoch);
-			AdvanceEpoch(resourceEpochByIndex, resourceEpoch);
-			AdvanceEpoch(internalTransitionEpochByIndex, internalTransitionEpoch);
-			AdvanceEpoch(otherQueueUAVEpochByOffset, otherQueueUAVEpoch);
-		}
-
-		bool ContainsNode(size_t nodeIndex) const {
-			return nodeIndex < nodeEpochByIndex.size() && nodeEpochByIndex[nodeIndex] == nodeEpoch;
-		}
-
-		void MarkNode(size_t nodeIndex) {
-			if (nodeIndex < nodeEpochByIndex.size()) {
-				nodeEpochByIndex[nodeIndex] = nodeEpoch;
-			}
-		}
-
-		bool ContainsResource(size_t resourceIndex) const {
-			return resourceIndex < resourceEpochByIndex.size() && resourceEpochByIndex[resourceIndex] == resourceEpoch;
-		}
-
-		void MarkResource(size_t resourceIndex) {
-			if (resourceIndex < resourceEpochByIndex.size()) {
-				resourceEpochByIndex[resourceIndex] = resourceEpoch;
-			}
-		}
-
-		bool ContainsInternalTransition(size_t resourceIndex) const {
-			return resourceIndex < internalTransitionEpochByIndex.size()
-				&& internalTransitionEpochByIndex[resourceIndex] == internalTransitionEpoch;
-		}
-
-		void MarkInternalTransition(size_t resourceIndex) {
-			if (resourceIndex < internalTransitionEpochByIndex.size()) {
-				internalTransitionEpochByIndex[resourceIndex] = internalTransitionEpoch;
-			}
-		}
-
-		bool ContainsOtherQueueUAV(size_t queueIndex, size_t resourceIndex) const {
-			if (queueIndex >= queueCount || resourceIndex >= resourceCount) {
-				return false;
-			}
-			return otherQueueUAVEpochByOffset[queueIndex * resourceCount + resourceIndex] == otherQueueUAVEpoch;
-		}
-
-		void MarkOtherQueueUAV(size_t queueIndex, size_t resourceIndex) {
-			if (queueIndex >= queueCount || resourceIndex >= resourceCount) {
-				return;
-			}
-			otherQueueUAVEpochByOffset[queueIndex * resourceCount + resourceIndex] = otherQueueUAVEpoch;
-		}
-
-	private:
-		static void AssignOrClear(std::vector<uint32_t>& values, size_t count) {
-			if (values.size() != count) {
-				values.assign(count, 0);
-			}
-			else {
-				std::fill(values.begin(), values.end(), 0);
-			}
-		}
-
-		static void AdvanceEpoch(std::vector<uint32_t>& values, uint32_t& epoch) {
-			++epoch;
-			if (epoch == 0) {
-				std::fill(values.begin(), values.end(), 0);
-				epoch = 1;
-			}
-		}
-	};
 
 	// Compiler implementation data deliberately lives outside this public header.
 	// This keeps compiler algorithm/layout changes from rebuilding all ORG clients.
 	struct Node;
 	struct CompilerState;
-	void PreparePersistentFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData, float deltaTime);
+	// Preparation, on the owner thread: BindPersistentFrame polls the passes' declarations and backings and installs the
+	// edits they make (a structural one builds on a worker); PreparePersistentExecution then prepares an execution
+	// against the selected publication.
+	struct PersistentExecution;
+	void PreparePersistentFrame(rhi::Device device, uint32_t frameIndex, const IHostExecutionData* hostData, float deltaTime,
+		const PersistentExecutionOptions& options);
+	void BootstrapPersistentGraph();
+	// The pass's declared pipelines for its device. Starts their builds; returns whether all are ready. Failed builds are
+	// reported in `failure`, when given, and throw otherwise.
+	bool RequestPassPipelines(const PassParameters& resources, DeviceInstanceId device, const std::string& passName, std::string* failure = nullptr);
+	// As above, and blocks until every build ended. A failed build throws.
+	void AwaitPassPipelines(const PassParameters& resources, DeviceInstanceId device, const std::string& passName);
+	// bootstrap: the first, whose passes were all just declared.
+	void BindPersistentFrame(bool ticket, bool bootstrap);
+	PersistentExecution PreparePersistentExecution(rhi::Device device, uint32_t frameIndex, const IHostExecutionData* hostData,
+		float deltaTime, const PersistentExecutionOptions& options);
+	// Execution of the prepared one: its uploads, then its main segment's admission, recording and submission.
 	void ExecutePersistentFrame(PassExecutionContext& context);
-	void ConfirmPersistentPresentationTail();
+	void SubmitPersistentUploads(PersistentExecution& execution);
+	// One execution of the prepared segment, in phases (RenderGraphPersistentExecute.cpp). Admit returns false when the
+	// segment needs nothing more: it was empty, admission-only, or took a kept recording.
+	struct PersistentSegmentRun;
+	// The execution's waits with those on another device's timelines relayed to the batch's device (docs/pipelines.md, "When pipelines build").
+	std::vector<std::vector<compiler::ExecutionTimelinePoint>> RelayCrossDeviceWaits(PersistentSegmentRun& run,
+		const std::vector<std::vector<compiler::ExecutionTimelinePoint>>& waits, std::vector<compiler::PreparedTimelineBinding>& extraTimelines);
+	bool AdmitPersistentSegment(PersistentSegmentRun& run);
+	void RecordPersistentSegment(PersistentSegmentRun& run);
+	void SubmitPersistentSegment(PersistentSegmentRun& run);
 	// skipAliasCandidates leaves alias-eligible transients unmaterialized so the
 	// structural build can place them (see PlanPersistentAliasPlacement).
-	void MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates = false);
+	void MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates = false, const char* site = nullptr);
+	// A resource a pass on another device uses: one shared D3D12 allocation, imported into Vulkan, as its representation on
+	// every device (the primary's included). Its descriptors on each device name that device's representation. Kept while
+	// the backing lives; the resource's next materialization clears them and the next binding makes new ones.
+	void EnsurePersistentRepresentations(Resource& resource);
+	// A multi-device resource placed in a shared alias pool (SharedAliasHeaps): its representations are resources placed at
+	// `offset` of the pool's D3D12 heap and of its Vulkan import, published with the placement so bindings treat them as aliased.
+	void PlaceSharedRepresentations(Resource& concrete, const std::shared_ptr<const AliasHeapGeneration>& heap, uint64_t poolID,
+		uint64_t offset, uint64_t size);
+	// Whether a multi-device resource can be placed in a shared alias pool: a buffer, or a 2D texture without render target or
+	// depth use whose format the Vulkan device can place in an imported D3D12 heap.
+	bool IsSharedAliasEligible(Resource* concrete) const;
+	// A shared candidate's allocation size and alignment: the larger of the two devices'.
+	rhi::ResourceAllocationInfo SharedAliasAllocationInfo(Resource* concrete) const;
 	bool IsPersistentAliasCandidate(Resource* concrete) const;
 	// Returns true when the edit changed (placement edges or bindings) and needs
 	// another build before installation.
+	// The memory widget's frame-graph timeline over the selected persistent executable: per batch, the bytes its passes touch
+	// (memory: resource ID -> bytes and category) and the live bytes with and without the alias pools.
+	void BuildPersistentFrameGraphSnapshot(ui::FrameGraphSnapshot& out,
+		const std::unordered_map<uint64_t, std::pair<uint64_t, std::string>>& memory) const;
+	// Frees the alias pools no structural plan has placed into for autoAliasPoolRetireIdleFrames frames.
+	void RetireIdlePersistentAliasPools(PersistentExecutionState& state);
 	bool PlanPersistentAliasPlacement(persistent::GraphEditTransaction& edit, const persistent::SelectedPublication& scheduled);
+	// Gives the frame transient observer (SetFrameTransientObserver) every resource the schedule's passes use.
+	void ReportFrameTransientUses(const persistent::SelectedPublication& scheduled);
+	// The first preparation of a graph PrepareFirstPersistentBuild built: its alias placement, planned against the installed
+	// schedule, built and installed (a structural edit). Nothing otherwise.
+	void PlaceDeferredPersistentAliases();
 	void BindUnboundPersistentEntries(persistent::GraphEditTransaction& edit);
 	// Structural build: bind, schedule, plan alias placement, rebuild if needed.
 	std::shared_ptr<const persistent::SelectedPublication> BuildPersistentStructural(persistent::GraphEditTransaction& edit);
@@ -1444,31 +937,53 @@ private:
 	// its schedule/placed builds run on a task worker while frames keep the
 	// selected publication; binding edits made meanwhile are replayed onto the
 	// result before a rebased install.
-	void SubmitPersistentStructuralBuild(const std::vector<uint32_t>& structural, const std::vector<uint32_t>& growGroups, rhi::Backend primaryBackend);
+	void SubmitPersistentStructuralBuild(const std::vector<uint32_t>& structural, const std::vector<uint32_t>& growGroups, rhi::Backend primaryBackend,
+		bool forceInline = false);
 	void AdvancePersistentStructuralBuild(std::vector<uint32_t>& structural);
+	// Blocks until the pending structural build is installed (a relower that cannot be prepared against the live publication).
+	void DrainPersistentStructuralBuild(std::vector<uint32_t>& structural);
 	void RunPersistentStructuralBuildPhase(bool validated);
 	// Hosts this frame's frame-interrupting passes in the main executable and
-	// removes the previous frame's. Returns requested passes that name no main
-	// pass to insert against; they run in the Tail segment instead.
-	std::vector<ExternalPassDesc> UpdatePersistentFrameInterruptingPasses(std::vector<ExternalPassDesc> requested, rhi::Backend primaryBackend);
+	// removes the previous frame's. Passes that name no main pass to insert
+	// against are dropped.
+	void UpdatePersistentFrameInterruptingPasses(std::vector<ExternalPassDesc> requested, rhi::Backend primaryBackend);
 	// Compile-dump mode for the persistent graph: written once per selected executable.
 	void WritePersistentGraphDebugDump(const persistent::SelectedPublication& selected) const;
-	bool m_persistentExecution = false;
+	// Schedule introspection, owner thread. Traces the selected executable and its epochs' when it is not the traced one.
+	void RefreshPersistentScheduleTraces(const persistent::SelectedPublication& selected);
+	// Records the submission waits filled into the persistent state's scratch for one execution of `executable` (a segment
+	// labelled segmentLabel), and publishes a snapshot once per round of executions.
+	void RecordPersistentScheduleSubmission(const persistent::ExecutableGeneration& executable, uint64_t frame);
+	void RecordPersistentTicketScheduleSubmissions(const PersistentTicket& ticket);
+	void PublishPersistentScheduleSnapshot();
+	std::atomic<bool> m_scheduleTraceEnabled{false};
+	std::atomic<std::shared_ptr<const PersistentScheduleSnapshot>> m_scheduleSnapshot;
 	std::vector<uint32_t> m_persistentEpochOrder;
 	bool m_persistentClosedExecutions = false;
-	// Set while PreparePersistentTicket runs: Update skips the dynamic segments, Execute stops after recording.
-	PersistentTicket* m_persistentTicketTarget = nullptr;
+	bool m_persistentRestAtLastUse = false;
+	bool m_persistentExternalHomeStates = false;
+	std::shared_ptr<PersistentAliasArena> m_persistentAliasArena;
+	std::shared_ptr<FrameAliasArena> m_frameAliasArena;  // SetFrameAliasRegion
+	AliasSpan m_frameAliasSpan{};
+	uint32_t m_frameAliasLane = 0;
+	FrameTransientObserver m_frameTransientObserver;  // SetFrameTransientObserver
+	// SetExternalPersistentEpochs; and the secondary lists their tickets record into, per queue slot in the host's stream (graphics
+	// lists, made at their first ticket).
+	std::vector<uint32_t> m_externalPersistentEpochs;
+	bool m_inlineAtExecution = false;  // SetInlineAtExecution
+	bool m_coalesceSubmissions = false;  // SetCoalescedSubmissions
+	bool m_mergeHandoffs = false;        // SetMergedHandoffs
+	bool m_uploadsWithBatches = false;   // SetUploadsWithBatches
+	bool m_keepGatedInline = false;      // SetKeptGatedInline
+	std::mutex m_externalSecondaryPoolsMutex;
+	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;
+	bool m_persistentRecordingReuse = false;
+	SharingChangePolicy m_sharingChangePolicy = SharingChangePolicy::Inline;
+	RecordingTimestampMode m_persistentRecordingTimestamps = RecordingTimestampMode::Off;
+	std::atomic<uint64_t> m_recordingsRecorded{0};
 	uint32_t m_persistentEpoch = UINT32_MAX;
 	PersistentExecuteTimings m_lastPersistentExecuteTimings{};
-	std::unordered_map<std::string, PersistentSegmentKind> m_persistentSegmentKinds;
 	ExternalQueueBoundary m_externalQueueBoundary{};
-    void SubmitOwnedCompileRequest(rhi::Device device, const std::vector<Node>& nodes,
-        std::span<const std::pair<size_t, size_t>> explicitEdges,
-        std::vector<std::pair<uint32_t, uint32_t>> dependencyOracle,
-        uint8_t frameIndex, float deltaTime, const IHostExecutionData* hostData);
-	bool TryExecuteSelectedAsyncFrame(PassExecutionContext& context, bool queueOnly = false);
-	bool TrySubmitRecordedFrame(PassExecutionContext& context);
-	bool PrepareSelectedAsyncFrame(PassExecutionContext& context);
 	std::unique_ptr<CompilerState> m_compilerState;
     std::shared_ptr<const ResolverCaptureContext> m_resolverCaptureContext;
     std::shared_ptr<const IHostExecutionData> m_asyncUpdateHostData;
@@ -1482,113 +997,36 @@ private:
 		std::shared_ptr<const std::vector<ResourceHandleAndRange>> handles;
 	};
 	std::unordered_map<const void*, ResolverHandleCacheEntry> m_resolverHandleCache;
-	// Interning must not extend the lifetime of exact-version resource sets.
-	// Active declarations own their blocks; the lookup table only reuses blocks
-	// which are already alive through a declaration or in-flight frame.
-	std::unordered_multimap<uint64_t, std::weak_ptr<const ResolverRequirementBlock>> m_resolverRequirementBlockCache;
 	uint64_t m_resourceRegistryGeneration = 1;
 	uint64_t m_resolverHandleCacheHitsThisFrame = 0;
 	uint64_t m_resolverHandleCacheMissesThisFrame = 0;
-	uint64_t m_resolverRequirementBlockHitsThisFrame = 0;
-	uint64_t m_resolverRequirementBlockMissesThisFrame = 0;
 	std::unordered_map<ResourceIdentifier, IResourceProvider*, ResourceIdentifier::Hasher> _providerMap;
 	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> m_resolvedResourceAliases;
+	// The names looked up (LookedUp). Locked: a pass may resolve a name while its graph is prepared on the host's thread.
+	void NoteLookup(ResourceIdentifier const& rid);
+	mutable std::mutex m_lookupMutex;
+	std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> m_lookedUp;
 
 	std::vector<IPassBuilder*> m_passBuilderOrder;
 	std::unordered_map<std::string, std::unique_ptr<IPassBuilder>> m_passBuildersByName;
 	std::unordered_set<std::string> m_passNamesSeenThisReset;
 
 	std::vector<AnyPassAndResources> m_masterPassList;
-	std::vector<size_t> m_retainedDeclarationRefreshCandidateMasterIndices;
 	std::vector<std::pair<std::string, std::string>> m_structuralExplicitAfterByName;
-	std::vector<AnyPassAndResources*> m_baseFramePassRefs;
-	std::vector<AnyPassAndResources> m_frameGeneratedPasses;
-	std::vector<AnyPassAndResources> m_frameExtensionPasses;
-	FramePassList m_framePasses;
-	std::vector<uint8_t> m_framePassIsFrameExtension;
-	uint64_t m_frameDeclarationRefreshRequestedCount = 0;
-	uint64_t m_frameDeclarationRefreshEquivalentCount = 0;
-	std::vector<size_t> m_assignedQueueSlotsByFramePass;
-	std::vector<uint8_t> m_activeQueueSlotsThisFrame;
+	std::shared_ptr<Runtime> m_runtime;
+	bool m_drivesFrameServices = true;  // SetDrivesFrameServices
+	bool m_sharedSetupDeferred = false;  // DeferSharedSetup, until FinishSharedSetup
+	bool m_deferFirstAliasPlacement = false;  // PrepareFirstPersistentBuild: its bootstrap leaves the alias placement to the first preparation
+	std::vector<std::string> m_sharedSetupPasses;
 	DeviceRegistry m_backendDevices;
 	std::array<uint8_t, static_cast<size_t>(QueueKind::Count)> m_minAutomaticSchedulingQueuesByKind = { 1, 1, 1 };
 	std::unordered_map<std::string, std::shared_ptr<RenderPass>> renderPassesByName;
-	std::unordered_map<std::string, std::shared_ptr<ComputePass>> computePassesByName;
 	std::unordered_map<std::string, std::string> m_passTechniquePathsByName;
 	std::unordered_map<std::string, std::shared_ptr<Resource>> resourcesByName;
 	std::unordered_map<uint64_t, std::shared_ptr<Resource>> resourcesByID;
 	std::unordered_map<uint64_t, std::shared_ptr<Resource>> m_transientFrameResourcesByID;
 	std::unordered_map<uint64_t, std::shared_ptr<Resource>> m_dynamicResourcesByStableID;
 	std::unordered_map<std::string, std::shared_ptr<Resource>> m_transientFrameResourcesByName;
-	std::unordered_map<uint64_t, uint64_t> resourceBackingGenerationByID;
-	struct LogicalExternalOwner {
-		uint64_t backingGeneration = 0;
-		BackendInstanceId backend = BackendInstanceId::Primary;
-	};
-	// API ownership is independent of each representation's resource state and
-	// must survive frame compilation while the backing allocation is unchanged.
-	std::unordered_map<uint64_t, LogicalExternalOwner> m_logicalExternalOwners;
-	std::unordered_map<uint64_t, uint32_t> resourceIdleFrameCounts;
-	std::vector<std::pair<uint64_t, uint64_t>> compiledResourceGenerations;
-	using ResourceMaterializeOptions = std::variant<PixelBuffer::MaterializeOptions, BufferBase::MaterializeOptions>;
-	std::unordered_map<uint64_t, ResourceMaterializeOptions> aliasMaterializeOptionsByID;
-	std::vector<std::optional<ResourceMaterializeOptions>> m_aliasMaterializeOptionsByResourceIndex;
-	std::vector<uint64_t> m_aliasMaterializeResourceIDs;
-	std::unordered_map<uint64_t, uint64_t> aliasPlacementSignatureByID;
-	std::unordered_map<uint64_t, org::alias::AliasPlacementRange> aliasPlacementRangesByID;
-	std::unordered_map<uint64_t, org::alias::AliasPlacementRange> schedulingPlacementRangesByID;
-	std::vector<org::alias::AliasPlacementRange> m_aliasPlacementRangeByResourceIndex;
-	std::vector<uint8_t> m_hasAliasPlacementByResourceIndex;
-	std::vector<org::alias::AliasPlacementRange> m_schedulingPlacementRangeByResourceIndex;
-	std::vector<uint8_t> m_hasSchedulingPlacementByResourceIndex;
-	std::unordered_map<uint64_t, std::vector<uint64_t>> m_schedulingEquivalentIDsCache;
-	struct SchedulingEquivalentIDRange {
-		uint32_t offset = 0;
-		uint32_t count = 0;
-	};
-	std::vector<uint64_t> m_schedulingEquivalentIDFlat;
-	std::vector<SchedulingEquivalentIDRange> m_schedulingEquivalentIDRangeByResourceIndex;
-	std::vector<uint64_t> m_frameDAGResourceIDsByIndex;
-	std::vector<uint64_t> m_frameDAGResourceIndexHashKeys;
-	std::vector<uint32_t> m_frameDAGResourceIndexHashValues;
-	std::vector<Resource*> m_frameDAGResourcePtrByIndex;
-	std::vector<uint32_t> m_frameDAGUnmaterializedResourceIndices;
-	size_t m_frameDAGResourceCount = 0;
-	std::unordered_map<uint64_t, size_t> m_frameSchedulingResourceIndexByID;
-	std::vector<std::pair<uint64_t, size_t>> m_frameSchedulingResourceIndexEntries;
-	std::vector<FrameResourceIndexLookupEntry> m_frameSchedulingResourceIndexLookup;
-	size_t m_frameSchedulingResourceCount = 0;
-	std::vector<uint64_t> m_frameSchedulingResourceIDByIndex;
-	std::vector<std::vector<size_t>> m_equivalentResourceIndicesByResourceIndex;
-	std::vector<org::alias::AliasActivationReason> m_aliasActivationPendingByResourceIndex;
-	std::vector<unsigned int> m_frameQueueLastUsageBatch;
-	std::vector<unsigned int> m_frameQueueLastProducerBatch;
-	std::vector<unsigned int> m_frameQueueLastTransitionBatch;
-	std::vector<FrameResourceEventSummary> m_frameResourceEventSummaries;
-	std::vector<FramePassStaticAccessSummary> m_framePassAccessSummaries;
-	std::vector<std::pair<uint64_t, Resource*>> m_materializeScratchItems;
-	std::vector<MaterializeGenerationResult> m_materializeScratchGenerationResults;
-	std::vector<FramePassSchedulingSummary> m_framePassSchedulingSummaries;
-	std::unordered_map<uint64_t, uint64_t> m_frameBackendUseMaskByResourceID;
-	std::unordered_map<uint64_t, CachedFramePassAccessSummary> m_framePassAccessSummaryCache;
-	std::unordered_map<uint64_t, org::alias::CachedAliasStaticResourceInfo> m_aliasStaticInfoCacheByResourceID;
-	org::alias::FrameAliasAnalysis m_aliasFrameAnalysisScratch;
-	std::unordered_map<uint64_t, uint64_t> aliasPlacementPoolByID;
-	std::unordered_map<uint64_t, org::alias::AliasActivationReason> aliasActivationPending;
-
-	using PersistentAliasPoolState = org::alias::PersistentAliasPoolState;
-	std::unordered_map<uint64_t, PersistentAliasPoolState> persistentAliasPools;
-	SharedAliasPoolManager m_sharedAliasPools;
-	std::unordered_map<uint64_t, uint64_t> m_sharedAliasResourcePoolGeneration;
-	std::unordered_map<uint64_t, uint64_t> m_sharedAliasResourcePoolID;
-	std::unordered_map<uint64_t, org::alias::CachedAliasPoolPlan> cachedAliasPlanByPoolID;
-	uint64_t aliasPoolPlanFrameIndex = 0;
-	uint32_t aliasPoolRetireIdleFrames = 120;
-	float aliasPoolGrowthHeadroom = 1.5f;
-
-	std::unordered_map<uint64_t, ResourceTransition> initialTransitions; // Transitions needed to reach the initial state of the resources before executing the first batch. Executed on graph setup.
-	std::vector<PassBatch> batches;
-	std::vector<PassBatch> m_reusablePassBatches;
 	org::memory::SnapshotProvider m_memorySnapshotProvider;
 	std::shared_ptr<org::runtime::IStatisticsService> m_statisticsService;
 	std::shared_ptr<org::runtime::IUploadService> m_uploadService;
@@ -1596,103 +1034,22 @@ private:
 	std::shared_ptr<org::runtime::IDescriptorService> m_descriptorService;
 	std::shared_ptr<org::runtime::IRenderGraphSettingsService> m_renderGraphSettingsService;
 	std::shared_ptr<org::runtime::ITaskService> m_taskService;
-	std::optional<basic_telemetry::Frame> m_compileProfileFrame;
-	uint64_t m_compileProfileFrameStartedAtNs = 0;
-	uint64_t m_lastMaterializeCandidateCount = 0;
-	bool m_compileProfileEnabled = false;
-	struct CapturedTrackerResource {
-		uint64_t resourceID = 0;
-		uint64_t backingGeneration = 0;
-	};
-	std::vector<CapturedTrackerResource> trackers; // Resources whose live state trackers receive compiled states after execution.
-	std::vector<FrameCompileResourceState> m_frameCompileResources; // Compile-only symbolic state, indexed by frame-local resource index.
-	std::vector<FrameResourceAccessSummary> m_frameResourceAccessSummaries;
-	std::vector<uint32_t> m_anonymousSlotChangesThisFrame;
-	BatchBuildState m_autoScheduleBatchBuildState;
-	FrameEpochSet m_autoScheduleScratchTransitioned;
-	FrameEpochSet m_autoScheduleScratchFallback;
-	std::vector<ResourceTransition> m_autoScheduleScratchTransitions;
-	std::vector<uint32_t> m_autoScheduleIndeg;
-	std::vector<size_t> m_autoScheduleReady;
-	const FramePassSchedulingSummary* m_waitCachePassSummary = nullptr;
-	const FrameEpochSet* m_waitCacheTransitionedResources = nullptr;
-	uint32_t m_waitCacheTransitionedEpoch = 0;
-	size_t m_waitCacheQueueCount = 0;
-	std::vector<int> m_waitCacheLatestTransitionByQueue;
-	std::vector<int> m_waitCacheLatestProducerByQueue;
-	std::vector<int> m_waitCacheLatestUsageByQueue;
-	std::vector<uint32_t> m_planActiveIndeg;
-	std::vector<uint32_t> m_planActiveLevel;
-	std::vector<size_t> m_planActiveReady;
-	std::vector<size_t> m_planActiveWidthByLevel;
-	std::vector<uint32_t> m_planActiveTouchedResourceEpochs;
-	uint32_t m_planActiveTouchedResourceEpoch = 1;
-	std::vector<size_t> m_aliasSchedulingNodeIndexByPassIndex;
-	std::vector<uint64_t> m_aliasSchedulingResourceIDs;
-	std::vector<uint64_t> m_aliasSchedulingExistingEdgeKeys;
-	std::vector<uint64_t> m_aliasSchedulingProposedEdgeKeys;
-	struct AliasQueueSyncUsage {
-		uint64_t resourceID = 0;
-		uint64_t queueMask = 0;
-	};
-	struct AliasQueueSyncOwner {
-		uint64_t resourceID = 0;
-		uint64_t poolID = 0;
-		uint64_t startByte = 0;
-		uint64_t endByte = 0;
-		size_t batchIndex = 0;
-		uint64_t queueMask = 0;
-	};
-	std::vector<AliasQueueSyncUsage> m_aliasQueueSyncBatchUsageScratch;
-	std::vector<AliasQueueSyncOwner> m_aliasQueueSyncOwnersScratch;
-	std::vector<uint32_t> m_crossFrameFirstUseResourceEpochs;
-	uint32_t m_crossFrameFirstUseResourceEpoch = 1;
-	std::vector<SchedulingDecisionTrace> m_schedulingDecisionTrace;
-	std::vector<TransitionPlacementCandidate> m_transitionPlacementCandidates;
-	TransitionPlacementStats m_transitionPlacementStats;
-	std::unordered_map<uint64_t, LastProducerAcrossFrames> m_lastProducerByResourceAcrossFrames;
-	// A write in a later frame must wait for every queue that accessed the
-	// resource in the prior frame, including read-only consumers and barriers.
-	// Keep one completion point per resource/queue; producer-only tracking is
-	// sufficient for reads, but cannot cover cross-frame write-after-read.
-	std::unordered_map<uint64_t, std::vector<LastProducerAcrossFrames>> m_lastAccessByResourceAcrossFrames;
-	std::unordered_map<uint64_t, std::vector<LastAliasPlacementProducerAcrossFrames>> m_lastAliasPlacementProducersByPoolAcrossFrames;
-	uint64_t m_crossFrameProducerPublishSerial = 0;
-	std::vector<std::vector<uint8_t>> m_hasPendingFrameStartQueueWait;
-	std::vector<std::vector<UINT64>> m_pendingFrameStartQueueWaitFenceValue;
-
 	QueueRegistry m_queueRegistry;
+	// Declared after the queue registry, so it is destroyed before the queues it submits to.
+	std::mutex m_externalClientMutex;
+	std::unique_ptr<ExternalClient> m_externalClient;
+	std::shared_ptr<rhi::TimelinePtr> m_frameWaitTimeline;  // SetFrameWaitTimeline
+	std::vector<SharedQueueTimeline> m_sharedQueueTimelines;  // SetSharedQueueTimelines
+	uint32_t m_passEpochFilter = UINT32_MAX;  // SetPassEpochFilter (persistent::AllEpochs)
+	uint64_t m_frameWaitValue = 0;
+	bool m_scopedFrameWait = false;  // SetScopedFrameWait
 	std::optional<PresentDependency> m_lastPresentDependency;
+	std::string m_presentPass;              // SetPresentPass
+	std::shared_ptr<Resource> m_swapchain;  // SetSwapchainResource
+	std::shared_ptr<const IVersionedResource> m_swapchainVersions;
 
-	rhi::CommandAllocatorPtr initialTransitionCommandAllocator;
-	rhi::TimelinePtr m_initialTransitionFence;
-	UINT64 m_initialTransitionFenceValue = 0;
 
-	rhi::TimelinePtr m_frameStartSyncFence; // TODO: Is there a better way of handling waiting for pre-frame things like copying resources?
-
-	rhi::TimelinePtr m_readbackFence;
-	rhi::TimelinePtr m_copyReadbackFence;
-
-	std::unique_ptr<CommandRecordingManager> m_pCommandRecordingManager;
-	ExecutionSchedule m_executionSchedule;
-	std::unordered_map<uint64_t, uint64_t> m_lastExternalSignalValueByTimeline;
-	struct RetiredInteropGeneration {
-		// Members are destroyed in reverse declaration order: placed resources
-		// must die before the heaps that own their memory.
-		std::vector<rhi::HeapPtr> heaps;
-		std::vector<Resource::APIRepresentationPtr> representations;
-		std::vector<uint64_t> queueCompletionValues;
-	};
-	std::vector<RetiredInteropGeneration> m_retiredInteropGenerations;
-	RetiredInteropGeneration BeginInteropRetirement();
-	void CollectRetiredInteropGenerations();
-
-	void BuildExecutionSchedule();
-	void AssignQueueSignalFenceValuesInSubmissionOrder(std::vector<PassBatch>& batchesToAssign);
-	void ResizeQueueParallelVectors();
 	void EnsureMinimumAutomaticSchedulingQueues();
-	static bool RetainedDeclarationMayNeedRefresh(const AnyPassAndResources& pass);
-	void RebuildRetainedDeclarationRefreshCandidates();
 
 	org::imm::ImmediateDispatch m_immediateDispatch{};
 
@@ -1703,11 +1060,15 @@ private:
 		return m_queueRegistry.GetNextFenceValue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueSlotIndex)));
 	}
 
-	std::function<bool()> m_getUseAsyncCompute;
-	std::function<bool()> m_getHeavyDebug;
 
 	void AddResource(std::shared_ptr<Resource> resource, bool transition = false);
 	void TrackTransientFrameResource(const std::shared_ptr<Resource>& resource);
+public:
+	// A structural build is in flight or waiting to be installed: executions still run the publication before it.
+	bool HasPendingStructuralBuild() const;
+private:
+	// Lets go of the transient pins of resources no execution binds any more (PersistentInstanceState::retiredPins).
+	void ReleaseRetiredPins(std::span<const compiler::ExecutionTimelinePoint> reached);
 	void TrackTransientFrameResource(Resource* resource);
 	void ShutdownOwnedState();
 
@@ -1744,12 +1105,7 @@ private:
 		}
 	}
 
-	void MaterializeUnmaterializedResources(std::span<const uint64_t> onlyResourceIDs = {});
-	void MaterializeMultiBackendRepresentations();
-	void PlanMultiBackendOwnershipTransfers();
-	FrameCompileResourceState& GetOrCreateFrameCompileResourceState(size_t resourceIndex, Resource* resource, uint64_t resourceID);
-	void CaptureCompileTrackersForExecution(std::span<const uint64_t> resourceIDs);
-	void PublishCompiledTrackerStates();
+	void MaterializeUnmaterializedResources();
 	void MaterializeReferencedResources(
 		const std::vector<ResourceRequirement>& resourceRequirements,
 		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions,
@@ -1757,268 +1113,16 @@ private:
 	std::vector<std::shared_ptr<Resource>> CaptureRetainedAnonymousKeepAlive(
 		const std::vector<ResourceRequirement>& resourceRequirements,
 		const std::vector<std::pair<ResourceHandleAndRange, ResourceState>>& internalTransitions) const;
-	void CollectFrameResourceIDs(std::unordered_set<uint64_t>& out) const;
-	void ApplyIdleDematerializationPolicy(std::span<const uint64_t> usedResourceIDs);
-	void SnapshotCompiledResourceGenerations(std::span<const uint64_t> usedResourceIDs);
-	void ValidateCompiledResourceGenerations() const;
-	void RebuildSchedulingEquivalentIDCache(std::span<const uint64_t> resourceIDs);
-	void RebuildFrameSchedulingResourceIndex(std::span<const uint64_t> resourceIDs);
-	void RebuildEquivalentResourceIndicesByResourceIndex();
-	void RebuildFrameCompileResources();
-	void RebuildFramePassSchedulingSummaries();
-	void RebuildFrameResourceAccessSummaries(const std::vector<Node>& nodes);
-	void ResetCompileFrameState();
 	void ResetStructuralBuildState();
-	void ClearFrameSchedulingResourceIndex();
-	void ClearFramePassSchedulingSummaries();
-	PassBatch AcquireReusablePassBatch(size_t queueCount);
-	void ResetFrameQueueBatchHistoryTables();
-	std::optional<size_t> TryGetFrameSchedulingResourceIndex(uint64_t resourceID) const;
-	const org::alias::AliasPlacementRange* TryGetAliasPlacementRangeByResourceIndex(size_t resourceIndex) const;
-	const org::alias::AliasPlacementRange* TryGetAliasPlacementRange(uint64_t resourceID) const;
-	const org::alias::AliasPlacementRange* TryGetSchedulingPlacementRangeByResourceIndex(size_t resourceIndex) const;
-	const org::alias::AliasPlacementRange* TryGetSchedulingPlacementRange(uint64_t resourceID) const;
-	std::vector<uint64_t> BuildSchedulingEquivalentIDs(uint64_t resourceID) const;
-	size_t FrameQueueBatchHistoryOffset(size_t queueSlot, size_t resourceIndex) const;
-	unsigned int GetFrameQueueHistoryValue(const std::vector<unsigned int>& history, size_t queueSlot, size_t resourceIndex) const;
-	void SetFrameQueueHistoryValue(std::vector<unsigned int>& history, size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
-	void RecordFrameResourceEvent(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
-	void RecordFrameQueueUsageBatch(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
-	void RecordFrameQueueTransitionBatch(size_t queueSlot, size_t resourceIndex, unsigned int batchIndex);
-	std::pair<unsigned int, uint64_t> GetFrameResourceLastEventBeforeBatch(size_t resourceIndex, unsigned int batchIndex) const;
-	std::span<const uint64_t> GetSchedulingEquivalentIDsCached(uint64_t resourceID);
-	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, RenderPassAndResources& passAndResources);
-	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, ComputePassAndResources& passAndResources);
-	void UpdateRetainedDeclarationCache(PassType type, std::string_view name, CopyPassAndResources& passAndResources);
 
-public: // Internal builder/compiler bridge; not part of the fluent declaration API.
-	std::shared_ptr<const ResolverRequirementBlock> RequestResolverRequirementBlock(
-		const ResolverDeclarationState& state,
-		std::span<const ResolverSnapshot::RequirementTemplate> templates);
 
-private:
-
-	bool RefreshRetainedDeclarationsForFrame(RenderPassAndResources& p, uint8_t frameIndex);
-	bool RefreshRetainedDeclarationsForFrame(ComputePassAndResources& p, uint8_t frameIndex);
-	bool RefreshRetainedDeclarationsForFrame(CopyPassAndResources& p, uint8_t frameIndex);
-	void CompileFrame(rhi::Device device, uint8_t frameIndex, const IHostExecutionData* hostData);
-	void PrepareAsyncFrame(rhi::Device device, uint8_t frameIndex, float deltaTime,
-		const IHostExecutionData* hostData);
-	void PrepareAndCompileFrame(rhi::Device device, uint8_t frameIndex,
-		const IHostExecutionData* hostData, bool asyncPreparationOnly, float deltaTime = 0.0f);
-	void BeginCompileProfileFrame(uint8_t frameIndex);
-	void EndCompileProfileFrame();
-	void RecordCompileProfileCounters(const std::vector<Node>& nodes, std::span<const uint64_t> usedResourceIDs);
-	void WriteCompiledGraphDebugDump(uint8_t frameIndex, const std::vector<Node>& nodes) const;
-	void WriteVramUsageDebugDump(uint8_t frameIndex) const;
-	void CoalesceQueueWaitsAndSignals(std::vector<PassBatch>& batchesToCoalesce) const;
-	bool ValidateSchedulingDecisionTrace(
-		const std::vector<Node>& nodes,
-		const FramePassList& framePasses,
-		const std::vector<PassBatch>& compiledBatches,
-		std::string& outSummary) const;
-	void LogRegionCompileSummary(uint8_t frameIndex, const std::vector<Node>& nodes);
+	// Re-runs the pass's declaration against current per-frame state: requirements, transitions, waits, resolver
+	// snapshots, referenced resources and (when they depend on it) its registry view and Setup. Persistent execution
+	// lowers from this directly; the old compiler's RefreshRetainedDeclarationsForFrame also updates its declaration cache.
+	void RedeclarePass(PassAndResources& p, PassType type);
+	void WriteVramUsageDebugDump(uint32_t frameIndex) const;
 	AnyPassAndResources MaterializeExternalPass(const ExternalPassDesc& desc, bool callSetup, bool materializeReferencedResources);
 	void RegisterExternalPassName(const ExternalPassDesc& desc, AnyPassAndResources& any);
-
-	//void ComputeResourceLoops();
-	bool IsNewBatchNeeded(
-		const FramePassSchedulingSummary& passSummary,
-		const PassBatch& currentBatch,
-		const BatchBuildState& batchBuildState,
-		std::string_view candidatePassName,
-		unsigned int currentBatchIndex,
-		size_t candidateQueueSlot);
-	
-
-	std::tuple<int, int, int> GetBatchesToWaitOn(
-		std::string_view passName,
-		size_t sourceQueueSlot,
-		const FramePassSchedulingSummary& passSummary,
-		const FrameEpochSet& resourcesTransitionedThisPass);
-
-	void ProcessResourceRequirements(
-		size_t passQueueSlot,
-		const std::vector<DenseRequirementSummary>& resourceRequirements,
-		std::string_view passName,
-		unsigned int batchIndex,
-		PassBatch& currentBatch,
-		FrameEpochSet& outTransitionedResourceIndices,
-		FrameEpochSet& outFallbackResourceIndices,
-		std::vector<ResourceTransition>& scratchTransitions);
-
-	template<typename PassRes>
-	void applySynchronization(
-		size_t                            passQueueSlot,
-		size_t                            sourceQueueSlot,
-		PassBatch&                        currentBatch,
-		unsigned int                      currentBatchIndex,
-		const PassRes&                    pass, // either ComputePassAndResources or RenderPassAndResources
-		const FramePassSchedulingSummary&  passSummary,
-		const FrameEpochSet&              resourcesTransitionedThisPass)
-	{
-		BT_ZONE_SCOPE("RenderGraph::applySynchronization");
-		if (!pass.name.empty()) {
-			BT_ZONE_TEXT(pass.name.data(), pass.name.size());
-		}
-		if (passQueueSlot == sourceQueueSlot) {
-			return;
-		}
-		auto [lastTransBatch, lastProdBatch, lastUsageBatch] =
-			GetBatchesToWaitOn(pass.name, sourceQueueSlot, passSummary, resourcesTransitionedThisPass);
-
-		ApplySynchronizationImpl(
-			passQueueSlot,
-			sourceQueueSlot,
-			currentBatch,
-			currentBatchIndex,
-			pass.name,
-			lastTransBatch,
-			lastProdBatch,
-			lastUsageBatch);
-	}
-
-	void ApplySynchronizationImpl(
-		size_t                            passQueueSlot,
-		size_t                            sourceQueueSlot,
-		PassBatch&                        currentBatch,
-		unsigned int                      currentBatchIndex,
-		std::string_view                  passName,
-		int                               lastTransBatch,
-		int                               lastProdBatch,
-		int                               lastUsageBatch)
-	{
-		(void)passName;
-		if (passQueueSlot == sourceQueueSlot) {
-			return;
-		}
-
-		auto markSourceCompletionSignal = [&](int batchIndex) {
-			if (batchIndex <= 0) {
-				return;
-			}
-
-			if (static_cast<unsigned int>(batchIndex) == currentBatchIndex) {
-				currentBatch.MarkQueueSignal(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
-				return;
-			}
-
-			batches[batchIndex].MarkQueueSignal(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
-		};
-
-		auto sourceCompletionFence = [&](int batchIndex) -> UINT64 {
-			if (batchIndex <= 0) {
-				return 0;
-			}
-
-			if (static_cast<unsigned int>(batchIndex) == currentBatchIndex) {
-				return currentBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
-			}
-
-			return batches[batchIndex].GetQueueSignalFenceValue(BatchSignalPhase::AfterCompletion, sourceQueueSlot);
-		};
-
-		// Handle the "transition" wait
-		if (lastTransBatch != -1) {
-			if (static_cast<unsigned int>(lastTransBatch) == currentBatchIndex) {
-				// same batch, signal & immediate wait
-				currentBatch.MarkQueueSignal(BatchSignalPhase::AfterTransitions, sourceQueueSlot);
-				currentBatch.AddQueueWait(
-					BatchWaitPhase::BeforeExecution,
-					passQueueSlot,
-					sourceQueueSlot,
-					currentBatch.GetQueueSignalFenceValue(BatchSignalPhase::AfterTransitions, sourceQueueSlot));
-			} else {
-				// different batch, signal that batch's completion, then wait before *transition*
-				const UINT64 completionFence = sourceCompletionFence(lastTransBatch);
-				if (completionFence != 0) {
-					markSourceCompletionSignal(lastTransBatch);
-					currentBatch.AddQueueWait(
-						BatchWaitPhase::BeforeTransitions,
-						passQueueSlot,
-						sourceQueueSlot,
-						completionFence);
-				}
-			}
-		}
-
-		// Handle the "producer" wait
-		// Writes are also recorded into the transition history for scheduling.
-		// Only preserve a separate producer wait if it would extend beyond the
-		// transition wait we already emitted.
-		if (lastProdBatch != -1 && lastProdBatch > lastTransBatch) {
-			const UINT64 completionFence = sourceCompletionFence(lastProdBatch);
-			if (completionFence != 0) {
-				markSourceCompletionSignal(lastProdBatch);
-				currentBatch.AddQueueWait(
-					BatchWaitPhase::BeforeTransitions,
-					passQueueSlot,
-					sourceQueueSlot,
-					completionFence);
-			}
-		}
-
-		// Handle the "usage" wait
-		if (lastUsageBatch != -1) {
-			const UINT64 completionFence = sourceCompletionFence(lastUsageBatch);
-			if (completionFence != 0) {
-				markSourceCompletionSignal(lastUsageBatch);
-				currentBatch.AddQueueWait(
-					BatchWaitPhase::BeforeTransitions,
-					passQueueSlot,
-					sourceQueueSlot,
-					completionFence);
-			}
-		}
-	}
-
-	void AddTransition(
-		unsigned int batchIndex,
-		PassBatch& currentBatch,
-		size_t passQueueSlot,
-		std::string_view passName,
-		const DenseRequirementSummary& requirement,
-		FrameEpochSet& outTransitionedResourceIndices,
-		FrameEpochSet& outFallbackResourceIndices,
-		std::vector<ResourceTransition>& scratchTransitions);
-	bool TryAddTransitionFastNoOp(
-		unsigned int batchIndex,
-		PassBatch& currentBatch,
-		size_t passQueueSlot,
-		const DenseRequirementSummary& requirement,
-		ResourceState requiredState);
-	bool TryAddTransitionTrackedNoOp(
-		PassBatch& currentBatch,
-		const DenseRequirementSummary& requirement,
-		ResourceState requiredState);
-	void AddTransitionSlowPath(
-		unsigned int batchIndex,
-		PassBatch& currentBatch,
-		size_t passQueueSlot,
-		std::string_view passName,
-		const DenseRequirementSummary& requirement,
-		ResourceState requiredState,
-		FrameEpochSet& outTransitionedResourceIndices,
-		FrameEpochSet& outFallbackResourceIndices,
-		std::vector<ResourceTransition>& scratchTransitions);
-
-	struct AddTransitionDebugStats {
-		std::string resourceName;
-		size_t callCount = 0;
-		size_t noOpCallCount = 0;
-		size_t emittedTransitionCount = 0;
-		size_t earlyPlacedTransitionCount = 0;
-		size_t beforePassTransitionCount = 0;
-		size_t graphicsFallbackTransitionCount = 0;
-		size_t aliasActivationTransitionCount = 0;
-	};
-
-	void LogAddTransitionDebugSummary() const;
-
-	static inline bool IsUAVState(const ResourceState& s) noexcept {
-		return ((s.access & rhi::ResourceAccessType::UnorderedAccess) != 0) ||
-			(s.layout == rhi::ResourceLayout::UnorderedAccess);
-	}
 
 	struct PassView {
 		bool isCompute = false;
@@ -2027,43 +1131,12 @@ private:
 	};
 
 	using AutoAliasPlannerStats = org::alias::AutoAliasPlannerStats;
-	using CachedAliasPoolPlan = org::alias::CachedAliasPoolPlan;
 
 	static PassView GetPassView(const AnyPassAndResources& pr);
-	void RebuildFramePassAccessSummaries();
-	bool BuildDependencyGraph(std::vector<Node>& nodes);
-	bool BuildDependencyGraph(std::vector<Node>& nodes, std::span<const std::pair<size_t, size_t>> explicitEdges);
-	bool FinalizeDependencyGraph(std::vector<Node>& nodes);
-	static void BuildNodes(RenderGraph& rg, std::vector<Node>& nodes);
-	static void PlanActiveQueueSlots(RenderGraph& rg, const FramePassList& passes, const std::vector<Node>& nodes);
-	static bool AddEdgeDedup(
-		size_t from, size_t to,
-		std::vector<Node>& nodes,
-		std::unordered_set<uint64_t>& edgeSet);
-	bool AddCurrentFrameAliasSchedulingEdges(std::vector<Node>& nodes);
-	void CommitPassToBatch(
-		RenderGraph& rg,
-		AnyPassAndResources& pr,
-		const Node& node,
-
-		unsigned int currentBatchIndex,
-		PassBatch& currentBatch,
-		BatchBuildState& batchBuildState,
-		FrameEpochSet& scratchTransitioned,
-		FrameEpochSet& scratchFallback,
-		std::vector<ResourceTransition>& scratchTransitions);
-	void AutoScheduleAndBuildBatches(
-		RenderGraph& rg,
-		FramePassList& passes,
-		std::vector<Node>& nodes);
-
-	std::unordered_map<uint64_t, uint64_t> autoAliasPoolByID;
-	std::unordered_map<uint64_t, std::string> autoAliasExclusionReasonByID;
 	std::vector<AutoAliasReasonCount> autoAliasExclusionReasonSummary;
 	std::vector<AutoAliasExcludedResourceDebug> autoAliasExcludedResources;
 	std::vector<AutoAliasPoolDebug> autoAliasPoolDebug;
 	AutoAliasPlannerStats autoAliasPlannerStats;
-	AutoAliasMode autoAliasPreviousMode = AutoAliasMode::Off;
 	AutoAliasMode autoAliasModeLastFrame = AutoAliasMode::Off;
 	AutoAliasPackingStrategy autoAliasPackingStrategyLastFrame = AutoAliasPackingStrategy::GreedySweepLine;
 	std::function<AutoAliasMode()> m_getAutoAliasMode;
@@ -2071,39 +1144,40 @@ private:
 	std::function<bool()> m_getRenderGraphCompileDumpEnabled;
 	std::function<bool()> m_getRenderGraphVramDumpEnabled;
 	std::function<bool()> m_getRenderGraphBatchTraceEnabled;
-	std::function<bool()> m_getRenderGraphLightweightCompileSummaryEnabled;
-	std::function<bool()> m_getReadOnlyUniformTransitionElisionEnabled;
 	std::function<bool()> m_getAutoAliasEnableLogging;
 	std::function<bool()> m_getAutoAliasLogExclusionReasons;
 	std::function<bool()> m_getAutoAliasBuildDebugData;
-	std::function<bool()> m_getQueueSchedulingEnableLogging;
-	std::function<org::runtime::QueueSchedulingSelectionPolicy()> m_getQueueSchedulingSelectionPolicy;
-	std::function<float()> m_getQueueSchedulingWidthScale;
-	std::function<float()> m_getQueueSchedulingPenaltyBias;
-	std::function<float()> m_getQueueSchedulingMinPenalty;
-	std::function<float()> m_getQueueSchedulingResourcePressureWeight;
-	std::function<float()> m_getQueueSchedulingUavPressureWeight;
-	std::function<float()> m_getQueueSchedulingAutoGraphicsBias;
-	std::function<float()> m_getQueueSchedulingAsyncOverlapBonus;
-	std::function<float()> m_getQueueSchedulingCrossQueueHandoffPenalty;
-	std::function<org::runtime::TransitionPlacementMode()> m_getTransitionPlacementMode;
-	std::unordered_map<uint64_t, AddTransitionDebugStats> m_addTransitionDebugStatsByResource;
 	std::function<uint32_t()> m_getAutoAliasPoolRetireIdleFrames;
 	std::function<float()> m_getAutoAliasPoolGrowthHeadroom;
 	std::function<void(std::string_view)> m_structuralMaterializeCheckpointCallback;
 	std::function<void(std::string_view, std::string_view)> m_structuralMaterializeResourceCheckpointCallback;
-	org::alias::RenderGraphAliasingSubsystem m_aliasingSubsystem;
 
-	ComputePassBuilder& GetOrCreateComputePassBuilder(std::string const& name);
 	RenderPassBuilder& GetOrCreateRenderPassBuilder(std::string const& name);
-	CopyPassBuilder& GetOrCreateCopyPassBuilder(std::string const& name);
 
 	friend class RenderPassBuilder;
-	friend class ComputePassBuilder;
-	friend class CopyPassBuilder;
-	friend class org::alias::RenderGraphAliasingSubsystem;
+	friend struct BuilderGraphAccess;
 };
 
 } // namespace org
 
 #include "Render/PassBuilders.h"
+
+namespace org {
+
+template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
+RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedRenderPass<PassT>);
+    auto& builder = GetOrCreateRenderPassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+template<typename PassT, typename... StableCtorArgs>
+RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
+    static_assert(DerivedRenderPass<PassT>);
+    auto& builder = GetOrCreateRenderPassBuilder(name);
+    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
+    return builder;
+}
+
+} // namespace org

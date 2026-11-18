@@ -69,11 +69,21 @@ public:
 		TrackedHandle& out,
 		std::optional<AllocationTrackDesc> trackDesc) const noexcept;
 
+	// Create a resource the caller owns outright, with no tracking entity (org::memory::CreateAllocatedResource). Any thread.
+	rhi::Result CreateResourceUntracked(
+		const rhi::ma::AllocationDesc& allocDesc,
+		const rhi::ResourceDesc& resourceDesc,
+		rhi::ma::AllocationPtr& outAllocation) const noexcept;
+
 	rhi::Result AllocateMemoryTracked(
 		const rhi::ma::AllocationDesc& allocDesc,
 		const rhi::ResourceAllocationInfo& allocationInfo,
 		TrackedHandle& outAllocation,
 		std::optional<AllocationTrackDesc> trackDesc = std::nullopt) const noexcept;
+
+	// Over the OS budget, video memory demotes lower priorities to system memory first. A placed allocation takes the
+	// priority of the heap it shares.
+	void SetResidencyPriority(TrackedHandle& allocation, rhi::ResidencyPriority priority) const noexcept;
 
 private:
 

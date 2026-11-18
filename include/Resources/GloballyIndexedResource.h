@@ -29,6 +29,8 @@ enum class SRVViewType : int {
 	TextureCube,
 	TextureCubeArray,
 	TextureCubeArrayFull,
+	// The stencil plane of a 2D depth-stencil texture, read as uint (D3D12: its second channel; Vulkan: its first).
+	Texture2DStencil,
 	NumSRVViewTypes
 };
 
@@ -377,7 +379,6 @@ private:
 		return m_SRVViews[static_cast<unsigned int>(m_primaryViewType)].infos;
 	}
 
-	friend class DynamicGloballyIndexedResource;
 	friend class BufferBase;
 };
 

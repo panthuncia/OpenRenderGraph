@@ -25,9 +25,24 @@ namespace org::runtime {
 
 class StagedUploadBatch;
 
-class IUploadService {
+// The any-thread half of an upload service: what code that creates resources off the owner thread (asset jobs, graph
+// workers) is handed, so it cannot reach the owner-only queue operations of IUploadService.
+class IUploadProducer {
 public:
-    virtual ~IUploadService() = default;
+    virtual ~IUploadProducer() = default;
+
+    // Texture upload whose source bytes are owned by the caller through `keepAlive`. On the owner thread this queues the
+    // upload directly; from any other thread (or while the service has no owner yet) the bytes are staged on the calling
+    // thread and posted to the owner's mailbox, recorded by the owner's next upload pass.
+    virtual void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+        uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
+        std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
+        std::shared_ptr<const void> keepAlive, const char* file = nullptr, int line = 0) = 0;
+};
+
+class IUploadService : public IUploadProducer {
+public:
+    ~IUploadService() override = default;
 
     virtual void Initialize() = 0;
     // Marks the calling thread as the owner of the frame (in-graph) upload path.
@@ -35,8 +50,7 @@ public:
     virtual void SetUploadResolveContext(UploadResolveContext context) = 0;
     virtual std::shared_ptr<RenderPass> GetUploadPass() const = 0;
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-    virtual void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset, const char* file, int line) = 0;
+    virtual void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset, const char* file = nullptr, int line = 0) = 0;
     virtual void UploadTextureSubresources(
         UploadTarget target,
         rhi::Format fmt,
@@ -47,62 +61,27 @@ public:
         uint32_t arraySize,
         const rhi::helpers::SubresourceData* srcSubresources,
         uint32_t srcCount,
-        const char* file,
-        int line) = 0;
-#else
-    virtual void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset) = 0;
-    virtual void UploadTextureSubresources(
-        UploadTarget target,
-        rhi::Format fmt,
-        uint32_t baseWidth,
-        uint32_t baseHeight,
-        uint32_t depthOrLayers,
-        uint32_t mipLevels,
-        uint32_t arraySize,
-        const rhi::helpers::SubresourceData* srcSubresources,
-        uint32_t srcCount) = 0;
-#endif
+        const char* file = nullptr,
+        int line = 0) = 0;
 
-    // Texture upload whose source bytes are owned by the caller through
-    // `keepAlive`. On the owner (render) thread this is UploadTextureSubresources;
-    // from any other thread the request is posted to the owner's mailbox and
-    // recorded by the next frame's upload pass, so producers never touch the
-    // frame upload queue. Live textures published to consumers are graph-ordered
-    // this way; only never-used, concurrent textures may use the worker service.
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-    virtual void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
+    // IUploadProducer::PostTextureSubresources. This default, for services without a mailbox, uploads directly and so
+    // is owner-thread only.
+    void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
         uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
         std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
-        std::shared_ptr<const void> keepAlive, const char* file, int line) {
+        std::shared_ptr<const void> keepAlive, const char* file = nullptr, int line = 0) override {
         (void)keepAlive;
         if (!subresources) return;
         UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
             subresources->data(), static_cast<uint32_t>(subresources->size()), file, line);
     }
-#else
-    virtual void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
-        uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
-        std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
-        std::shared_ptr<const void> keepAlive) {
-        (void)keepAlive;
-        if (!subresources) return;
-        UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
-            subresources->data(), static_cast<uint32_t>(subresources->size()));
-    }
-#endif
 
     // Upload several regions of one target as a single queue entry: one telemetry
     // capture, one upload-heap allocation, one map/unmap. Regions must be sorted
     // by dstOffset and must not overlap. The default forwards region by region.
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
-    virtual void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const UploadRegion> regions, const char* file, int line) {
+    virtual void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const UploadRegion> regions, const char* file = nullptr, int line = 0) {
         for (const auto& region : regions) UploadData(region.data, region.size, resourceToUpdate, region.dstOffset, file, line);
     }
-#else
-    virtual void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const UploadRegion> regions) {
-        for (const auto& region : regions) UploadData(region.data, region.size, resourceToUpdate, region.dstOffset);
-    }
-#endif
 
     virtual void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size) = 0;
 
@@ -118,21 +97,69 @@ public:
     // every entry is then one copy with no further bookkeeping. Switching it off queues what is waiting.
     virtual void SetStagedUploadsRecordedDirectly(bool direct) { (void)direct; }
     // Owner thread: records the waiting staged batches' copies into `list` (whose frame slot is frameIndex:
-    // the batches live until it retires), in submission order: a copy that overlaps one recorded before it -
-    // in these batches, or among the list's copies before them when afterCopies - waits for it. Returns the
-    // number of copies; the caller orders them against everything else.
-    virtual size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies) {
-        (void)list; (void)frameIndex; (void)afterCopies;
+    // the batches live until it retires), in submission order: a copy that overlaps one recorded before it in
+    // these batches waits for it. afterWork: the copies follow work they must wait for (copies earlier in the
+    // list, or the previous execution's): one full barrier ahead of the first, recorded only when there is a
+    // copy, so an epoch with no batch pays nothing. Returns the number of copies.
+    virtual size_t RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork) {
+        (void)list; (void)frameIndex; (void)afterWork;
         return 0;
     }
-    virtual void ProcessDeferredReleases(uint8_t frameIndex) = 0;
-    // Owner thread: ProcessDeferredReleases, except that the GPU objects retiring at this step are handed back instead of
-    // destroyed here. They are already safe to destroy; they go when the returned owner is dropped, on the thread that
-    // drops it - for a host whose render thread must not pay for driver frees.
-    virtual std::shared_ptr<void> ProcessDeferredReleasesRetiringElsewhere(uint8_t frameIndex) {
-        ProcessDeferredReleases(frameIndex);
-        return {};
+    // Owner thread, direct mode: queues a batch its producer already recorded (StagedUploadBatch::Record), whose list
+    // the host submits as it is, ahead of the copies it records itself - so only when that is the batch's place: nothing
+    // staged, queued or posted before it is waiting, and no backing was released since it was recorded. False leaves the
+    // batch with the caller, which submits it as staged (SubmitStagedUploads) instead.
+    virtual bool SubmitRecordedUploads(std::shared_ptr<StagedUploadBatch> batch) {
+        (void)batch;
+        return false;
     }
+    // Owner thread: the accepted recorded batches' lists, in order, for frame slot frameIndex (the batches live until it
+    // retires). Call before RecordStagedUploads: a batch whose recording a backing release has since outdated goes back
+    // to be recorded there, first, and none is returned.
+    virtual size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex) {
+        (void)out; (void)frameIndex;
+        return 0;
+    }
+    // Where the uploads go, for a host that splits them between queues (RenderGraph::RecordPendingUploads' queue-scoped uploads).
+    // TakeRecordedUploads, also appending to `destinations` every buffer backing the taken lists write. False when that is not
+    // known (the default, unless nothing was taken): the caller then treats the lists as writing anything.
+    virtual bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
+        std::vector<rhi::ResourceHandle>& destinations) {
+        (void)destinations;
+        const size_t before = out.size();
+        TakeRecordedUploads(out, frameIndex);
+        return out.size() == before;
+    }
+    // Owner thread, direct mode: appends the destination backing of every copy RecordStagedUploads would record now, one per copy
+    // in recording order. False when one is not known (the default): the caller then records them with RecordStagedUploads.
+    virtual bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const {
+        (void)out;
+        return false;
+    }
+    // RecordStagedUploads, with each copy recorded into the list `route` names for its destination backing (null: `list`) instead:
+    // the copies of one destination all go to the same list, in order. Each list that takes a copy starts with afterWork's barrier.
+    // Returns the copies recorded in all; routed counts those that went elsewhere than `list`. Only a service whose
+    // StagedUploadDestinations answers routes (the default records everything into `list`).
+    virtual size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
+        const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) {
+        (void)route;
+        routed = 0;
+        return RecordStagedUploads(list, frameIndex, afterWork);
+    }
+    // Owner thread, direct mode: hands the waiting staged batches over to `out` instead of recording them, for a host that records
+    // them on another thread (RenderGraph::TakePendingUploads). They live until frame slot frameIndex retires, as recorded ones do.
+    // Batches staged after this call wait for the next one. False when the service cannot hand them over (the default, unless
+    // none are waiting).
+    virtual bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<StagedUploadBatch>>& out) {
+        (void)frameIndex; (void)out;
+        return !HasPendingUploads();
+    }
+    // Owner thread: whether a host's upload list would record anything now (queued or posted uploads, copies, staged or
+    // recorded batches). False lets a host skip the list. A post from another thread after the call goes with the next one.
+    virtual bool HasPendingUploads() const { return true; }
+    // Owner thread: the slot's previous execution completed, so its upload pages are reused. GPU objects retire through the
+    // runtime (Runtime::Retire), not here.
+    virtual void ProcessDeferredReleases(uint32_t frameIndex) = 0;
 
     // ── Worker upload path (copy queue, CopyQueueUploadService) ──────
     // Never touches the frame upload instance: bytes are staged into the
@@ -142,10 +169,59 @@ public:
     virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
         std::span<const StreamingUploadSegment> segments, size_t totalSize,
         WorkerOwnedDestination destination, size_t dstOffset = 0) = 0;
+    // The same path, many ranges of one destination in one call (CopyQueueUploadService::QueueBufferUploadRanges): one
+    // ticket for the batch, completed after every range. The bytes are staged before it returns. The default forwards range
+    // by range and returns the last range's ticket (or the first that failed: null or cancelled).
+    virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadRanges(
+        std::span<const StreamingUploadRange> ranges, WorkerOwnedDestination destination) {
+        std::shared_ptr<TrackedUploadTicket> ticket;
+        for (const auto& range : ranges) {
+            if (range.size == 0) continue;
+            const StreamingUploadSegment segment{ range.data, range.size };
+            ticket = QueueTrackedStreamingUploadSegments({ &segment, 1 }, segment.size, destination, range.dstOffset);
+            if (!ticket || ticket->state.load(std::memory_order_acquire) == TrackedUploadTicketState::Cancelled) return ticket;
+        }
+        return ticket;
+    }
+    // The same path, a GPU copy from another buffer (CopyQueueUploadService::QueueBufferCopyRanges): one ticket for the ranges,
+    // completed after every one. The source must be a buffer no queue writes while the copy is queued (an immutable published
+    // version, kept alive by the caller until the ticket completes) and rhi::QueueSharing::Concurrent like the destination. It is
+    // ordered after every upload queued on this path before it, including writes to the source itself. Null: the path cannot copy
+    // (no dedicated queue), and the caller uploads instead.
+    virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingCopyRanges(
+        std::shared_ptr<Resource> source, std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination) {
+        (void)source; (void)ranges; (void)destination;
+        return {};
+    }
+    // Whether that path has a queue of its own (the dedicated uploader of graph work). Without one its copies go to the graph's
+    // copy queue, which a host may alias to its graphics queue: a producer that relies on running beside the frame checks this.
+    virtual bool HasDedicatedStreamingQueue() const { return false; }
+    // Any thread: signals `timeline` to `value` on that path's queue once every upload the calling thread queued on it before
+    // is done (CopyQueueUploadService::QueueSignal). Another queue may wait on the value before it is signalled, so a producer
+    // that announced one always queues it. Its ticket is Submitted once the signal is on that queue (see QueueSignal). Null when
+    // the path has no queue of its own to signal from.
+    virtual std::shared_ptr<TrackedUploadTicket> QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
+        (void)timeline; (void)value;
+        return {};
+    }
+    // Any thread: the uploads the calling thread queues on that path from now on wait, on the GPU, until each timeline reached its
+    // value (another queue's progress: a frame in flight still reading the destination they overwrite). Nothing waits on the CPU.
+    // False when the path has no queue of its own.
+    // A producer whose signal later work of the same frame waits for passes only sealed points (GraphHost::SealedPoint): work
+    // submitted earlier in the frame may sit behind that later work, or reach the device only once the frame ends. On a queue
+    // shared with the host's own copies the host may hold the wait on the CPU, and every upload queued after it with it.
+    virtual bool QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points) {
+        (void)points;
+        return false;
+    }
 
     virtual void Cleanup() = 0;
 };
 
 std::shared_ptr<IUploadService> CreateDefaultUploadService();
+// An upload queue of a graph's own (RenderGraph::SetUploadService before Setup), for a graph that runs alongside others, on its
+// own thread: only its upload pass drains it, against its own registry and page ring. The worker (copy-queue) path stays the
+// runtime's.
+std::shared_ptr<IUploadService> CreateGraphUploadService();
 
 }

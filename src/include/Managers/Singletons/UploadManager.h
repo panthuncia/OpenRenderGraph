@@ -13,7 +13,6 @@
 #include <thread>
 #include <condition_variable>
 #include <deque>
-#include <stacktrace>
 
 #include "rhi_helpers.h"
 #include "Render/ResourceRegistry.h"
@@ -49,8 +48,13 @@ public:
 	using UploadTarget = org::runtime::UploadTarget;
 
 	static UploadManager& GetInstance();
+	// A graph's own upload queue (runtime::CreateGraphUploadService), for a graph that runs alongside others: what is uploaded
+	// through it is drained by its graph's upload pass alone, resolved against that graph's registry and paged on its own ring.
+	// The worker (copy-queue) upload path is shared's.
+	explicit UploadManager(UploadManager& shared);
+	UploadManager(const UploadManager&) = delete;
+	UploadManager& operator=(const UploadManager&) = delete;
 	void Initialize();
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset, const char* file, int line);
 	void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions, const char* file, int line);
 	void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
@@ -69,32 +73,23 @@ public:
 		uint32_t srcCount,
 		const char* file,
 		int line);
-#else
-	void UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset);
-	void UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions);
-	void PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
-		uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
-		std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
-		std::shared_ptr<const void> keepAlive);
-	void UploadTextureSubresources(
-		UploadTarget target,
-		rhi::Format fmt,
-		uint32_t baseWidth,
-		uint32_t baseHeight,
-		uint32_t depthOrLayers,
-		uint32_t mipLevels,
-		uint32_t arraySize,
-		const rhi::helpers::SubresourceData* srcSubresources,
-		uint32_t srcCount);
-#endif	
-	void ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
+	void ProcessUploads(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList);
 	void SetOwnerThread();
 	void QueueResourceCopy(const std::shared_ptr<Resource>& destination, const std::shared_ptr<Resource>& source, size_t size);
-	void ExecuteResourceCopies(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList);
-	void ProcessDeferredReleases(uint8_t frameIndex);
+	void ExecuteResourceCopies(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList);
+	void ProcessDeferredReleases(uint32_t frameIndex);
 	void SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
 	void SetStagedUploadsRecordedDirectly(bool direct);
-	size_t RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies);
+	size_t RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork);
+	bool SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
+	size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex);
+	bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex, std::vector<rhi::ResourceHandle>& destinations);
+	bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out);
+	bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const;
+	// IUploadService::HasPendingUploads: queued copies, or anything the instance holds.
+	bool HasPendingUploads() const;
+	size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
+		const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed);
 	void SetUploadResolveContext(UploadResolveContext ctx);
 	std::shared_ptr<RenderPass> GetUploadPass() const { return m_uploadPass; }
 	std::string DescribeQueuedTargetByGlobalResourceId(uint64_t globalResourceId);
@@ -103,14 +98,25 @@ public:
 	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadSegments(
 		std::span<const StreamingUploadSegment> segments, size_t totalSize,
 		WorkerOwnedDestination destination, size_t dstOffset = 0);
-	org::runtime::CopyQueueUploadService* CopyQueueUploads() { return m_copyQueueUploads.get(); }
+	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingUploadRanges(
+		std::span<const StreamingUploadRange> ranges, WorkerOwnedDestination destination);
+	// A GPU copy between two buffers on that path (IUploadService::QueueTrackedStreamingCopyRanges); null without a queue of its own.
+	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingCopyRanges(std::shared_ptr<Resource> source,
+		std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination);
+	org::runtime::CopyQueueUploadService* CopyQueueUploads() { return m_shared ? m_shared->CopyQueueUploads() : m_copyQueueUploads.get(); }
+	// Whether the worker upload path has a queue of its own (not the graph's copy queue, which may alias the graphics one).
+	bool HasDedicatedStreamingQueue() const { return m_shared ? m_shared->HasDedicatedStreamingQueue() : static_cast<bool>(m_uploadQueue); }
+	// The queue of its own the copy-queue uploader made (Initialize), if any: the runtime's frontier covers it.
+	rhi::Queue GetDedicatedUploadQueue() const { return m_shared ? m_shared->GetDedicatedUploadQueue() : m_uploadQueue; }
+	std::shared_ptr<TrackedUploadTicket> QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
+	bool QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points);
 
 	void Cleanup();
 private:
 
 	class UploadPass : public RenderPass, public IDynamicDeclaredResources, public IHasImmediateModeCommands {
 	public:
-		UploadPass() {
+		explicit UploadPass(UploadManager& owner) : m_owner(owner) {
 		}
 
 		void DeclareResourceUsages(RenderPassBuilder* builder) override {
@@ -122,8 +128,8 @@ private:
 		}
 
 		void RecordImmediateCommands(ImmediateExecutionContext& context) override {
-			GetInstance().ExecuteResourceCopies(context.frameIndex, context.list);// copies come before uploads to avoid overwriting data
-			GetInstance().ProcessUploads(context.frameIndex, context.list);
+			m_owner.ExecuteResourceCopies(context.frameIndex, context.list);// copies come before uploads to avoid overwriting data
+			m_owner.ProcessUploads(context.frameIndex, context.list);
 		}
 
 		PassReturn Execute(PassExecutionContext& context) override {
@@ -147,19 +153,21 @@ private:
 		}
 
 	private:
+		UploadManager& m_owner;
 		mutable std::atomic_bool m_declaredResourcesDirty = true;
 	};
-
 	UploadManager() {
-		m_uploadPass = std::make_shared<UploadPass>();
+		m_uploadPass = std::make_shared<UploadPass>(*this);
 	}
+	// The instance whose worker path a graph's own (UploadManager(UploadManager&)) uses; null for the shared one.
+	UploadManager* m_shared = nullptr;
 	void MarkUploadPassDirty();
 	void CaptureResourceCopyTelemetry(ResourceCopy& copy);
 	void RefreshQueuedCopyTelemetryLocked();
 	bool IsUploadTargetValid(const UploadTarget& target, const char* reason, const char* file, int line);
 	void CaptureUploadTargetTelemetry(const UploadTarget& target, uint64_t& outId, std::string& outName);
 
-	uint8_t m_numFramesInFlight = 0;
+	uint32_t m_numFramesInFlight = 0;
 
 	std::vector<ResourceCopy> queuedResourceCopies;
 	std::mutex m_uploadQueueMutex;
@@ -171,6 +179,9 @@ private:
 
 	// ── Worker upload path ──────────────────────────────────────────────
 	std::unique_ptr<org::runtime::CopyQueueUploadService> m_copyQueueUploads;
+	// The copy-queue uploader's own queue (Device::CreateQueue: a distinct queue, or an adopted device's spare one), destroyed
+	// with it; null when it shares the primary copy queue.
+	rhi::Queue m_uploadQueue{};
 
 };
 

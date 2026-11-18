@@ -34,6 +34,11 @@ public:
     static OwnedDescriptorBinding CaptureResourceView(
         std::shared_ptr<const ResourceBindingSnapshot> snapshot, const BindlessViewRequest& view,
         uint64_t deviceGeneration, std::shared_ptr<runtime::ResourceCleanupQueue> cleanup);
+    // CaptureResourceView for a descriptor shaders read without the graph knowing (a bindless table's entry). The
+    // snapshot's resource must be externally immutable (RequireUndeclaredShaderRead): throws std::logic_error otherwise.
+    static OwnedDescriptorBinding CaptureUndeclaredView(
+        std::shared_ptr<const ResourceBindingSnapshot> snapshot, const BindlessViewRequest& view,
+        uint64_t deviceGeneration, std::shared_ptr<runtime::ResourceCleanupQueue> cleanup);
     static OwnedDescriptorBinding CaptureSampler(uint32_t index, uint64_t deviceGeneration,
         std::shared_ptr<DescriptorHeap> heap, std::shared_ptr<runtime::ResourceCleanupQueue> cleanup);
 

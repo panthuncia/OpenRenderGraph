@@ -4,7 +4,6 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <stacktrace>
 #include <string>
 #include <unordered_map>
 
@@ -27,11 +26,9 @@ public:
 		uint64_t owningResourceID,
 		bool unorderedAccess = false,
 		const char* name = nullptr,
-		bool shared = false) {
-		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, nullptr, shared));
-#if BUILD_TYPE == BUILD_DEBUG
-		//sp->m_creation = std::stacktrace::current();
-#endif
+		bool shared = false,
+		rhi::ResourceFlags extraFlags = rhi::RF_None) {
+		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, nullptr, shared, extraFlags));
 		return sp;
 	}
 
@@ -41,11 +38,9 @@ public:
 		uint64_t owningResourceID,
 		const BufferAliasPlacement& placement,
 		bool unorderedAccess = false,
-		const char* name = nullptr) {
-		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, &placement, false));
-#if BUILD_TYPE == BUILD_DEBUG
-		//sp->m_creation = std::stacktrace::current();
-#endif
+		const char* name = nullptr,
+		rhi::ResourceFlags extraFlags = rhi::RF_None) {
+		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, &placement, false, extraFlags));
 		return sp;
 	}
 
@@ -73,9 +68,6 @@ public:
 	}
 
 private:
-#if BUILD_TYPE == BUILD_DEBUG
-	std::stacktrace m_creation;
-#endif
 	size_t m_size = 0;
 	rhi::BufferBarrier m_barrier = {};
 
@@ -100,7 +92,8 @@ private:
 		bool unorderedAccess = false,
 		const char* name = nullptr,
 		const BufferAliasPlacement* aliasPlacement = nullptr,
-		bool shared = false);
+		bool shared = false,
+		rhi::ResourceFlags extraFlags = rhi::RF_None);
 
 	struct LiveAllocInfo {
 		size_t size = 0;
@@ -108,7 +101,8 @@ private:
 	};
 
 	void RegisterLiveAlloc();
-	void UnregisterLiveAlloc();
+	// Returns the name it was tracked with, for the deletion it goes to.
+	std::string UnregisterLiveAlloc();
 	void UpdateLiveAllocName(const char* name);
 	static std::mutex& LiveAllocMutex();
 	static std::unordered_map<const GpuBufferBacking*, LiveAllocInfo>& LiveAllocs();

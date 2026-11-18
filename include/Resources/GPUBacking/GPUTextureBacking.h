@@ -1,7 +1,6 @@
 #pragma once
 #include <rhi.h>
 #include <resource_states.h>
-#include <stacktrace>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -13,6 +12,14 @@
 
 
 namespace org {
+
+/// The mip count a texture of this description is created with: its explicit subresource chain, else a full chain
+/// when generateMipMaps is set, else 1.
+uint16_t ResolveTextureMipLevels(const TextureDescription& desc);
+
+/// The RHI description a texture of this description is created with, without a clear value. Alias placement sizes
+/// textures from it, so a placement always covers the allocation.
+rhi::ResourceDesc TextureResourceDesc(const TextureDescription& desc);
 
 class GpuTextureBacking {
 public:
@@ -71,9 +78,6 @@ public:
 	}
 
 private:
-#if BUILD_TYPE == BUILD_DEBUG
-	std::stacktrace m_creation;
-#endif
 	void initialize(const TextureDescription& desc,
 		uint64_t owningResourceID,
 		const char* name);
@@ -88,7 +92,8 @@ private:
 	};
 
 	void RegisterLiveAlloc();
-	void UnregisterLiveAlloc();
+	// Returns the name it was tracked with, for the deletion it goes to.
+	std::string UnregisterLiveAlloc();
 	void UpdateLiveAllocName(const char* name);
 	static std::mutex& LiveAllocMutex();
 	static std::unordered_map<const GpuTextureBacking*, LiveAllocInfo>& LiveAllocs();

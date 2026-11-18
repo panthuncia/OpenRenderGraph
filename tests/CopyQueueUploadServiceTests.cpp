@@ -9,6 +9,7 @@
 //    and oversize uploads take a dedicated page that is not recycled.
 
 #include <Render/Runtime/CopyQueueUploadService.h>
+#include "TestSupport.h"
 #include <Render/Runtime/RuntimeDevice.h>
 #include <Resources/ExternalBufferResource.h>
 #include <rhi.h>
@@ -24,7 +25,6 @@
 #include <thread>
 #include <vector>
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "CHECK failed at line %d: %s\n", __LINE__, #x); return __LINE__; } } while (false)
 
 namespace {
 
@@ -186,6 +186,61 @@ int TestPageReuseAndCancel(Harness& h) {
     return 0;
 }
 
+// Tests signal entries (QueueSignal). It checks that:
+// - a consumer submitted before the copies waits on the external timeline's value. The wait comes before the signal.
+// - the consumer reads every copy the producer queued ahead of the signal.
+// - a signal with nothing to copy goes out in a batch of its own.
+int TestSignalEntries(Harness& h) {
+    constexpr uint64_t kBytes = 96 * 1024;
+    auto destination = MakeDeviceBuffer(h.device.Get(), kBytes, "CopyQueueUploadSignalled");
+    CHECK(destination);
+    auto timeline = std::make_shared<rhi::TimelinePtr>();
+    CHECK(!rhi::Failed(h.device->CreateTimeline(*timeline, 0, "CopyQueueUploadFrameValues")) && *timeline);
+    rhi::ResourcePtr readback;
+    CHECK(!rhi::Failed(h.device->CreateCommittedResource(
+        rhi::helpers::ResourceDesc::Buffer(kBytes, rhi::HeapType::Readback, {}, "CopyQueueUploadSignalReadback"), readback)));
+    rhi::CommandAllocatorPtr allocator;
+    rhi::CommandListPtr list;
+    CHECK(!rhi::Failed(h.device->CreateCommandAllocator(rhi::QueueKind::Graphics, allocator)));
+    CHECK(!rhi::Failed(h.device->CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), list)));
+    rhi::BufferBarrier toSource{
+        .buffer = destination->GetAPIResource().GetHandle(),
+        .beforeSync = rhi::ResourceSyncState::All,
+        .afterSync = rhi::ResourceSyncState::Copy,
+        .beforeAccess = rhi::ResourceAccessType::Common,
+        .afterAccess = rhi::ResourceAccessType::CopySource,
+    };
+    list->Barriers({ .buffers = { &toSource, 1 } });
+    list->CopyBufferRegion(readback->GetHandle(), 0, destination->GetAPIResource().GetHandle(), 0, kBytes);
+    list->End();
+    const rhi::CommandList lists[] = { list.Get() };
+    const rhi::TimelinePoint wait{ (*timeline)->GetHandle(), 3 };
+    CHECK(!rhi::Failed(h.graphics.Submit(lists, { .waits = { &wait, 1 } })));
+    const auto expected = Pattern(kBytes, 17);
+    // Three regions from three uploads, then the signal: the consumer sees all of them.
+    for (uint64_t part = 0; part < 3; ++part) {
+        const org::StreamingUploadSegment segment[] = { { expected.data() + part * (kBytes / 3), kBytes / 3 } };
+        CHECK(h.service.QueueBufferUpload(segment, kBytes / 3,
+            org::WorkerOwnedDestination{ destination, org::WorkerOwnedDestination::Ownership::PooledBackingLease }, part * (kBytes / 3)));
+    }
+    CHECK(h.service.QueueSignal(timeline, 3));
+    CHECK(!rhi::Failed(h.device->WaitIdle()));
+    CHECK((*timeline)->GetCompletedValue() >= 3);
+    void* mapped = nullptr;
+    readback->Map(&mapped, 0, kBytes);
+    CHECK(mapped);
+    CHECK(std::memcmp(mapped, expected.data(), kBytes) == 0);
+    readback->Unmap(0, 0);
+    // Nothing to copy: the signal alone.
+    CHECK(h.service.QueueSignal(timeline, 4));
+    CHECK((*timeline)->HostWait(4, 5000) == rhi::Result::Ok);
+    // Invalid arguments.
+    CHECK(!h.service.QueueSignal(timeline, 0));
+    CHECK(!h.service.QueueSignal({}, 5));
+    CHECK(h.service.WaitIdle(5000));
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -222,6 +277,7 @@ int main(int argc, char** argv) {
     if (const auto failure = TestSegmentedUpload(h)) return failure;
     if (const auto failure = TestOffsetAndOversize(h)) return failure;
     if (const auto failure = TestPageReuseAndCancel(h)) return failure;
+    if (const auto failure = TestSignalEntries(h)) return failure;
 
     h.service.Cleanup();
     CHECK(!h.service.Initialized());

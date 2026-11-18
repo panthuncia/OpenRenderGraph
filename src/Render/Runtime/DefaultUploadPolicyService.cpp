@@ -70,13 +70,13 @@ public:
     }
 
     void BeginFrame() override {
-        // BufferUploadPolicyState carries dirty ranges across frame boundaries
-        // and consumes them only during FlushAll(). All current client
-        // BeginFrame implementations therefore only acquire their buffer-local
-        // mirror lock before calling that no-op. Iterating every registered
-        // buffer here turned one render-thread frame boundary into a global
-        // rendezvous with concurrent graph publication writers. Preserve the
-        // client hook for the small dirty set only.
+        // BufferUploadPolicyState carries dirty ranges across frame boundaries.
+        // It consumes them only during FlushAll(). So every current client
+        // BeginFrame implementation only takes its buffer-local mirror lock and
+        // then calls a no-op. Iterating every registered buffer here turned each
+        // render-thread frame boundary into a global rendezvous with concurrent
+        // graph publication writers. So the client hook is kept, but only the
+        // small dirty set gets it.
         auto clients = SnapshotDirtyClients(false);
         for (auto* client : clients) {
             if (client) client->OnUploadPolicyBeginFrame();

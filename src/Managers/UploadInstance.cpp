@@ -1,5 +1,5 @@
 #include "Managers/UploadInstance.h"
-#include "Utilities/EnvironmentFlag.h"
+#include "Render/Runtime/OpenRenderGraphSettings.h"
 #include <unordered_map>
 #include "Render/Runtime/StagedUploadBatch.h"
 
@@ -30,19 +30,11 @@ namespace {
 	}
 
 	bool UploadTelemetryLoggingEnabled() {
-		static const bool enabled = [] {
-			for (const char* name : {
-				"SARP_UPLOAD_TELEMETRY_LOG",
-				"SARP_TEXTURE_STREAMING_TRANSITION_LOG" }) {
-				if (org::detail::EnvironmentFlagEnabled(name)) return true;
-			}
-			return false;
-		}();
-		return enabled;
+		return org::runtime::DiagnosticLogEnabled(org::runtime::DiagnosticLog::UploadTelemetry);
 	}
 }
 
-UploadInstance::UploadInstance(uint8_t numFramesInFlight, size_t pageSize)
+UploadInstance::UploadInstance(uint32_t numFramesInFlight, size_t pageSize)
 	: UploadInstance(Config{
 		.numFramesInFlight = numFramesInFlight,
 		.pageSizeBytes = pageSize,
@@ -56,7 +48,7 @@ UploadInstance::UploadInstance(Config config)
 	, m_debugName(std::move(config.debugName))
 	, m_pageNamePrefix(std::move(config.pageNamePrefix))
 	, m_usageHint(std::move(config.usageHint))
-	, m_numFramesInFlight((std::max)(uint8_t{ 1 }, config.numFramesInFlight))
+	, m_numFramesInFlight((std::max)(uint32_t{ 1 }, config.numFramesInFlight))
 {
 	m_framePages.resize(m_numFramesInFlight);
 	m_frameStaged.resize(m_numFramesInFlight);
@@ -75,11 +67,20 @@ void UploadInstance::SetOwnerThread() {
 
 bool UploadInstance::IsOwnerThread() const noexcept {
 	const auto owner = m_ownerThreadHash.load(std::memory_order_acquire);
-	return owner == 0 || owner == std::hash<std::thread::id>{}(std::this_thread::get_id());
+	return owner != 0 && owner == std::hash<std::thread::id>{}(std::this_thread::get_id());
+}
+
+bool UploadInstance::ClaimOwnerThread() noexcept {
+	const auto self = std::hash<std::thread::id>{}(std::this_thread::get_id());
+	std::size_t owner = 0;
+	if (m_ownerThreadHash.compare_exchange_strong(owner, self, std::memory_order_acq_rel, std::memory_order_acquire)) {
+		return true;
+	}
+	return owner == self;
 }
 
 void UploadInstance::NoteOffOwnerCall(const char* api) {
-	if (IsOwnerThread()) return;
+	if (ClaimOwnerThread()) return;
 	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.OffThreadCalls");
 	basic_telemetry::AddCounter(std::string("ORG.Upload.FrameInstance.OffThreadCalls.") + api);
 	const auto logged = m_offThreadCallsLogged.fetch_add(1, std::memory_order_relaxed);
@@ -89,18 +90,10 @@ void UploadInstance::NoteOffOwnerCall(const char* api) {
 	}
 }
 
-void UploadInstance::NoteProducerCall(const char* api, const UploadTarget& target) {
-	if (IsOwnerThread()) return;
-	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.OffThreadCalls");
-	basic_telemetry::AddCounter(std::string("ORG.Upload.FrameInstance.OffThreadCalls.") + api);
-	const auto logged = m_offThreadCallsLogged.fetch_add(1, std::memory_order_relaxed);
-	if (logged < 32u) {
-		const std::string name = target.kind == UploadTarget::Kind::PinnedShared && target.pinned
-			? target.pinned->GetName()
-			: std::string("registry-handle");
-		spdlog::warn("UploadInstance '{}': {} called off the owner thread target='{}' (frame upload instance is render-thread owned)",
-			m_debugName, api, name);
-	}
+// A posted (mailbox) upload: the supported producer path, counted, not misuse.
+void UploadInstance::NoteProducerCall(const char* api) {
+	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.PostedCalls");
+	basic_telemetry::AddCounter(std::string("ORG.Upload.FrameInstance.PostedCalls.") + api);
 }
 
 void UploadInstance::SetResolveContext(UploadResolveContext ctx) {
@@ -154,6 +147,7 @@ UploadInstance::UploadPagePtr UploadInstance::CreatePage(size_t size, bool dedic
 	page->dedicated = dedicated;
 	page->index = m_nextPageIndex++;
 	page->buffer = Buffer::CreateShared(rhi::HeapType::Upload, page->capacity, false);
+	page->buffer->SetName(m_debugName + " page");
 	{
 		std::lock_guard lock(m_pageLifetimeTraceMutex);
 		m_pageLifetimeTraces.push_back({ page->buffer, page->capacity, page->index, dedicated });
@@ -353,14 +347,12 @@ bool UploadInstance::TryCoalesceAppend(ResourceUpdate& last, const ResourceUpdat
 
 	last.size += next.size;
 	last.lastSequence = next.lastSequence;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	last.file = next.file;
 	last.line = next.line;
 	last.stackSize = next.stackSize;
 	for (uint8_t i = 0; i < next.stackSize && i < ResourceUpdate::MaxStack; ++i) {
 		last.stack[i] = next.stack[i];
 	}
-#endif
 	return true;
 }
 
@@ -431,13 +423,8 @@ void UploadInstance::PruneInvalidRegistryHandleUpdatesLocked(const char* reason)
 				++writeIndex;
 				continue;
 			}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 			const char* file = update.file;
 			const int line = update.line;
-#else
-			const char* file = nullptr;
-			const int line = 0;
-#endif
 			if (!m_invalidRegistryHandle(targetAccessor(update), reason, file, line)) {
 				changed = true;
 				continue;
@@ -461,12 +448,8 @@ void UploadInstance::PruneInvalidRegistryHandleUpdatesLocked(const char* reason)
 	});
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadInstance::UploadData(const void* data, size_t size, UploadTarget target, size_t dstOffset,
                                 const char* file, int line)
-#else
-void UploadInstance::UploadData(const void* data, size_t size, UploadTarget target, size_t dstOffset)
-#endif
 {
 	if (!data || size == 0) {
 		return;
@@ -474,15 +457,13 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	if (!IsOwnerThread()) {
 		// Producers never touch the owner's queue: the bytes are copied and the
 		// owner applies the upload before its next upload pass records.
-		NoteProducerCall("UploadData", target);
+		NoteProducerCall("UploadData");
 		PostedBufferUpload posted;
 		posted.target = std::move(target);
 		posted.bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
 		posted.dstOffset = dstOffset;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		posted.file = file;
 		posted.line = line;
-#endif
 		m_postedBufferUploads.Push(std::move(posted));
 		MarkPendingWorkChangedLocked();
 		return;
@@ -494,7 +475,6 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	update.size = size;
 	update.resourceToUpdate = target;
 	update.dataBufferOffset = dstOffset;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	update.file = file;
 	update.line = line;
 #ifdef _WIN32
@@ -502,7 +482,6 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	USHORT captured = RtlCaptureStackBackTrace(1, ResourceUpdate::MaxStack, frames, nullptr);
 	update.stackSize = static_cast<uint8_t>(captured);
 	for (USHORT i = 0; i < captured; i++) update.stack[i] = frames[i];
-#endif
 #endif
 	CaptureTargetTelemetry(update.resourceToUpdate,
 		update.targetGlobalResourceId, update.targetDebugName);
@@ -525,9 +504,7 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	MapUpload(uploadBuffer, &mapped);
 	if (mapped) std::memcpy(mapped + uploadOffset, data, size);
 	UnmapUpload(uploadBuffer, uploadOffset, size);
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	if (!mapped) __debugbreak();
-#endif
 
 	{
 		const auto rfound = std::ranges::find(m_resourceUpdates.rbegin(), m_resourceUpdates.rend(),
@@ -549,12 +526,8 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	}
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const UploadRegion> regions,
                                      const char* file, int line)
-#else
-void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const UploadRegion> regions)
-#endif
 {
 	// Contiguous runs of regions (dstOffset == previous end) share one queue
 	// entry; every entry of the batch shares one upload-heap allocation, one
@@ -571,11 +544,7 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 	if (!IsOwnerThread()) {
 		for (const auto& region : regions) {
 			if (!region.data || region.size == 0) continue;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 			UploadData(region.data, region.size, target, region.dstOffset, file, line);
-#else
-			UploadData(region.data, region.size, target, region.dstOffset);
-#endif
 		}
 		return;
 	}
@@ -611,10 +580,8 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 				update.lastSequence = update.firstSequence;
 				update.targetGlobalResourceId = targetId;
 				update.targetDebugName = targetName;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 				update.file = file;
 				update.line = line;
-#endif
 				if (firstSequence == 0) firstSequence = update.firstSequence;
 				m_resourceUpdates.push_back(std::move(update));
 				open = &m_resourceUpdates.back();
@@ -636,9 +603,7 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 		}
 	}
 	UnmapUpload(uploadBuffer, uploadOffset, totalBytes);
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	if (!mapped) __debugbreak();
-#endif
 
 	{
 		// The batch's entries are the newest staging entries with sequences in
@@ -653,7 +618,6 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 	}
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadInstance::UploadTextureSubresources(
 	UploadTarget target,
 	rhi::Format fmt,
@@ -666,38 +630,21 @@ void UploadInstance::UploadTextureSubresources(
 	uint32_t srcCount,
 	const char* file,
 	int line)
-#else
-void UploadInstance::UploadTextureSubresources(
-	UploadTarget target,
-	rhi::Format fmt,
-	uint32_t baseWidth,
-	uint32_t baseHeight,
-	uint32_t depthOrLayers,
-	uint32_t mipLevels,
-	uint32_t arraySize,
-	const rhi::helpers::SubresourceData* srcSubresources,
-	uint32_t srcCount)
-#endif
 {
 	if (!srcSubresources || srcCount == 0) return;
 	rhi::Span<const rhi::helpers::SubresourceData> srcSpan{ srcSubresources, srcCount };
 	const auto plan = rhi::helpers::PlanTextureUploadSubresources(
 		fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize, srcSpan);
 	if (plan.totalSize == 0 || plan.footprints.empty()) return;
-	if (!IsOwnerThread()) {
+	if (!ClaimOwnerThread()) {
 		// The raw entry cannot outlive the caller's source pointers, so an
 		// off-owner call has no safe way to post; PostTextureSubresources is the
 		// producer-side API (caller-owned bytes).
-		NoteProducerCall("UploadTextureSubresources", target);
+		NoteOffOwnerCall("UploadTextureSubresources");
 		throw std::logic_error("UploadInstance::UploadTextureSubresources called off the owner thread; use PostTextureSubresources");
 	}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	UploadTextureSubresourcesPrepared(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
 		srcSubresources, srcCount, PrepareDedicatedPage(static_cast<size_t>(plan.totalSize)), file, line);
-#else
-	UploadTextureSubresourcesPrepared(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
-		srcSubresources, srcCount, PrepareDedicatedPage(static_cast<size_t>(plan.totalSize)), nullptr, 0);
-#endif
 }
 
 void UploadInstance::UploadTextureSubresourcesPrepared(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
@@ -741,10 +688,8 @@ void UploadInstance::UploadTextureSubresourcesPrepared(UploadTarget target, rhi:
 			update.z = fp.zSlice;
 			update.uploadBuffer = uploadBuffer;
 			update.staging = true;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 			update.file = file;
 			update.line = line;
-#endif
 			update.targetGlobalResourceId = targetGlobalResourceId;
 			update.targetDebugName = targetDebugName;
 			update.sequence = ++m_lastUploadSequence;
@@ -772,30 +717,18 @@ void UploadInstance::UploadTextureSubresourcesPrepared(UploadTarget target, rhi:
 	}
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
 	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
 	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
 	std::shared_ptr<const void> keepAlive, const char* file, int line)
-#else
-void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
-	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
-	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
-	std::shared_ptr<const void> keepAlive)
-#endif
 {
 	if (!subresources || subresources->empty()) return;
 	if (IsOwnerThread()) {
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
 			subresources->data(), static_cast<uint32_t>(subresources->size()), file, line);
-#else
-		UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
-			subresources->data(), static_cast<uint32_t>(subresources->size()));
-#endif
 		return;
 	}
-	NoteProducerCall("PostTextureSubresources", target);
+	NoteProducerCall("PostTextureSubresources");
 	rhi::Span<const rhi::helpers::SubresourceData> srcSpan{ subresources->data(),
 		static_cast<uint32_t>(subresources->size()) };
 	const auto plan = rhi::helpers::PlanTextureUploadSubresources(
@@ -833,10 +766,8 @@ void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fm
 		update.uploadBuffer = posted.page->buffer;
 		update.active = posted.mapped;
 		update.staging = false;
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		update.file = file;
 		update.line = line;
-#endif
 		posted.updates.push_back(std::move(update));
 	}
 	(void)keepAlive; // bytes are staged; the caller's storage may be released
@@ -876,73 +807,66 @@ void UploadInstance::SetStagedUploadsRecordedDirectly(bool direct) {
 	if (m_stagedDirect == direct) return;
 	m_stagedDirect = direct;
 	if (!direct) {
-		auto waiting = std::move(m_directStaged);
+		// Recorded batches came first: queued first, as staged ones.
+		auto waiting = std::move(m_directRecorded);
+		m_directRecorded.clear();
+		waiting.insert(waiting.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
 		m_directStaged.clear();
 		for (auto& batch : waiting) SubmitStagedUploads(std::move(batch));
 	}
 }
 
-size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies) {
+bool UploadInstance::SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch, bool a_nothingQueued) {
+	NoteOffOwnerCall("SubmitRecordedUploads");
+	// Its copies go to the GPU ahead of everything the owner records itself, so it is taken only when that is its place
+	// in submission order: nothing staged, queued or posted before it is still waiting.
+	if (!batch || !m_stagedDirect || !batch->Recorded() || batch->RecordedSerial() != BufferBase::BackingReleaseSerial() ||
+		!a_nothingQueued || !m_directStaged.empty() || HasPendingWork())
+		return false;
+	m_currentFrameUploadBytes += batch->Bytes();
+	m_directRecorded.push_back(std::move(batch));
+	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.RecordedBatches");
+	return true;
+}
+
+size_t UploadInstance::TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex) {
+	NoteOffOwnerCall("TakeRecordedUploads");
+	if (m_directRecorded.empty()) return 0;
+	// A backing released since a batch was recorded: its copies name the old one. The owner records them instead, first.
+	if (std::ranges::any_of(m_directRecorded, [](const auto& batch) { return batch->RecordedSerial() != BufferBase::BackingReleaseSerial(); })) {
+		m_directStaged.insert(m_directStaged.begin(), std::make_move_iterator(m_directRecorded.begin()), std::make_move_iterator(m_directRecorded.end()));
+		m_directRecorded.clear();
+		basic_telemetry::AddCounter("ORG.Upload.FrameInstance.RecordedBatchesRerecorded");
+		return 0;
+	}
+	for (const auto& batch : m_directRecorded) out.push_back(batch->RecordedList());
+	const size_t taken = m_directRecorded.size();
+	if (m_numFramesInFlight != 0) {
+		auto& retained = FrameStaged(frameIndex);
+		retained.insert(retained.end(), std::make_move_iterator(m_directRecorded.begin()), std::make_move_iterator(m_directRecorded.end()));
+	}
+	m_directRecorded.clear();
+	return taken;
+}
+
+size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork) {
 	BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads");
-	uint64_t bytes = 0;
 	NoteOffOwnerCall("RecordStagedUploads");
-	size_t copies = 0;
-	// Copies in one list are unordered without a barrier, and batches can overlap (a producer's batch whose
-	// submission never went out, then its replacement): the later write has to win. One barrier per overlap,
-	// none in steady state.
-	auto ordered = [&list] {
+	uint64_t bytes = 0;
+	for (const auto& batch : m_directStaged) bytes += batch->Bytes();
+	// After the work before them (the list's own copies, the previous execution), the batches' first copy waits for it:
+	// one barrier, and none without a batch.
+	if (afterWork && !m_directStaged.empty()) {
 		const auto full = rhi::FullMemoryBarrier();
 		rhi::BarrierBatch barriers{};
 		barriers.globals = {&full, 1u};
 		list.Barriers(barriers);
-	};
-	if (afterCopies && !m_directStaged.empty()) ordered();
-	struct Written {
-		rhi::ResourceHandle target;
-		uint64_t begin = 0, end = 0;
-	};
-	// Index by backing, as in the scoped branch, without changing this host's barriers.
-	std::unordered_map<uint64_t, std::vector<Written>> written;
-	written.reserve(32);
-	{
-		BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads.Copies");
-		for (const auto& batch : m_directStaged) {
-			for (const auto& entry : batch->Entries()) {
-				if (entry.target.kind != UploadTarget::Kind::PinnedShared || !entry.target.pinned || !entry.page)
-					throw std::logic_error("Direct staged uploads need pointer targets");
-				const auto target = entry.target.pinned->GetAPIResource().GetHandle();
-				const uint64_t begin = entry.dstOffset, end = entry.dstOffset + entry.size;
-				const uint64_t key = (uint64_t{target.generation} << 32) | target.index;
-				auto [writtenIt, inserted] = written.try_emplace(key);
-				if (inserted)
-					writtenIt->second.reserve(128);
-				const bool overlaps = std::ranges::any_of(writtenIt->second, [&](const Written& w) {
-					return w.target.index == target.index && w.target.generation == target.generation && begin < w.end && w.begin < end;
-				});
-				if (overlaps) {
-					ordered();
-					written.clear();
-					auto& fresh = written.try_emplace(key).first->second;
-					fresh.reserve(128);
-					fresh.push_back({target, begin, end});
-				} else {
-					writtenIt->second.push_back({target, begin, end});
-				}
-				// A copy past the target's current backing is the producer's defect (staged against another size): the RHI
-				// rejects it and the submission fails, so name it here, where the target's name is known.
-				if (const auto* buffer = dynamic_cast<const Buffer*>(entry.target.pinned.get()); buffer && end > buffer->GetSize())
-					spdlog::error("UploadInstance '{}': staged upload of {} bytes at {} into '{}' is past its {} bytes", m_debugName, entry.size,
-						entry.dstOffset, buffer->GetName(), buffer->GetSize());
-				list.CopyBufferRegion(target, entry.dstOffset, entry.page->GetAPIResource().GetHandle(), entry.pageOffset, entry.size);
-				++copies;
-				bytes += entry.size;
-			}
-		}
 	}
+	const size_t copies = org::runtime::StagedUploadBatch::RecordCopies(list, m_directStaged, m_debugName);
 	{
 		BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads.Retain");
 		if (!m_directStaged.empty() && m_numFramesInFlight != 0) {
-			auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
+			auto& retained = FrameStaged(frameIndex);
 			retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
 		}
 		m_directStaged.clear();
@@ -953,14 +877,87 @@ size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint8_t frame
 	return copies;
 }
 
+bool UploadInstance::TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
+	std::vector<rhi::ResourceHandle>& destinations) {
+	// Read before the take: the batches move to the slot's retained list. A batch the take sends back to be recorded as
+	// staged (an outdated recording) returns no list, and its destinations are then the staged ones.
+	std::vector<rhi::ResourceHandle> written;
+	const bool known = org::runtime::StagedUploadBatch::AppendDestinations(m_directRecorded, written);
+	if (!TakeRecordedUploads(out, frameIndex)) return true;
+	destinations.insert(destinations.end(), written.begin(), written.end());
+	return known;
+}
+
+bool UploadInstance::TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out) {
+	NoteOffOwnerCall("TakeStagedUploads");
+	if (m_directStaged.empty()) return true;
+	out.insert(out.end(), m_directStaged.begin(), m_directStaged.end());
+	// Kept with the slot until it retires, as RecordStagedUploads keeps the batches it records.
+	if (m_numFramesInFlight != 0) {
+		auto& retained = FrameStaged(frameIndex);
+		retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
+	}
+	m_directStaged.clear();
+	return true;
+}
+
+bool UploadInstance::StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const {
+	return org::runtime::StagedUploadBatch::AppendDestinations(m_directStaged, out);
+}
+
+size_t UploadInstance::RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
+	const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) {
+	routed = 0;
+	if (!route || m_directStaged.empty()) return RecordStagedUploads(list, frameIndex, afterWork);
+	BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploadsRouted");
+	NoteOffOwnerCall("RecordStagedUploadsRouted");
+	std::vector<rhi::ResourceHandle> destinations;
+	if (!org::runtime::StagedUploadBatch::AppendDestinations(m_directStaged, destinations))
+		return RecordStagedUploads(list, frameIndex, afterWork);
+	// Each destination's list, asked once; the lists in the order their first copy comes. Every copy of one destination goes to
+	// the same list, so the batches' order between overlapping copies (the later write wins) holds within it.
+	auto key = [](rhi::ResourceHandle handle) { return (uint64_t{handle.generation} << 32) | handle.index; };
+	std::unordered_map<uint64_t, rhi::CommandList*> byDestination;
+	std::vector<rhi::CommandList*> targets;
+	for (const auto destination : destinations) {
+		const auto found = byDestination.find(key(destination));
+		if (found != byDestination.end()) continue;
+		auto* target = route(destination);
+		if (!target) target = &list;
+		byDestination.emplace(key(destination), target);
+		if (std::ranges::find(targets, target) == targets.end()) targets.push_back(target);
+	}
+	uint64_t bytes = 0;
+	for (const auto& batch : m_directStaged) bytes += batch->Bytes();
+	size_t copies = 0;
+	for (auto* target : targets) {
+		// After the work before them on the target's queue (its earlier copies, the previous execution): one barrier per list.
+		if (afterWork) {
+			const auto full = rhi::FullMemoryBarrier();
+			rhi::BarrierBatch barriers{};
+			barriers.globals = {&full, 1u};
+			target->Barriers(barriers);
+		}
+		const size_t recorded = org::runtime::StagedUploadBatch::RecordCopies(*target, m_directStaged, m_debugName,
+			[&](rhi::ResourceHandle destination) { return byDestination.at(key(destination)) == target; });
+		copies += recorded;
+		if (target != &list) routed += recorded;
+	}
+	if (m_numFramesInFlight != 0) {
+		auto& retained = FrameStaged(frameIndex);
+		retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
+	}
+	m_directStaged.clear();
+	BT_ZONE_VALUE(copies);
+	BT_PLOT("ORG.Upload.StagedCopies", static_cast<int64_t>(copies));
+	BT_PLOT("ORG.Upload.StagedBytes", static_cast<int64_t>(bytes));
+	return copies;
+}
+
 void UploadInstance::DrainPostedUploads() {
 	PostedBufferUpload buffer;
 	while (m_postedBufferUploads.Pop(buffer)) {
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		UploadData(buffer.bytes.data(), buffer.bytes.size(), buffer.target, buffer.dstOffset, buffer.file, buffer.line);
-#else
-		UploadData(buffer.bytes.data(), buffer.bytes.size(), buffer.target, buffer.dstOffset);
-#endif
 	}
 	PostedTextureUpload texture;
 	while (m_postedTextureUploads.Pop(texture)) {
@@ -994,12 +991,12 @@ void UploadInstance::DrainReadyPageInbox() {
 	}
 }
 
-void UploadInstance::ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList) {
+void UploadInstance::ProcessUploads(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList) {
 	ProcessUploadsThrough(frameIndex, commandList, UINT64_MAX);
 }
 
 void UploadInstance::ProcessUploadsThrough(
-	uint8_t frameIndex,
+	uint32_t frameIndex,
 	org::imm::ImmediateCommandList& commandList,
 	uint64_t sequenceInclusive) {
 	NoteOffOwnerCall("ProcessUploadsThrough");
@@ -1088,7 +1085,7 @@ void UploadInstance::ProcessUploadsThrough(
 		for (const auto& page : completedPages) {
 			if (page) m_openPageSet.erase(page.get());
 		}
-		auto& submissionPages = m_framePages[frameIndex % m_numFramesInFlight];
+		auto& submissionPages = FramePages(frameIndex);
 		std::unordered_set<UploadPage*> alreadyScheduled;
 		alreadyScheduled.reserve(submissionPages.size() + completedPages.size());
 		for (const auto& page : submissionPages) {
@@ -1104,7 +1101,7 @@ void UploadInstance::ProcessUploadsThrough(
 	RecordProcessedUploadTelemetry(resourceUpdates, textureUpdates);
 	// Staged batches whose entries this pass records stay alive until its frame slot retires.
 	if (sequenceInclusive == UINT64_MAX && !m_pendingStaged.empty() && m_numFramesInFlight != 0) {
-		auto& retained = m_frameStaged[frameIndex % m_numFramesInFlight];
+		auto& retained = FrameStaged(frameIndex);
 		retained.insert(retained.end(), std::make_move_iterator(m_pendingStaged.begin()), std::make_move_iterator(m_pendingStaged.end()));
 		m_pendingStaged.clear();
 	}
@@ -1264,16 +1261,14 @@ void UploadInstance::RecordProcessedUploadTelemetry(
 	m_uploadTelemetryLastLog = now;
 }
 
-void UploadInstance::ProcessDeferredReleases(uint8_t frameIndex) {
+void UploadInstance::ProcessDeferredReleases(uint32_t frameIndex) {
 	BT_ZONE_SCOPE("UploadInstance::ProcessDeferredReleases");
 	NoteOffOwnerCall("ProcessDeferredReleases");
 	if (m_numFramesInFlight == 0) {
 		return;
 	}
-	frameIndex %= m_numFramesInFlight;
-
-	m_frameStaged[frameIndex].clear();  // the GPU is done with the slot: producers may reuse these batches
-	auto& retiringPages = m_framePages[frameIndex];
+	FrameStaged(frameIndex).clear();  // the GPU is done with the run: producers may reuse these batches
+	auto& retiringPages = FramePages(frameIndex);
 	std::unordered_set<Resource*> pendingUploadBuffers;
 	pendingUploadBuffers.reserve(m_resourceUpdates.size() + m_textureUpdates.size());
 	for (const auto& update : m_resourceUpdates) {
@@ -1402,6 +1397,10 @@ bool UploadInstance::HasPendingWork() const {
 		!m_postedTextureUploads.Empty() || !m_postedBufferUploads.Empty();
 }
 
+bool UploadInstance::HasPendingUploads() const {
+	return HasPendingWork() || !m_directStaged.empty() || !m_directRecorded.empty() || !m_pendingStaged.empty();
+}
+
 uint64_t UploadInstance::CapturePendingUploadSequence() {
 	NoteOffOwnerCall("CapturePendingUploadSequence");
 	DrainPostedUploads();
@@ -1454,9 +1453,7 @@ std::string UploadInstance::DescribeQueuedTargetByGlobalResourceId(uint64_t glob
 		result
 			<< updateKind
 			<< " name='" << (update.targetDebugName.empty() ? std::string("<unknown>") : update.targetDebugName) << "'";
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 		result << " queuedAt=" << (update.file ? update.file : "<unknown>") << ":" << update.line;
-#endif
 		if (target.kind == UploadTarget::Kind::RegistryHandle) {
 			result
 				<< " handle[idx=" << target.h.GetKey().idx

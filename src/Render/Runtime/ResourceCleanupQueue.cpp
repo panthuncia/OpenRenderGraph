@@ -32,8 +32,8 @@ struct ResourceCleanupQueue::State {
 ResourceCleanupQueue::ResourceCleanupQueue() : m_state(std::make_shared<State>()) {}
 std::shared_ptr<ResourceCleanupQueue> ResourceCleanupQueue::Create() {
     auto result = std::shared_ptr<ResourceCleanupQueue>(new ResourceCleanupQueue());
-    // The thread owns State, not the queue: dropping the last public owner
-    // merely wakes it. There is no thread join in a final-reference deleter.
+    // The thread owns State, not the queue. Dropping the last public owner
+    // only wakes the thread. So a final-reference deleter never joins a thread.
     std::thread([state = result->m_state] { state->Run(); }).detach();
     return result;
 }

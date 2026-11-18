@@ -1,3 +1,6 @@
+#include "OpenRenderGraph/Runtime.h"
+#include "OpenRenderGraph/GraphInstance.h"
+#include "TestSupport.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
 #include <Render/RenderGraph/RenderGraph.h>
 #include <Render/PassExecutionContext.h>
@@ -10,7 +13,6 @@
 #include <chrono>
 #include "Render/BindingTable.h"
 
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Retirement check failed at %d: %s\n", __LINE__, #x); return __LINE__; } } while (false)
 
 namespace {
 struct RetirementChain {
@@ -59,15 +61,18 @@ int TestFrameRetirement(rhi::Device device, rhi::Backend backend) {
     CHECK(TestCompletionWake(device) == 0);
     CHECK(TestBindingOwnership(device) == 0);
     {
-        org::RenderGraph graph(device, backend);
+        // The caller's runtime, or one of its own for this check.
+        const auto runtime = org::Runtime::Current() ? org::Runtime::Current()->shared_from_this()
+            : org::Runtime::Create({.device = device, .backend = backend});
+        auto instance = org::GraphInstance::Adopt(runtime, std::make_unique<org::RenderGraph>(runtime));
+        auto& graph = *instance->Graph();
         graph.StopFrameProduction();
         graph.StopFrameProduction();
         org::UpdateExecutionContext update{};
-        org::PassExecutionContext execute{};
-        bool rejectedUpdate = false, rejectedExecute = false;
-        try { graph.Update(update, device); } catch (const std::logic_error&) { rejectedUpdate = true; }
-        try { graph.Execute(execute); } catch (const std::logic_error&) { rejectedExecute = true; }
-        CHECK(rejectedUpdate && rejectedExecute);
+        // A stopped graph refuses its preparation, so no execution of it can exist.
+        bool rejectedUpdate = false;
+        try { (void)instance->Prepare(update); } catch (const std::logic_error&) { rejectedUpdate = true; }
+        CHECK(rejectedUpdate);
 
         auto& retirement = org::DescriptorHeapManager::GetInstance();
         retirement.Initialize();

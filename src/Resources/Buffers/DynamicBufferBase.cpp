@@ -1,6 +1,7 @@
 #include "Resources/Buffers/DynamicBufferBase.h"
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <exception>
 #include <functional>
@@ -28,6 +29,10 @@ namespace org {
 
 namespace {
     thread_local uint32_t g_backingMutationScopeDepth = 0;
+    // The number of owners that capture backings on their own threads. See BufferBase::RegisterConcurrentBackingCapture.
+    std::atomic<uint32_t> g_concurrentBackingCaptures{0};
+    // BufferBase::BackingReleaseSerial.
+    std::atomic<uint64_t> g_backingReleases{0};
     std::mutex g_deferredBackingResizeClientsMutex;
     std::vector<IDeferredBackingResizeClient*> g_deferredBackingResizeClients;
     std::mutex g_asyncResizeSchedulerMutex;
@@ -289,10 +294,9 @@ void AsyncBufferBackingResizeState::Schedule(
             return;
         }
 
-        // Submission can be rejected transiently while a task domain is at
-        // capacity.  Undo only this request's in-flight marker so the next
-        // level-triggered reserve request can submit it again.  The desired
-        // byte size and request recipe remain intact.
+        // Submission can fail for a moment while a task domain is at capacity. Undo only this request's in-flight
+        // marker, so the next reserve request can submit it again. Reserve requests are level-triggered. The desired
+        // byte size and the request recipe stay intact.
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             if (token == state->inFlightToken && !state->readyValid) {
@@ -305,9 +309,9 @@ void AsyncBufferBackingResizeState::Schedule(
         return;
     }
 
-    // The renderer installs the unified scheduler before deferred resize clients
-    // become active.  During startup/shutdown there is no safe detached fallback:
-    // complete the request inline so its state remains owned and observable.
+    // The renderer installs the unified scheduler before deferred resize clients become active. During startup and
+    // shutdown there is no safe way to run the request detached. So complete it inline, which keeps its state owned and
+    // observable.
     spdlog::warn("Unified task scheduler unavailable for '{}'; executing safe backing creation inline", taskName);
     task();
 }
@@ -373,6 +377,41 @@ BufferBase::ScopedBackingMutation::~ScopedBackingMutation() {
 
 bool BufferBase::IsBackingMutationAllowedOnThisThread() {
     return g_backingMutationScopeDepth > 0u;
+}
+
+void BufferBase::EnterBackingMutation() {
+    ++g_backingMutationScopeDepth;
+}
+
+void BufferBase::LeaveBackingMutation() {
+    if (g_backingMutationScopeDepth > 0u) {
+        --g_backingMutationScopeDepth;
+    }
+}
+
+void BufferBase::RegisterConcurrentBackingCapture() {
+    g_concurrentBackingCaptures.fetch_add(1u, std::memory_order_acq_rel);
+}
+
+void BufferBase::UnregisterConcurrentBackingCapture() {
+    g_concurrentBackingCaptures.fetch_sub(1u, std::memory_order_acq_rel);
+}
+
+void BufferBase::RequireBackingMutationAllowed(const char* operation, uint64_t newSize) const {
+    // A buffer without a backing has nothing a capture could see. One example is a new VersionedBuffer version that is
+    // still being sized.
+    if (g_concurrentBackingCaptures.load(std::memory_order_acquire) == 0u || IsBackingMutationAllowedOnThisThread() || !IsMaterialized()) {
+        return;
+    }
+    std::ostringstream threadId;
+    threadId << std::this_thread::get_id();
+    std::ostringstream message;
+    message
+        << "GPU buffer backing change (" << operation << ") outside a backing mutation scope while a concurrent capture owner"
+        << " prepares: resource='" << GetName() << "' id=" << GetGlobalResourceID() << " oldSize=" << m_bufferSize
+        << " newSize=" << newSize << " backingGeneration=" << m_backingGeneration << " thread=" << threadId.str();
+    spdlog::critical("{}", message.str());
+    throw std::runtime_error(message.str());
 }
 
 BufferBase::BufferBase(
@@ -446,22 +485,21 @@ bool BufferBase::TryGetBufferByteSize(uint64_t& outByteSize) const {
 
 bool BufferBase::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 	outDesc = rhi::helpers::ResourceDesc::Buffer(m_bufferSize, m_accessType);
-	// As the backing creates it (GpuBufferBacking): every graph buffer is shared concurrently by all queue families.
+	// Match how GpuBufferBacking creates the buffer. Every graph buffer is shared concurrently by all queue families.
 	outDesc.queueSharing = rhi::QueueSharing::Concurrent;
-	// Some dynamic-buffer implementations install a pre-created backing through
-	// SetBacking rather than ConfigureBacking. Their descriptor requirements are
-	// authoritative too; otherwise peer materialization can omit the UAV flag
-	// while still recreating a UAV descriptor for that representation.
+	// Some dynamic-buffer implementations install a pre-created backing through SetBacking instead of
+	// ConfigureBacking. Their descriptor requirements count too. Otherwise peer materialization can leave out the UAV
+	// flag but still recreate a UAV descriptor for that representation.
 	if (m_unorderedAccess || (m_descriptorRequirements && m_descriptorRequirements->createUAV)) {
 		outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
 	}
+	outDesc.resourceFlags |= m_extraResourceFlags;
 	return m_bufferSize != 0;
 }
 
 void BufferBase::RefreshAPIRepresentationDescriptors(BackendInstanceId backendInstance) {
-	// As with textures, an explicit primary representation supersedes the
-	// resource's original backing in multi-RHI mode. Refresh the primary arena as
-	// well so descriptor accesses and graph-resolved resource handles agree.
+	// In multi-RHI mode, an explicit primary representation replaces the resource's original backing. Textures work
+	// the same way. Refresh the primary arena too, so descriptor accesses and graph-resolved resource handles agree.
 	if (!m_descriptorRequirements.has_value()) return;
 	auto resource = Resource::GetAPIResource(backendInstance);
 	if (!resource) return;
@@ -513,6 +551,7 @@ uint64_t BufferBase::GetBackingGeneration() const {
 
 void BufferBase::Materialize(const MaterializeOptions* options) {
 	ClearAPIRepresentations();
+    std::scoped_lock lock(m_materializationMutex);
     if (m_dataBuffer) {
         return;
     }
@@ -526,14 +565,20 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
             m_bufferSize,
             GetGlobalResourceID(),
             options->aliasPlacement.value(),
-            m_unorderedAccess);
+            m_unorderedAccess,
+            nullptr,
+            m_extraResourceFlags);
     }
     else {
         m_dataBuffer = GpuBufferBacking::CreateUnique(
             m_accessType,
             m_bufferSize,
             GetGlobalResourceID(),
-            m_unorderedAccess);
+            m_unorderedAccess,
+            nullptr,
+            false,
+            m_extraResourceFlags);
+        if (m_residencyPriority) DeviceManager::GetInstance().SetResidencyPriority(m_dataBuffer->m_bufferAllocation, *m_residencyPriority);
     }
 
     ProbeVirtualShadowBufferStep(GetName(), "after backing create");
@@ -545,6 +590,7 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
 }
 
 BackingAllocationSnapshot BufferBase::CaptureBackingAllocation(bool retain) {
+    std::scoped_lock lock(m_materializationMutex);
     if (!m_dataBuffer || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid()) return {};
     auto lease = retain ? m_dataBuffer->CaptureAllocationLease() : std::shared_ptr<const void>{};
     if (retain && !lease) return {};
@@ -560,6 +606,7 @@ BackingAllocationSnapshot BufferBase::CaptureBackingAllocation(bool retain) {
 void BufferBase::Dematerialize() {
 	const bool hadAttachedPrimary = GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid();
 	ClearAPIRepresentations();
+    std::scoped_lock lock(m_materializationMutex);
     if (!m_dataBuffer) {
 		if (hadAttachedPrimary) {
 			RotateDescriptorSlotsForPublication();
@@ -570,6 +617,12 @@ void BufferBase::Dematerialize() {
 	RotateDescriptorSlotsForPublication();
     m_dataBuffer.reset();
     ++m_backingGeneration;
+    ForgetPublishedAllocation();
+    g_backingReleases.fetch_add(1u, std::memory_order_acq_rel);
+}
+
+uint64_t BufferBase::BackingReleaseSerial() noexcept {
+    return g_backingReleases.load(std::memory_order_acquire);
 }
 
 void BufferBase::SetDescriptorRequirements(const DescriptorRequirements& requirements) {
@@ -721,6 +774,8 @@ void BufferBase::SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t 
             DescriptorHeapManager::GetInstance().RetireDescriptorSlots(DetachDescriptorSlotsForDeferredRelease());
         }
         DescriptorHeapManager::GetInstance().RetireBufferBacking(std::move(m_dataBuffer));
+        // A staged-upload batch recorded before this names the retired backing (StagedUploadBatch::RecordedSerial).
+        g_backingReleases.fetch_add(1u, std::memory_order_acq_rel);
     }
     m_dataBuffer = std::move(backing);
     m_bufferSize = bufferSize;
@@ -764,6 +819,7 @@ void BufferBase::QueueResourceCopyFromOldBacking(uint64_t bytesToCopy) {
 }
 
 std::shared_ptr<org::runtime::IUploadService> BufferBase::RetainBufferUploadService() const {
+    if (auto pinned = m_pinnedUploadService.lock()) return pinned;
     auto service = RetainUploadService();
     if (!service) throw std::runtime_error("Buffer upload service generation is unavailable");
     return service;
@@ -771,12 +827,7 @@ std::shared_ptr<org::runtime::IUploadService> BufferBase::RetainBufferUploadServ
 
 void BufferBase::UploadBufferData(const void* data, size_t size, org::runtime::UploadTarget target,
     size_t offset, const char* file, int line) const {
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
     RetainBufferUploadService()->UploadData(data, size, std::move(target), offset, file, line);
-#else
-    (void)file; (void)line;
-    RetainBufferUploadService()->UploadData(data, size, std::move(target), offset);
-#endif
 }
 
 void BufferBase::ApplyMetadataToBacking(const EntityComponentBundle& bundle) {

@@ -1,6 +1,11 @@
+#include "OpenRenderGraph/Trace.h"
+#include <filesystem>
+#include <fstream>
 #include "Render/RenderGraph/PersistentGraph.h"
+#include "TestSupport.h"
+#include "ScheduleChecks.h"
 #include "Render/RenderGraph/GraphReplay.h"
-#include "Render/RenderGraph/ExperimentalRhiExecution.h"
+#include "Render/RenderGraph/RhiExecution.h"
 #include "GraphReplayRunner.h"
 #include <cstdio>
 #include <stdexcept>
@@ -10,15 +15,8 @@
 #include <algorithm>
 
 using namespace org::persistent;
-using namespace org::experimental;
-#define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "Failure at %d: %s\n", __LINE__, #x); return 1; } } while (false)
+using namespace org::compiler;
 template<class F> bool Rejects(F&& fn) { try { fn(); } catch (const std::exception&) { return true; } return false; }
-BindingVersion Binding(uint64_t id) {
-    BindingVersion b;
-    b.identity = id; b.backingRevision = id; b.shape = {1,1,false};
-    b.owner = std::make_shared<const uint64_t>(id);
-    return b;
-}
 struct ManualTasks final : org::runtime::ITaskService {
     struct Scope final : org::runtime::ITaskScope {
         ManualTasks& owner;
@@ -49,145 +47,328 @@ struct ManualTasks final : org::runtime::ITaskService {
     }
 };
 
-// Independent small reference check: each conflicting authored access must
-// precede its later user in execution order. No compiler helpers are called.
-bool CheckConflicts(const CompiledGraph& graph) {
-    if (!graph.structure) return false;
-    std::vector<uint32_t> position(graph.structure->passes.size(), UINT32_MAX);
-    uint32_t n = 0;
-    for (const auto& batch : graph.batches)
-        for (auto pass : batch.passes) {
-            if (pass >= position.size() || position[pass] != UINT32_MAX) return false;
-            position[pass] = n++;
-        }
-    if (n != position.size()) return false;
-    const auto count = position.size();
-    std::vector<uint8_t> happensBefore(count * count);
-    std::vector<uint8_t> authored(count * count);
-    for (const auto* edges : {&graph.structure->explicitEdges,&graph.structure->placementEdges})
-        for (auto [from,to] : *edges) {
-            if (from >= count || to >= count) return false;
-            authored[from * count + to] = 1;
-        }
-    for (size_t k = 0; k < count; ++k)
-        for (size_t i = 0; i < count; ++i)
-            for (size_t j = 0; j < count; ++j)
-                if (authored[i * count + k] && authored[k * count + j]) authored[i * count + j] = 1;
-    std::vector<uint32_t> lastOnQueue(graph.structure->queues.size(),UINT32_MAX);
-    for (const auto& batch : graph.batches) {
-        if (batch.queue >= lastOnQueue.size()) return false;
-        const auto& queue = graph.structure->queues[batch.queue];
-        if (!queue.active) return false;
-        auto& previous = lastOnQueue[batch.queue];
-        for (auto pass : batch.passes) {
-            const auto& declaration = graph.structure->passes[pass];
-            // Pass backend affinity and queue backend-instance identity are
-            // different domains; authored compatibility is the numeric contract.
-            if (std::find(declaration.compatibleQueueSlots.begin(),declaration.compatibleQueueSlots.end(),batch.queue)
-                    == declaration.compatibleQueueSlots.end()) return false;
-            if (previous != UINT32_MAX) happensBefore[previous * count + pass] = 1;
-            previous = pass;
-        }
-    }
-    for (const auto& wait : graph.relativeWaits) {
-        if (wait.producerBatch >= graph.batches.size() || wait.consumerBatch >= graph.batches.size()) return false;
-        const auto& producer = graph.batches[wait.producerBatch];
-        const auto& consumer = graph.batches[wait.consumerBatch];
-        if (producer.passes.empty() || consumer.passes.empty()) return false;
-        happensBefore[producer.passes.back() * count + consumer.passes.front()] = 1;
-    }
-    for (size_t k = 0; k < count; ++k)
-        for (size_t i = 0; i < count; ++i)
-            for (size_t j = 0; j < count; ++j)
-                if (happensBefore[i * count + k] && happensBefore[k * count + j]) happensBefore[i * count + j] = 1;
-    for (auto [from,to] : graph.structure->explicitEdges)
-        if (from >= count || to >= count || !happensBefore[from * count + to]) return false;
-    for (auto [from,to] : graph.structure->placementEdges)
-        if (from >= count || to >= count || !happensBefore[from * count + to]) return false;
-    for (uint32_t a = 0; a < position.size(); ++a)
-        for (uint32_t b = a + 1; b < position.size(); ++b)
-            for (const auto& x : graph.structure->passes[a].accesses)
-                for (const auto& y : graph.structure->passes[b].accesses)
-                    if (x.resourceIndex == y.resourceIndex && (x.write || y.write)
-                        && !happensBefore[a * count + b]
-                        && !(authored[b * count + a] && happensBefore[b * count + a])) return false;
-    return true;
-}
-// Test-only full-cell simulation, deliberately independent of production range
-// partitioning, dense placement maps and symbolic-state validation helpers.
-bool CheckStates(const CompiledGraph& graph) {
-    if (!graph.structure || !graph.states.complete) return false;
-    const auto& structure = *graph.structure;
-    if (structure.resourceShapes.size() != structure.resourceIDs.size()) return false;
-    struct Cell {
-        CompileResourceState state;
-        uint32_t pass = UINT32_MAX, batch = UINT32_MAX;
-        bool terminal = false;
-    };
-    std::vector<std::vector<Cell>> cells;
-    for (const auto shape : structure.resourceShapes) {
-        if (uint64_t{shape.mips} * shape.slices > 2'000'000) return false;
-        cells.emplace_back(size_t{shape.mips} * shape.slices);
-    }
-    auto visit = [&](uint32_t resource, CompileRange range, auto&& fn) {
-        if (resource >= cells.size()) return false;
-        const auto shape = structure.resourceShapes[resource];
-        if (!range.mips || !range.slices || range.mip >= shape.mips || range.slice >= shape.slices
-            || range.mips > shape.mips - range.mip || range.slices > shape.slices - range.slice) return false;
-        for (uint32_t slice = range.slice; slice < range.slice + range.slices; ++slice)
-            for (uint32_t mip = range.mip; mip < range.mip + range.mips; ++mip)
-                if (!fn(cells[resource][size_t{slice} * shape.mips + mip])) return false;
-        return true;
-    };
-    auto normalized = [&](uint32_t resource, CompileResourceState state) {
-        if (!structure.resourceShapes[resource].hasLayout) state.layout = 0;
-        return state;
-    };
-    std::vector<bool> consumed(graph.states.steps.size());
-    for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
-        for (const auto passIndex : graph.batches[batch].passes) {
-            if (passIndex >= structure.passes.size()) return false;
-            for (size_t i = 0; i < graph.states.steps.size(); ++i) {
-                const auto& step = graph.states.steps[i];
-                if (step.pass != passIndex || step.batch != batch) continue;
-                if (!visit(step.resource, step.range, [&](Cell& cell) {
-                    if (cell.pass != step.previousPass || cell.batch != step.previousBatch
-                        || cell.state != step.before || cell.pass == passIndex) return false;
-                    cell = {step.after,passIndex,batch,false};
-                    return true;
-                })) return false;
-                consumed[i] = true;
-            }
-            const auto& pass = structure.passes[passIndex];
-            for (const auto& use : pass.entryStates) {
-                if (!visit(use.resource,use.range,[&](Cell& cell) {
-                    return cell.pass == passIndex && cell.batch == batch
-                        && cell.state == normalized(use.resource,use.state);
-                })) return false;
-            }
-            for (const auto& use : pass.exitStates) {
-                if (!visit(use.resource,use.range,[&](Cell& cell) {
-                    if (cell.pass != passIndex || cell.batch != batch) return false;
-                    cell.state = normalized(use.resource,use.state);
-                    return true;
-                })) return false;
-            }
-        }
-    }
-    if (std::find(consumed.begin(),consumed.end(),false) != consumed.end()) return false;
-    for (const auto& final : graph.states.finalStates) {
-        if (!visit(final.resource,final.range,[&](Cell& cell) {
-            if (cell.terminal || cell.batch != final.batch || cell.state != final.state) return false;
-            cell.terminal = true;
-            return true;
-        })) return false;
-    }
-    for (const auto& resource : cells)
-        for (const auto& cell : resource)
-            if ((cell.pass != UINT32_MAX) != cell.terminal) return false;
-    return true;
-}
 int main() {
+    {
+        // Schedule cache: a build with the same compile input as an earlier one (from another program, at another
+        // generation) reuses its schedule and input. A different structure compiles a new schedule.
+        auto cache = std::make_shared<ScheduleCache>();
+        CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        workspace.SetScheduleCache(cache);
+        auto build = [&](bool write) {
+            GraphProgram program;
+            auto edit = program.BeginEdit();
+            auto binding = Binding(77); binding.shape = {1,1,true};
+            const auto slot = edit.AddResource(binding.shape,binding);
+            const CompileResourceState state{static_cast<uint64_t>(write ? rhi::ResourceAccessType::UnorderedAccess : rhi::ResourceAccessType::ShaderResource),
+                static_cast<uint64_t>(write ? rhi::ResourceLayout::UnorderedAccess : rhi::ResourceLayout::ShaderResource),
+                static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading), write};
+            edit.Declare(edit.AddPass({}),slot,{},state);
+            edit.Declare(edit.AddPass({}),slot,{},state);
+            auto selected = edit.Build(workspace,cancelled);
+            if (!selected || !program.Install(selected)) throw std::logic_error("Schedule cache program did not install");
+            return selected;
+        };
+        const auto first = build(true);
+        const auto second = build(true);
+        CHECK(second->executable->graph == first->executable->graph);
+        CHECK(second->executable->compileInput == first->executable->compileInput);
+        CHECK(second->executable->graph->structure.get() == &second->executable->compileInput->structure);
+        CHECK(second->executable != first->executable);
+        const auto other = build(false);
+        CHECK(other->executable->graph != first->executable->graph);
+        const auto stats = cache->GetStats();
+        CHECK(stats.hits == 1 && stats.misses == 2 && stats.entries == 2);
+        // Leased or validated inputs are never cached.
+        GraphCompileInput leased; leased.leases.push_back(std::make_shared<const int>(0));
+        CHECK(!ScheduleCache::Cacheable(leased));
+    }
+    {
+        // An external client (for example an upload's copies) goes through the shared sequencer like a graph execution:
+        // - the copy starts from the texture's current state,
+        // - a graph that samples the texture next starts from CopyDest and waits for the copy's signal,
+        // - a second client of the same shape reuses the cached schedule.
+        auto sequencer = std::make_shared<ResourceSequencer>();
+        auto cache = std::make_shared<ScheduleCache>();
+        CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        workspace.SetScheduleCache(cache);
+        const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::Common), static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
+        const CompileResourceState copyDest{static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),
+            static_cast<uint64_t>(rhi::ResourceLayout::CopyDest), static_cast<uint64_t>(rhi::ResourceSyncState::Copy), true};
+        const CompileResourceState sampled{static_cast<uint64_t>(rhi::ResourceAccessType::ShaderResource),
+            static_cast<uint64_t>(rhi::ResourceLayout::ShaderResource), static_cast<uint64_t>(rhi::ResourceSyncState::PixelShading), false};
+        auto backing = [&](uint32_t index) {
+            auto state = std::make_shared<PreparedBackingState>();
+            state->graphResourceID = 1; state->resource = {index,1}; state->shape = {1,1,true};
+            state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
+            auto binding = Binding(index); binding.identity = (uint64_t{1} << 32) | index; binding.shape = state->shape;
+            binding.admission = state;
+            return binding;
+        };
+        auto entryBefore = [](const FrameAdmission& frame) {
+            for (const auto& batch : frame.barriers.batches)
+                for (const auto& barrier : batch.textures) return barrier.beforeLayout;
+            return rhi::ResourceLayout::Undefined;
+        };
+        GraphProgram empty;
+        const std::vector<CompileQueue> queues{{}};
+        const std::array<ExecutionTimelinePoint,1> queue{{{51,0}}};
+        SynchronousAdmission external(4, {}, sequencer), frames(4, {}, sequencer);
+        const std::array<ExternalAccess,1> upload{{{backing(95), {0,1,0,1}, copyDest}}};
+        auto client = BuildExternalPublication(empty, queues, 0, upload, workspace);
+        CHECK(client && client->executable->graph->batches.size() == 1);
+        auto copy = external.Prepare(client, queue);
+        CHECK(entryBefore(copy) == rhi::ResourceLayout::Common);
+        GraphExecutionTimeline receipt; receipt.batches.resize(1); receipt.batches[0].signal = {51,1};
+        {
+            auto hold = external.HoldSequencer();
+            external.Readmit(copy);
+            external.Commit(copy, receipt);
+        }
+        // The frame graph that samples it, on another timeline.
+        GraphProgram frameProgram;
+        auto edit = frameProgram.BeginEdit();
+        auto binding = backing(95);
+        const auto slot = edit.AddResource(binding.shape, binding);
+        edit.Declare(edit.AddPass({}), slot, {}, sampled);
+        auto frame = edit.Build(workspace, cancelled);
+        CHECK(frame && frameProgram.Install(frame));
+        const std::array<ExecutionTimelinePoint,1> frameQueue{{{52,0}}};
+        auto read = frames.Prepare(frame, frameQueue);
+        CHECK(entryBefore(read) == rhi::ResourceLayout::CopyDest);
+        CHECK(read.incomingWaits[0] == std::vector<ExecutionTimelinePoint>{ExecutionTimelinePoint(51,1)});
+        frames.Abandon(read);
+        // Another upload of the same shape into another texture: the same schedule.
+        const std::array<ExternalAccess,1> second{{{backing(96), {0,1,0,1}, copyDest}}};
+        auto again = BuildExternalPublication(empty, queues, 0, second, workspace);
+        CHECK(again && again->executable->graph == client->executable->graph);
+    }
+    {
+        // A D3D12 copy queue's lists take no copy layouts (copies leave textures in Common): its copy steps leave Common, so the
+        // next use transitions from what the texture is really in. Another queue's copy steps keep CopyDest.
+        CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        for (const bool copyQueue : {true, false}) {
+            GraphProgram program;
+            auto edit = program.BeginEdit();
+            edit.SetQueues({{0,true},{0,true,copyQueue}});
+            auto binding = Binding(98); binding.identity = (uint64_t{1} << 32) | 98; binding.shape = {1,1,true};
+            const auto slot = edit.AddResource(binding.shape,binding);
+            CompilePass copy; copy.compatibleQueueSlots = {1}; copy.preferredQueueSlot = 1;
+            edit.Declare(edit.AddPass(copy),slot,{},{static_cast<uint64_t>(rhi::ResourceAccessType::CopyDest),
+                static_cast<uint64_t>(rhi::ResourceLayout::CopyDest),static_cast<uint64_t>(rhi::ResourceSyncState::Copy),true});
+            auto selected = edit.Build(workspace,cancelled);
+            CHECK(selected && program.Install(selected));
+            const auto& steps = selected->executable->graph->states.steps;
+            CHECK(steps.size() == 1);
+            CHECK(steps[0].after.layout == static_cast<uint64_t>(copyQueue ? rhi::ResourceLayout::Common : rhi::ResourceLayout::CopyDest));
+        }
+    }
+    {
+        // Two graphs on one runtime share its sequencer: a texture one graph writes on one queue enters the other's execution in
+        // the state it left, behind a wait on the writer's signal. The reader is prepared before the writer commits and readmitted
+        // at submission (Readmit), so its handoff is the writer's, not the backing's seeded state. And a timeline retired with its
+        // graph needs no wait.
+        auto sequencer = std::make_shared<ResourceSequencer>();
+        CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::Common), static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
+        auto state = std::make_shared<PreparedBackingState>();
+        state->graphResourceID = 1; state->resource = {97,1}; state->shape = {1,1,true};
+        state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
+        auto program = [&](CompileResourceState use, uint32_t queue = 0) {
+            auto result = std::make_unique<GraphProgram>();
+            auto edit = result->BeginEdit();
+            CompilePass pass;
+            if (queue) {
+                edit.SetQueues({{0,true},{0,true}});
+                pass.compatibleQueueSlots = {queue}; pass.preferredQueueSlot = queue;
+            }
+            auto binding = Binding(97); binding.identity = (uint64_t{1} << 32) | 97; binding.shape = state->shape;
+            binding.admission = state;
+            const auto slot = edit.AddResource(binding.shape,binding);
+            edit.Declare(edit.AddPass(pass),slot,{},use);
+            auto selected = edit.Build(workspace,cancelled);
+            if (!selected || !result->Install(selected)) throw std::logic_error("Shared sequencer program did not install");
+            return std::pair{std::move(result), selected};
+        };
+        auto [writerProgram, writer] = program({static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccess),
+            static_cast<uint64_t>(rhi::ResourceLayout::UnorderedAccess), static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading), true});
+        auto [readerProgram, reader] = program({static_cast<uint64_t>(rhi::ResourceAccessType::ShaderResource),
+            static_cast<uint64_t>(rhi::ResourceLayout::ShaderResource), static_cast<uint64_t>(rhi::ResourceSyncState::PixelShading), false});
+        SynchronousAdmission writes(4, {}, sequencer), reads(4, {}, sequencer);
+        const std::array<ExecutionTimelinePoint,1> writerQueue{{{41,0}}}, readerQueue{{{42,0}}};
+        auto entryLayout = [](const FrameAdmission& frame) {
+            for (const auto& batch : frame.barriers.batches)
+                for (const auto& barrier : batch.textures) return barrier.beforeLayout;
+            return rhi::ResourceLayout::Undefined;
+        };
+        auto read = reads.Prepare(reader,readerQueue);
+        CHECK(entryLayout(read) == rhi::ResourceLayout::Common && read.incomingWaits[0].empty());
+        auto write = writes.Prepare(writer,writerQueue);
+        GraphExecutionTimeline receipt; receipt.batches.resize(1); receipt.batches[0].signal = {41,1};
+        {
+            auto hold = writes.HoldSequencer();
+            writes.Commit(write,receipt);
+        }
+        {
+            auto hold = reads.HoldSequencer();
+            reads.Readmit(read);
+            CHECK(entryLayout(read) == rhi::ResourceLayout::UnorderedAccess);
+            CHECK(read.incomingWaits[0] == std::vector<ExecutionTimelinePoint>{ExecutionTimelinePoint(41,1)});
+            receipt.batches[0].signal = {42,1};
+            reads.Commit(read,receipt);
+        }
+        // The writer's graph goes, and its timeline with it: a later write waits on the reader alone.
+        sequencer->RetireTimeline(41);
+        auto again = writes.Prepare(writer,writerQueue);
+        CHECK(entryLayout(again) == rhi::ResourceLayout::ShaderResource);
+        CHECK(again.incomingWaits[0] == std::vector<ExecutionTimelinePoint>{ExecutionTimelinePoint(42,1)});
+        writes.Abandon(again);
+        // A reader on another queue: the texture is released on the queue it was left on, to Common, and acquired from Common by
+        // the reader's entry barrier, which waits for the release (RenderGraph submits it ahead and adds the wait).
+        auto [computeProgram, computeReader] = program({static_cast<uint64_t>(rhi::ResourceAccessType::ShaderResource),
+            static_cast<uint64_t>(rhi::ResourceLayout::ShaderResource), static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading), false}, 1);
+        const std::array<ExecutionTimelinePoint,2> twoQueues{{{43,0},{44,0}}};
+        auto across = reads.Prepare(computeReader,twoQueues);
+        const auto& acrossGraph = *computeReader->executable->graph;
+        CHECK(acrossGraph.batches.size() == 1 && acrossGraph.batches[0].queue == 1);
+        CHECK(across.barriers.releases.size() == 1 && across.barriers.releases[0].queue == 0);
+        CHECK(across.barriers.releases[0].consumers == std::vector<uint32_t>{0});
+        const auto& released = across.barriers.releases[0].textures.at(0);
+        CHECK(released.beforeLayout == rhi::ResourceLayout::ShaderResource && released.afterLayout == rhi::ResourceLayout::Common
+            && released.queueOwnership == rhi::QueueOwnership::Release && released.ownershipPeer == rhi::QueueKind::Compute);
+        // The acquire repeats the release (Vulkan pairs them exactly); the barrier after it takes the texture on from Common.
+        const auto& acquire = across.barriers.batches[0].textures.at(0);
+        CHECK(acquire.beforeLayout == rhi::ResourceLayout::ShaderResource && acquire.afterLayout == rhi::ResourceLayout::Common
+            && acquire.queueOwnership == rhi::QueueOwnership::Acquire && acquire.ownershipPeer == rhi::QueueKind::Graphics);
+        const auto& acquired = across.barriers.batches[0].acquired.at(0);
+        CHECK(acquired.beforeLayout == rhi::ResourceLayout::Common && acquired.afterLayout == rhi::ResourceLayout::ShaderResource
+            && acquired.queueOwnership == rhi::QueueOwnership::None);
+        reads.Abandon(across);
+        // A closed admission is never readmitted.
+        SynchronousAdmission closed(4, {}, sequencer);
+        closed.SetClosedExecutions(true);
+        auto prepared = closed.Prepare(reader,readerQueue);
+        CHECK(Rejects([&] { closed.Readmit(prepared); }));
+        closed.Abandon(prepared);
+    }
+    {
+        // A texture alternating queues within each execution (written on graphics, read on compute, twice), and across
+        // executions (the next one's first writer is on graphics, the last reader on compute): every queue change is a release
+        // to Common on the producer's queue and a barrier from Common on the consumer's, in the body and at entry alike.
+        auto sequencer = std::make_shared<ResourceSequencer>();
+        CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::Common), static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
+        auto state = std::make_shared<PreparedBackingState>();
+        state->graphResourceID = 1; state->resource = {95,1}; state->shape = {1,1,true}; state->debugName = "Alternating";
+        state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
+        GraphProgram program;
+        auto edit = program.BeginEdit();
+        edit.SetQueues({{0,true},{0,true}});
+        auto binding = Binding(95); binding.identity = (uint64_t{1} << 32) | 95; binding.shape = state->shape;
+        binding.admission = state;
+        const auto slot = edit.AddResource(binding.shape,binding);
+        const CompileResourceState uav{static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccess),
+            static_cast<uint64_t>(rhi::ResourceLayout::UnorderedAccess), static_cast<uint64_t>(rhi::ResourceSyncState::PixelShading), true};
+        const CompileResourceState srv{static_cast<uint64_t>(rhi::ResourceAccessType::ShaderResource),
+            static_cast<uint64_t>(rhi::ResourceLayout::ShaderResource), static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading), false};
+        for (uint32_t i = 0; i < 4; ++i) {
+            CompilePass pass; const uint32_t queue = i % 2;
+            pass.compatibleQueueSlots = {queue}; pass.preferredQueueSlot = queue;
+            edit.Declare(edit.AddPass(pass),slot,{},queue ? srv : uav);
+        }
+        auto selected = edit.Build(workspace,cancelled);
+        CHECK(selected && program.Install(selected));
+        const auto& graph = *selected->executable->graph;
+        CHECK(graph.batches.size() == 4);
+        SynchronousAdmission admission(4, {}, sequencer);
+        const std::array<ExecutionTimelinePoint,2> queues{{{51,0},{52,0}}};
+        // The decision trace records why each barrier is what it is.
+        auto sink = std::make_shared<org::trace::MemorySink>();
+        org::trace::SetSink(sink);
+        org::trace::SetCategories(org::trace::Category::Barriers | org::trace::Category::Handoff
+            | org::trace::Category::Admission);
+        const auto layoutOf = [](const CompileResourceState& use) { return static_cast<rhi::ResourceLayout>(use.layout); };
+        for (uint64_t frame = 1; frame <= 3; ++frame) {
+            auto admitted = admission.Prepare(selected,queues);
+            for (uint32_t i = 0; i < 4; ++i) {
+                const auto& out = admitted.barriers.batches[i];
+                CHECK(graph.batches[i].queue == i % 2);
+                // The batch's own barrier takes the texture on from Common (from the state it is created in, the first time).
+                const bool fromEntry = i == 0;
+                const auto& taken = fromEntry ? (frame == 1 ? out.textures : out.acquired) : out.beforePass.at(0).textures;
+                CHECK(taken.size() == 1 && taken[0].beforeLayout == rhi::ResourceLayout::Common
+                    && taken[0].afterLayout == layoutOf(i % 2 ? srv : uav) && taken[0].queueOwnership == rhi::QueueOwnership::None);
+                // Every batch but the last releases it to Common for the next, on the other queue.
+                const auto& released = out.afterPass.at(0).textures;
+                if (i < 3) CHECK(released.size() == 1 && released[0].afterLayout == rhi::ResourceLayout::Common
+                    && released[0].beforeLayout == layoutOf(i % 2 ? srv : uav) && released[0].queueOwnership == rhi::QueueOwnership::Release);
+                else CHECK(released.empty());
+            }
+            // From the second execution, the last reader's queue releases it ahead of the first writer.
+            if (frame > 1)
+                CHECK(admitted.barriers.releases.size() == 1 && admitted.barriers.releases[0].queue == 1
+                    && admitted.barriers.releases[0].textures.size() == 1
+                    && admitted.barriers.releases[0].textures[0].beforeLayout == layoutOf(srv)
+                    && admitted.barriers.releases[0].textures[0].afterLayout == rhi::ResourceLayout::Common);
+            else CHECK(admitted.barriers.releases.empty());
+            GraphExecutionTimeline receipt; receipt.batches.resize(graph.batches.size());
+            for (size_t i = 0; i < graph.batches.size(); ++i) receipt.batches[i].signal = {graph.batches[i].queue ? 52u : 51u, frame * 10 + i};
+            auto hold = admission.HoldSequencer();
+            admission.Readmit(admitted);
+            admission.Commit(admitted,receipt);
+        }
+        org::trace::SetSink(nullptr);
+        // Per execution, Prepare and Readmit each plan the four steps: the in-batch steps cross queues, and the entry step takes
+        // the ledger's state from the second execution on, which hands off from the compute queue it was left on.
+        const auto steps = sink->Of("state-step");
+        CHECK(steps.size() == 3 * 2 * 4);
+        for (size_t i = 0; i < steps.size(); ++i) {
+            const auto& step = steps[i];
+            const auto position = i % 4;
+            const bool firstExecution = i < 8;
+            CHECK(step.Text("resource") == "Alternating");
+            CHECK(step.Text("path") == (position == 0 ? (firstExecution ? "entry-seeded" : "entry-ledger") : "body-cross-queue"));
+            if (position == 0 && !firstExecution) CHECK(step.Text("ledgerQueue") == "1");
+        }
+        const auto planned = sink->Of("handoff-planned");
+        CHECK(planned.size() == 2 * 2);
+        for (const auto& handoff : planned) CHECK(handoff.Text("fromQueue") == "1" && handoff.Text("toQueue") == "0");
+        CHECK(sink->Of("ledger-commit").size() == 3 * 4);
+        // Every barrier the plan holds is traced where it is recorded; a body barrier on the consumer's queue never names
+        // the producer queue's layout.
+        for (const auto& barrier : sink->Of("barrier"))
+            if (barrier.Text("list") == "before-pass") CHECK(barrier.Text("beforeLayout") == "COMMON");
+    }
+    {
+        // The decision trace: off without a sink, the resource filter, and JSON lines.
+        auto sink = std::make_shared<org::trace::MemorySink>();
+        org::trace::SetCategories(org::trace::Category::Barriers);
+        CHECK(!org::trace::Enabled(org::trace::Category::Barriers));
+        org::trace::SetSink(sink);
+        CHECK(org::trace::Enabled(org::trace::Category::Barriers) && !org::trace::Enabled(org::trace::Category::Handoff));
+        org::trace::SetResourceFilter("Visibility");
+        ORG_TRACE(Barriers, "kept").Resource("Visibility Buffer").Add("n", uint32_t{1});
+        ORG_TRACE(Barriers, "filtered").Resource("GTAO Output");
+        ORG_TRACE(Barriers, "unnamed").Add("n", uint32_t{2});
+        ORG_TRACE(Handoff, "off").Resource("Visibility Buffer");
+        const auto events = sink->Take();
+        CHECK(events.size() == 2 && events[0].decision == "kept" && events[1].decision == "unnamed");
+        CHECK(events[0].Text("n") == "1" && events[0].Text("resource") == "Visibility Buffer");
+        org::trace::SetResourceFilter({});
+        const auto path = (std::filesystem::temp_directory_path() / "org_trace_test.jsonl").string();
+        org::trace::SetSink(org::trace::MakeJsonLinesSink(path));
+        ORG_TRACE(Barriers, "line").Resource("A \"quoted\" name").Add("flag", true).Add("value", int32_t{-3});
+        org::trace::SetSink(nullptr);
+        std::ifstream file(path);
+        std::string line;
+        std::getline(file, line);
+        CHECK(line.find("\"decision\":\"line\"") != std::string::npos
+            && line.find("\"resource\":\"A \\\"quoted\\\" name\"") != std::string::npos
+            && line.find("\"flag\":true") != std::string::npos && line.find("\"value\":-3") != std::string::npos);
+        org::trace::SetCategories(org::trace::Category::None);
+    }
     {
         // Closed executions: a texture written in one epoch and read in another leaves each execution in its
         // home state, so an epoch's barrier plan does not depend on whether the other ran, is cached, and
@@ -230,10 +411,10 @@ int main() {
                         if (barrier.afterLayout == rhi::ResourceLayout::Common) return true;
             return false;
         };
+        // The handoff into the execution: its batches' entry barriers.
         auto entryLayout = [](const FrameAdmission& frame) {
             for (const auto& batch : frame.barriers.batches)
-                for (const auto& before : batch.beforePass)
-                    for (const auto& barrier : before.textures) return barrier.beforeLayout;
+                for (const auto& barrier : batch.textures) return barrier.beforeLayout;
             return rhi::ResourceLayout::Undefined;
         };
         auto first = admission.Prepare(readEpoch,queues);
@@ -264,6 +445,146 @@ int main() {
         try { (void)open.Prepare(writeEpoch,queues); } catch (const std::exception&) { threw = true; }
         CHECK(threw && !single.closed);
         open.Abandon(single);
+        // Resting at last use (SetRestAtLastUse): the same epochs closed, but each texture rests where its last use left it. No
+        // execution has an exit barrier, the next execution enters from that state, and the closed plan cache is not used.
+        SynchronousAdmission resting(8);
+        resting.SetClosedExecutions(true);
+        resting.SetRestAtLastUse(true);
+        auto commitResting = [&](const FrameAdmission& frame, uint64_t value) {
+            GraphExecutionTimeline receipt; receipt.batches.resize(frame.publication->executable->graph->batches.size());
+            for (auto& batch : receipt.batches) batch.signal = {12,value};
+            resting.Commit(frame,receipt);
+        };
+        auto exitBarriers = [](const FrameAdmission& frame) {
+            size_t count = 0;
+            for (const auto& batch : frame.Barriers().batches)
+                for (const auto& after : batch.afterPass) count += after.textures.size();
+            return count;
+        };
+        auto restWrite = resting.Prepare(writeEpoch,queues);
+        CHECK(restWrite.closed && exitBarriers(restWrite) == 0 && entryLayout(restWrite) == rhi::ResourceLayout::Common);
+        commitResting(restWrite,10);
+        // The reader finds the texture as the writer left it, in UnorderedAccess.
+        auto restRead = resting.Prepare(readEpoch,queues);
+        CHECK(exitBarriers(restRead) == 0 && !restRead.cachedPlan && entryLayout(restRead) == rhi::ResourceLayout::UnorderedAccess);
+        commitResting(restRead,11);
+        // And the next writer finds it in ShaderResource, where the reader left it.
+        auto restAgain = resting.Prepare(writeEpoch,queues);
+        CHECK(!restAgain.cachedPlan && entryLayout(restAgain) == rhi::ResourceLayout::ShaderResource);
+        commitResting(restAgain,12);
+        CHECK(resting.PlanCacheHits() == 0 && resting.PlanCacheMisses() == 0);
+    }
+    {
+        // External home states: a host-owned texture used on the compute queue is taken from the graphics queue at entry and
+        // given back there at exit, in its home state, each execution. Without the option it stays where its last use left it.
+        GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        auto edit = program.BeginEdit();
+        edit.SetQueues({{0,true},{0,true}});
+        auto binding = Binding(95); binding.identity = (uint64_t{1} << 32) | 95; binding.shape = {1,1,true};
+        auto state = std::make_shared<PreparedBackingState>();
+        state->graphResourceID = 1; state->resource = {95,1}; state->shape = binding.shape; state->hostOwned = true;
+        const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::Common), static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
+        state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
+        binding.admission = state;
+        const auto slot = edit.AddResource(binding.shape,binding);
+        CompilePass pass;
+        pass.compatibleQueueSlots = {1}; pass.preferredQueueSlot = 1;
+        edit.Declare(edit.AddPass(pass),slot,{},{static_cast<uint64_t>(rhi::ResourceAccessType::UnorderedAccess),
+            static_cast<uint64_t>(rhi::ResourceLayout::UnorderedAccess),static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading),true});
+        auto selected = edit.Build(workspace,cancelled);
+        CHECK(selected && program.Install(selected));
+        const std::array<ExecutionTimelinePoint,2> queues{{{13,0},{14,0}}};
+        const auto run = [&](SynchronousAdmission& admission, uint64_t value) {
+            auto frame = admission.Prepare(selected,queues);
+            const auto& barriers = frame.barriers;
+            bool released = false;
+            for (const auto& batch : barriers.batches)
+                for (const auto& after : batch.afterPass)
+                    for (const auto& barrier : after.textures)
+                        released = released || (barrier.queueOwnership == rhi::QueueOwnership::Release && barrier.ownershipPeer == rhi::QueueKind::Graphics
+                            && barrier.afterLayout == rhi::ResourceLayout::Common);
+            uint32_t committedQueue = UINT32_MAX;
+            for (const auto& batch : barriers.batches)
+                for (const auto queue : batch.committedQueues) committedQueue = queue;
+            struct Result { bool entryRelease, released, acquired; uint32_t committedQueue; } result{
+                barriers.releases.size() == 1 && barriers.releases.front().queue == 0, released,
+                barriers.homeAcquires.textures.size() == 1 && barriers.homeAcquires.producers == std::vector<uint32_t>{0}
+                    && barriers.homeAcquires.textures.front().queueOwnership == rhi::QueueOwnership::Acquire
+                    && barriers.homeAcquires.home.empty(),
+                committedQueue};
+            GraphExecutionTimeline receipt; receipt.batches.resize(frame.publication->executable->graph->batches.size());
+            for (auto& batch : receipt.batches) batch.signal = {14,value};
+            admission.Commit(frame,receipt);
+            return result;
+        };
+        SynchronousAdmission external(8);
+        external.SetExternalHomeStates(true);
+        for (uint64_t value = 1; value <= 2; ++value) {
+            const auto result = run(external, value);
+            CHECK(result.entryRelease && result.released && result.acquired && result.committedQueue == 0);
+        }
+        SynchronousAdmission plain(8);
+        const auto first = run(plain, 1), second = run(plain, 2);
+        CHECK(!first.entryRelease && !first.released && !first.acquired && first.committedQueue == 1);
+        CHECK(!second.entryRelease && !second.acquired && second.committedQueue == 1);
+    }
+    {
+        // External home states with a home that is not Common: a host keeps the texture in DepthRead (an imported depth buffer). It
+        // is written on the graphics queue and read on the compute queue. Each execution enters it from DepthRead without
+        // discarding it, and gives it back on the graphics queue in DepthRead.
+        GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};
+        auto edit = program.BeginEdit();
+        edit.SetQueues({{0,true},{0,true}});
+        auto binding = Binding(96); binding.identity = (uint64_t{1} << 32) | 96; binding.shape = {1,1,true};
+        auto state = std::make_shared<PreparedBackingState>();
+        state->graphResourceID = 1; state->resource = {96,1}; state->shape = binding.shape; state->hostOwned = true;
+        const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
+            static_cast<uint64_t>(rhi::ResourceLayout::DepthRead), static_cast<uint64_t>(rhi::ResourceSyncState::All), false};
+        state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
+        binding.admission = state;
+        const auto slot = edit.AddResource(binding.shape,binding);
+        CompilePass writer;
+        writer.compatibleQueueSlots = {0}; writer.preferredQueueSlot = 0;
+        edit.Declare(edit.AddPass(writer),slot,{},{static_cast<uint64_t>(rhi::ResourceAccessType::DepthReadWrite),
+            static_cast<uint64_t>(rhi::ResourceLayout::DepthReadWrite),static_cast<uint64_t>(rhi::ResourceSyncState::DepthStencil),true});
+        CompilePass reader;
+        reader.compatibleQueueSlots = {1}; reader.preferredQueueSlot = 1;
+        edit.Declare(edit.AddPass(reader),slot,{},{static_cast<uint64_t>(rhi::ResourceAccessType::ShaderResource),
+            static_cast<uint64_t>(rhi::ResourceLayout::ShaderResource),static_cast<uint64_t>(rhi::ResourceSyncState::ComputeShading),false});
+        auto selected = edit.Build(workspace,cancelled);
+        CHECK(selected && program.Install(selected));
+        const std::array<ExecutionTimelinePoint,2> queues{{{15,0},{16,0}}};
+        SynchronousAdmission admission(8);
+        admission.SetExternalHomeStates(true);
+        for (uint64_t value = 1; value <= 2; ++value) {
+            auto frame = admission.Prepare(selected,queues);
+            const auto& barriers = frame.barriers;
+            bool discarded = false, enteredFromHome = false, fromUndefined = false;
+            const auto visit = [&](const rhi::TextureBarrier& barrier) {
+                discarded = discarded || barrier.discard;
+                fromUndefined = fromUndefined || barrier.beforeLayout == rhi::ResourceLayout::Undefined;
+                enteredFromHome = enteredFromHome || (barrier.beforeLayout == rhi::ResourceLayout::DepthRead
+                    && barrier.afterLayout == rhi::ResourceLayout::DepthReadWrite);
+            };
+            for (const auto& batch : barriers.batches) {
+                for (const auto& barrier : batch.textures) visit(barrier);
+                for (const auto& barrier : batch.acquired) visit(barrier);
+                for (const auto& pass : batch.beforePass) for (const auto& barrier : pass.textures) visit(barrier);
+                for (const auto& pass : batch.afterPass) for (const auto& barrier : pass.textures) visit(barrier);
+            }
+            for (const auto& release : barriers.releases) for (const auto& barrier : release.textures) visit(barrier);
+            for (const auto& barrier : barriers.homeAcquires.textures) visit(barrier);
+            for (const auto& barrier : barriers.homeAcquires.home) visit(barrier);
+            const bool wentHome = barriers.homeAcquires.home.size() == 1
+                && barriers.homeAcquires.home.front().afterLayout == rhi::ResourceLayout::DepthRead;
+            CHECK(!discarded && !fromUndefined && enteredFromHome && wentHome);
+            const auto& graphBatches = frame.publication->executable->graph->batches;
+            GraphExecutionTimeline receipt; receipt.batches.resize(graphBatches.size());
+            for (size_t i = 0; i < graphBatches.size(); ++i)
+                receipt.batches[i].signal = {graphBatches[i].queue == 0 ? 15u : 16u, value};
+            admission.Commit(frame,receipt);
+        }
     }
     {
         // Host epochs: one whole-frame executable, epochs in their declared order, and
@@ -376,7 +697,7 @@ int main() {
         CHECK(frame.publication == selected && selected->bindings.At(slot).admission->regions == backing.regions);
         CHECK(frame.backings[0].authoritativeIncoming && frame.backings[0].regions == reported.regions);
         CHECK(frame.incomingWaits[0] == std::vector<ExecutionTimelinePoint>{ExecutionTimelinePoint(90,5)});
-        CHECK(frame.barriers.batches[0].beforePass[0].textures[0].beforeLayout == rhi::ResourceLayout::CopyDest);
+        CHECK(frame.barriers.batches[0].textures[0].beforeLayout == rhi::ResourceLayout::CopyDest);
         persistent.Abandon(frame);
         for (uint32_t failure = 0; failure < 4; ++failure) {
             auto invalid = report;
@@ -395,10 +716,10 @@ int main() {
         invalidBinding.admission = std::make_shared<const PreparedBackingState>(reported);
         CHECK(Rejects([&] { invalidPublication.ReplaceBinding(slot,invalidBinding); }));
         const auto incoming = ledger.Prepare(*selected->executable->graph,std::span{&reported,1});
-        CHECK(incoming.batches[0].beforePass[0].textures[0].beforeLayout == rhi::ResourceLayout::CopyDest);
+        CHECK(incoming.batches[0].textures[0].beforeLayout == rhi::ResourceLayout::CopyDest);
         CHECK(incoming.batches[0].authoritativeSeeds.size() == 1);
         const auto abandoned = ledger.Prepare(*selected->executable->graph,std::span{&backing,1});
-        CHECK(abandoned.batches[0].beforePass[0].textures[0].beforeLayout == rhi::ResourceLayout::UnorderedAccess);
+        CHECK(abandoned.batches[0].textures[0].beforeLayout == rhi::ResourceLayout::UnorderedAccess);
         for (uint32_t failure = 0; failure < 4; ++failure) {
             auto invalid = reported;
             auto regions = std::make_shared<std::vector<PreparedStateRegion>>(*reported.regions);
@@ -417,7 +738,7 @@ int main() {
         auto expanded = addConsumer.Build(workspace,cancelled); CHECK(program.Install(expanded));
         const auto later = ledger.Prepare(*expanded->executable->graph,std::span{&backing,1});
         const auto& graph = *expanded->executable->graph;
-        CHECK(later.batches.at(graph.batchByPass.at(1)).beforePass.at(graph.positionByPass.at(1)).textures[0].beforeLayout
+        CHECK(later.batches.at(graph.batchByPass.at(1)).textures[0].beforeLayout
             == rhi::ResourceLayout::CopyDest);
         CHECK(graph.batches.size() == 2);
         const auto bothQueues = ledger.Prepare(graph,std::span{&reported,1});
@@ -426,7 +747,7 @@ int main() {
         CHECK(authoritativeSeedCount == 1);
         for (const auto& batch : bothQueues.batches) ledger.CommitBatch(batch);
         const auto committed = ledger.Prepare(graph,std::span{&backing,1});
-        CHECK(committed.batches.at(graph.batchByPass.at(0)).beforePass.at(graph.positionByPass.at(0)).textures[0].beforeLayout
+        CHECK(committed.batches.at(graph.batchByPass.at(0)).textures[0].beforeLayout
             == rhi::ResourceLayout::UnorderedAccess);
         const std::array<ExecutionTimelinePoint,2> twoQueues{{{12,0},{13,0}}};
         auto acrossQueues = persistent.Prepare(expanded,twoQueues,{},std::span{&report,1});
@@ -443,7 +764,7 @@ int main() {
         CHECK(persistent.IncomingRevisionCount() == 1);
         auto repeated = persistent.Prepare(expanded,twoQueues,{},std::span{&report,1});
         CHECK(repeated.incomingEffects.empty() && !repeated.backings[0].authoritativeIncoming);
-        CHECK(repeated.barriers.batches.at(graph.batchByPass.at(0)).beforePass.at(graph.positionByPass.at(0)).textures[0].beforeLayout
+        CHECK(repeated.barriers.batches.at(graph.batchByPass.at(0)).textures[0].beforeLayout
             == rhi::ResourceLayout::UnorderedAccess);
         persistent.Abandon(repeated);
         auto inconsistent = report; ++inconsistent.producerCompletion.value;
@@ -1089,7 +1410,7 @@ int main() {
             reinterpret_cast<const org::AliasHeapGeneration*>(heapOwner.get()));
         const auto heapIdentity = heap.get();
         const std::weak_ptr<const org::AliasHeapGeneration> heapWeak = heap;
-        auto aliasBackings = frame.backings;
+        auto aliasBackings = std::vector<org::compiler::PreparedBackingState>(frame.backings.begin(), frame.backings.end());
         aliasBackings[0].aliasHeap = heap;
         aliasBackings[0].aliasHeapIdentity = heapIdentity;
         aliasBackings[0].aliasSize = 4096;
@@ -1116,9 +1437,8 @@ int main() {
         const std::array<ExecutionTimelinePoint,1> impossibleDone{{{1,6}}};
         CHECK(Rejects([&] { admission.RetireCompleted(impossibleDone); }));
         auto next = admission.Prepare(selected,queues);
-        CHECK(!next.incomingWaits[0].empty());
-        CHECK(next.incomingWaits[0][0].timeline == 2);
-        CHECK(next.incomingWaits[0][0].value == 7);
+        // The writer's point (2, 7) has completed (batchDone): no wait.
+        CHECK(next.incomingWaits[0].empty());
         admission.Abandon(next);
         CHECK(Rejects([&] { admission.Abandon(next); }));
         auto partial = admission.Prepare(selected,queues);
@@ -1851,7 +2171,7 @@ int main() {
         std::vector<org::PreparedPass> invocations(rotated->logical->passSlots.size());
         invocations[consumer.index] = org::PreparedPass::NoOp();
         invocations[present.index] = org::PreparedPass::NoOp();
-        auto sealed = org::experimental::SealPersistentFrame(1,frame,std::move(invocations));
+        auto sealed = org::compiler::SealPersistentFrame(1,frame,std::move(invocations));
         CHECK(sealed && sealed->initialStates->at(swapchainIndex).resource.index == 200);
         admission.Commit(frame,receipt);
         CHECK(admission.StateBackingCount() == 3);
@@ -1882,7 +2202,7 @@ int main() {
             backing.regions = std::make_shared<const std::vector<PreparedStateRegion>>(
                 std::initializer_list<PreparedStateRegion>{{{0,1,0,1},{0,0,0,false}}});
             backing.aliasHeap = heap; backing.aliasHeapIdentity = heap.get();
-            backing.aliasOffset = offset; backing.aliasSize = 256;
+            backing.aliasOffset = offset; backing.aliasSize = 256; backing.aliasPoolID = 1;
             binding.admission = std::make_shared<const PreparedBackingState>(backing);
             return binding;
         };

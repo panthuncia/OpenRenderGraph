@@ -26,9 +26,9 @@ namespace org::imm {
     using ResolveByIdFn = ResourceRegistry::RegistryHandle(*)(void* user, ResourceIdentifier const& id, bool allowFailure);
 	using ResolveByPtrFn = ResourceRegistry::RegistryHandle(*)(void* user, Resource* res, bool allowFailure);
     
-	// "Dispatch" that lives on RenderGraph so immediate replay can
-    // turn a RegistryHandle into low-level RHI handles/descriptor slots after
-    // frame materialization has completed.
+	// Dispatch functions that live on RenderGraph. Immediate replay uses them to
+    // turn a RegistryHandle into low-level RHI handles and descriptor slots, after
+    // the frame's resources are materialized.
 
     struct ImmediateDispatch {
         RenderGraph* user = nullptr;
@@ -196,6 +196,8 @@ namespace org::imm {
             const std::vector<std::byte>& bytecode, const Resolver& resolve);
         void Record(rhi::CommandList& list) const;
         size_t Size() const { return m_copies.size(); }
+        // Appends every buffer the copies touch, destinations and sources (their backings as captured).
+        void AppendBuffers(std::vector<rhi::ResourceHandle>& out) const;
     private:
         struct Copy {
             BackingAllocationSnapshot dst, src;

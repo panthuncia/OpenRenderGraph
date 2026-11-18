@@ -18,7 +18,7 @@ bool ExternalTextureResource::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) 
 	outDesc.texture.depthOrLayers = m_arraySize;
 	outDesc.texture.mipLevels = m_mipLevels;
 	outDesc.texture.sampleCount = 1;
-	// The views the description asks for are the ones the imported image supports; persistent
+	// The description asks for exactly the views the imported image supports. Persistent
 	// graphs validate each declared view against these flags.
 	auto flags = static_cast<uint32_t>(rhi::ResourceFlags::RF_None);
 	if (m_description.hasRTV) flags |= rhi::ResourceFlags::RF_AllowRenderTarget;
@@ -26,6 +26,8 @@ bool ExternalTextureResource::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) 
 	if (m_description.hasUAV || m_description.hasNonShaderVisibleUAV) flags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
 	if (m_commonLayoutOnly) flags |= rhi::ResourceFlags::RF_AllowSimultaneousAccess;
 	outDesc.resourceFlags = static_cast<rhi::ResourceFlags>(flags);
+	// What the importer says the image was created with: a concurrent one may be used from any queue without ownership transfers.
+	outDesc.queueSharing = m_description.queueSharing;
 	return outDesc.texture.format != rhi::Format::Unknown;
 }
 
@@ -38,6 +40,8 @@ DescriptorHeapManager::ViewRequirements BuildExternalTextureViews(
 	views.mipLevels = mipLevels;
 	views.isCubemap = description.isCubemap;
 	views.isArray = description.isArray;
+	views.is3D = description.type == rhi::ResourceType::Texture3D;
+	views.depth = description.depth;
 	views.arraySize = description.arraySize;
 	views.totalArraySlices = arraySize;
 	views.baseFormat = description.format;
@@ -68,16 +72,16 @@ std::shared_ptr<ExternalTextureResource> ExternalTextureResource::CreateShared(
     result->m_mipLevels = static_cast<uint16_t>((std::max)(size_t{ 1 }, description.imageDimensions.size()));
     result->m_arraySize = static_cast<uint16_t>(description.isCubemap ? 6u * description.arraySize :
         (description.isArray ? description.arraySize : 1u));
-    // CreateShared is the retained cross-API import path. Such resources have
-    // the simultaneous-access contract even on proxy devices that do not
-    // faithfully expose every native creation flag through GetDesc(). The
-    // legacy constructor remains available for ordinary external textures.
+    // CreateShared is the cross-API import path, and it retains the imported
+    // resource. Such resources always allow simultaneous access. This holds even
+    // on proxy devices whose GetDesc() does not report every native creation
+    // flag. The legacy constructor is still available for ordinary external
+    // textures.
 	result->m_commonLayoutOnly = commonLayoutOnly;
 	auto views = BuildExternalTextureViews(description, result->m_mipLevels, result->m_arraySize);
 	auto apiResource = result->m_resource.Get();
 	DescriptorHeapManager::GetInstance().AssignDescriptorSlots(*result, apiResource, views);
-    if (description.initialLayout == rhi::ResourceLayout::Common)
-        result->ResetToCommon();
+    result->SeedInitialLayout(description.initialLayout);
     return result;
 }
 
@@ -113,10 +117,7 @@ bool ExternalTextureResource::RefreshShared(
 	m_handle = m_resource.Get().GetHandle();
 	m_commonLayoutOnly = commonLayoutOnly;
 	m_description = description;
-	if (description.initialLayout == rhi::ResourceLayout::Common)
-		ResetToCommon();
-	else
-		ResetToUndefined();
+	SeedInitialLayout(description.initialLayout);
 	auto views = BuildExternalTextureViews(description, m_mipLevels, m_arraySize);
 	auto apiResource = m_resource.Get();
 	DescriptorHeapManager::GetInstance().AssignDescriptorSlots(*this, apiResource, views);
@@ -158,6 +159,27 @@ void ExternalTextureResource::ResetToUndefined()
     wholeRange.sliceUpper = { BoundType::All, 0 };
     m_stateTracker = SymbolicTracker(wholeRange, ResourceState{
         rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None });
+}
+
+void ExternalTextureResource::SeedInitialLayout(rhi::ResourceLayout layout)
+{
+	// The layout the host keeps the image in: the state the graph finds it in, and with external home states the one each
+	// execution gives it back in. Undefined only when the host says its contents do not matter.
+	if (layout == rhi::ResourceLayout::Undefined) {
+		ResetToUndefined();
+		return;
+	}
+	if (layout == rhi::ResourceLayout::Common) {
+		ResetToCommon();
+		return;
+	}
+	RangeSpec wholeRange{};
+	wholeRange.mipLower = { BoundType::All, 0 };
+	wholeRange.mipUpper = { BoundType::All, 0 };
+	wholeRange.sliceLower = { BoundType::All, 0 };
+	wholeRange.sliceUpper = { BoundType::All, 0 };
+	m_stateTracker = SymbolicTracker(wholeRange, ResourceState{
+		rhi::ResourceAccessType::Common, layout, rhi::ResourceSyncState::All });
 }
 
 void ExternalTextureResource::ResetToCommon()

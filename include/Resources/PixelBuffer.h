@@ -91,6 +91,7 @@ public:
 
     bool HasValidBackingResource() const;
     BackingAllocationSnapshot CaptureBackingAllocation(bool retain = true) override;
+    std::recursive_mutex* BackingMutex() noexcept override { return &m_materializationMutex; }
 
     uint64_t GetBackingGeneration() const override {
         return m_backingGeneration;
@@ -155,7 +156,7 @@ private:
     uint32_t m_internalWidth = 0; // Internal width, used for padding textures to power of two
     uint32_t m_internalHeight = 0; // Internal height, used for padding textures to power of two
     rhi::ClearValue m_clearValue;
-    mutable std::mutex m_materializationMutex;
+    mutable std::recursive_mutex m_materializationMutex;
 };
 
 

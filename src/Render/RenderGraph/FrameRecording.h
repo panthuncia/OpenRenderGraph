@@ -1,14 +1,10 @@
 #pragma once
 
-#include "Render/RenderGraph/ExperimentalRhiExecution.h"
+#include "Render/RenderGraph/RhiExecution.h"
 #include "Render/Runtime/ITaskService.h"
-#include "FramePlanning.h"
-#include <condition_variable>
 #include <functional>
-#include <mutex>
-#include <thread>
 
-namespace org::experimental {
+namespace org::compiler {
 
 struct FrameRecordingJob {
     uint32_t slot = 0;
@@ -17,6 +13,11 @@ struct FrameRecordingJob {
     rhi::Queue queue;
     std::shared_ptr<CommandListPool> pool;
     OwnedRecordingList recording;
+    // A late batch of an external epoch (CompilePass::recordAtExecution). It has no command list. Its packet keeps the
+    // recording for later, and the host's execution records it (PreparedRhiExecutionBatch::RecordDeferred).
+    bool deferred = false;
+    // When non-empty, the plan's timelines as this job's device sees them. A peer device waits on its imported copies.
+    std::vector<PreparedTimelineBinding> timelines;
 };
 
 // Everything the recorder may read is frozen before dispatch. It has no graph,
@@ -28,36 +29,13 @@ struct PlannedFrame {
     PlannedFrame(const PlannedFrame&) = delete;
     PlannedFrame& operator=(const PlannedFrame&) = delete;
     PlannedFrame(std::shared_ptr<const RenderFrameSnapshot> frame, std::vector<FrameRecordingJob> work,
-        std::vector<PreparedTimelineBinding> bindings, std::vector<std::vector<ExecutionTimelinePoint>> waits,
-        std::shared_ptr<const PlannedFrameState> state = {})
+        std::vector<PreparedTimelineBinding> bindings, std::vector<std::vector<ExecutionTimelinePoint>> waits)
         : snapshot(std::move(frame)), jobs(std::move(work)), timelines(std::move(bindings)),
-          incomingWaits(std::move(waits)), planning(std::move(state)) {}
+          incomingWaits(std::move(waits)) {}
     std::shared_ptr<const RenderFrameSnapshot> snapshot;
     std::vector<FrameRecordingJob> jobs;
     std::vector<PreparedTimelineBinding> timelines;
     std::vector<std::vector<ExecutionTimelinePoint>> incomingWaits;
-    std::shared_ptr<const PlannedFrameState> planning;
-};
-
-class DispatchedFrameRecording;
-
-// Long-lived recording workers. Per-frame dispatch only enqueues small work
-// closures; it does not create tasks, futures, scopes, or threads.
-class PersistentRecordingLanes {
-public:
-    explicit PersistentRecordingLanes(size_t laneCount);
-    ~PersistentRecordingLanes();
-    PersistentRecordingLanes(const PersistentRecordingLanes&) = delete;
-    PersistentRecordingLanes& operator=(const PersistentRecordingLanes&) = delete;
-    void Submit(std::function<void()> work);
-    size_t LaneCount() const noexcept { return m_threads.size(); }
-private:
-    void Run();
-    std::mutex m_mutex;
-    std::condition_variable m_ready;
-    std::deque<std::function<void()>> m_work;
-    std::vector<std::thread> m_threads;
-    bool m_stopping = false;
 };
 
 class RecordedFrame {
@@ -67,50 +45,34 @@ public:
     RecordedFrame(const RecordedFrame&) = delete;
     const auto& Snapshot() const noexcept { return m_snapshot; }
     std::shared_ptr<const GraphExecutionTimeline> Submit(ExecutionTimelineAdmission& admission) &&;
-    // Async epochs: hands the packets to their queues with timelines the caller assigned (one per batch),
-    // touching no admission state - safe on the submitting thread while the owner prepares other work. The
-    // owner records the submission afterwards (ExecutionTimelineAdmission::RecordSubmitted). False when a
-    // packet failed; the frame is consumed either way.
+    // Admits the frame at submission time (ExecutionTimelineAdmission::SubmitPrepared). The caller passes:
+    // - the waits the admission computed at submission, which replace the plan's waits,
+    // - the lists that go ahead of each batch's own lists,
+    // - the leases that keep those lists alive.
+    std::shared_ptr<const GraphExecutionTimeline> Submit(ExecutionTimelineAdmission& admission,
+        const std::vector<std::vector<ExecutionTimelinePoint>>& incomingWaits,
+        std::span<const std::span<const rhi::CommandList>> leading, std::vector<std::shared_ptr<const void>> leases,
+        std::span<const PreparedTimelineBinding> extraTimelines = {}) &&;
+    // For async epochs. Hands the packets to their queues with the timelines the caller assigned, one per batch.
+    // It touches no admission state. So it is safe on the submitting thread while the owner prepares other work.
+    // The owner records the submission afterwards (ExecutionTimelineAdmission::RecordSubmitted).
+    // Returns false when a packet failed. The frame is consumed either way.
     bool SubmitPackets(std::span<const ExecutionBatchTimeline> batches);
     const auto& Packets() const noexcept { return m_batches; }
     const auto& IncomingWaits() const noexcept { return m_incomingWaits; }
 private:
     friend RecordedFrame RecordFrame(PlannedFrame, const std::shared_ptr<runtime::ITaskService>&, size_t);
-    friend class DispatchedFrameRecording;
-    friend DispatchedFrameRecording DispatchFrameRecording(PlannedFrame,
-        PersistentRecordingLanes&, size_t);
     RecordedFrame() = default;
     std::shared_ptr<const RenderFrameSnapshot> m_snapshot;
     std::vector<std::vector<ExecutionTimelinePoint>> m_incomingWaits;
     std::vector<std::shared_ptr<const IPreparedExecutionBatch>> m_batches;
-    std::shared_ptr<const PlannedFrameState> m_planning;
     bool m_submitted = false;
 };
 
 // Owns peer recording workers for one logical frame. No worker waits for
-// another worker: collection is a non-blocking readiness probe followed by a
-// FIFO join on the submission thread.
-class DispatchedFrameRecording {
-public:
-    DispatchedFrameRecording() = default;
-    DispatchedFrameRecording(DispatchedFrameRecording&&) noexcept = default;
-    DispatchedFrameRecording& operator=(DispatchedFrameRecording&&) noexcept = default;
-    DispatchedFrameRecording(const DispatchedFrameRecording&) = delete;
-    DispatchedFrameRecording& operator=(const DispatchedFrameRecording&) = delete;
-
-    bool Valid() const noexcept { return static_cast<bool>(m_state); }
-    bool Ready() const;
-    RecordedFrame Join();
-private:
-    friend DispatchedFrameRecording DispatchFrameRecording(PlannedFrame,
-        PersistentRecordingLanes&, size_t);
-    struct State;
-    std::shared_ptr<State> m_state;
-};
-
+// another worker. To collect them, the submission thread first checks
+// readiness without blocking, then joins the workers in FIFO order.
 RecordedFrame RecordFrame(PlannedFrame plan,
     const std::shared_ptr<runtime::ITaskService>& tasks, size_t concurrency);
-DispatchedFrameRecording DispatchFrameRecording(PlannedFrame plan,
-    PersistentRecordingLanes& lanes, size_t concurrency);
 
-} // namespace org::experimental
+} // namespace org::compiler

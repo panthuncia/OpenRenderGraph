@@ -9,8 +9,9 @@
 #include <utility>
 #include <vector>
 
-// Pure compiler kernels shared by live and owned-input compilation. Callers
-// provide views/accessors and own all scratch; no graph/resource/pass callbacks.
+// Pure compiler kernels, shared by live and owned-input compilation. Callers
+// provide views and accessors, and own all scratch memory. The kernels make no
+// graph, resource or pass callbacks.
 namespace org::compiler {
 
 template<class Index>
@@ -95,10 +96,11 @@ void ComputeCriticality(const Order& topologicalOrder, Successors&& successors,
     }
 }
 
-// Shared deterministic first-fit queue selection.  The live compiler and the
-// owned-input compiler intentionally use this exact routine; policy belongs in
-// compiler input/callbacks, never in the worker route.  The ready vector stores
-// node indices, while the returned first component is an index into that vector.
+// Deterministic first-fit queue selection. The live compiler and the
+// owned-input compiler both use this exact routine on purpose. Policy belongs
+// in the compiler input and callbacks, never in the worker route. The ready
+// vector stores node indices. The first component of the result is an index
+// into that vector.
 template<class Index, class CompatibleQueues, class PreferredQueue,
     class QueueHasWork, class Fits>
 std::optional<std::pair<size_t, uint32_t>> SelectFirstFitCandidate(

@@ -350,7 +350,7 @@ static void buildChildrenForType(
     case K::TextureBuffer:
     case K::ShaderStorageBuffer:
     {
-        //use getElementVarLayout() (not getElementTypeLayout()).
+        // Use getElementVarLayout(), not getElementTypeLayout().
         auto* elemVar = typeLayout->getElementVarLayout();
         if (!elemVar) break;
 

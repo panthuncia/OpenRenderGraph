@@ -15,21 +15,13 @@ public:
         ReadbackManager::GetInstance().RequestReadbackCapture(passName, resource, range, std::move(callback), preferredQueueKind);
     }
 
+    void RequestScheduledReadbackCapture(const std::string& passName, uint64_t schedulingID, const RangeSpec& range,
+        ReadbackCaptureCallback callback) override {
+        ReadbackManager::GetInstance().RequestScheduledReadbackCapture(passName, schedulingID, range, std::move(callback));
+    }
+
     std::vector<org::runtime::ReadbackCaptureInfo> ConsumeCaptureRequests() override {
-        auto captures = ReadbackManager::GetInstance().ConsumeCaptureRequests();
-        std::vector<org::runtime::ReadbackCaptureInfo> out;
-        out.reserve(captures.size());
-        for (auto& capture : captures) {
-            out.push_back({
-                .passName = std::move(capture.passName),
-                .resource = std::move(capture.resource),
-                .resourceId = capture.resourceId,
-                .range = capture.range,
-                .callback = std::move(capture.callback),
-                .preferredQueueKind = capture.preferredQueueKind
-                });
-        }
-        return out;
+        return ReadbackManager::GetInstance().ConsumeCaptureRequests();
     }
 
     std::shared_ptr<Resource> AcquireReadbackBuffer(uint64_t byteSize, const char* debugName) override {

@@ -154,6 +154,7 @@ public:
 
     uint64_t GetBackingGeneration() const override;
     BackingAllocationSnapshot CaptureBackingAllocation(bool retain = true) override;
+    std::recursive_mutex* BackingMutex() noexcept override { return &m_materializationMutex; }
 
     void Materialize(const MaterializeOptions* options = nullptr);
 
@@ -177,12 +178,40 @@ public:
 
     bool IsAliasingAllowed() const;
 
+    // Storage for ray tracing acceleration structures (RF_RaytracingAccelerationStructure): passes then reach it only
+    // through PassBuilder::AccelerationStructureBuild or AccelerationStructureRead. Set before it materializes.
+    void SetAccelerationStructureStorage(bool storage) {
+        m_extraResourceFlags = storage ? rhi::RF_RaytracingAccelerationStructure : rhi::RF_None;
+    }
+    bool IsAccelerationStructureStorage() const { return (m_extraResourceFlags & rhi::RF_RaytracingAccelerationStructure) != 0u; }
+    // Residency priority of the buffer's own allocation, set when it materializes (alias placements take their pool's).
+    void SetResidencyPriority(rhi::ResidencyPriority priority) { m_residencyPriority = priority; }
+
     void SetUploadPolicyTag(org::runtime::UploadPolicyTag tag);
+    // Sends this buffer's uploads to `service`, whatever upload service the upload policy configures (the frame
+    // graph's). A buffer that a job graph owns uploads through that graph, whose upload pass lands them ahead of its
+    // passes. Pair it with an Immediate tag, so that writes are not held for the policy's flush. The pin expires with the
+    // service.
+    void PinUploadService(const std::shared_ptr<org::runtime::IUploadService>& service) { m_pinnedUploadService = service; }
 
     org::runtime::UploadPolicyTag GetUploadPolicyTag() const;
 
     bool IsUploadPolicyImmediate() const;
     static bool IsBackingMutationAllowedOnThisThread();
+    // The ScopedBackingMutation depth of this thread, for scopes that cannot hold one (GraphHost::BackingMutation).
+    static void EnterBackingMutation();
+    static void LeaveBackingMutation();
+    // An owner that captures backings on its own thread while other threads run (GraphHost's async epochs) registers
+    // for as long as it does so. While it is registered, a buffer's backing may change (ResizeBytes, ResizeStructured)
+    // only inside a ScopedBackingMutation. The owner serializes these scopes against its captures (BackedResource).
+    // Backing changes anywhere else throw.
+    static void RegisterConcurrentBackingCapture();
+    static void UnregisterConcurrentBackingCapture();
+    // Throws when a concurrent capture owner is registered and this thread is outside a backing mutation scope.
+    void RequireBackingMutationAllowed(const char* operation, uint64_t newSize) const;
+    // How many backings all buffers have released, process-wide. A copy recorded ahead (StagedUploadBatch::Record)
+    // names its targets' backings as they were then. It stays valid while this number has not changed.
+    static uint64_t BackingReleaseSerial() noexcept;
 
     virtual ~BufferBase();
 
@@ -195,6 +224,8 @@ protected:
     std::shared_ptr<org::runtime::IUploadService> RetainBufferUploadService() const;
     void UploadBufferData(const void* data, size_t size, org::runtime::UploadTarget target, size_t offset,
         const char* file = nullptr, int line = 0) const;
+    // Replaces the backing in place. Deprecated for a buffer a graph declares: make a new version of a VersionedBuffer
+    // instead, which old work keeps using until it retires (docs/persistent-epochs.md, "Versioned resources").
     void SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t bufferSize);
     void CreateAndSetBacking(rhi::HeapType accessType, uint64_t bufferSize, bool unorderedAccess);
     void SetBackingName(const std::string& baseName, const std::string& suffix);
@@ -217,9 +248,15 @@ protected:
     std::optional<DescriptorRequirements> m_descriptorRequirements;
     bool m_allowAlias = false;
     std::optional<uint64_t> m_aliasingPoolID;
+    rhi::ResourceFlags m_extraResourceFlags = rhi::RF_None;
+    std::optional<rhi::ResidencyPriority> m_residencyPriority;
 
 private:
+    // Two graphs that share a buffer may materialize it at the same time (RenderGraph::MaterializeUnmaterializedResources).
+    // This mutex makes sure the buffer gets only one backing.
+    std::recursive_mutex m_materializationMutex;
     uint64_t m_backingGeneration = 0;
+    std::weak_ptr<org::runtime::IUploadService> m_pinnedUploadService;  // PinUploadService
     org::runtime::UploadPolicyTag m_uploadPolicyTag = org::runtime::UploadPolicyTag::Immediate;
     bool m_uploadPolicyRegistered = false;
 };

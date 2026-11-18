@@ -1,10 +1,10 @@
 #pragma once
-#include "Render/RenderGraph/ExperimentalGraphCompiler.h"
-#include "Render/RenderGraph/ExperimentalExecutionState.h"
+#include "Render/RenderGraph/GraphCompiler.h"
+#include "Render/RenderGraph/ExecutionState.h"
 #include <iosfwd>
 #include <memory>
 
-namespace org::experimental {
+namespace org::compiler {
 // Versioned numeric graph snapshots. Never serialize leases or native handles.
 void WriteGraphReplay(std::ostream& output, const GraphCompileStructure& structure);
 GraphCompileStructure ReadGraphReplay(std::istream& input);

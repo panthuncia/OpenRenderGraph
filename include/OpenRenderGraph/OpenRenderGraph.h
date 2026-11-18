@@ -16,8 +16,6 @@
 #include "../Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.h"
 
 #include "../RenderPasses/Base/RenderPass.h"
-#include "../RenderPasses/Base/ComputePass.h"
-#include "../RenderPasses/Base/CopyPass.h"
 #include "../RenderPasses/Base/PassReturn.h"
 
 #include "../Interfaces/IResourceProvider.h"

@@ -5,6 +5,7 @@
 #include <memory>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 
 #include <resource_states.h>
@@ -20,6 +21,7 @@ namespace org {
 
 class SymbolicTracker;
 class BindingTableVersion;
+class AliasHeapGeneration;
 
 class Resource : public std::enable_shared_from_this<Resource> {
 public:
@@ -203,6 +205,8 @@ public:
     virtual void SetName(const std::string& newName) { this->name = newName; OnSetName(); }
 	virtual rhi::Resource GetAPIResource() = 0;
 	struct APIRepresentation {
+		// The memory a placed representation lives in. Declared first, so it outlives `resource`.
+		std::shared_ptr<const void> memoryOwner;
 		rhi::ResourcePtr resource;
 		SymbolicTracker tracker;
 		uint64_t backingGeneration = 0;
@@ -212,11 +216,27 @@ public:
 		BackendInstanceId device;
 		rhi::ResourcePtr resource;
 		ResourceState initialState{ rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None };
+		std::shared_ptr<const void> memoryOwner;
+	};
+	// Representations placed in an alias pool shared between devices: the pool's heap generation and the range they occupy.
+	struct APIRepresentationPlacement {
+		std::shared_ptr<const AliasHeapGeneration> heap;
+		uint64_t poolID = 0, offset = 0, size = 0;
 	};
 	APIRepresentationPtr AcquireAPIRepresentation(BackendInstanceId backendInstance) const {
 		std::scoped_lock lock(m_representationMutex);
 		const auto it = m_representations.find(static_cast<uint8_t>(backendInstance));
 		return it != m_representations.end() ? it->second : APIRepresentationPtr{};
+	}
+	// Every device's representation as one published set, indexed by device. The same object until the next publication or
+	// clear, so it identifies the allocation: bindings of one resource captured at different times share it.
+	struct APIRepresentationSet {
+		std::vector<APIRepresentationPtr> devices; // By backend instance.
+		APIRepresentationPlacement placement;      // Empty unless placed in a shared alias pool.
+	};
+	std::shared_ptr<const APIRepresentationSet> AcquireAPIRepresentationSet() const {
+		std::scoped_lock lock(m_representationMutex);
+		return m_representationSet;
 	}
 
 	[[nodiscard]] bool HasECSEntity() const noexcept { return static_cast<bool>(m_ecsEntity); }
@@ -246,6 +266,9 @@ public:
 	// Publishes a complete set of device-local backings as one generation. No
 	// execution thread can observe only half of a cross-device resource pair.
 	bool PublishAPIRepresentations(std::vector<PendingAPIRepresentation> pending) {
+		return PublishAPIRepresentations(std::move(pending), APIRepresentationPlacement{});
+	}
+	bool PublishAPIRepresentations(std::vector<PendingAPIRepresentation> pending, APIRepresentationPlacement placement) {
 		if (pending.empty()) return true;
 		std::unordered_map<uint8_t, APIRepresentationPtr> replacements;
 		replacements.reserve(pending.size());
@@ -253,6 +276,7 @@ public:
 		for (auto& item : pending) {
 			if (!item.resource) return false;
 			auto representation = std::make_shared<APIRepresentation>();
+			representation->memoryOwner = std::move(item.memoryOwner);
 			representation->resource = std::move(item.resource);
 			representation->tracker = SymbolicTracker(RangeSpec{}, item.initialState);
 			representation->backingGeneration = generation;
@@ -261,6 +285,14 @@ public:
 		std::scoped_lock lock(m_representationMutex);
 		for (auto& [device, representation] : replacements)
 			m_representations[device] = std::move(representation);
+		auto set = std::make_shared<APIRepresentationSet>();
+		for (const auto& [device, representation] : m_representations) {
+			if (!representation || !representation->resource) continue;
+			if (set->devices.size() <= device) set->devices.resize(device + 1u);
+			set->devices[device] = representation;
+		}
+		set->placement = std::move(placement);
+		m_representationSet = std::move(set);
 		m_publishedRepresentationGeneration = generation;
 		return true;
 	}
@@ -285,6 +317,7 @@ public:
 	void ClearAPIRepresentations() {
 		std::scoped_lock lock(m_representationMutex);
 		m_representations.clear();
+		m_representationSet.reset();
 	}
 	std::vector<APIRepresentationPtr> TakeAPIRepresentations() {
 		std::vector<APIRepresentationPtr> retired;
@@ -295,12 +328,16 @@ public:
 			if (representation) retired.push_back(std::move(representation));
 		}
 		m_representations.clear();
+		m_representationSet.reset();
 		return retired;
 	}
     virtual uint64_t GetGlobalResourceID() const { return m_globalResourceID; }
 	// Identity used by render-graph scheduling. Dynamic wrappers override this so
 	// dependency identity remains stable when their backing resource changes.
 	virtual uint64_t GetSchedulingResourceID() const { return GetGlobalResourceID(); }
+	// A new identity from the counter resources take theirs from. It names no resource. A versioned resource takes one for the
+	// graph slot that stands for it across its versions.
+	static uint64_t ReserveGlobalResourceID() noexcept { return globalResourceCount.fetch_add(1, std::memory_order_relaxed); }
 	GraphOwnership GetGraphOwnership() const noexcept { return m_graphOwnership; }
 	void SetGraphOwnership(GraphOwnership ownership) noexcept { m_graphOwnership = ownership; }
 	bool IsRenderGraphManaged() const noexcept { return m_graphOwnership == GraphOwnership::GraphManaged; }
@@ -335,9 +372,20 @@ public:
 		return { .buffers = { &bufferBarrier, 1 } };
 	}
 	bool HasLayout() const { return m_hasLayout; }
-	// Textures with the simultaneous-access contract (shared with another API that uses them between
-	// the graph's commands) stay in layout Common: the graph changes only their access and sync.
+	// Some textures have the simultaneous-access contract. They are shared with another API that uses them
+	// between the graph's commands. Such textures stay in layout Common, and the graph changes only their
+	// access and sync.
 	virtual bool CommonLayoutOnly() const noexcept { return false; }
+	// The host owns it: it allocated it and uses it between the graph's executions. With external home states
+	// (RenderGraph::SetPersistentExternalHomeStates), every execution gives it back in its home state, on the graphics queue.
+	virtual bool HostOwned() const noexcept { return false; }
+	// A graph-owned resource the host still touches between the graph's executions (an interop bridge, until the host's own
+	// uses become passes). With external home states it goes home as a host-owned texture does: every execution gives it back
+	// in the state its tracker held when it was captured (its home), on the graphics queue. Set it before any graph captures it.
+	void SetHostHome(bool hostHome) noexcept { m_hostHome = hostHome; }
+	bool HostHome() const noexcept { return m_hostHome; }
+	// Whether every execution gives it back in its home state under external home states: host-owned, or graph-owned with a host home.
+	bool GoesHome() const noexcept { return HostOwned() || m_hostHome; }
 	void AddAliasedResource(Resource* resource) {
 		m_aliasedResources.push_back(resource);
 	}
@@ -391,6 +439,7 @@ private:
 	inline static thread_local std::uint32_t s_ecsRegistrationSuppressionDepth = 0;
 	mutable std::mutex m_representationMutex;
 	std::unordered_map<uint8_t, APIRepresentationPtr> m_representations;
+	std::shared_ptr<const APIRepresentationSet> m_representationSet; // Guarded by m_representationMutex.
 	std::atomic<uint64_t> m_nextRepresentationGeneration{ 1 };
 	std::atomic<uint64_t> m_publishedRepresentationGeneration{ 0 };
     bool m_uploadInProgress = false;
@@ -398,16 +447,26 @@ private:
 	inline static ECSEntityHooks s_ecsEntityHooks{};
     uint64_t m_globalResourceID;
 	GraphOwnership m_graphOwnership = GraphOwnership::GraphManaged;
+	bool m_hostHome = false;
 	ECSEntityHandle m_ecsEntity; // For access through ECS queries without dereferencing Flecs during teardown
 
     //friend class RenderGraph;
     friend class ResourceGroup;
     friend class ::ResourceManager;
     friend class DynamicResource;
-    friend class DynamicGloballyIndexedResource;
     friend class DynamicBuffer;
     friend class UploadManager; // Kinda a hack, for deduplicating transition lists
 };
 
+
+// A resource that shaders read through a descriptor index the graph never sees (a bindless table, say) has no
+// declaration: the graph neither transitions it nor orders it against its writers. Such a resource must not change
+// while shaders can read it, and must already be in its shader-read state: GraphOwnership::
+// ExternalImmutableShaderResource. Throws std::logic_error naming the resource when it isn't.
+inline void RequireUndeclaredShaderRead(const Resource& resource) {
+	if (resource.GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource) return;
+	throw std::logic_error("Resource '" + resource.GetName() + "' is graph-managed, so shaders can't read it through a "
+		"descriptor the graph doesn't know about: the graph would not transition it or order its writes");
+}
 
 } // namespace org

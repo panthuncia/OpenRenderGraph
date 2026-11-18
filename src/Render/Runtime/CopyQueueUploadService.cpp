@@ -28,8 +28,8 @@ CopyQueueUploadService::~CopyQueueUploadService() {
 }
 
 CopyQueueUploadService::ThreadSlot& CopyQueueUploadService::Slot() {
-	// One open page per producer thread; the epoch invalidates slots that
-	// outlive a Cleanup/Initialize cycle so no stale page from an old device
+	// One open page per producer thread. The epoch invalidates slots that
+	// outlive a Cleanup/Initialize cycle. So no stale page from an old device
 	// is ever written to.
 	static thread_local ThreadSlot slot;
 	const auto epoch = m_epoch.load(std::memory_order_acquire);
@@ -223,9 +223,9 @@ std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueBufferUpload(
 	BT_ZONE_SCOPE("CopyQueueUploadService::QueueBufferUpload");
 	BT_ZONE_VALUE(static_cast<int64_t>(totalSize));
 
-	// An upload larger than a page is split into page-sized chunks that share
-	// the producer thread's pages; the ticket rides on the last chunk, and
-	// batches complete in order, so the ticket completes after every chunk.
+	// An upload larger than a page is split into page-sized chunks. The chunks
+	// share the producer thread's pages. The ticket rides on the last chunk.
+	// Batches complete in order, so the ticket completes after every chunk.
 	auto ticket = std::make_shared<TrackedUploadTicket>();
 	const auto queued = std::chrono::steady_clock::now();
 	size_t segmentIndex = 0;
@@ -252,6 +252,120 @@ std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueBufferUpload(
 	return ticket;
 }
 
+std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueBufferUploadRanges(
+	std::span<const StreamingUploadRange> ranges, org::WorkerOwnedDestination destination) {
+	if (!Initialized() || !destination.resource || ranges.empty()) return {};
+	size_t totalSize = 0;
+	for (const auto& range : ranges) {
+		if (range.data == nullptr && range.size != 0) return {};
+		totalSize += range.size;
+	}
+	if (totalSize == 0) return {};
+	BT_ZONE_SCOPE("CopyQueueUploadService::QueueBufferUploadRanges");
+	BT_ZONE_VALUE(static_cast<int64_t>(totalSize));
+
+	// Create one entry per staging page that the ranges land on. These are the producer thread's pages, taken the
+	// same way StageChunk takes them. Each page is mapped once while it takes ranges, with one copy region per range.
+	// The ticket rides on the last entry. Batches complete in order, so the ticket completes after every range.
+	auto ticket = std::make_shared<TrackedUploadTicket>();
+	const auto queued = std::chrono::steady_clock::now();
+	auto& slot = Slot();
+	PendingCopy entry;
+	uint8_t* mapped = nullptr;
+	size_t mappedFrom = 0;
+	size_t writtenEnd = 0;
+	bool pushed = false;
+	// Opens an entry on the thread's page and maps the page. It takes a new page when the bytes do not fit.
+	// rangeCount is the number of ranges the entry may take.
+	const auto openEntry = [&](size_t bytes, size_t rangeCount) -> bool {
+		if (slot.page && slot.page->tail + bytes > slot.page->capacity) {
+			ClosePage(std::move(slot.page));
+		}
+		if (slot.page && !slot.page->buffer) slot.page.reset();
+		if (!slot.page) {
+			slot.page = AcquirePage();
+			if (!slot.page) return false;
+		}
+		void* pointer = nullptr;
+		slot.page->buffer->Map(&pointer, 0, slot.page->capacity);
+		if (!pointer) {
+			spdlog::error("CopyQueueUploadService '{}': upload page map failed", m_config.debugName);
+			return false;
+		}
+		slot.page->pendingRegions.fetch_add(1, std::memory_order_acq_rel);
+		entry.page = slot.page;
+		entry.destination = destination.resource;
+		entry.queued = queued;
+		entry.regions.reserve(rangeCount);
+		mapped = static_cast<uint8_t*>(pointer);
+		mappedFrom = writtenEnd = slot.page->tail;
+		return true;
+	};
+	// Unmaps the bytes written to the open entry, then pushes the entry onto the intake.
+	const auto closeEntry = [&](bool last) {
+		entry.page->buffer->Unmap(mappedFrom, writtenEnd - mappedFrom);
+		if (last) entry.ticket = ticket;
+		m_intake.Push(std::move(entry));
+		entry = PendingCopy{};
+		pushed = true;
+	};
+	for (size_t i = 0; i < ranges.size(); ++i) {
+		const auto& range = ranges[i];
+		size_t done = 0;
+		while (done < range.size) {
+			// A range larger than a page is split into page-sized chunks, as QueueBufferUpload splits.
+			const size_t chunk = (std::min)(range.size - done, m_config.pageBytes);
+			if (entry.page && entry.page->tail + chunk > entry.page->capacity) closeEntry(false);
+			if (!entry.page && !openEntry(chunk, ranges.size() - i)) {
+				if (pushed) m_wake.notify_one();
+				ticket->Cancel();
+				return ticket;
+			}
+			auto& page = *entry.page;
+			const size_t offset = page.tail;
+			std::memcpy(mapped + offset, static_cast<const uint8_t*>(range.data) + done, chunk);
+			page.tail = AlignUp(offset + chunk, kRegionAlignment);
+			writtenEnd = offset + chunk;
+			entry.regions.push_back({ offset, range.dstOffset + done, chunk });
+			entry.size += chunk;
+			done += chunk;
+		}
+	}
+	closeEntry(true);
+	m_wake.notify_one();
+	return ticket;
+}
+
+std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueBufferCopyRanges(std::shared_ptr<Resource> source,
+	std::span<const StreamingCopyRange> ranges, org::WorkerOwnedDestination destination) {
+	if (!Initialized() || !source || !destination.resource || source == destination.resource) return {};
+	BT_ZONE_SCOPE("CopyQueueUploadService::QueueBufferCopyRanges");
+
+	// One entry and no staging page. Each range becomes one region, which the GPU reads from the source. Ranges are not
+	// split, because nothing is staged. So this entry alone may exceed maxBatchBytes and maxBatchCopies. The regions of a
+	// ranges entry may do the same.
+	auto ticket = std::make_shared<TrackedUploadTicket>();
+	PendingCopy entry;
+	entry.regions.reserve(ranges.size());
+	for (const auto& range : ranges) {
+		if (range.size == 0) continue;
+		entry.regions.push_back({ range.srcOffset, range.dstOffset, range.size });
+		entry.size += range.size;
+	}
+	BT_ZONE_VALUE(static_cast<int64_t>(entry.size));
+	// When there is nothing to copy, the ticket rides an entry with no copies. That entry has no source and no destination,
+	// so it needs no barriers and has no hazard. The ticket still completes in order, on the service's timeline.
+	if (!entry.regions.empty()) {
+		entry.source = std::move(source);
+		entry.destination = std::move(destination.resource);
+	}
+	entry.ticket = ticket;
+	entry.queued = std::chrono::steady_clock::now();
+	m_intake.Push(std::move(entry));
+	m_wake.notify_one();
+	return ticket;
+}
+
 // ---------------------------------------------------------------------------
 // Submitter
 
@@ -262,8 +376,16 @@ CopyQueueUploadService::CommandPair CopyQueueUploadService::AcquireCommandPair()
 		return pair;
 	}
 	CommandPair pair;
-	if (rhi::Failed(m_device.CreateCommandAllocator(rhi::QueueKind::Copy, pair.allocator)) ||
-		rhi::Failed(m_device.CreateCommandList(rhi::QueueKind::Copy, pair.allocator.Get(), pair.list))) {
+	// Create the allocator for the queue the lists are submitted to. A dedicated upload queue may be in a different family
+	// than the device's copy queue. One allocator serves every list, because each command pool costs driver memory.
+	if (!m_listAllocator && rhi::Failed(m_device.CreateCommandAllocator(m_copyQueue, m_listAllocator))) {
+		m_listAllocator = {};
+		spdlog::error("CopyQueueUploadService '{}': copy command allocator creation failed", m_config.debugName);
+		return {};
+	}
+	const bool shared = m_listAllocator->SupportsSharedLists();
+	if ((!shared && rhi::Failed(m_device.CreateCommandAllocator(m_copyQueue, pair.allocator))) ||
+		rhi::Failed(m_device.CreateCommandList(rhi::QueueKind::Copy, shared ? m_listAllocator.Get() : pair.allocator.Get(), pair.list))) {
 		spdlog::error("CopyQueueUploadService '{}': copy command list creation failed", m_config.debugName);
 		return {};
 	}
@@ -271,21 +393,77 @@ CopyQueueUploadService::CommandPair CopyQueueUploadService::AcquireCommandPair()
 }
 
 void CopyQueueUploadService::RecycleCommandPair(CommandPair&& pair) {
-	if (!pair.allocator || !pair.list) return;
-	pair.allocator->Recycle();
-	pair.list->Recycle(pair.allocator.Get());
+	if (!pair.list) return;
+	if (pair.allocator) {
+		pair.allocator->Recycle();
+		pair.list->Recycle(pair.allocator.Get());
+	} else if (m_listAllocator) {
+		// Resets only this list. The others of the shared allocator may still run on the GPU.
+		pair.list->Recycle(m_listAllocator.Get());
+	} else {
+		return;
+	}
 	if (m_freePairs.size() < m_config.maxInFlightBatches + 1) {
 		m_freePairs.push_back(std::move(pair));
 	}
+}
+
+std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value) {
+	if (!Initialized() || !timeline || !*timeline || value == 0) return {};
+	auto ticket = std::make_shared<TrackedUploadTicket>();
+	PendingCopy signal;
+	signal.signalTimeline = std::move(timeline);
+	signal.signalValue = value;
+	signal.ticket = ticket;
+	signal.queued = std::chrono::steady_clock::now();
+	m_intake.Push(std::move(signal));
+	m_wake.notify_one();
+	return ticket;
+}
+
+bool CopyQueueUploadService::QueueWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points) {
+	if (!Initialized()) return false;
+	PendingCopy wait;
+	for (const auto& [timeline, value] : points)
+		if (timeline && *timeline && value) wait.waits.emplace_back(timeline, value);
+	if (wait.waits.empty()) return true;
+	wait.queued = std::chrono::steady_clock::now();
+	m_intake.Push(std::move(wait));
+	m_wake.notify_one();
+	return true;
 }
 
 bool CopyQueueUploadService::CollectBatch(Batch& batch) {
 	batch.copies.clear();
 	batch.bytes = 0;
 	PendingCopy copy;
-	while (batch.copies.size() < m_config.maxBatchCopies) {
-		if (!batch.copies.empty() && m_intake.Count() == 0) break;
-		if (!m_intake.Pop(copy)) break;
+	size_t regions = 0; // copy regions. A ranges entry counts each of its regions.
+	// A batch records no barriers between its copies. So it must never hold both a write and a read of one resource.
+	// These entries end the batch:
+	// - a buffer copy whose source an earlier entry writes,
+	// - an entry that writes a resource an earlier copy reads,
+	// - a wait entry (it holds only what was queued after it).
+	// That entry is carried over, unclaimed, and opens the next batch. The check uses whole resources, not byte ranges.
+	// That is conservative and cheap.
+	std::unordered_set<Resource*> written;
+	std::unordered_set<Resource*> read;
+	while (regions < m_config.maxBatchCopies) {
+		if (m_carried) {
+			copy = std::move(*m_carried);
+			m_carried.reset();
+			m_hasCarried.store(false, std::memory_order_release);
+		} else {
+			if (!batch.copies.empty() && m_intake.Count() == 0) break;
+			if (!m_intake.Pop(copy)) break;
+		}
+		// A wait also ends the batch: the whole batch waits for it, and the entries queued before it must not. Graph work may wait
+		// for those (their signals, the batch's value) and the wait may be for that graph work: a cycle (copy-queue-sealed-stall).
+		if (!batch.copies.empty() && (!copy.waits.empty() || (copy.source && written.contains(copy.source.get())) ||
+				(copy.destination && read.contains(copy.destination.get())))) {
+			m_carried = std::move(copy);
+			m_hasCarried.store(true, std::memory_order_release);
+			break;
+		}
 		if (copy.ticket) {
 			auto expected = TrackedUploadTicketState::Queued;
 			if (!copy.ticket->state.compare_exchange_strong(expected, TrackedUploadTicketState::Claimed,
@@ -298,7 +476,10 @@ bool CopyQueueUploadService::CollectBatch(Batch& batch) {
 			}
 			copy.ticket->NotifyChanged();
 		}
+		if (copy.destination) written.insert(copy.destination.get());
+		if (copy.source) read.insert(copy.source.get());
 		batch.bytes += copy.size;
+		regions += copy.regions.empty() ? 1 : copy.regions.size();
 		batch.copies.push_back(std::move(copy));
 		if (batch.bytes >= m_config.maxBatchBytes) break;
 	}
@@ -315,34 +496,62 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 	}
 	auto& list = batch.pair.list.Get();
 
-	// One barrier per distinct destination on each side of the copies. The
-	// same barriers are legal on both backends: buffers have no layout, and the
-	// destinations are QueueSharing::Concurrent so no family transfer is needed.
+	// Record barriers on each side of the copies. There is one barrier per
+	// distinct destination (to CopyDest) and one per distinct buffer copy source
+	// (to CopySource). CollectBatch keeps the two sets disjoint. The same barriers
+	// are legal on both backends. Buffers have no layout. Destinations and sources
+	// are both QueueSharing::Concurrent, so no queue-family transfer is needed.
 	std::vector<rhi::BufferBarrier> barriers;
 	std::unordered_set<Resource*> seen;
 	barriers.reserve(batch.copies.size());
-	for (const auto& copy : batch.copies) {
-		if (!copy.destination || !seen.insert(copy.destination.get()).second) continue;
+	const auto addBarrier = [&](const std::shared_ptr<Resource>& resource, rhi::ResourceAccessType access) {
+		if (!resource || !seen.insert(resource.get()).second) return;
 		rhi::BufferBarrier barrier{};
-		barrier.buffer = copy.destination->GetAPIResource().GetHandle();
+		barrier.buffer = resource->GetAPIResource().GetHandle();
 		barrier.beforeSync = rhi::ResourceSyncState::All;
 		barrier.afterSync = rhi::ResourceSyncState::Copy;
 		barrier.beforeAccess = rhi::ResourceAccessType::Common;
-		barrier.afterAccess = rhi::ResourceAccessType::CopyDest;
+		barrier.afterAccess = access;
 		barriers.push_back(barrier);
+	};
+	for (const auto& copy : batch.copies) {
+		addBarrier(copy.destination, rhi::ResourceAccessType::CopyDest);
+		if (copy.destination) addBarrier(copy.source, rhi::ResourceAccessType::CopySource);
 	}
 	if (!barriers.empty()) {
 		list.Barriers({ .buffers = { barriers.data(), static_cast<uint32_t>(barriers.size()) } });
 	}
+	size_t regions = 0;
 	for (const auto& copy : batch.copies) {
-		if (!copy.destination || !copy.page) continue;
-		list.CopyBufferRegion(copy.destination->GetAPIResource().GetHandle(), copy.dstOffset,
-			copy.page->buffer->GetHandle(), copy.srcOffset, copy.size);
+		if (!copy.destination) continue;
+		if (copy.source) {
+			// A buffer copy entry: its regions read the source.
+			const auto dst = copy.destination->GetAPIResource().GetHandle();
+			const auto src = copy.source->GetAPIResource().GetHandle();
+			for (const auto& region : copy.regions) {
+				list.CopyBufferRegion(dst, region.dstOffset, src, region.srcOffset, region.size);
+			}
+			regions += copy.regions.size();
+			continue;
+		}
+		if (!copy.page) continue;
+		if (copy.regions.empty()) {
+			list.CopyBufferRegion(copy.destination->GetAPIResource().GetHandle(), copy.dstOffset,
+				copy.page->buffer->GetHandle(), copy.srcOffset, copy.size);
+			++regions;
+			continue;
+		}
+		const auto dst = copy.destination->GetAPIResource().GetHandle();
+		const auto src = copy.page->buffer->GetHandle();
+		for (const auto& region : copy.regions) {
+			list.CopyBufferRegion(dst, region.dstOffset, src, region.srcOffset, region.size);
+		}
+		regions += copy.regions.size();
 	}
 	for (auto& barrier : barriers) {
 		barrier.beforeSync = rhi::ResourceSyncState::Copy;
 		barrier.afterSync = rhi::ResourceSyncState::All;
-		barrier.beforeAccess = rhi::ResourceAccessType::CopyDest;
+		barrier.beforeAccess = barrier.afterAccess; // CopyDest or CopySource
 		barrier.afterAccess = rhi::ResourceAccessType::Common;
 	}
 	if (!barriers.empty()) {
@@ -362,9 +571,51 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 		};
 	}
 	const rhi::CommandList lists[] = { batch.pair.list.Get() };
-	const rhi::TimelinePoint signal{ (*timeline)->GetHandle(), batch.timelineValue };
-	if (rhi::Failed(m_copyQueue.Submit(lists, { .signals = { &signal, 1 } }))) {
-		spdlog::error("CopyQueueUploadService '{}': copy queue submission failed", m_config.debugName);
+	// Signal the batch's own value first. Then signal each signal entry's timeline, at the largest value the batch carries
+	// for it.
+	std::vector<rhi::TimelinePoint> signals{ { (*timeline)->GetHandle(), batch.timelineValue } };
+	size_t externalSignals = 0;
+	for (const auto& copy : batch.copies) {
+		if (!copy.signalTimeline) continue;
+		const auto handle = (*copy.signalTimeline)->GetHandle();
+		auto found = std::find_if(signals.begin() + 1, signals.end(), [&](const rhi::TimelinePoint& a_point) {
+			return a_point.t.index == handle.index && a_point.t.generation == handle.generation;
+		});
+		if (found == signals.end()) signals.push_back({ handle, copy.signalValue });
+		else found->value = (std::max)(found->value, copy.signalValue);
+		++externalSignals;
+	}
+	// Collect the wait entries' points. Each timeline waits for the largest value any entry asks for. The whole batch waits.
+	// So copies queued before a wait in the same batch also start later.
+	std::vector<rhi::TimelinePoint> waits;
+	for (const auto& copy : batch.copies) {
+		for (const auto& [waitTimeline, value] : copy.waits) {
+			const auto handle = (*waitTimeline)->GetHandle();
+			auto found = std::find_if(waits.begin(), waits.end(), [&](const rhi::TimelinePoint& a_point) {
+				return a_point.t.index == handle.index && a_point.t.generation == handle.generation;
+			});
+			if (found == waits.end()) waits.push_back({ handle, value });
+			else found->value = (std::max)(found->value, value);
+		}
+	}
+	// The waits are met here, on this thread, before the submission: the submission then carries only reached waits. A wait inside
+	// Submit would hold what the RHI holds there (its device's timeline lock, which every timeline query takes) for as long as the
+	// GPU takes, and a host that orders a queue it shares on the CPU waits inside Submit. The order is the same: batches go to the
+	// one queue in order, so a wait on the queue holds the later batches as this one does. Bounded: past it, the waits stay on the
+	// submission, for the GPU.
+	for (const auto& copy : batch.copies) {
+		for (const auto& [waitTimeline, value] : copy.waits) {
+			if (!waitTimeline || !*waitTimeline || (*waitTimeline)->GetCompletedValue() >= value) continue;
+			if ((*waitTimeline)->HostWait(value, 10'000) != rhi::Result::Ok) {
+				spdlog::warn("CopyQueueUploadService '{}': a wait was not reached in 10 s (timeline t{} wants {}, at {}); it stays on the submission",
+					m_config.debugName, (*waitTimeline)->GetHandle().index, value, (*waitTimeline)->GetCompletedValue());
+			}
+		}
+	}
+	if (rhi::Failed(m_copyQueue.Submit(lists, { .waits = { waits.data(), static_cast<uint32_t>(waits.size()) },
+			.signals = { signals.data(), static_cast<uint32_t>(signals.size()) } }))) {
+		spdlog::error("CopyQueueUploadService '{}': copy queue submission failed{}", m_config.debugName,
+			externalSignals ? fmt::format("; {} external signals dropped (their waiters will not proceed)", externalSignals) : std::string());
 		FinishBatch(batch, true);
 		return false;
 	}
@@ -383,7 +634,7 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 	{
 		std::lock_guard lock(m_statsMutex);
 		++m_stats.batchesSubmitted;
-		m_stats.copiesSubmitted += batch.copies.size();
+		m_stats.copiesSubmitted += regions;
 		m_stats.bytesSubmitted += batch.bytes;
 	}
 	basic_telemetry::AddCounter("ORG.Upload.Worker.BatchesSubmitted");
@@ -426,7 +677,7 @@ void CopyQueueUploadService::SubmitterMain(std::stop_token stopToken) {
 			}
 			bool submittedAny = false;
 			while (m_inFlight.size() < m_config.maxInFlightBatches &&
-				m_intake.Count() != 0 && !stopToken.stop_requested()) {
+				(m_intake.Count() != 0 || m_carried) && !stopToken.stop_requested()) {
 				Batch batch;
 				if (!CollectBatch(batch)) break;
 				if (RecordAndSubmit(batch)) {
@@ -436,7 +687,7 @@ void CopyQueueUploadService::SubmitterMain(std::stop_token stopToken) {
 				}
 			}
 			RetirePages();
-			if (m_inFlight.empty() && m_intake.Count() == 0) {
+			if (m_inFlight.empty() && m_intake.Count() == 0 && !m_carried) {
 				m_idle.notify_all();
 			}
 			if (stopToken.stop_requested() && m_inFlight.empty()) break;
@@ -445,11 +696,11 @@ void CopyQueueUploadService::SubmitterMain(std::stop_token stopToken) {
 			if (!m_inFlight.empty()) {
 				// Poll completion at millisecond granularity; a new upload wakes us sooner.
 				m_wake.wait_for(lock, stopToken, std::chrono::milliseconds(1), [this] {
-					return m_intake.Count() != 0;
+					return m_intake.Count() != 0 || m_hasCarried.load(std::memory_order_acquire);
 				});
 			} else {
 				m_wake.wait(lock, stopToken, [this] {
-					return m_intake.Count() != 0;
+					return m_intake.Count() != 0 || m_hasCarried.load(std::memory_order_acquire);
 				});
 			}
 		}
@@ -466,7 +717,7 @@ bool CopyQueueUploadService::WaitIdle(uint32_t timeoutMs) {
 	if (!Initialized()) return true;
 	std::unique_lock lock(m_wakeMutex);
 	const auto idle = [this] {
-		return m_intake.Count() == 0 &&
+		return m_intake.Count() == 0 && !m_hasCarried.load(std::memory_order_acquire) &&
 			m_inFlightCount.load(std::memory_order_acquire) == 0;
 	};
 	if (idle()) return true;
@@ -496,13 +747,20 @@ CopyQueueUploadService::Stats CopyQueueUploadService::GetStats() const {
 
 void CopyQueueUploadService::Cleanup() {
 	if (!m_initialized.exchange(false, std::memory_order_acq_rel)) return;
-	// Producers observing !Initialized() get null tickets from here on; a
-	// producer that already staged bytes still pushes, and the drain below
-	// cancels it.
+	// From here on, producers see !Initialized() and get null tickets. A
+	// producer that already staged bytes still pushes its entry. The drain
+	// below cancels it.
 	if (m_submitter.joinable()) {
 		m_submitter.request_stop();
 		m_wake.notify_all();
 		m_submitter.join();
+	}
+	// Drain the carried entry first, because it comes before the intake. Then drain the intake.
+	if (m_carried) {
+		if (m_carried->ticket) m_carried->ticket->Cancel();
+		if (m_carried->page) m_carried->page->pendingRegions.fetch_sub(1, std::memory_order_acq_rel);
+		m_carried.reset();
+		m_hasCarried.store(false, std::memory_order_release);
 	}
 	PendingCopy copy;
 	while (m_intake.Pop(copy)) {
@@ -517,13 +775,14 @@ void CopyQueueUploadService::Cleanup() {
 		if (last != 0) (void)(*m_timeline)->HostWait(last);
 	}
 	m_freePairs.clear();
+	m_listAllocator = {};
 	m_epoch.fetch_add(1, std::memory_order_acq_rel); // invalidate every thread's open page
 	{
 		std::lock_guard lock(m_pageMutex);
 		m_freePages.clear();
 		m_closedPages.clear();
 		// A producer thread's open page may outlive this call in its thread
-		// slot; drop the GPU buffer now so nothing survives the device.
+		// slot. Drop the GPU buffer now so nothing outlives the device.
 		for (auto& weak : m_allPages) {
 			if (auto page = weak.lock()) page->buffer.Reset();
 		}

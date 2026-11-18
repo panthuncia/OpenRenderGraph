@@ -39,6 +39,12 @@ private:
             if constexpr (requires(const Work& value) { value.Commit(); })
                 for (const auto& entry : work) if (!entry->discarded) entry->work.Commit();
         }
+        // The GPU has completed the execution the work was submitted with. Work that has a Complete() is told about it.
+        // For example, a job whose result gates readiness publishes the result then.
+        void Completed(CompletionContext) const override {
+            if constexpr (requires(const Work& value) { value.Complete(); })
+                for (const auto& entry : work) if (!entry->discarded) entry->work.Complete();
+        }
         void Abandoned(AbandonReason) const override { ReturnUnsubmitted(); }
         void ReturnUnsubmitted() const {
             if (resolved.exchange(true)) return;
@@ -95,6 +101,28 @@ public:
         }
         // If publication throws, destruction returns the removed nodes without allocation.
         preparation.Reserve(std::move(reservation));
+    }
+        // Reserves the entries of `selected` that are still pending, in order, and returns them. A declaration's snapshot
+    // outlives the execution that takes its work. Every execution of the compiled graph prepares against the snapshot
+    // until a new declaration installs. So each execution takes only what no earlier one took. This includes work that
+    // an abandoned execution returned.
+    Snapshot ReserveAvailable(const Snapshot& selected, const FramePreparationContext& preparation) const {
+        Snapshot taken;
+        if (selected.empty()) return taken;
+        auto reservation = std::make_shared<Reservation>(m_state);
+        {
+            std::lock_guard lock(m_state->mutex);
+            for (const auto& entry : selected) {
+                if (!entry) continue;
+                const auto found = std::find(m_state->pending.begin(), m_state->pending.end(), entry);
+                if (found == m_state->pending.end()) continue;
+                reservation->work.splice(reservation->work.end(), m_state->pending, found);
+                taken.push_back(entry);
+            }
+            m_state->counters.reserved += taken.size();
+        }
+        if (!taken.empty()) preparation.Reserve(std::move(reservation));
+        return taken;
     }
     // Prevent obsolete jobs from returning after a frame is cancelled. This
     // does not revoke already recorded GPU work; callers still drain/join it.

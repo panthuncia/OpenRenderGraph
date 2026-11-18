@@ -7,7 +7,8 @@ include(GNUInstallDirs)
 option(OPENRENDERGRAPH_ENABLE_SUBMODULE_FALLBACK "Allow fallback to in-tree BasicRHI when package is unavailable" ON)
 option(OPENRENDERGRAPH_FORWARD_BASICRHI_DEP_OPTIONS "Forward BasicRHI PIX/Streamline options when adding BasicRHI subdirectory" ON)
 option(OPENRENDERGRAPH_ENABLE_DEBUG_UI "Build the optional ImGui/ImPlot/Slang inspector" OFF)
-option(OPENRENDERGRAPH_ENABLE_D3D11_INTEROP "Build the optional Windows D3D11/D3D12 interop library" OFF)
+option(OPENRENDERGRAPH_ENABLE_SCHEDULE_UI "Build the persistent schedule inspector (DebugUI/ScheduleInspector.h), Dear ImGui only" OFF)
+option(OPENRENDERGRAPH_ENABLE_MEMORY_UI "Build the memory introspection widget (DebugUI/MemoryIntrospectionWidget.h), Dear ImGui and ImPlot only" OFF)
 option(OPENRENDERGRAPH_BUILD_TESTS "Build OpenRenderGraph tests" OFF)
 option(ORG_ENABLE_NVPERF "Build Telemetry/NvPerfCapture against NVIDIA's Nsight Perf SDK (otherwise it reports itself unavailable)" OFF)
 set(ORG_NVPERF_ROOT "" CACHE PATH "Nsight Perf SDK root: include/ and bin/x64/nvperf_grfx_host.lib (ORG_ENABLE_NVPERF)")
@@ -84,15 +85,27 @@ if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     find_package(implot CONFIG REQUIRED)
     find_package(slang CONFIG REQUIRED)
 endif()
+if((OPENRENDERGRAPH_ENABLE_SCHEDULE_UI OR OPENRENDERGRAPH_ENABLE_MEMORY_UI) AND NOT TARGET imgui::imgui)
+    find_package(imgui CONFIG REQUIRED)
+endif()
+if(OPENRENDERGRAPH_ENABLE_MEMORY_UI AND NOT TARGET implot::implot)
+    find_package(implot CONFIG REQUIRED)
+endif()
 
 add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRegistry.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ExtensionRegistry.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorGraphHost.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorRuntime.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/PersistentGraphHost.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/BorrowedRecorder.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorHost.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/DeviceTable.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/GraphHost.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/JobGraph.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/GraphInstance.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/DeviceMemory.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Telemetry/NvPerfCapture.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/PersistentGraphHost.h"
+	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/GraphHost.h"
+	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/DeviceMemory.h"
+	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/Runtime.h"
+	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/Trace.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/DescriptorHeap.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/OwnedDescriptorBinding.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/BindingTable.cpp"
@@ -101,22 +114,19 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/BindingTable.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ResourceCleanupQueue.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PublicationBindingBundle.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/OwnedDescriptorBinding.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/BindingTable.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/ResourceCleanupQueue.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/OwnedDescriptorBinding.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/BindingTable.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ResourceCleanupQueue.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PreparedTablePublisher.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RecordingContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/LatchBlock.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FrameArena.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Buffers/LateBackings.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/VersionedResource.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedTablePublisher.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/DeclaredTableLayout.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/ResourceUseDeclaration.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/CompileTelemetry.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PublicationBindingBundle.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/PreparedInvocationArena.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/External/ContributorRuntime.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/CommandListPool.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/QueueRegistry.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/ImmediateExecution/ImmediateCommandList.cpp"
@@ -129,32 +139,50 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultUploadPolicyService.cpp"
     
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultReadbackService.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/ReadbackCapturePlan.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultDescriptorService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/ThreadPoolTaskService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ThreadPoolTaskService.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultRenderGraphSettingsService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/RuntimeDevice.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/Runtime.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Telemetry/DecisionTrace.cpp"
     
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassBuilders.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FeatureDomainRegistry.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/Base/RenderPass.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/GenerateMipsPass.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/ResolveMultisamplePass.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassExecutionContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalGraphCompiler.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphCompiler.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/PersistentGraph.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphDiagnostics.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphStructural.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistent.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentCaptures.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentExecute.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentStructural.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentTickets.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentTrace.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/PersistentLowering.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/AliasPacking.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FrameAliasArena.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ScheduleTrace.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ScheduleTraceBuild.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/ScheduleTrace.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphReplay.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/GraphReplay.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/PersistentGraph.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/RenderPasses/Base/PersistentTypedPass.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExperimentalExecutionState.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExecutionState.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/SharedAliasPoolManager.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompile.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PipelineLibrary.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PipelinePermutations.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FrameRecording.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FramePlanning.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphCompileProfile.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalEpochExecution.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalClient.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExecutionHandle.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/Aliasing/RenderGraphAliasingAlgorithms.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/CommandRecordingManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/DeviceManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/DescriptorHeapManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/UploadManager.cpp"
@@ -162,13 +190,13 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/ReadbackManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/StatisticsManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBackingResource.cpp"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBufferResource.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBufferResource.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalTextureResource.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/PixelBuffer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Buffers/Buffer.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Buffers/DynamicBufferBase.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ResourceStateTracker.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/GPUBacking/GPUBufferBacking.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/GPUBacking/GpuBufferBacking.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/GPUBacking/GPUTextureBacking.cpp"
 )
 
@@ -180,6 +208,9 @@ set_target_properties(OpenRenderGraph PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
 )
+
+# The folder of the built-in passes' shaders, for hosts that build ORG as a subdirectory.
+set(OPENRENDERGRAPH_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders" CACHE INTERNAL "OpenRenderGraph built-in shaders")
 
 target_include_directories(OpenRenderGraph
     PUBLIC
@@ -221,11 +252,27 @@ if(ORG_ENABLE_NVPERF)
 endif()
 target_compile_definitions(OpenRenderGraph PRIVATE ORG_ENABLE_NVPERF=$<BOOL:${_org_nvperf}>)
 
+# The memory introspection widget alone: Dear ImGui and ImPlot (the host's contexts), no Slang. The host feeds it a
+# ui::MemorySnapshot built from the graph's memory snapshot provider (Render/MemoryIntrospectionAPI.h). The debug UI links it
+# rather than compiling the widget a second time.
+if(OPENRENDERGRAPH_ENABLE_MEMORY_UI OR OPENRENDERGRAPH_ENABLE_DEBUG_UI)
+    add_library(OpenRenderGraphMemoryUI STATIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/DebugUI/MemoryIntrospectionWidget.h")
+    add_library(OpenRenderGraph::MemoryUI ALIAS OpenRenderGraphMemoryUI)
+    target_compile_features(OpenRenderGraphMemoryUI PUBLIC cxx_std_23)
+    target_include_directories(OpenRenderGraphMemoryUI PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    if(MSVC)
+        target_compile_options(OpenRenderGraphMemoryUI PRIVATE /utf-8)
+    endif()
+    target_link_libraries(OpenRenderGraphMemoryUI PUBLIC OpenRenderGraph::OpenRenderGraph imgui::imgui implot::implot)
+endif()
+
 if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     add_library(OpenRenderGraphDebugUI STATIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryViewWidget.cpp"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/RenderGraphInspector.cpp")
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryViewWidget.cpp")
     add_library(OpenRenderGraph::DebugUI ALIAS OpenRenderGraphDebugUI)
     target_compile_features(OpenRenderGraphDebugUI PUBLIC cxx_std_23)
     target_include_directories(OpenRenderGraphDebugUI PUBLIC
@@ -236,8 +283,24 @@ if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
     if(MSVC)
         target_compile_options(OpenRenderGraphDebugUI PRIVATE /utf-8)
     endif()
-    target_link_libraries(OpenRenderGraphDebugUI PUBLIC OpenRenderGraph::OpenRenderGraph
+    target_link_libraries(OpenRenderGraphDebugUI PUBLIC OpenRenderGraph::OpenRenderGraph OpenRenderGraph::MemoryUI
         imgui::imgui implot::implot slang::slang)
+endif()
+
+# The persistent schedule inspector: plain Dear ImGui (the host's imgui::imgui and its context), no ImPlot or Slang.
+if(OPENRENDERGRAPH_ENABLE_SCHEDULE_UI)
+    add_library(OpenRenderGraphScheduleUI STATIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/ScheduleInspector.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/DebugUI/ScheduleInspector.h")
+    add_library(OpenRenderGraph::ScheduleUI ALIAS OpenRenderGraphScheduleUI)
+    target_compile_features(OpenRenderGraphScheduleUI PUBLIC cxx_std_23)
+    target_include_directories(OpenRenderGraphScheduleUI PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    if(MSVC)
+        target_compile_options(OpenRenderGraphScheduleUI PRIVATE /utf-8)
+    endif()
+    target_link_libraries(OpenRenderGraphScheduleUI PUBLIC OpenRenderGraph::OpenRenderGraph imgui::imgui)
 endif()
 
 target_compile_definitions(OpenRenderGraph
@@ -265,12 +328,13 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_definitions(OpenRenderGraphResourceUseTests PRIVATE NOMINMAX)
     target_link_libraries(OpenRenderGraphResourceUseTests PRIVATE OpenRenderGraph)
     add_test(NAME OpenRenderGraphResourceUseTests COMMAND OpenRenderGraphResourceUseTests)
-    add_executable(OpenRenderGraphExecutionBoundaryTests tests/ExecutionBoundaryTests.cpp)
-    target_compile_features(OpenRenderGraphExecutionBoundaryTests PRIVATE cxx_std_23)
-    target_compile_definitions(OpenRenderGraphExecutionBoundaryTests PRIVATE NOMINMAX)
-    target_link_libraries(OpenRenderGraphExecutionBoundaryTests PRIVATE OpenRenderGraph)
-    add_test(NAME OpenRenderGraphExecutionBoundaryTests COMMAND OpenRenderGraphExecutionBoundaryTests)
-    add_executable(OpenRenderGraphPersistentTests tests/PersistentGraphTests.cpp tests/GraphReplayRunner.h)
+    add_executable(OpenRenderGraphTrackingWorldTests tests/TrackingWorldTests.cpp)
+    target_compile_features(OpenRenderGraphTrackingWorldTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphTrackingWorldTests PRIVATE NOMINMAX)
+    target_include_directories(OpenRenderGraphTrackingWorldTests PRIVATE src/include)
+    target_link_libraries(OpenRenderGraphTrackingWorldTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphTrackingWorldTests COMMAND OpenRenderGraphTrackingWorldTests)
+    add_executable(OpenRenderGraphPersistentTests tests/PersistentGraphTests.cpp tests/GraphReplayRunner.h tests/ScheduleChecks.h)
     target_compile_features(OpenRenderGraphPersistentTests PRIVATE cxx_std_23)
     target_compile_definitions(OpenRenderGraphPersistentTests PRIVATE
         ORG_REPLAY_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
@@ -278,46 +342,64 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     add_test(NAME OpenRenderGraphPersistentTests COMMAND OpenRenderGraphPersistentTests)
     set_tests_properties(OpenRenderGraphPersistentTests PROPERTIES
         ENVIRONMENT "ORG_GRAPH_REPLAY_OUTPUT=${CMAKE_CURRENT_BINARY_DIR}/persistent_test_snapshot.orggraph")
+    # Rebinding safety: which slots share a backing, at the persistent layer (no device).
+    add_executable(OpenRenderGraphRebindingTests tests/RebindingTests.cpp tests/ScheduleChecks.h)
+    target_compile_features(OpenRenderGraphRebindingTests PRIVATE cxx_std_23)
+    target_link_libraries(OpenRenderGraphRebindingTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphRebindingTests COMMAND OpenRenderGraphRebindingTests)
+    # Declaration layouts compared by content (no device).
+    add_executable(OpenRenderGraphTokenTests tests/TokenTests.cpp)
+    target_compile_features(OpenRenderGraphTokenTests PRIVATE cxx_std_23)
+    target_link_libraries(OpenRenderGraphTokenTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphTokenTests COMMAND OpenRenderGraphTokenTests)
+    add_executable(OpenRenderGraphAliasPackingTests tests/AliasPackingTests.cpp src/Render/RenderGraph/AliasPacking.cpp)
+    target_compile_features(OpenRenderGraphAliasPackingTests PRIVATE cxx_std_23)
+    add_test(NAME OpenRenderGraphAliasPackingTests COMMAND OpenRenderGraphAliasPackingTests)
+    add_executable(OpenRenderGraphGoldenScheduleTests tests/GoldenScheduleTests.cpp)
+    target_compile_features(OpenRenderGraphGoldenScheduleTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphGoldenScheduleTests PRIVATE
+        ORG_REPLAY_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    target_link_libraries(OpenRenderGraphGoldenScheduleTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphGoldenScheduleTests COMMAND OpenRenderGraphGoldenScheduleTests)
     add_executable(OpenRenderGraphHeadlessBenchmark tests/HeadlessGraphBenchmark.cpp tests/GraphReplayRunner.h)
     target_compile_features(OpenRenderGraphHeadlessBenchmark PRIVATE cxx_std_23)
     target_link_libraries(OpenRenderGraphHeadlessBenchmark PRIVATE OpenRenderGraph)
-    add_executable(OpenRenderGraphRecordingRecipeTests tests/RecordingRecipeTests.cpp)
-    target_compile_features(OpenRenderGraphRecordingRecipeTests PRIVATE cxx_std_23)
-    target_compile_definitions(OpenRenderGraphRecordingRecipeTests PRIVATE NOMINMAX)
+    add_test(NAME OpenRenderGraphHeadlessBenchmark COMMAND OpenRenderGraphHeadlessBenchmark)
+    add_test(NAME OpenRenderGraphHeadlessBenchmark.Sequence COMMAND OpenRenderGraphHeadlessBenchmark
+        --sequence "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/binding_rotation_tail.orgsequence")
+    set_tests_properties(OpenRenderGraphHeadlessBenchmark OpenRenderGraphHeadlessBenchmark.Sequence PROPERTIES TIMEOUT 120)
+    add_executable(OpenRenderGraphRecordingTests tests/RecordingTests.cpp)
+    target_compile_features(OpenRenderGraphRecordingTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphRecordingTests PRIVATE NOMINMAX)
     if(MSVC)
-        target_compile_options(OpenRenderGraphRecordingRecipeTests PRIVATE /utf-8)
+        target_compile_options(OpenRenderGraphRecordingTests PRIVATE /utf-8)
     endif()
-    target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE OpenRenderGraph)
-    # Typed recipe fixtures instantiate graph declarations and pull the D3D12 backend.
+    target_link_libraries(OpenRenderGraphRecordingTests PRIVATE OpenRenderGraph)
+    # Typed recording fixtures instantiate graph declarations and pull the D3D12 backend.
     if(WIN32 AND TARGET Streamline::headers)
-        target_sources(OpenRenderGraphRecordingRecipeTests PRIVATE
+        target_sources(OpenRenderGraphRecordingTests PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRHI/tests/StreamlineStubs.cpp")
-        target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE Streamline::headers)
+        target_link_libraries(OpenRenderGraphRecordingTests PRIVATE Streamline::headers)
     endif()
     if(WIN32 AND TARGET Pix::headers)
         find_library(OPENRENDERGRAPH_PIX_RUNTIME NAMES WinPixEventRuntime
             HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer" REQUIRED)
-        target_link_libraries(OpenRenderGraphRecordingRecipeTests PRIVATE "${OPENRENDERGRAPH_PIX_RUNTIME}")
-        add_custom_command(TARGET OpenRenderGraphRecordingRecipeTests POST_BUILD
+        target_link_libraries(OpenRenderGraphRecordingTests PRIVATE "${OPENRENDERGRAPH_PIX_RUNTIME}")
+        add_custom_command(TARGET OpenRenderGraphRecordingTests POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${CMAKE_CURRENT_SOURCE_DIR}/../BasicRenderer/WinPixEventRuntime.dll"
-                "$<TARGET_FILE_DIR:OpenRenderGraphRecordingRecipeTests>")
+                "$<TARGET_FILE_DIR:OpenRenderGraphRecordingTests>")
     endif()
-    add_test(NAME OpenRenderGraphRecordingRecipeTests COMMAND OpenRenderGraphRecordingRecipeTests)
+    add_test(NAME OpenRenderGraphRecordingTests COMMAND OpenRenderGraphRecordingTests)
     # Offscreen suites that create D3D12 (WARP) devices exist only when the D3D12 backend is built.
     set(_org_d3d12_tests OFF)
     if(NOT DEFINED BASICRHI_ENABLE_D3D12 OR BASICRHI_ENABLE_D3D12) # packaged BasicRHI: assume D3D12
         set(_org_d3d12_tests ON)
     endif()
     add_custom_target(OpenRenderGraphAsyncFrameTests DEPENDS
-        OpenRenderGraphFrameContextTests OpenRenderGraphAsyncCompileTests
+        OpenRenderGraphAsyncCompileTests
         $<$<BOOL:${_org_d3d12_tests}>:OpenRenderGraphExternalResourceTests>)
-    add_executable(OpenRenderGraphFrameContextTests tests/FrameContextTests.cpp)
-    target_compile_features(OpenRenderGraphFrameContextTests PRIVATE cxx_std_23)
-    target_include_directories(OpenRenderGraphFrameContextTests PRIVATE include)
-    target_compile_definitions(OpenRenderGraphFrameContextTests PRIVATE NOMINMAX)
-    add_test(NAME OpenRenderGraphFrameContextTests COMMAND OpenRenderGraphFrameContextTests)
-    add_executable(OpenRenderGraphAsyncCompileTests tests/AsyncCompileTests.cpp tests/FramePlanningTests.cpp)
+    add_executable(OpenRenderGraphAsyncCompileTests tests/AsyncCompileTests.cpp)
     target_compile_features(OpenRenderGraphAsyncCompileTests PRIVATE cxx_std_23)
     target_include_directories(OpenRenderGraphAsyncCompileTests PRIVATE include)
     target_link_libraries(OpenRenderGraphAsyncCompileTests PRIVATE
@@ -326,7 +408,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_definitions(OpenRenderGraphAsyncCompileTests PRIVATE NOMINMAX)
     add_test(NAME OpenRenderGraphAsyncCompileTests COMMAND OpenRenderGraphAsyncCompileTests)
     if(_org_d3d12_tests)
-    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/FrameRecordingTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/ReadbackCaptureTests.cpp)
+    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/RuntimeTests.cpp tests/ExternalClientTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/PipelineLibraryTests.cpp tests/ReadbackCaptureTests.cpp tests/RebindingGpuTests.cpp)
     target_include_directories(OpenRenderGraphExternalResourceTests PRIVATE src/include)
     target_compile_definitions(OpenRenderGraphExternalResourceTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     if(WIN32 AND BASICRHI_ENABLE_STREAMLINE)
@@ -340,7 +422,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
         endif()
     endif()
     if(MSVC)
-        target_compile_options(OpenRenderGraphExternalResourceTests PRIVATE /utf-8)
+        target_compile_options(OpenRenderGraphExternalResourceTests PRIVATE /utf-8 /bigobj)
     endif()
     target_link_libraries(OpenRenderGraphExternalResourceTests PRIVATE OpenRenderGraph BasicRHI::BasicRHI d3d12 dxgi d3dcompiler)
     if(WIN32 AND TARGET Pix::headers)
@@ -385,8 +467,16 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     endif() # _org_d3d12_tests
     add_executable(OpenRenderGraphContributorHeaderC tests/ContributorHeaderCompile.c)
     set_target_properties(OpenRenderGraphContributorHeaderC PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
-    target_include_directories(OpenRenderGraphContributorHeaderC PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_include_directories(OpenRenderGraphContributorHeaderC PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include"
+        "$<TARGET_PROPERTY:BasicRHI::BasicRHI,INTERFACE_INCLUDE_DIRECTORIES>")
     add_test(NAME OpenRenderGraphContributorHeaderC COMMAND OpenRenderGraphContributorHeaderC)
+    if(WIN32)
+        # A contributor module (samples/ContributorSample.cpp), against the C header alone: a host's in-game check loads it.
+        add_library(ORGContributorSample SHARED samples/ContributorSample.cpp)
+        target_compile_features(ORGContributorSample PRIVATE cxx_std_20)
+        target_include_directories(ORGContributorSample PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include"
+            "$<TARGET_PROPERTY:BasicRHI::BasicRHI,INTERFACE_INCLUDE_DIRECTORIES>")
+    endif()
     add_executable(OpenRenderGraphContributorRegistryTests tests/ContributorRegistryTests.cpp)
     target_compile_features(OpenRenderGraphContributorRegistryTests PRIVATE cxx_std_23)
     target_link_libraries(OpenRenderGraphContributorRegistryTests PRIVATE OpenRenderGraph)
@@ -403,11 +493,37 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             basicrhi_compile_spirv(OUTPUT "${_org_persistent_write_spv}"
                 SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PersistentHostWrite.hlsl"
                 ENTRY main PROFILE cs_6_6)
-            add_executable(OpenRenderGraphPersistentVulkanHostTests tests/PersistentVulkanHostTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp "${_org_persistent_write_spv}")
+            # Input layouts, keyed pipelines and the built-in utility passes (the "pipelines" mode).
+            set(_org_pipeline_spv_dir "${CMAKE_CURRENT_BINARY_DIR}/test_shaders/pipelines")
+            set(_org_pipeline_spvs)
+            foreach(_shader IN ITEMS
+                    "GenerateMips2D|${CMAKE_CURRENT_SOURCE_DIR}/shaders/GenerateMips.hlsl|main|cs_6_6|"
+                    "GenerateMipsArray|${CMAKE_CURRENT_SOURCE_DIR}/shaders/GenerateMips.hlsl|main|cs_6_6|ORG_GENERATE_MIPS_ARRAY=1"
+                    "ResolveMultisample|${CMAKE_CURRENT_SOURCE_DIR}/shaders/ResolveMultisample.hlsl|main|cs_6_6|"
+                    "InputLayoutVS|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/InputLayout.hlsl|VSMain|vs_6_6|"
+                    "InputLayoutPS|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/InputLayout.hlsl|PSMain|ps_6_6|"
+                    "PermutationWrite0|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PermutationWrite.hlsl|main|cs_6_6|WRITE_BIAS=0"
+                    "PermutationWrite100|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PermutationWrite.hlsl|main|cs_6_6|WRITE_BIAS=100")
+                string(REPLACE "|" ";" _parts "${_shader}")
+                list(GET _parts 0 _name)
+                list(GET _parts 1 _source)
+                list(GET _parts 2 _entry)
+                list(GET _parts 3 _profile)
+                list(GET _parts 4 _defines)
+                basicrhi_compile_spirv(OUTPUT "${_org_pipeline_spv_dir}/${_name}.spv" SOURCE "${_source}"
+                    ENTRY ${_entry} PROFILE ${_profile} DEFINES ${_defines}
+                    INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ColorSpace.hlsli")
+                list(APPEND _org_pipeline_spvs "${_org_pipeline_spv_dir}/${_name}.spv")
+            endforeach()
+            add_executable(OpenRenderGraphPersistentVulkanHostTests tests/PersistentVulkanHostTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp
+                tests/ContributorHostTests.cpp tests/RebindingGpuTests.cpp tests/PipelineVulkanTests.cpp "${_org_persistent_write_spv}"
+                ${_org_pipeline_spvs})
             target_compile_features(OpenRenderGraphPersistentVulkanHostTests PRIVATE cxx_std_23)
             target_include_directories(OpenRenderGraphPersistentVulkanHostTests PRIVATE src/include)
             target_compile_definitions(OpenRenderGraphPersistentVulkanHostTests PRIVATE NOMINMAX
-                ORG_TEST_PERSISTENT_WRITE_SPV="${_org_persistent_write_spv}")
+                ORG_TEST_PERSISTENT_WRITE_SPV="${_org_persistent_write_spv}"
+                ORG_TEST_PIPELINE_SPV_DIR="${_org_pipeline_spv_dir}")
             if(MSVC)
                 target_compile_options(OpenRenderGraphPersistentVulkanHostTests PRIVATE /utf-8)
             endif()
@@ -431,8 +547,44 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             endif()
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests COMMAND OpenRenderGraphPersistentVulkanHostTests)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Async COMMAND OpenRenderGraphPersistentVulkanHostTests async)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Reuse COMMAND OpenRenderGraphPersistentVulkanHostTests reuse)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Revision COMMAND OpenRenderGraphPersistentVulkanHostTests revision)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Segment COMMAND OpenRenderGraphPersistentVulkanHostTests segment)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.External COMMAND OpenRenderGraphPersistentVulkanHostTests external)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.AsyncOpen COMMAND OpenRenderGraphPersistentVulkanHostTests async open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Inline COMMAND OpenRenderGraphPersistentVulkanHostTests inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.AsyncInline COMMAND OpenRenderGraphPersistentVulkanHostTests async inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.AsyncOpenInline COMMAND OpenRenderGraphPersistentVulkanHostTests async open inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.ReuseInline COMMAND OpenRenderGraphPersistentVulkanHostTests reuse inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.RevisionInline COMMAND OpenRenderGraphPersistentVulkanHostTests revision inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.RevisionOpenInline COMMAND OpenRenderGraphPersistentVulkanHostTests revision open inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Split COMMAND OpenRenderGraphPersistentVulkanHostTests split)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.SplitOpen COMMAND OpenRenderGraphPersistentVulkanHostTests split open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Stream COMMAND OpenRenderGraphPersistentVulkanHostTests stream)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.StreamOpen COMMAND OpenRenderGraphPersistentVulkanHostTests stream open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.StreamHome COMMAND OpenRenderGraphPersistentVulkanHostTests stream open home)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Built COMMAND OpenRenderGraphPersistentVulkanHostTests built)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.BuiltOpen COMMAND OpenRenderGraphPersistentVulkanHostTests built open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Arena COMMAND OpenRenderGraphPersistentVulkanHostTests arena)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Leases COMMAND OpenRenderGraphPersistentVulkanHostTests leases)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.LeasesOpen COMMAND OpenRenderGraphPersistentVulkanHostTests leases open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.LeasesWide COMMAND OpenRenderGraphPersistentVulkanHostTests leases-wide)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.ReuseOpen COMMAND OpenRenderGraphPersistentVulkanHostTests reuse open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.RevisionOpen COMMAND OpenRenderGraphPersistentVulkanHostTests revision open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.ExternalOpen COMMAND OpenRenderGraphPersistentVulkanHostTests external open)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Contributor COMMAND OpenRenderGraphPersistentVulkanHostTests contributor)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Rebinding COMMAND OpenRenderGraphPersistentVulkanHostTests rebinding)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Pipelines COMMAND OpenRenderGraphPersistentVulkanHostTests pipelines)
             set_tests_properties(OpenRenderGraphPersistentVulkanHostTests OpenRenderGraphPersistentVulkanHostTests.Async
-                PROPERTIES TIMEOUT 60)
+                OpenRenderGraphPersistentVulkanHostTests.Reuse OpenRenderGraphPersistentVulkanHostTests.Revision
+                OpenRenderGraphPersistentVulkanHostTests.AsyncOpen OpenRenderGraphPersistentVulkanHostTests.ReuseOpen
+                OpenRenderGraphPersistentVulkanHostTests.RevisionOpen OpenRenderGraphPersistentVulkanHostTests.ExternalOpen
+                OpenRenderGraphPersistentVulkanHostTests.Contributor OpenRenderGraphPersistentVulkanHostTests.Rebinding
+                OpenRenderGraphPersistentVulkanHostTests.Pipelines OpenRenderGraphPersistentVulkanHostTests.Inline
+                OpenRenderGraphPersistentVulkanHostTests.AsyncInline OpenRenderGraphPersistentVulkanHostTests.AsyncOpenInline
+                OpenRenderGraphPersistentVulkanHostTests.ReuseInline OpenRenderGraphPersistentVulkanHostTests.RevisionInline
+                OpenRenderGraphPersistentVulkanHostTests.RevisionOpenInline PROPERTIES TIMEOUT 60)
+
         endif()
     endif()
     if(WIN32 AND BASICRENDERER_TEST_RUNTIME_DIR)
@@ -457,28 +609,6 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     endif()
 endif()
 
-if(OPENRENDERGRAPH_ENABLE_D3D11_INTEROP)
-    if(NOT WIN32)
-        message(FATAL_ERROR "OPENRENDERGRAPH_ENABLE_D3D11_INTEROP is only supported on Windows")
-    endif()
-    if(NOT TARGET Microsoft::CppWinRT)
-        find_package(cppwinrt CONFIG REQUIRED)
-    endif()
-    add_library(OpenRenderGraphD3D11Interop STATIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/Interop/D3D11Interop.cpp")
-    add_library(OpenRenderGraph::D3D11Interop ALIAS OpenRenderGraphD3D11Interop)
-    target_compile_features(OpenRenderGraphD3D11Interop PUBLIC cxx_std_23)
-    target_compile_definitions(OpenRenderGraphD3D11Interop PRIVATE NOMINMAX)
-    target_include_directories(OpenRenderGraphD3D11Interop PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-    target_link_libraries(OpenRenderGraphD3D11Interop PUBLIC BasicRHI::BasicRHI
-        PRIVATE Microsoft::CppWinRT d3d11 d3d12 dxgi)
-    install(TARGETS OpenRenderGraphD3D11Interop EXPORT OpenRenderGraphTargets
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-endif()
-
 install(TARGETS OpenRenderGraph
     EXPORT OpenRenderGraphTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -490,6 +620,12 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
 
+# The built-in passes' shaders (GenerateMipsPass, ResolveMultisamplePass). A host's PipelineCompiler maps
+# org::kBuiltinShaderPrefix to this folder.
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shaders/"
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/OpenRenderGraph/shaders"
+)
+
 install(EXPORT OpenRenderGraphTargets
     FILE OpenRenderGraphTargets.cmake
     NAMESPACE OpenRenderGraph::
@@ -497,6 +633,7 @@ install(EXPORT OpenRenderGraphTargets
 )
 
 include(CMakePackageConfigHelpers)
+set(OPENRENDERGRAPH_INSTALL_SHADER_DIR "${CMAKE_INSTALL_DATADIR}/OpenRenderGraph/shaders")
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/OpenRenderGraphConfigVersion.cmake"
     VERSION ${PROJECT_VERSION}
@@ -506,7 +643,7 @@ write_basic_package_version_file(
 configure_package_config_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/OpenRenderGraphConfig.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/OpenRenderGraphConfig.cmake"
-    PATH_VARS CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_LIBDIR
+    PATH_VARS CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_LIBDIR OPENRENDERGRAPH_INSTALL_SHADER_DIR
     INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/OpenRenderGraph"
 )
 

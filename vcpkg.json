@@ -5,6 +5,8 @@
     "spdlog",
     "flecs",
     "boost-container-hash",
+    "nlohmann-json",
+    "sqlite3",
     {
       "name": "imgui",
       "features": [ "dx12-binding", "win32-binding" ]

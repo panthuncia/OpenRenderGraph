@@ -8,7 +8,7 @@
 #include <cstdio>
 #include <mutex>
 
-namespace org::experimental {
+namespace org::compiler {
 namespace {
 constexpr size_t Limit = 2000000;
 GraphCompileStructure ReadSnapshot(std::istream&, bool requireEnd);
@@ -219,7 +219,7 @@ void ObserveGraphReplay(std::shared_ptr<const GraphCompileStructure> structure) 
     static Recorder recorder;
     if (recorder.path.empty()) return;
     std::lock_guard lock(recorder.mutex);
-    // CompiledGraph::structure may alias GraphCompileInput's control block.
+    // Schedule::structure may alias GraphCompileInput's control block.
     // Copy numeric metadata to avoid retaining frame payloads and semantic pins.
     recorder.latest = std::make_shared<const GraphCompileStructure>(*structure);
 }

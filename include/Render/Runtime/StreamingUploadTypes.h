@@ -16,6 +16,22 @@ struct StreamingUploadSegment {
 	std::size_t size = 0;
 };
 
+// One range of a batched upload to one destination (QueueTrackedStreamingUploadRanges): `size` bytes from `data` to the
+// destination at `dstOffset`.
+struct StreamingUploadRange {
+	const void* data = nullptr;
+	std::size_t size = 0;
+	std::size_t dstOffset = 0;
+};
+
+// One range of a GPU copy between two buffers on the worker path (QueueTrackedStreamingCopyRanges): `size` bytes from the source
+// at `srcOffset` to the destination at `dstOffset`.
+struct StreamingCopyRange {
+	std::size_t srcOffset = 0;
+	std::size_t dstOffset = 0;
+	std::size_t size = 0;
+};
+
 class Resource;
 
 enum class TrackedUploadTicketState : uint8_t { Queued, Claimed, Submitted, Completed, Cancelled };
@@ -88,16 +104,20 @@ struct StreamingUploadDescriptor {
     std::shared_ptr<TrackedUploadTicket> ticket;
 };
 
-// Worker-side upload destination. The producer attests that, for the whole
-// write window, no queue can access any byte of the resource: it is either a
-// pooled versioned backing leased from VersionedGpuBufferBackingPool::Acquire
-// (pool-only owned or retired past the frame ring) or a texture that no queue
-// has used yet. Live, published resources never go through this path; they are
-// written by the render thread's frame upload instance, ordered by the graph.
-// The resource must be created with rhi::QueueSharing::Concurrent so the copy
+// Worker-side upload destination. The producer attests that no queue can
+// access any byte of the resource for the whole write window. The resource is
+// one of:
+// - a pooled versioned backing leased from org::services::BackingPool::Acquire.
+//   It is owned only by the pool, or every frame that read it released it.
+// - a texture that no queue has used yet,
+// - a VersionedBuffer version not yet adopted. No queue uses a version before
+//   its owner adopts it, and the owner adopts it after these copies complete.
+// Live, published resources never go through this path. The render thread's
+// frame upload instance writes them, in the order the graph sets.
+// The resource must be created with rhi::QueueSharing::Concurrent, so the copy
 // queue write needs no queue-family ownership transfer on any backend.
 struct WorkerOwnedDestination {
-    enum class Ownership : uint8_t { PooledBackingLease, FreshTexture };
+    enum class Ownership : uint8_t { PooledBackingLease, FreshTexture, PendingVersion };
     std::shared_ptr<Resource> resource;
     Ownership ownership = Ownership::PooledBackingLease;
 };

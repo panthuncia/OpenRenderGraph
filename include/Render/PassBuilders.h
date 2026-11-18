@@ -10,7 +10,9 @@
 #include <spdlog/spdlog.h>
 
 #include "Render/FeatureDomainRegistry.h"
-#include "Render/RenderGraph/RenderGraph.h"
+#include "Render/PipelineDesc.h"
+#include "Render/ResourceRegistry.h"
+#include "RenderPasses/Base/RenderPass.h"
 #include "ResourceRequirements.h"
 #include "Resources/ResourceStateTracker.h"
 #include "Resources/ResourceIdentifier.h"
@@ -22,6 +24,20 @@
 
 // Tag for a contiguous mip-range [first..first+count)
 namespace org {
+
+// Acceleration structure storage built into and read in one pass (cluster builds that then move what they built).
+inline constexpr rhi::ResourceAccessType kAccelerationStructureBuildAccess = static_cast<rhi::ResourceAccessType>(
+    static_cast<uint64_t>(rhi::ResourceAccessType::RaytracingAccelerationStructureWrite)
+    | static_cast<uint64_t>(rhi::ResourceAccessType::RaytracingAccelerationStructureRead));
+// Inputs, outputs and scratch of acceleration structure operations: their access at the build stage, and at every shader
+// stage, since the same pass's shaders often write a build's inputs or read its outputs.
+inline constexpr rhi::ResourceSyncState kAccelerationStructureBuildStageSync = static_cast<rhi::ResourceSyncState>(
+    static_cast<uint32_t>(rhi::ResourceSyncState::BuildRaytracingAccelerationStructure) | static_cast<uint32_t>(rhi::ResourceSyncState::AllShading));
+// Layouts as requirements derive them (AccessToLayout), so a resolver's declared uses match its members' requirements.
+inline const ResourceState kAccelerationStructureBuildInputState{
+    rhi::ResourceAccessType::ShaderResource, AccessToLayout(rhi::ResourceAccessType::ShaderResource, true), kAccelerationStructureBuildStageSync};
+inline const ResourceState kAccelerationStructureBuildOutputState{
+    rhi::ResourceAccessType::UnorderedAccess, AccessToLayout(rhi::ResourceAccessType::UnorderedAccess, true), kAccelerationStructureBuildStageSync};
 
 struct Mip {
 	Mip(uint32_t first, uint32_t count) : first(first), count(count) {}
@@ -216,6 +232,27 @@ inline ResourceIdentifierAndRange Subresources(const char* r,
 }
 
 // If we have a ResourceIdentifierAndRange, ask the builder to resolve it into an actual ResourceAndRange:
+class RenderGraph;
+class PipelineLibrary;
+
+// The calls that pass builders make into the graph. RenderGraph defines them alongside itself, so declaring a pass
+// does not need RenderGraph.h.
+struct BuilderGraphAccess {
+    static ResourceRegistry::RegistryHandle RequestResourceHandle(RenderGraph* graph, Resource* resource, bool allowFailure = false);
+    static std::shared_ptr<IResourceResolver> RequestResolver(RenderGraph* graph, ResourceIdentifier const& id, bool allowFailure = false);
+    static std::shared_ptr<const ResolverDeclarationState> CaptureResolverDeclarationState(RenderGraph* graph, const IResourceResolver& resolver);
+    static std::shared_ptr<const std::vector<ResourceHandleAndRange>> RequestResolverResourceHandles(RenderGraph* graph,
+        const ResolverDeclarationState& state);
+    static void RegisterResolvedResourceAlias(RenderGraph* graph, ResourceIdentifier const& id, std::shared_ptr<Resource> resource);
+    static void AddResource(RenderGraph* graph, std::shared_ptr<Resource> resource);
+    static Resource* Resolve(RenderGraph* graph, ResourceRegistry::RegistryHandle handle);
+    static std::shared_ptr<PipelineLibraryEntry> AcquirePipeline(RenderGraph* graph, PipelineDesc desc);
+    static std::shared_ptr<PipelineLibrary> Pipelines(RenderGraph* graph);
+    static std::shared_ptr<CommandSignatureLibraryEntry> AcquireCommandSignature(RenderGraph* graph, CommandSignatureDesc desc);
+    static void AddRenderPass(RenderGraph* graph, std::shared_ptr<RenderPass> pass, RenderPassParameters& resources, std::string name,
+        std::vector<ResolverSnapshot> resolverSnapshots);
+};
+
 std::vector<ResourceHandleAndRange> expandToRanges(ResourceIdentifierAndRange const& rir, RenderGraph* graph);
 
 // If we have an initializer_list of ResourceIdentifierAndRange,
@@ -258,7 +295,7 @@ processResourceArguments(const ResourcePtrAndRange& rar,
     RenderGraph* graph)
 {
 	auto range = rar.range;
-    auto handle = graph->RequestResourceHandle(rar.resource.get());
+    auto handle = BuilderGraphAccess::RequestResourceHandle(graph, rar.resource.get());
     return { ResourceHandleAndRange{ handle, range } };
 }
 
@@ -278,9 +315,9 @@ inline std::vector<ResourceHandleAndRange>
 processResourceArguments(const ResourceResolverAndRange& rrr,
     RenderGraph* graph)
 {
-    const auto captured = graph->CaptureResolverDeclarationState(*rrr.pResolver);
+    const auto captured = BuilderGraphAccess::CaptureResolverDeclarationState(graph, *rrr.pResolver);
     if (captured && captured->resources) {
-        const auto handles = graph->RequestResolverResourceHandles(*captured);
+        const auto handles = BuilderGraphAccess::RequestResolverResourceHandles(graph, *captured);
         std::vector<ResourceHandleAndRange> out;
         out.reserve(handles->size());
         for (const auto& handle : *handles) out.emplace_back(handle.resource, rrr.range);
@@ -291,7 +328,7 @@ processResourceArguments(const ResourceResolverAndRange& rrr,
     out.reserve(resources.size());
     for (const auto& resource : resources) {
         out.push_back(ResourceHandleAndRange{
-            graph->RequestResourceHandle(resource.get()), rrr.range });
+            BuilderGraphAccess::RequestResourceHandle(graph, resource.get()), rrr.range });
     }
     return out;
 }
@@ -313,21 +350,21 @@ processResourceArguments(const ResourceIdentifierAndRange& rir,
     RenderGraph* graph)
 {
     // This could be a resolver- ask the graph.
-    if (auto resolver = graph->RequestResolver(rir.identifier, true)) {
-        const auto captured = graph->CaptureResolverDeclarationState(*resolver);
+    if (auto resolver = BuilderGraphAccess::RequestResolver(graph, rir.identifier, true)) {
+        const auto captured = BuilderGraphAccess::CaptureResolverDeclarationState(graph, *resolver);
         auto resources = captured && captured->resources ? *captured->resources : resolver->Resolve();
         // Dynamic-wrapper identifiers are explicit aliases whose concrete resource
         // may change between retained declaration revisions.  Ordinary resolvers
         // must not replace their symbolic entry: some of them intentionally expose
         // a different declaration shape (such as a resource set).
         if (resources.size() == 1u && resources.front()) {
-            graph->RegisterResolvedResourceAlias(rir.identifier, resources.front());
+            BuilderGraphAccess::RegisterResolvedResourceAlias(graph, rir.identifier, resources.front());
         }
         std::vector<ResourceHandleAndRange> resolvedRanges;
         resolvedRanges.reserve(resources.size());
         for (const auto& resource : resources) {
             resolvedRanges.push_back(ResourceHandleAndRange{
-                graph->RequestResourceHandle(resource.get()), rir.range });
+                BuilderGraphAccess::RequestResourceHandle(graph, resource.get()), rir.range });
         }
         return resolvedRanges;
     }
@@ -481,101 +518,6 @@ namespace detail
 			&& range.sliceLower == Bound{ BoundType::All, 0 }
 			&& range.sliceUpper == Bound{ BoundType::All, 0 };
         }
-
-        inline void AppendUniqueDescriptorRegistration(std::vector<AutoDescriptorRegistration>& registrations, const AutoDescriptorRegistration& registration) {
-        if (std::find(registrations.begin(), registrations.end(), registration) == registrations.end()) {
-            registrations.push_back(registration);
-        }
-        }
-
-        inline bool TryResolveAutoDescriptorRange(const RangeSpec& range, unsigned int& mip, unsigned int& slice) {
-            if (IsWholeRange(range)) {
-                mip = 0;
-                slice = 0;
-                return true;
-            }
-
-            const bool exactMip = range.mipLower.type == BoundType::Exact && range.mipUpper.type == BoundType::Exact;
-            const bool wholeMip = range.mipLower == Bound{ BoundType::All, 0 } && range.mipUpper == Bound{ BoundType::All, 0 };
-            const bool exactSlice = range.sliceLower.type == BoundType::Exact && range.sliceUpper.type == BoundType::Exact;
-            const bool wholeSlice = range.sliceLower == Bound{ BoundType::All, 0 } && range.sliceUpper == Bound{ BoundType::All, 0 };
-
-            if (!(wholeMip || (exactMip && range.mipLower.value == range.mipUpper.value))) {
-                return false;
-            }
-            if (!(wholeSlice || (exactSlice && range.sliceLower.value == range.sliceUpper.value))) {
-                return false;
-            }
-
-            mip = exactMip ? range.mipLower.value : 0;
-            slice = exactSlice ? range.sliceLower.value : 0;
-            return true;
-        }
-
-        inline bool IsResolverBackedIdentifier(RenderGraph* graph, const ResourceIdentifier& id) {
-		return graph != nullptr && graph->RequestResolver(id, true) != nullptr;
-        }
-
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const ResourceIdentifier& id, DescriptorType type) {
-            if (IsResolverBackedIdentifier(graph, id)) {
-				auto resolver = graph->RequestResolver(id, true);
-				if (resolver) {
-					DescriptorAccessor accessor{};
-					accessor.type = type;
-					accessor.mip = 0;
-					accessor.slice = 0;
-					AppendUniqueDescriptorRegistration(registrations,
-						AutoDescriptorRegistration{ id, accessor, {}, std::move(resolver) });
-				}
-                return;
-            }
-
-            DescriptorAccessor accessor{};
-            accessor.type = type;
-            accessor.mip = 0;
-            accessor.slice = 0;
-            AppendUniqueDescriptorRegistration(registrations, AutoDescriptorRegistration{ id, accessor });
-        }
-
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const ResourceIdentifierAndRange& idAndRange, DescriptorType type) {
-            if (IsResolverBackedIdentifier(graph, idAndRange.identifier)) {
-                return;
-            }
-
-            unsigned int mip = 0;
-            unsigned int slice = 0;
-            if (!TryResolveAutoDescriptorRange(idAndRange.range, mip, slice)) {
-                return;
-            }
-
-            DescriptorAccessor accessor{};
-            accessor.type = type;
-            accessor.mip = mip;
-            accessor.slice = slice;
-            AppendUniqueDescriptorRegistration(registrations, AutoDescriptorRegistration{ idAndRange.identifier, accessor });
-        }
-
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, const char* id, DescriptorType type) {
-        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ id }, type);
-        }
-
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, std::string_view id, DescriptorType type) {
-        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ id }, type);
-        }
-
-        template<class S>
-		requires (StringLike<S> && !std::is_same_v<std::remove_cvref_t<S>, const char*> && !std::is_same_v<std::remove_cvref_t<S>, char*>)
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph* graph, std::vector<AutoDescriptorRegistration>& registrations, S&& id, DescriptorType type) {
-        TrackDefaultDescriptorIdentifier(graph, registrations, ResourceIdentifier{ std::string_view{ std::forward<S>(id) } }, type);
-	}
-
-        template<typename T>
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const std::shared_ptr<T>&, DescriptorType) {}
-
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourcePtrAndRange&, DescriptorType) {}
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourceHandleAndRange&, DescriptorType) {}
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const ResourceResolverAndRange&, DescriptorType) {}
-        inline void TrackDefaultDescriptorIdentifier(RenderGraph*, std::vector<AutoDescriptorRegistration>&, const IResourceResolver&, DescriptorType) {}
 }
 
 template<class S>
@@ -607,6 +549,14 @@ std::is_same_v<std::remove_cvref_t<T>, IResourceResolver>;
 template<typename T>
 concept NotIResourceResolver = !std::derived_from<std::decay_t<T>, IResourceResolver>; // annoying
 
+// A client's handle that picks what a use declares: a resolver (such as a versioned slot) when DeclaredResolver is not
+// null, else the resource DeclaredResource returns. A client keeps one handle type for both kinds this way.
+template<typename T>
+concept SelfDeclaringResource = requires(const T& value) {
+    { value.DeclaredResolver() } -> std::convertible_to<const IResourceResolver*>;
+    { value.DeclaredResource() } -> std::convertible_to<std::shared_ptr<Resource>>;
+};
+
 template<typename T>
 concept DerivedRenderPass = std::derived_from<T, RenderPass>;
 
@@ -617,21 +567,16 @@ namespace detail
     inline constexpr bool dependent_false_v = false;
 
     inline void TrackResolverSnapshot(std::vector<ResolverSnapshot>& snapshots,
-        const IResourceResolver& resolver, const ResolverDeclarationState& state,
+        const IResourceResolver& resolver, const std::shared_ptr<const ResolverDeclarationState>& state,
         std::optional<ResolverSnapshot::RequirementTemplate> binding = std::nullopt) {
-        const auto identity = state.dependencyIdentity.get();
-        if (!state.tracked || !identity) return;
+        const auto identity = state->dependencyIdentity.get();
+        if (!state->tracked || !identity) return;
         auto found = std::find_if(snapshots.begin(), snapshots.end(), [identity](const auto& snapshot) {
-            return snapshot.dependencyIdentity.get() == identity;
+            return snapshot.DependencyIdentity().get() == identity;
         });
         if (found == snapshots.end()) {
             snapshots.emplace_back(resolver.Clone(), state);
             found = std::prev(snapshots.end());
-            if (state.resources) {
-                found->resourceIDs.reserve(state.resources->size());
-                for (const auto& resource : *state.resources)
-                    found->resourceIDs.push_back(resource ? resource->GetGlobalResourceID() : 0u);
-            }
         }
         if (!binding) {
             found->hasUnclassifiedDeclaration = true;
@@ -646,19 +591,19 @@ namespace detail
     inline void TrackResolverDeclaration(RenderGraph* graph, std::vector<ResolverSnapshot>& snapshots,
         const T& value, ResourceState required) {
         auto capture = [&](const IResourceResolver& resolver, RangeSpec range) {
-            const auto state = graph->CaptureResolverDeclarationState(resolver);
-            if (state) TrackResolverSnapshot(snapshots, resolver, *state,
+            const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, resolver);
+            if (state) TrackResolverSnapshot(snapshots, resolver, state,
                 ResolverSnapshot::RequirementTemplate{range, required});
         };
         using Value = std::remove_cvref_t<T>;
         if constexpr (std::is_same_v<Value, ResourceResolverAndRange>) {
             capture(*value.pResolver, value.range);
         } else if constexpr (std::is_same_v<Value, ResourceIdentifierAndRange>) {
-            if (auto resolver = graph->RequestResolver(value.identifier, true)) capture(*resolver, value.range);
+            if (auto resolver = BuilderGraphAccess::RequestResolver(graph, value.identifier, true)) capture(*resolver, value.range);
         } else if constexpr (std::is_same_v<Value, ResourceIdentifier>) {
-            if (auto resolver = graph->RequestResolver(value, true)) capture(*resolver, {});
+            if (auto resolver = BuilderGraphAccess::RequestResolver(graph, value, true)) capture(*resolver, {});
         } else if constexpr (StringLike<T>) {
-            if (auto resolver = graph->RequestResolver(ResourceIdentifier{std::string_view{value}}, true)) capture(*resolver, {});
+            if (auto resolver = BuilderGraphAccess::RequestResolver(graph, ResourceIdentifier{std::string_view{value}}, true)) capture(*resolver, {});
         }
     }
 
@@ -670,9 +615,9 @@ namespace detail
         if (!graph) {
             return;
         }
-        if (auto resolver = graph->RequestResolver(id, true)) {
-            const auto state = graph->CaptureResolverDeclarationState(*resolver);
-            if (state) TrackResolverSnapshot(resolverSnapshots, *resolver, *state);
+        if (auto resolver = BuilderGraphAccess::RequestResolver(graph, id, true)) {
+            const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, *resolver);
+            if (state) TrackResolverSnapshot(resolverSnapshots, *resolver, state);
         }
     }
 
@@ -890,11 +835,16 @@ class RenderPassBuilder : public IPassBuilder {
 public:
     PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Render; }
     IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
-    std::shared_ptr<const ResourceUseLayout> ResourceUses() const { return resourceUses_; }
+    // The layout as declared so far, with the feature domains the declarations activated.
+    std::shared_ptr<const ResourceUseLayout> ResourceUses() const {
+        resourceUses_->activeFeatureDomains.clear();
+        for (const auto& domain : params.activeFeatureDomains) resourceUses_->activeFeatureDomains.push_back(domain.hash);
+        return resourceUses_;
+    }
 
 private:
     template<class T>
-        requires (!std::derived_from<T, IResourceResolver>)
+        requires (!std::derived_from<T, IResourceResolver> && !SelfDeclaringResource<T>)
     DeclaredResourceUse DeclareResourceUse(const T& resource, ResourceUseSpecification specification) {
         ValidateResourceUse(specification);
         if constexpr (detail::SharedPtrToResource<T>) {
@@ -906,13 +856,13 @@ private:
         const auto ranges = processResourceArguments(resource, graph);
         std::shared_ptr<const void> resolverIdentity;
         const auto captureResolver = [&](const IResourceResolver* resolver) {
-            if (resolver) if (const auto state = graph->CaptureResolverDeclarationState(*resolver); state && state->tracked)
+            if (resolver) if (const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, *resolver); state && state->tracked)
                 resolverIdentity = state->dependencyIdentity;
         };
         if constexpr (std::same_as<T, ResourceResolverAndRange>) captureResolver(resource.pResolver.get());
-        else if constexpr (std::same_as<T, ResourceIdentifierAndRange>) captureResolver(graph->RequestResolver(resource.identifier, true).get());
-        else if constexpr (std::same_as<T, ResourceIdentifier>) captureResolver(graph->RequestResolver(resource, true).get());
-        else if constexpr (detail::StringLike<T>) captureResolver(graph->RequestResolver(ResourceIdentifier{std::string_view{resource}}, true).get());
+        else if constexpr (std::same_as<T, ResourceIdentifierAndRange>) captureResolver(BuilderGraphAccess::RequestResolver(graph, resource.identifier, true).get());
+        else if constexpr (std::same_as<T, ResourceIdentifier>) captureResolver(BuilderGraphAccess::RequestResolver(graph, resource, true).get());
+        else if constexpr (detail::StringLike<T>) captureResolver(BuilderGraphAccess::RequestResolver(graph, ResourceIdentifier{std::string_view{resource}}, true).get());
         if (resolverIdentity) {
             auto& groups = resourceUses_->resolverViews;
             auto found = std::find_if(groups.begin(), groups.end(), [&](const auto& group) { return group.identity == resolverIdentity; });
@@ -930,7 +880,14 @@ private:
         using A = rhi::ResourceAccessType;
         // Symbolic names still need their registration/domain side effects, even
         // when the same resource was previously declared by pointer.
-        if (!alreadyDeclared || !detail::SharedPtrToResource<T>) switch (specification.access) {
+        if (specification.accelerationStructureBuildStage) {
+            if (specification.access == A::ShaderResource) { if (!alreadyDeclared || !detail::SharedPtrToResource<T>) addAccelerationStructureBuildInput(resource); }
+            else if (specification.access == A::UnorderedAccess) { if (!alreadyDeclared || !detail::SharedPtrToResource<T>) addAccelerationStructureBuildOutput(resource); }
+            else throw std::invalid_argument("Acceleration structure build stage uses are shader resources or unordered access");
+        }
+        // The build access combines two flags, so it is no enumerator a switch may name (MSVC C4063).
+        else if (specification.access == kAccelerationStructureBuildAccess) { if (!alreadyDeclared || !detail::SharedPtrToResource<T>) addAccelerationStructureBuild(resource); }
+        else if (!alreadyDeclared || !detail::SharedPtrToResource<T>) switch (specification.access) {
         case A::ShaderResource: addShaderResource(resource); break;
         case A::UnorderedAccess: addUnorderedAccess(resource); break;
         case A::UnorderedAccessClear: addUnorderedAccessClear(resource); break;
@@ -941,18 +898,23 @@ private:
         case A::DepthRead: addDepthRead(resource); break;
         case A::DepthReadWrite: addDepthReadWrite(resource); break;
         case A::DepthStencilClear: addDepthStencilClear(resource); break;
+        case A::Common: addLegacyInterop(resource); break;
         case A::CopySource: addCopySource(resource); break;
         case A::CopyDest: addCopyDest(resource); break;
+        case A::RaytracingAccelerationStructureRead: addAccelerationStructureRead(resource); break;
         case A::VertexBuffer: addVertexBuffer(resource); break;
         case A::IndexBuffer: addIndexBuffer(resource); break;
         case A::Present: addPresent(resource); break;
         default: throw std::invalid_argument("Unsupported resource use access");
         }
         DeclaredResourceUse result;
-        uint32_t memberOrdinal = 0;
         for (const auto& range : ranges) {
-            auto* concrete = graph->_registry.Resolve(range.resource);
+            auto* concrete = BuilderGraphAccess::Resolve(graph, range.resource);
             if (!concrete) throw std::invalid_argument("Resource declaration did not resolve");
+            // The graph does not track an externally immutable resource, so a pass may only read it.
+            if (concrete->GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource
+                && specification.access != rhi::ResourceAccessType::ShaderResource)
+                throw std::invalid_argument("Resource '" + concrete->GetName() + "' is externally immutable: a pass may only read it");
             const auto validBound = [](Bound bound, uint32_t count) {
                 return bound.type == BoundType::All || bound.value < count;
             };
@@ -965,15 +927,15 @@ private:
                 if (view.mip >= concrete->GetMipLevels() || view.slice >= concrete->GetArraySize())
                     throw std::invalid_argument("Declared view outside resource bounds");
             const ResourceBindingToken binding{concrete->GetSchedulingResourceID(), range.resource.GetGlobalResourceID()};
-            const ResourceState state{specification.access, AccessToLayout(specification.access, true), RenderSyncFromAccess(specification.access)};
+            const ResourceState state{specification.access, AccessToLayout(specification.access, true),
+                specification.accelerationStructureBuildStage ? kAccelerationStructureBuildStageSync : RenderSyncFromAccess(specification.access)};
             auto& uses = resourceUses_->uses;
             auto found = std::find_if(uses.begin(), uses.end(), [&](const auto& use) {
                 return use.resolverIdentity == resolverIdentity && use.binding.registryResourceID == binding.registryResourceID && use.resource.range == range.range
                     && use.state == state && use.state.sync == state.sync;
             });
-            if (found == uses.end()) { uses.push_back({range, state, binding, {}, resolverIdentity, memberOrdinal}); found = std::prev(uses.end()); }
+            if (found == uses.end()) { uses.push_back({range, state, binding, {}, resolverIdentity}); found = std::prev(uses.end()); }
             const auto ordinal = static_cast<uint32_t>(found - uses.begin());
-            ++memberOrdinal;
             result.resources.push_back(binding);
             for (const auto view : specification.views) {
                 auto& views = found->requiredViews;
@@ -982,14 +944,62 @@ private:
                 result.views.push_back({resourceUses_, ordinal, static_cast<uint32_t>(existing - views.begin())});
             }
         }
-        RegisterUseViews(resource, specification);
+        if constexpr (std::same_as<T, ResourceIdentifier>) NameUseViews(resource, result, resolverIdentity, specification);
+        else if constexpr (std::same_as<T, ResourceIdentifierAndRange>) NameUseViews(resource.identifier, result, resolverIdentity, specification);
+        else if constexpr (detail::StringLike<T>) NameUseViews(ResourceIdentifier{std::string_view{resource}}, result, resolverIdentity, specification);
         return result;
+    }
+    // A pipeline's ResourceDescriptorIndex(name) slot resolves to the first shader-visible view declared under that name.
+    // An unordered-access view replaces a shader-resource or constant-buffer view.
+    void NameUseViews(const ResourceIdentifier& identifier, const DeclaredResourceUse& declared,
+        const std::shared_ptr<const void>& resolverIdentity, const ResourceUseSpecification& specification) {
+        auto& layout = *resourceUses_;
+        const auto shaderVisible = [](BindlessViewKind kind) {
+            return kind == BindlessViewKind::ShaderResource || kind == BindlessViewKind::UnorderedAccess
+                || kind == BindlessViewKind::ConstantBuffer;
+        };
+        std::optional<ResourceUseLayout::NamedView> named;
+        for (const auto& token : declared.views) {
+            const auto kind = layout.uses[token.use].requiredViews[token.view].kind;
+            if (!shaderVisible(kind)) continue;
+            named = ResourceUseLayout::NamedView{identifier.hash, token.use, token.view, kind};
+            break;
+        }
+        // The resolver has no member yet. The name follows the group, whatever members it has when a frame records.
+        if (!named && resolverIdentity) {
+            const auto& groups = layout.resolverViews;
+            const auto group = std::find_if(groups.begin(), groups.end(), [&](const auto& g) { return g.identity == resolverIdentity; });
+            const auto view = std::find_if(specification.views.begin(), specification.views.end(),
+                [&](const auto& v) { return shaderVisible(v.kind); });
+            if (group != groups.end() && view != specification.views.end())
+                named = ResourceUseLayout::NamedView{identifier.hash, UINT32_MAX, UINT32_MAX, view->kind,
+                    static_cast<uint32_t>(group - groups.begin()), *view};
+        }
+        if (!named) return;
+        auto found = std::find_if(layout.namedViews.begin(), layout.namedViews.end(),
+            [&](const auto& entry) { return entry.nameHash == identifier.hash; });
+        if (found == layout.namedViews.end()) layout.namedViews.push_back(*named);
+        else if (named->kind == BindlessViewKind::UnorderedAccess && found->kind != BindlessViewKind::UnorderedAccess) *found = *named;
     }
     DeclaredResourceUse DeclareResourceUse(const IResourceResolver& resolver, ResourceUseSpecification specification) {
         return DeclareResourceUse(ResourceResolverAndRange{resolver}, std::move(specification));
     }
+    // A self-declaring handle: its resolver, or else its resource.
+    template<class T>
+        requires SelfDeclaringResource<T>
+    DeclaredResourceUse DeclareResourceUse(const T& value, ResourceUseSpecification specification) {
+        if (const IResourceResolver* resolver = value.DeclaredResolver())
+            return DeclareResourceUse(*resolver, std::move(specification));
+        return DeclareResourceUse(std::shared_ptr<Resource>(value.DeclaredResource()), std::move(specification));
+    }
 
 public:
+    // Names a use declared by pointer, so a pipeline's ResourceDescriptorIndex(name) slot resolves to its first
+    // shader-visible view, as when the resource is declared by that name. For a graph with no provider of the name, such
+    // as a job graph whose passes reuse a shader written for the frame graph.
+    void NameUse(const ResourceIdentifier& identifier, const DeclaredResourceUse& use) {
+        NameUseViews(identifier, use, nullptr, {});
+    }
     template<class T> DeclaredResourceUse ShaderResource(const T& resource, SrvView view = {}) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::ShaderResource, {view}});
     }
@@ -1000,6 +1010,11 @@ public:
     }
     template<class T> DeclaredResourceUse UnorderedAccess(const T& resource, UavView view = {}) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::UnorderedAccess, {view}});
+    }
+    // A legacy interop use (the common state) with a token, for code outside the graph that records into the pass's list, such as
+    // a vendor SDK: Record resolves the token to this frame's backing (RecordingContext::Resolve). No view is declared.
+    template<class T> DeclaredResourceUse LegacyInteropUse(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::Common, {}});
     }
     template<class T> DeclaredResourceUse UnorderedAccess(const T& resource, std::span<const UavView> views) {
         ResourceUseSpecification specification{rhi::ResourceAccessType::UnorderedAccess, {}};
@@ -1058,6 +1073,24 @@ public:
     DeclaredResourceUse CopyDestination(const T& resolver) {
         return DeclareResourceUse(static_cast<const IResourceResolver&>(resolver), {rhi::ResourceAccessType::CopyDest, {}});
     }
+    // Acceleration structure storage (BufferBase::SetAccelerationStructureStorage): built into and read back within the pass,
+    // as cluster builds and moves do, or only read. Such a buffer takes no other access and has no views.
+    template<class T> DeclaredResourceUse AccelerationStructureBuild(const T& resource) {
+        return DeclareResourceUse(resource, {kAccelerationStructureBuildAccess, {}});
+    }
+    template<class T> DeclaredResourceUse AccelerationStructureRead(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::RaytracingAccelerationStructureRead, {}});
+    }
+    // Read by acceleration structure operations (argument and address arrays, counts, instance descriptions, geometry),
+    // and possibly by the pass's shaders: a shader resource at the build stage as well as the shading stages.
+    template<class T> DeclaredResourceUse AccelerationStructureBuildInput(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::ShaderResource, {}, true});
+    }
+    // Written by acceleration structure operations (destination address and size arrays, scratch), and possibly by the
+    // pass's shaders: unordered access at the build stage as well as the shading stages.
+    template<class T> DeclaredResourceUse AccelerationStructureBuildOutput(const T& resource) {
+        return DeclareResourceUse(resource, {rhi::ResourceAccessType::UnorderedAccess, {}, true});
+    }
     template<class T> ResourceBindingToken CopyDestination(const T& resource) {
         return DeclareResourceUse(resource, {rhi::ResourceAccessType::CopyDest, {}}).Resource();
     }
@@ -1079,11 +1112,11 @@ public:
     }
 
     RenderPassBuilder& LegacyInterop(const IResourceResolver& resolver) & {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
+        const auto state = BuilderGraphAccess::CaptureResolverDeclarationState(graph, resolver);
         if (state && state->resources) addLegacyInterop(ResourceResolverAndRange{resolver});
         else {
             const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
+            for (const auto& resource : resources) BuilderGraphAccess::AddResource(graph, resource);
             addLegacyInterop(resources);
         }
         return *this;
@@ -1155,6 +1188,15 @@ public:
         return std::move(*this);
     }
 
+	// A pipeline of this pass, by description. The graph builds it for the device the pass lands on, before publishing the
+	// pass; bind the returned handle in Record. Declaring it again returns the same pipeline, so call this from Declare.
+	PipelineState Pipeline(PipelineDesc desc);
+	// As Pipeline, for a command signature: hand the returned handle to RecordingContext::ExecuteIndirect.
+	CommandSignatureState CommandSignature(CommandSignatureDesc desc);
+	/// @brief The runtime's pipeline library. A pass whose pipelines depend on the frame keeps a PipelinePermutations over
+	/// it, and selects from that in Prepare (docs/pipelines.md).
+	std::shared_ptr<PipelineLibrary> Pipelines() const;
+
 	RenderPassBuilder& RequireBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return *this; }
 	RenderPassBuilder RequireBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return std::move(*this); }
 	RenderPassBuilder& PreferBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return *this; }
@@ -1184,32 +1226,6 @@ public:
 
 private:
     std::shared_ptr<ResourceUseLayout> resourceUses_ = std::make_shared<ResourceUseLayout>();
-    template<class T> void RegisterUseViews(const T& resource, const ResourceUseSpecification& specification) {
-        if constexpr (detail::StringLike<T>)
-            RegisterUseViews(ResourceIdentifier{std::string_view{resource}}, specification);
-    }
-    void RegisterUseViews(const ResourceIdentifier& identifier, const ResourceUseSpecification& specification) {
-        for (const auto view : specification.views) {
-            if (view.kind != BindlessViewKind::ShaderResource && view.kind != BindlessViewKind::UnorderedAccess
-                && view.kind != BindlessViewKind::ConstantBuffer) continue;
-            DescriptorAccessor accessor{};
-            accessor.type = view.kind == BindlessViewKind::ShaderResource ? DescriptorType::SRV
-                : view.kind == BindlessViewKind::UnorderedAccess ? DescriptorType::UAV : DescriptorType::CBV;
-            accessor.mip = view.mip; accessor.slice = view.slice;
-            accessor.hasSRVViewType = view.kind == BindlessViewKind::ShaderResource && view.variant != UINT32_MAX;
-            accessor.SRVType = static_cast<SRVViewType>(view.variant);
-            accessor.hasUAVViewType = view.kind == BindlessViewKind::UnorderedAccess && view.variant != UINT32_MAX;
-            accessor.UAVType = static_cast<UAVViewType>(view.variant);
-            auto& registrations = view.kind == BindlessViewKind::ShaderResource ? params.autoDescriptorShaderResources
-                : view.kind == BindlessViewKind::UnorderedAccess ? params.autoDescriptorUnorderedAccessViews : params.autoDescriptorConstantBuffers;
-            detail::AppendUniqueDescriptorRegistration(registrations,
-                AutoDescriptorRegistration{identifier, accessor, {}, graph->RequestResolver(identifier, true)});
-        }
-    }
-    void RegisterUseViews(const ResourceIdentifierAndRange& resource, const ResourceUseSpecification& specification) {
-        RegisterUseViews(resource.identifier, specification);
-    }
-
     struct AuthorState {
         RenderPassParameters params;
         std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> declaredIds;
@@ -1271,8 +1287,13 @@ private:
         resolverSnapshots_.clear();
 
         RestoreAuthorState(std::move(authorState));
+        params.declaredPipelines.clear(); // Declare names them, each time it runs.
+        params.declaredCommandSignatures.clear();
 
-        pass->DeclareResourceUsages(this);
+        {
+            const ResolverCaptureScope captures;
+            pass->DeclareResourceUsages(this);
+        }
 
         params.isGeometryPass = m_isGeometryPass;
         params.preferredQueueKind = m_preferredQueueKind;
@@ -1294,13 +1315,17 @@ private:
 			|| !params.constantBuffers.empty()
 			|| !params.unorderedAccessViews.empty()
 			|| !params.unorderedAccessClearViews.empty()
-			|| !params.indirectArgumentBuffers.empty();
+			|| !params.indirectArgumentBuffers.empty()
+			|| !params.accelerationStructureBuilds.empty()
+			|| !params.accelerationStructureReads.empty()
+			|| !params.accelerationStructureBuildInputs.empty()
+			|| !params.accelerationStructureBuildOutputs.empty();
 		if (params.preferredQueueKind == QueueKind::Compute && hasGraphicsOnlyOperations)
 			throw std::invalid_argument("Pass declares graphics-only operations but prefers the compute queue");
 		if (params.preferredQueueKind == QueueKind::Copy && (hasGraphicsOnlyOperations || hasShaderOperations))
 			throw std::invalid_argument("Pass declares non-copy operations but prefers the copy queue");
 
-        graph->AddRenderPass(pass, params, passName, TakeResolverSnapshots());
+        BuilderGraphAccess::AddRenderPass(graph, pass, params, passName, TakeResolverSnapshots());
     }
 
     void Reset() override {
@@ -1323,7 +1348,6 @@ private:
 	RenderPassBuilder& addShaderResource(T&& x) {
     detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
             ResourceState{rhi::ResourceAccessType::ShaderResource, AccessToLayout(rhi::ResourceAccessType::ShaderResource, true), RenderSyncFromAccess(rhi::ResourceAccessType::ShaderResource)});
-    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
 		return *this;
@@ -1441,7 +1465,6 @@ private:
 	RenderPassBuilder& addConstantBuffer(T&& x) {
     detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
             ResourceState{rhi::ResourceAccessType::ConstantBuffer, AccessToLayout(rhi::ResourceAccessType::ConstantBuffer, true), RenderSyncFromAccess(rhi::ResourceAccessType::ConstantBuffer)});
-    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
 		return *this;
@@ -1462,7 +1485,6 @@ private:
 	RenderPassBuilder& addUnorderedAccess(T&& x) {
     detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
             ResourceState{rhi::ResourceAccessType::UnorderedAccess, AccessToLayout(rhi::ResourceAccessType::UnorderedAccess, true), RenderSyncFromAccess(rhi::ResourceAccessType::UnorderedAccess)});
-    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
 		return *this;
@@ -1482,7 +1504,6 @@ private:
     RenderPassBuilder& addUnorderedAccessClear(T&& x) {
         detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
             ResourceState{rhi::ResourceAccessType::UnorderedAccessClear, AccessToLayout(rhi::ResourceAccessType::UnorderedAccessClear, true), RenderSyncFromAccess(rhi::ResourceAccessType::UnorderedAccessClear)});
-        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
         detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
         detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessClearViews, std::forward<T>(x));
         return *this;
@@ -1494,6 +1515,42 @@ private:
         for (auto&& e : xs) {
             addUnorderedAccessClear(std::forward<decltype(e)>(e));
         }
+        return *this;
+    }
+
+    // Acceleration structure storage
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addAccelerationStructureBuild(T&& x) {
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
+            ResourceState{kAccelerationStructureBuildAccess, AccessToLayout(kAccelerationStructureBuildAccess, true), RenderSyncFromAccess(kAccelerationStructureBuildAccess)});
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.accelerationStructureBuilds, std::forward<T>(x));
+        return *this;
+    }
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addAccelerationStructureRead(T&& x) {
+        constexpr auto read = rhi::ResourceAccessType::RaytracingAccelerationStructureRead;
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x, ResourceState{read, AccessToLayout(read, true), RenderSyncFromAccess(read)});
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.accelerationStructureReads, std::forward<T>(x));
+        return *this;
+    }
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addAccelerationStructureBuildInput(T&& x) {
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x, kAccelerationStructureBuildInputState);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.accelerationStructureBuildInputs, std::forward<T>(x));
+        return *this;
+    }
+    template<typename T>
+        requires ResourceLike<T>
+    RenderPassBuilder& addAccelerationStructureBuildOutput(T&& x) {
+        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x, kAccelerationStructureBuildOutputState);
+        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
+        detail::AppendTrackedResource(graph, _declaredIds, params.accelerationStructureBuildOutputs, std::forward<T>(x));
         return *this;
     }
 
@@ -1661,6 +1718,23 @@ private:
 	}
 
     std::vector<ResourceRequirement> GatherResourceRequirements() const {
+        auto requirements = GatherAccessRequirements();
+        if (params.accelerationStructureBuildInputs.empty() && params.accelerationStructureBuildOutputs.empty()) return requirements;
+        // Build stage uses carry their own sync, so they are a resource's only use in the pass.
+        auto build = detail::BuildRequirements(
+            [](rhi::ResourceAccessType) { return kAccelerationStructureBuildStageSync; },
+            std::pair{ std::cref(params.accelerationStructureBuildInputs), rhi::ResourceAccessType::ShaderResource },
+            std::pair{ std::cref(params.accelerationStructureBuildOutputs), rhi::ResourceAccessType::UnorderedAccess });
+        for (const auto& requirement : build) {
+            const uint64_t id = requirement.resourceHandleAndRange.resource.GetGlobalResourceID();
+            if (std::any_of(requirements.begin(), requirements.end(), [&](const auto& other) { return other.resourceHandleAndRange.resource.GetGlobalResourceID() == id; }))
+                throw std::invalid_argument("A resource with an acceleration structure build stage use has no other use in the pass");
+        }
+        requirements.insert(requirements.end(), build.begin(), build.end());
+        return requirements;
+    }
+
+    std::vector<ResourceRequirement> GatherAccessRequirements() const {
         return detail::BuildRequirements(
             [](rhi::ResourceAccessType access) { return RenderSyncFromAccess(access); },
             std::pair{ std::cref(params.shaderResources), rhi::ResourceAccessType::ShaderResource },
@@ -1674,6 +1748,8 @@ private:
             std::pair{ std::cref(params.unorderedAccessClearViews), rhi::ResourceAccessType::UnorderedAccessClear },
             std::pair{ std::cref(params.copySources), rhi::ResourceAccessType::CopySource },
             std::pair{ std::cref(params.copyTargets), rhi::ResourceAccessType::CopyDest },
+            std::pair{ std::cref(params.accelerationStructureBuilds), kAccelerationStructureBuildAccess },
+            std::pair{ std::cref(params.accelerationStructureReads), rhi::ResourceAccessType::RaytracingAccelerationStructureRead },
             std::pair{ std::cref(params.indirectArgumentBuffers), rhi::ResourceAccessType::IndirectArgument },
             std::pair{ std::cref(params.indexBuffers), rhi::ResourceAccessType::IndexBuffer },
             std::pair{ std::cref(params.vertexBuffers), rhi::ResourceAccessType::VertexBuffer },
@@ -1697,919 +1773,5 @@ private:
 
     friend class RenderGraph; // Allow RenderGraph to create instances of this builder
 };
-
-template<typename T>
-concept DerivedComputePass = std::derived_from<T, ComputePass>;
-
-class ComputePassBuilder : public IPassBuilder {
-public:
-    PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Compute; }
-    IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
-    // Variadic entry points
-
-    //First set, callable on Lvalues
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& ShaderResource(Args&&... args) & {
-        (addShaderResource(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& ConstantBuffer(Args&&... args) & {
-        (addConstantBuffer(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& UnorderedAccess(Args&&... args) & {
-        (addUnorderedAccess(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& UnorderedAccessClear(Args&&... args) & {
-        (addUnorderedAccessClear(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& IndirectArguments(Args&&... args) & {
-        (addIndirectArguments(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder& LegacyInterop(Args&&... args)& {
-        (addLegacyInterop(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename T>
-        requires ResourceLike<T>
-    ComputePassBuilder& InternalTransition(T&& resource, ResourceState exitState)& {
-        addInternalTransition(std::forward<T>(resource), exitState);
-        return *this;
-    }
-
-    template<typename... Args>
-    ComputePassBuilder& ActiveFeatureDomain(Args&&... args) & {
-        (addActiveFeatureDomain(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    // Second set, callable on temporaries
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder ShaderResource(Args&&... args) && {
-        (addShaderResource(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder ConstantBuffer(Args&&... args) && {
-        (addConstantBuffer(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder UnorderedAccess(Args&&... args) && {
-        (addUnorderedAccess(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder UnorderedAccessClear(Args&&... args) && {
-        (addUnorderedAccessClear(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder IndirectArguments(Args&&... args) && {
-        (addIndirectArguments(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    ComputePassBuilder LegacyInterop(Args&&... args)&& {
-        (addLegacyInterop(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename T>
-        requires ResourceLike<T>
-    ComputePassBuilder InternalTransition(T&& resource, ResourceState exitState)&& {
-        addInternalTransition(std::forward<T>(resource), exitState);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-    ComputePassBuilder ActiveFeatureDomain(Args&&... args) && {
-        (addActiveFeatureDomain(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-private:
-    template<typename AddCallable>
-    ComputePassBuilder& DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) & {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
-        if (state && state->resources) {
-            addCallable(ResourceResolverAndRange{resolver});
-        } else {
-            const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
-            addCallable(resources);
-        }
-        return *this;
-    }
-
-    template<typename AddCallable>
-    ComputePassBuilder DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) && {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
-        if (state && state->resources) {
-            addCallable(ResourceResolverAndRange{resolver});
-        } else {
-            const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
-            addCallable(resources);
-        }
-        return std::move(*this);
-    }
-
-public:
-        std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
-
-        ComputePassBuilder& PreferQueue(QueueKind kind) & {
-                if (!IsQueueKindSupportedByComputePass(kind)) {
-                        throw std::invalid_argument("Compute passes only support graphics or compute queues");
-                }
-                m_preferredQueueKind = kind;
-            m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-                return *this;
-        }
-
-        ComputePassBuilder PreferQueue(QueueKind kind) && {
-                if (!IsQueueKindSupportedByComputePass(kind)) {
-                        throw std::invalid_argument("Compute passes only support graphics or compute queues");
-                }
-                m_preferredQueueKind = kind;
-            m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-    				return std::move(*this);
-    		}
-
-    		ComputePassBuilder& AutomaticQueueAssignment() & {
-    				m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
-    				return *this;
-    		}
-
-    		ComputePassBuilder AutomaticQueueAssignment() && {
-    				m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
-                return std::move(*this);
-        }
-
-        ComputePassBuilder& PinToQueue(QueueSlotIndex slot) & {
-                m_pinnedQueueSlot = slot;
-                return *this;
-        }
-
-        ComputePassBuilder PinToQueue(QueueSlotIndex slot) && {
-                m_pinnedQueueSlot = slot;
-                return std::move(*this);
-        }
-
-		ComputePassBuilder& RequireBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return *this; }
-		ComputePassBuilder RequireBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return std::move(*this); }
-		ComputePassBuilder& PreferBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return *this; }
-		ComputePassBuilder PreferBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return std::move(*this); }
-		ComputePassBuilder& RequireAPI(rhi::Backend backend) & { return RequireBackend(backend); }
-		ComputePassBuilder RequireAPI(rhi::Backend backend) && { return std::move(*this).RequireBackend(backend); }
-		ComputePassBuilder& PreferAPI(rhi::Backend backend) & { return PreferBackend(backend); }
-		ComputePassBuilder PreferAPI(rhi::Backend backend) && { return std::move(*this).PreferBackend(backend); }
-		ComputePassBuilder& RequireDevice(DeviceInstanceId device) & { m_backendAffinity = { BackendAffinityStrength::Required, rhi::Backend::Null, device }; return *this; }
-		ComputePassBuilder RequireDevice(DeviceInstanceId device) && { m_backendAffinity = { BackendAffinityStrength::Required, rhi::Backend::Null, device }; return std::move(*this); }
-		ComputePassBuilder& PreferDevice(DeviceInstanceId device) & { m_backendAffinity = { BackendAffinityStrength::Preferred, rhi::Backend::Null, device }; return *this; }
-		ComputePassBuilder PreferDevice(DeviceInstanceId device) && { m_backendAffinity = { BackendAffinityStrength::Preferred, rhi::Backend::Null, device }; return std::move(*this); }
-
-		ComputePassBuilder& WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) & {
-			params.externalWaitsBeforeTransitions.push_back({ timeline, value });
-			return *this;
-		}
-
-		ComputePassBuilder WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) && {
-			params.externalWaitsBeforeTransitions.push_back({ timeline, value });
-			return std::move(*this);
-		}
-		ComputePassBuilder& WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) & { params.externalWaitBindingsBeforeTransitions.push_back(binding); return *this; }
-		ComputePassBuilder WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) && { params.externalWaitBindingsBeforeTransitions.push_back(binding); return std::move(*this); }
-
-        // LVALUE overloads for IResourceResolver
-        ComputePassBuilder& ShaderResource(const IResourceResolver& r)& {
-		return DeclareResolverAccess(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-        ComputePassBuilder& ConstantBuffer(const IResourceResolver& r)& {
-		return DeclareResolverAccess(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-        ComputePassBuilder& UnorderedAccess(const IResourceResolver& r)& {
-		return DeclareResolverAccess(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-        ComputePassBuilder& UnorderedAccessClear(const IResourceResolver& r)& {
-		return DeclareResolverAccess(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-        ComputePassBuilder& IndirectArguments(const IResourceResolver& r)& {
-		return DeclareResolverAccess(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-        ComputePassBuilder& LegacyInterop(const IResourceResolver& r)& {
-		return DeclareResolverAccess(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-        // RVALUE overloads for IResourceResolver
-        ComputePassBuilder ShaderResource(const IResourceResolver& r)&& {
-		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addShaderResource(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-        ComputePassBuilder ConstantBuffer(const IResourceResolver& r)&& {
-		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addConstantBuffer(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-        ComputePassBuilder UnorderedAccess(const IResourceResolver& r)&& {
-		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addUnorderedAccess(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-        ComputePassBuilder UnorderedAccessClear(const IResourceResolver& r)&& {
-		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addUnorderedAccessClear(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-        ComputePassBuilder IndirectArguments(const IResourceResolver& r)&& {
-		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addIndirectArguments(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-        ComputePassBuilder LegacyInterop(const IResourceResolver& r)&& {
-		return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addLegacyInterop(std::forward<decltype(resolved)>(resolved)); });
-        }
-
-    auto const& DeclaredResourceIds() const { return _declaredIds; }
-
-private:
-    struct AuthorState {
-        ComputePassParameters params;
-        std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> declaredIds;
-        std::vector<ResolverSnapshot> resolverSnapshots;
-    };
-
-    ComputePassBuilder(RenderGraph* g, std::string name)
-        : graph(g), passName(std::move(name)) {}
-
-    // Copy and move constructors are default, but private
-    ComputePassBuilder(const ComputePassBuilder&) = default;
-    ComputePassBuilder(ComputePassBuilder&&) = default;
-
-    // Same for assignment
-    ComputePassBuilder& operator=(const ComputePassBuilder&) = default;
-    ComputePassBuilder& operator=(ComputePassBuilder&&) = default;
-
-    AuthorState CaptureAuthorState() && {
-        return {
-            std::move(params),
-            std::move(_declaredIds),
-            std::move(resolverSnapshots_)
-        };
-    }
-
-    void RestoreAuthorState(AuthorState&& state) {
-        params = std::move(state.params);
-        _declaredIds = std::move(state.declaredIds);
-        resolverSnapshots_ = std::move(state.resolverSnapshots);
-    }
-
-    template<DerivedComputePass PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-    void Instantiate(InputsT&& inputs, StableCtorArgs&&... ctorArgs)
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-    template<DerivedComputePass PassT, typename... StableCtorArgs>
-    void Instantiate(StableCtorArgs&&... ctorArgs)
-    {
-        Instantiate<PassT>(org::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
-    void Finalize() override {
-        if (!built_) return;
-
-        auto authorState = std::move(*this).CaptureAuthorState();
-
-        params = {};
-        _declaredIds.clear();
-        resolverSnapshots_.clear();
-
-        RestoreAuthorState(std::move(authorState));
-
-        pass->DeclareResourceUsages(this);
-
-        params.identifierSet = _declaredIds;
-        params.preferredQueueKind = m_preferredQueueKind;
-        params.queueAssignmentPolicy = m_queueAssignmentPolicy;
-        params.pinnedQueueSlot = m_pinnedQueueSlot;
-		params.backendAffinity = m_backendAffinity;
-        params.staticResourceRequirements = GatherResourceRequirements();
-
-        graph->AddComputePass(pass, params, passName, TakeResolverSnapshots());
-    }
-
-    void Reset() override {
-        built_ = false;
-        pass = nullptr;
-        params = {};
-        _declaredIds.clear();
-        resolverSnapshots_.clear();
-        m_preferredQueueKind = QueueKind::Compute;
-		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
-        m_pinnedQueueSlot = std::nullopt;
-		m_backendAffinity = {};
-    }
-
-    // Shader resource
-	template<typename T>
-        requires ResourceLike<T>
-	ComputePassBuilder& addShaderResource(T&& x) {
-        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
-            ResourceState{rhi::ResourceAccessType::ShaderResource, AccessToLayout(rhi::ResourceAccessType::ShaderResource, true), ComputeSyncFromAccess(rhi::ResourceAccessType::ShaderResource)});
-    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorShaderResources, x, DescriptorType::SRV);
-        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
-        detail::AppendTrackedResource(graph, _declaredIds, params.shaderResources, std::forward<T>(x));
-		return *this;
-	}
-    template<class Range>
-        requires (std::ranges::range<Range>&&
-    ResourceLike<std::ranges::range_value_t<Range>>)
-        ComputePassBuilder& addShaderResource(Range&& xs) {
-        for (auto&& e : xs) {
-            addShaderResource(std::forward<decltype(e)>(e));
-        }
-        return *this;
-    }
-
-    // Constant buffer
-	template<typename T>
-        requires ResourceLike<T>
-	ComputePassBuilder& addConstantBuffer(T&& x) {
-        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
-            ResourceState{rhi::ResourceAccessType::ConstantBuffer, AccessToLayout(rhi::ResourceAccessType::ConstantBuffer, true), ComputeSyncFromAccess(rhi::ResourceAccessType::ConstantBuffer)});
-    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorConstantBuffers, x, DescriptorType::CBV);
-        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
-        detail::AppendTrackedResource(graph, _declaredIds, params.constantBuffers, std::forward<T>(x));
-		return *this;
-	}
-    template<class Range>
-		requires (std::ranges::range<Range>&&
-	ResourceLike<std::ranges::range_value_t<Range>>)
-        ComputePassBuilder& addConstantBuffer(Range&& xs) {
-		for (auto&& e : xs) {
-			addConstantBuffer(std::forward<decltype(e)>(e));
-		}
-		return *this;
-	}
-
-    // Unordered access
-	template<typename T>
-        requires ResourceLike<T>
-	ComputePassBuilder& addUnorderedAccess(T&& x) {
-        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
-            ResourceState{rhi::ResourceAccessType::UnorderedAccess, AccessToLayout(rhi::ResourceAccessType::UnorderedAccess, true), ComputeSyncFromAccess(rhi::ResourceAccessType::UnorderedAccess)});
-    detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
-        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
-        detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessViews, std::forward<T>(x));
-		return *this;
-	}
-    template<class Range>
-		requires (std::ranges::range<Range>&&
-	ResourceLike<std::ranges::range_value_t<Range>>)
-        ComputePassBuilder& addUnorderedAccess(Range&& xs) {
-        for (auto&& e : xs) {
-            addUnorderedAccess(std::forward<decltype(e)>(e));
-        }
-        return *this;
-	}
-
-    template<typename T>
-        requires ResourceLike<T>
-    ComputePassBuilder& addUnorderedAccessClear(T&& x) {
-        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
-            ResourceState{rhi::ResourceAccessType::UnorderedAccessClear, AccessToLayout(rhi::ResourceAccessType::UnorderedAccessClear, true), ComputeSyncFromAccess(rhi::ResourceAccessType::UnorderedAccessClear)});
-        detail::TrackDefaultDescriptorIdentifier(graph, params.autoDescriptorUnorderedAccessViews, x, DescriptorType::UAV);
-        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
-        detail::AppendTrackedResource(graph, _declaredIds, params.unorderedAccessClearViews, std::forward<T>(x));
-        return *this;
-    }
-    template<class Range>
-        requires (std::ranges::range<Range>&&
-    ResourceLike<std::ranges::range_value_t<Range>>)
-    ComputePassBuilder& addUnorderedAccessClear(Range&& xs) {
-        for (auto&& e : xs) {
-            addUnorderedAccessClear(std::forward<decltype(e)>(e));
-        }
-        return *this;
-    }
-
-	// Indirect arguments
-	template<typename T>
-        requires ResourceLike<T>
-	ComputePassBuilder& addIndirectArguments(T&& x) {
-        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
-            ResourceState{rhi::ResourceAccessType::IndirectArgument, AccessToLayout(rhi::ResourceAccessType::IndirectArgument, true), ComputeSyncFromAccess(rhi::ResourceAccessType::IndirectArgument)});
-    detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
-        detail::AppendTrackedResource(graph, _declaredIds, params.indirectArgumentBuffers, std::forward<T>(x));
-		return *this;
-	}
-	template<class Range>
-		requires (std::ranges::range<Range>&&
-	ResourceLike<std::ranges::range_value_t<Range>>)
-        ComputePassBuilder& addIndirectArguments(Range&& xs) {
-		for (auto&& e : xs) {
-			addIndirectArguments(std::forward<decltype(e)>(e));
-		}
-		return *this;
-	}
-
-    // Legacy interop resources
-    template<typename T>
-        requires ResourceLike<T>
-    ComputePassBuilder& addLegacyInterop(T&& x) {
-        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
-            ResourceState{rhi::ResourceAccessType::Common, AccessToLayout(rhi::ResourceAccessType::Common, true), ComputeSyncFromAccess(rhi::ResourceAccessType::Common)});
-        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
-        detail::AppendTrackedResource(graph, _declaredIds, params.legacyInteropResources, std::forward<T>(x));
-        return *this;
-    }
-    template<class Range>
-		requires (std::ranges::range<Range>&&
-    ResourceLike<std::ranges::range_value_t<Range>>)
-        ComputePassBuilder& addLegacyInterop(Range&& xs) {
-        for (auto&& e : xs) {
-            addLegacyInterop(std::forward<decltype(e)>(e));
-        }
-		return *this;
-	}
-
-    ComputePassBuilder& addInternalTransition(
-        ResourceIdentifierAndRange rar,
-        ResourceState exitState) &
-    {
-		auto ranges = processResourceArguments(rar, graph);
-        for (auto& r : ranges) {
-            //if (!r.resource) continue;
-            params.internalTransitions.emplace_back(r, exitState);
-		}
-        return *this;
-	}
-    template<typename T>
-        requires ResourceLike<T>
-    ComputePassBuilder& addInternalTransition(T&& x, ResourceState exitState)& {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
-        detail::TrackFeatureDomainActivation(params.activeFeatureDomains, x);
-        detail::AppendInternalTransition(graph, _declaredIds, params.internalTransitions, std::forward<T>(x), exitState);
-        return *this;
-    }
-
-    void addActiveFeatureDomain(const FeatureDomainIdentifier& domain) {
-        params.activeFeatureDomains.insert(domain);
-    }
-
-    void addActiveFeatureDomain(FeatureDomainIdentifier&& domain) {
-        params.activeFeatureDomains.insert(std::move(domain));
-    }
-
-    void addActiveFeatureDomain(const char* domain) {
-        if (domain) {
-            params.activeFeatureDomains.insert(FeatureDomainIdentifier{ domain });
-        }
-    }
-
-    void addActiveFeatureDomain(std::string_view domain) {
-        params.activeFeatureDomains.insert(FeatureDomainIdentifier{ domain });
-    }
-
-    template<class S>
-        requires (detail::StringLike<S> && !std::is_same_v<std::remove_cvref_t<S>, const char*> && !std::is_same_v<std::remove_cvref_t<S>, char*>)
-    void addActiveFeatureDomain(S&& domain) {
-        params.activeFeatureDomains.insert(FeatureDomainIdentifier{ std::string_view{ std::forward<S>(domain) } });
-    }
-
-    std::vector<ResourceRequirement> GatherResourceRequirements() const {
-        return detail::BuildRequirements(
-            [](rhi::ResourceAccessType access) { return ComputeSyncFromAccess(access); },
-            std::pair{ std::cref(params.shaderResources), rhi::ResourceAccessType::ShaderResource },
-            std::pair{ std::cref(params.constantBuffers), rhi::ResourceAccessType::ConstantBuffer },
-            std::pair{ std::cref(params.unorderedAccessViews), rhi::ResourceAccessType::UnorderedAccess },
-            std::pair{ std::cref(params.unorderedAccessClearViews), rhi::ResourceAccessType::UnorderedAccessClear },
-            std::pair{ std::cref(params.indirectArgumentBuffers), rhi::ResourceAccessType::IndirectArgument },
-            std::pair{ std::cref(params.legacyInteropResources), rhi::ResourceAccessType::Common });
-    }
-
-    // storage
-    RenderGraph*             graph;
-    std::string              passName;
-    ComputePassParameters     params;
-    std::shared_ptr<ComputePass> pass;
-    bool built_ = false;
-	QueueKind m_preferredQueueKind = QueueKind::Compute;
-    QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
-    std::optional<QueueSlotIndex> m_pinnedQueueSlot;
-	BackendAffinity m_backendAffinity{};
-    std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
-    std::vector<ResolverSnapshot> resolverSnapshots_;
-
-	friend class RenderGraph; // Allow RenderGraph to create instances of this builder
-};
-
-template<typename T>
-concept DerivedCopyPass = std::derived_from<T, CopyPass>;
-
-class CopyPassBuilder : public IPassBuilder {
-public:
-    PassBuilderKind Kind() const noexcept override { return PassBuilderKind::Copy; }
-    IResourceProvider* ResourceProvider() noexcept override { return pass.get(); }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    CopyPassBuilder& CopyDestination(Args&&... args) & {
-        (addCopyDest(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    CopyPassBuilder& CopySource(Args&&... args) & {
-        (addCopySource(std::forward<Args>(args)), ...);
-        return *this;
-    }
-
-    template<typename T>
-        requires ResourceLike<T>
-    CopyPassBuilder& InternalTransition(T&& resource, ResourceState exitState)& {
-        addInternalTransition(std::forward<T>(resource), exitState);
-        return *this;
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    CopyPassBuilder CopyDestination(Args&&... args) && {
-        (addCopyDest(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename... Args>
-        requires ((NotIResourceResolver<Args>) && ...)
-    CopyPassBuilder CopySource(Args&&... args) && {
-        (addCopySource(std::forward<Args>(args)), ...);
-        return std::move(*this);
-    }
-
-    template<typename T>
-        requires ResourceLike<T>
-    CopyPassBuilder InternalTransition(T&& resource, ResourceState exitState)&& {
-        addInternalTransition(std::forward<T>(resource), exitState);
-        return std::move(*this);
-    }
-
-private:
-    template<typename AddCallable>
-    CopyPassBuilder& DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) & {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
-        if (state && state->resources) {
-            addCallable(ResourceResolverAndRange{resolver});
-        } else {
-            const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
-            addCallable(resources);
-        }
-        return *this;
-    }
-
-    template<typename AddCallable>
-    CopyPassBuilder DeclareResolverAccess(const IResourceResolver& resolver, AddCallable&& addCallable) && {
-        const auto state = graph->CaptureResolverDeclarationState(resolver);
-        if (state && state->resources) {
-            addCallable(ResourceResolverAndRange{resolver});
-        } else {
-            const auto resources = resolver.Resolve();
-            for (const auto& resource : resources) graph->AddResource(resource);
-            addCallable(resources);
-        }
-        return std::move(*this);
-    }
-
-public:
-    std::vector<ResolverSnapshot> TakeResolverSnapshots() { return std::move(resolverSnapshots_); }
-
-    CopyPassBuilder& PreferQueue(QueueKind kind) & {
-        if (!IsQueueKindSupportedByCopyPass(kind)) {
-            throw std::invalid_argument("Copy passes only support graphics or copy queues");
-        }
-        m_preferredQueueKind = kind;
-        m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-        return *this;
-    }
-
-    CopyPassBuilder PreferQueue(QueueKind kind) && {
-        if (!IsQueueKindSupportedByCopyPass(kind)) {
-            throw std::invalid_argument("Copy passes only support graphics or copy queues");
-        }
-        m_preferredQueueKind = kind;
-        m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-		return std::move(*this);
-	}
-
-	CopyPassBuilder& AutomaticQueueAssignment() & {
-		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
-		return *this;
-	}
-
-	CopyPassBuilder AutomaticQueueAssignment() && {
-		m_queueAssignmentPolicy = QueueAssignmentPolicy::Automatic;
-        return std::move(*this);
-    }
-
-    CopyPassBuilder& PinToQueue(QueueSlotIndex slot) & {
-        m_pinnedQueueSlot = slot;
-        return *this;
-    }
-
-    CopyPassBuilder PinToQueue(QueueSlotIndex slot) && {
-        m_pinnedQueueSlot = slot;
-        return std::move(*this);
-    }
-
-	CopyPassBuilder& RequireBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return *this; }
-	CopyPassBuilder RequireBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Required, backend }; return std::move(*this); }
-	CopyPassBuilder& PreferBackend(rhi::Backend backend) & { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return *this; }
-	CopyPassBuilder PreferBackend(rhi::Backend backend) && { m_backendAffinity = { BackendAffinityStrength::Preferred, backend }; return std::move(*this); }
-	CopyPassBuilder& RequireAPI(rhi::Backend backend) & { return RequireBackend(backend); }
-	CopyPassBuilder RequireAPI(rhi::Backend backend) && { return std::move(*this).RequireBackend(backend); }
-	CopyPassBuilder& PreferAPI(rhi::Backend backend) & { return PreferBackend(backend); }
-	CopyPassBuilder PreferAPI(rhi::Backend backend) && { return std::move(*this).PreferBackend(backend); }
-	CopyPassBuilder& RequireDevice(DeviceInstanceId device) & { m_backendAffinity = { BackendAffinityStrength::Required, rhi::Backend::Null, device }; return *this; }
-	CopyPassBuilder RequireDevice(DeviceInstanceId device) && { m_backendAffinity = { BackendAffinityStrength::Required, rhi::Backend::Null, device }; return std::move(*this); }
-	CopyPassBuilder& PreferDevice(DeviceInstanceId device) & { m_backendAffinity = { BackendAffinityStrength::Preferred, rhi::Backend::Null, device }; return *this; }
-	CopyPassBuilder PreferDevice(DeviceInstanceId device) && { m_backendAffinity = { BackendAffinityStrength::Preferred, rhi::Backend::Null, device }; return std::move(*this); }
-
-	CopyPassBuilder& WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) & {
-		params.externalWaitsBeforeTransitions.push_back({ timeline, value });
-		return *this;
-	}
-
-	CopyPassBuilder WithExternalWaitBeforeTransitions(rhi::Timeline timeline, uint64_t value) && {
-		params.externalWaitsBeforeTransitions.push_back({ timeline, value });
-		return std::move(*this);
-	}
-	CopyPassBuilder& WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) & { params.externalWaitBindingsBeforeTransitions.push_back(binding); return *this; }
-	CopyPassBuilder WithExternalWaitBindingBeforeTransitions(ExternalTimelineBinding binding) && { params.externalWaitBindingsBeforeTransitions.push_back(binding); return std::move(*this); }
-
-    CopyPassBuilder& CopyDestination(const IResourceResolver& r)& {
-        return DeclareResolverAccess(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-    CopyPassBuilder& CopySource(const IResourceResolver& r)& {
-        return DeclareResolverAccess(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-    CopyPassBuilder CopyDestination(const IResourceResolver& r)&& {
-        return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addCopyDest(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-    CopyPassBuilder CopySource(const IResourceResolver& r)&& {
-        return std::move(*this).DeclareResolverAccess(r, [&](auto&& resolved) { addCopySource(std::forward<decltype(resolved)>(resolved)); });
-    }
-
-    auto const& DeclaredResourceIds() const { return _declaredIds; }
-
-private:
-    struct AuthorState {
-        CopyPassParameters params;
-        std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> declaredIds;
-        std::vector<ResolverSnapshot> resolverSnapshots;
-    };
-
-    CopyPassBuilder(RenderGraph* g, std::string name)
-        : graph(g), passName(std::move(name)) {}
-
-    CopyPassBuilder(const CopyPassBuilder&) = default;
-    CopyPassBuilder(CopyPassBuilder&&) = default;
-    CopyPassBuilder& operator=(const CopyPassBuilder&) = default;
-    CopyPassBuilder& operator=(CopyPassBuilder&&) = default;
-
-    AuthorState CaptureAuthorState() && {
-        return {
-            std::move(params),
-            std::move(_declaredIds),
-            std::move(resolverSnapshots_)
-        };
-    }
-
-    void RestoreAuthorState(AuthorState&& state) {
-        params = std::move(state.params);
-        _declaredIds = std::move(state.declaredIds);
-        resolverSnapshots_ = std::move(state.resolverSnapshots);
-    }
-
-    template<DerivedCopyPass PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-    void Instantiate(InputsT&& inputs, StableCtorArgs&&... ctorArgs)
-    {
-        if (!built_)
-        {
-            built_ = true;
-            pass = detail::MakePass<PassT>(
-                std::forward<InputsT>(inputs),
-                std::forward<StableCtorArgs>(ctorArgs)...);
-        }
-
-        pass->SetInputs(std::forward<InputsT>(inputs));
-    }
-
-    template<DerivedCopyPass PassT, typename... StableCtorArgs>
-    void Instantiate(StableCtorArgs&&... ctorArgs)
-    {
-        Instantiate<PassT>(org::NoInputs{}, std::forward<StableCtorArgs>(ctorArgs)...);
-    }
-
-    void Finalize() override {
-        if (!built_) return;
-
-        auto authorState = std::move(*this).CaptureAuthorState();
-
-        params = {};
-        _declaredIds.clear();
-        resolverSnapshots_.clear();
-
-        RestoreAuthorState(std::move(authorState));
-
-        pass->DeclareResourceUsages(this);
-
-        params.identifierSet = _declaredIds;
-        params.preferredQueueKind = m_preferredQueueKind;
-        params.queueAssignmentPolicy = m_queueAssignmentPolicy;
-        params.pinnedQueueSlot = m_pinnedQueueSlot;
-		params.backendAffinity = m_backendAffinity;
-        params.staticResourceRequirements = GatherResourceRequirements();
-
-        graph->AddCopyPass(pass, params, passName, TakeResolverSnapshots());
-    }
-
-    void Reset() override {
-        built_ = false;
-        pass = nullptr;
-        params = {};
-        _declaredIds.clear();
-        resolverSnapshots_.clear();
-        m_preferredQueueKind = QueueKind::Copy;
-		m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-        m_pinnedQueueSlot = std::nullopt;
-		m_backendAffinity = {};
-    }
-
-    template<typename T>
-        requires ResourceLike<T>
-    CopyPassBuilder& addCopyDest(T&& x) {
-        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
-            ResourceState{rhi::ResourceAccessType::CopyDest, AccessToLayout(rhi::ResourceAccessType::CopyDest, true), rhi::ResourceSyncState::Copy});
-        detail::AppendTrackedResource(graph, _declaredIds, params.copyTargets, std::forward<T>(x));
-        return *this;
-    }
-
-    template<class Range>
-        requires (std::ranges::range<Range>&&
-    ResourceLike<std::ranges::range_value_t<Range>>)
-    CopyPassBuilder& addCopyDest(Range&& xs) {
-        for (auto&& e : xs) {
-            addCopyDest(std::forward<decltype(e)>(e));
-        }
-        return *this;
-    }
-
-    template<typename T>
-        requires ResourceLike<T>
-    CopyPassBuilder& addCopySource(T&& x) {
-        detail::TrackResolverDeclaration(graph, resolverSnapshots_, x,
-            ResourceState{rhi::ResourceAccessType::CopySource, AccessToLayout(rhi::ResourceAccessType::CopySource, true), rhi::ResourceSyncState::Copy});
-        detail::AppendTrackedResource(graph, _declaredIds, params.copySources, std::forward<T>(x));
-        return *this;
-    }
-
-    template<class Range>
-        requires (std::ranges::range<Range>&&
-    ResourceLike<std::ranges::range_value_t<Range>>)
-    CopyPassBuilder& addCopySource(Range&& xs) {
-        for (auto&& e : xs) {
-            addCopySource(std::forward<decltype(e)>(e));
-        }
-        return *this;
-    }
-
-    template<typename T>
-        requires ResourceLike<T>
-    CopyPassBuilder& addInternalTransition(T&& x, ResourceState exitState)& {
-        detail::MaybeTrackResolverSnapshot(graph, resolverSnapshots_, x);
-        detail::AppendInternalTransition(graph, _declaredIds, params.internalTransitions, std::forward<T>(x), exitState);
-        return *this;
-    }
-
-    std::vector<ResourceRequirement> GatherResourceRequirements() const {
-        return detail::BuildRequirements(
-            [](rhi::ResourceAccessType access) {
-                if ((access & (rhi::ResourceAccessType::CopySource | rhi::ResourceAccessType::CopyDest)) != 0) {
-                    return rhi::ResourceSyncState::Copy;
-                }
-                return rhi::ResourceSyncState::All;
-            },
-            std::pair{ std::cref(params.copySources), rhi::ResourceAccessType::CopySource },
-            std::pair{ std::cref(params.copyTargets), rhi::ResourceAccessType::CopyDest });
-    }
-
-    RenderGraph* graph;
-    std::string passName;
-    CopyPassParameters params;
-    std::shared_ptr<CopyPass> pass;
-    bool built_ = false;
-    QueueKind m_preferredQueueKind = QueueKind::Copy;
-	QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-    std::optional<QueueSlotIndex> m_pinnedQueueSlot;
-	BackendAffinity m_backendAffinity{};
-    std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
-    std::vector<ResolverSnapshot> resolverSnapshots_;
-
-    friend class RenderGraph;
-};
-
-template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedComputePass<PassT>);
-    auto& builder = GetOrCreateComputePassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, typename... StableCtorArgs>
-ComputePassBuilder& RenderGraph::BuildComputePass(std::string const& name, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedComputePass<PassT>);
-    auto& builder = GetOrCreateComputePassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedRenderPass<PassT>);
-    auto& builder = GetOrCreateRenderPassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, typename... StableCtorArgs>
-RenderPassBuilder& RenderGraph::BuildRenderPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedRenderPass<PassT>);
-    auto& builder = GetOrCreateRenderPassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, org::PassInputs InputsT, typename... StableCtorArgs>
-CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, InputsT&& inputs, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedCopyPass<PassT>);
-    auto& builder = GetOrCreateCopyPassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<InputsT>(inputs), std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
-template<typename PassT, typename... StableCtorArgs>
-CopyPassBuilder& RenderGraph::BuildCopyPass(std::string const& name, StableCtorArgs&&... ctorArgs) {
-    static_assert(DerivedCopyPass<PassT>);
-    auto& builder = GetOrCreateCopyPassBuilder(name);
-    builder.template Instantiate<PassT>(std::forward<StableCtorArgs>(ctorArgs)...);
-    return builder;
-}
-
 
 } // namespace org

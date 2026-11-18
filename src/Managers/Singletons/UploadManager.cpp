@@ -12,6 +12,7 @@
 #include "Render/PassBuilders.h"
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 #include "Managers/Singletons/DeviceManager.h"
+#include "OpenRenderGraph/Runtime.h"
 
 
 namespace org {
@@ -26,6 +27,10 @@ namespace {
 		range.sliceUpper = { BoundType::Exact, slice };
 		return range;
 	}
+}
+
+UploadManager::UploadManager(UploadManager& shared) : m_shared(&shared) {
+	m_uploadPass = std::make_shared<UploadPass>(*this);
 }
 
 void UploadManager::Initialize() {
@@ -51,12 +56,24 @@ void UploadManager::Initialize() {
 			return IsUploadTargetValid(target, reason, file, line);
 		});
 	m_uploadInstance->SetResolveContext(m_ctx);
+	if (m_shared) {
+		MarkUploadPassDirty();
+		return;
+	}
 	if (!m_copyQueueUploads) {
 		m_copyQueueUploads = std::make_unique<org::runtime::CopyQueueUploadService>();
 	}
 	if (!m_copyQueueUploads->Initialized()) {
 		auto& deviceManager = DeviceManager::GetInstance();
-		m_copyQueueUploads->Initialize(deviceManager.GetDevice(), deviceManager.GetCopyQueue());
+		auto device = deviceManager.GetDevice();
+		// The dedicated uploader of graph work: a queue of its own when the device has one to give (a distinct copy queue, or an
+		// adopted device's spare queue), so its copies never wait behind the graph's, nor the graph's behind them.
+		if (!m_uploadQueue) {
+			rhi::Queue queue;
+			if (device.CreateQueue(rhi::QueueKind::Copy, "ORG Upload Queue", queue) == rhi::Result::Ok && queue)
+				m_uploadQueue = queue;
+		}
+		m_copyQueueUploads->Initialize(device, m_uploadQueue ? m_uploadQueue : deviceManager.GetCopyQueue());
 		if (!m_copyQueueUploads->Initialized()) {
 			throw std::runtime_error("UploadManager failed to initialize the copy-queue upload service");
 		}
@@ -137,69 +154,38 @@ bool UploadManager::IsUploadTargetValid(const UploadTarget& target, const char* 
 		target.h.GetEpoch(),
 		file ? file : "<unknown>",
 		line);
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	throw std::runtime_error("UploadManager: invalid registry handle uploads detected. This likely indicates a bug where uploads are being queued referencing registry handles that have since been released.");
-#endif
 	return false;
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadManager::UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset, const char* file, int line)
-#else
-void UploadManager::UploadData(const void* data, size_t size, UploadTarget resourceToUpdate, size_t dataBufferOffset)
-#endif
 {
 	if (!m_uploadInstance) {
 		Initialize();
 	}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	m_uploadInstance->UploadData(data, size, std::move(resourceToUpdate), dataBufferOffset, file, line);
-#else
-	m_uploadInstance->UploadData(data, size, std::move(resourceToUpdate), dataBufferOffset);
-#endif
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadManager::UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions, const char* file, int line)
-#else
-void UploadManager::UploadDataBatch(UploadTarget resourceToUpdate, std::span<const org::runtime::UploadRegion> regions)
-#endif
 {
 	if (!m_uploadInstance) {
 		Initialize();
 	}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	m_uploadInstance->UploadDataBatch(std::move(resourceToUpdate), regions, file, line);
-#else
-	m_uploadInstance->UploadDataBatch(std::move(resourceToUpdate), regions);
-#endif
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadManager::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
 	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
 	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
 	std::shared_ptr<const void> keepAlive, const char* file, int line)
-#else
-void UploadManager::PostTextureSubresources(UploadTarget target, rhi::Format fmt, uint32_t baseWidth, uint32_t baseHeight,
-	uint32_t depthOrLayers, uint32_t mipLevels, uint32_t arraySize,
-	std::shared_ptr<const std::vector<rhi::helpers::SubresourceData>> subresources,
-	std::shared_ptr<const void> keepAlive)
-#endif
 {
 	if (!m_uploadInstance) {
 		Initialize();
 	}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	m_uploadInstance->PostTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers,
 		mipLevels, arraySize, std::move(subresources), std::move(keepAlive), file, line);
-#else
-	m_uploadInstance->PostTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers,
-		mipLevels, arraySize, std::move(subresources), std::move(keepAlive));
-#endif
 }
 
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 void UploadManager::UploadTextureSubresources(
 	UploadTarget target,
 	rhi::Format fmt,
@@ -212,18 +198,6 @@ void UploadManager::UploadTextureSubresources(
 	uint32_t srcCount,
 	const char* file,
 	int line)
-#else
-void UploadManager::UploadTextureSubresources(
-	UploadTarget target,
-	rhi::Format fmt,
-	uint32_t baseWidth,
-	uint32_t baseHeight,
-	uint32_t depthOrLayers,
-	uint32_t mipLevels,
-	uint32_t arraySize,
-	const rhi::helpers::SubresourceData* srcSubresources,
-	uint32_t srcCount)
-#endif
 {
 	if (target.kind == UploadTarget::Kind::PinnedShared && target.pinned &&
 		!target.pinned->IsRenderGraphManaged()) {
@@ -234,7 +208,6 @@ void UploadManager::UploadTextureSubresources(
 	if (!m_uploadInstance) {
 		Initialize();
 	}
-#if BUILD_TYPE == BUILD_TYPE_DEBUG
 	m_uploadInstance->UploadTextureSubresources(
 		std::move(target),
 		fmt,
@@ -247,18 +220,6 @@ void UploadManager::UploadTextureSubresources(
 		srcCount,
 		file,
 		line);
-#else
-	m_uploadInstance->UploadTextureSubresources(
-		std::move(target),
-		fmt,
-		baseWidth,
-		baseHeight,
-		depthOrLayers,
-		mipLevels,
-		arraySize,
-		srcSubresources,
-		srcCount);
-#endif
 }
 
 // The instance is created on first use, like UploadData's: a frame whose uploads are all staged makes no
@@ -279,12 +240,62 @@ void UploadManager::SetStagedUploadsRecordedDirectly(bool direct)
 	}
 }
 
-size_t UploadManager::RecordStagedUploads(rhi::CommandList& list, uint8_t frameIndex, bool afterCopies)
+size_t UploadManager::RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork)
 {
-	return m_uploadInstance ? m_uploadInstance->RecordStagedUploads(list, frameIndex, afterCopies) : 0;
+	return m_uploadInstance ? m_uploadInstance->RecordStagedUploads(list, frameIndex, afterWork) : 0;
 }
 
-void UploadManager::ProcessDeferredReleases(uint8_t frameIndex)
+bool UploadManager::SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch)
+{
+	if (!m_uploadInstance) {
+		Initialize();
+	}
+	bool nothingQueued = false;
+	{
+		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
+		nothingQueued = queuedResourceCopies.empty();
+	}
+	return m_uploadInstance->SubmitRecordedUploads(std::move(batch), nothingQueued);
+}
+
+size_t UploadManager::TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex)
+{
+	return m_uploadInstance ? m_uploadInstance->TakeRecordedUploads(out, frameIndex) : 0;
+}
+
+bool UploadManager::TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out)
+{
+	return m_uploadInstance ? m_uploadInstance->TakeStagedUploads(frameIndex, out) : true;
+}
+
+bool UploadManager::TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
+	std::vector<rhi::ResourceHandle>& destinations)
+{
+	return m_uploadInstance ? m_uploadInstance->TakeRecordedUploadsWithDestinations(out, frameIndex, destinations) : true;
+}
+
+bool UploadManager::HasPendingUploads() const
+{
+	{
+		std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(m_uploadQueueMutex));
+		if (!queuedResourceCopies.empty()) return true;
+	}
+	return m_uploadInstance && m_uploadInstance->HasPendingUploads();
+}
+
+bool UploadManager::StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const
+{
+	return m_uploadInstance ? m_uploadInstance->StagedUploadDestinations(out) : true;
+}
+
+size_t UploadManager::RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
+	const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed)
+{
+	routed = 0;
+	return m_uploadInstance ? m_uploadInstance->RecordStagedUploadsRouted(list, frameIndex, afterWork, route, routed) : 0;
+}
+
+void UploadManager::ProcessDeferredReleases(uint32_t frameIndex)
 {
 	if (m_uploadInstance) {
 		m_uploadInstance->ProcessDeferredReleases(frameIndex);
@@ -344,7 +355,7 @@ void UploadManager::SetOwnerThread() {
 	m_uploadInstance->SetOwnerThread();
 }
 
-void UploadManager::ProcessUploads(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList) {
+void UploadManager::ProcessUploads(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList) {
 	if (m_uploadInstance) {
 		m_uploadInstance->ProcessUploads(frameIndex, commandList);
 	}
@@ -361,7 +372,7 @@ void UploadManager::QueueResourceCopy(const std::shared_ptr<Resource>& destinati
 	MarkUploadPassDirty();
 }
 
-void UploadManager::ExecuteResourceCopies(uint8_t frameIndex, org::imm::ImmediateCommandList& commandList) {
+void UploadManager::ExecuteResourceCopies(uint32_t frameIndex, org::imm::ImmediateCommandList& commandList) {
 	(void)frameIndex;
 	std::vector<ResourceCopy> resourceCopies;
 	{
@@ -392,6 +403,14 @@ void UploadManager::Cleanup() {
 		m_copyQueueUploads->Cleanup();
 		m_copyQueueUploads.reset();
 	}
+	if (m_uploadQueue) {
+		// The runtime registered the queue (Runtime::Create). Unregistered first, its points read as reached once it is gone;
+		// otherwise the runtime's next retirement polls a destroyed timeline.
+		if (auto* runtime = Runtime::Current()) runtime->UnregisterQueue(m_uploadQueue);
+		if (auto device = DeviceManager::GetInstance().GetDevice())
+			device.DestroyQueue(m_uploadQueue.GetQueueHandle());
+		m_uploadQueue = {};
+	}
 
 	if (m_uploadInstance) {
 		m_uploadInstance->Cleanup();
@@ -410,8 +429,45 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUploadS
 	std::span<const StreamingUploadSegment> segments, size_t totalSize,
 	WorkerOwnedDestination destination, size_t dstOffset)
 {
+	if (m_shared) return m_shared->QueueTrackedStreamingUploadSegments(segments, totalSize, std::move(destination), dstOffset);
 	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
 	return m_copyQueueUploads->QueueBufferUpload(segments, totalSize, std::move(destination), dstOffset);
+}
+
+std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUploadRanges(
+	std::span<const StreamingUploadRange> ranges, WorkerOwnedDestination destination)
+{
+	if (m_shared) return m_shared->QueueTrackedStreamingUploadRanges(ranges, std::move(destination));
+	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
+	return m_copyQueueUploads->QueueBufferUploadRanges(ranges, std::move(destination));
+}
+
+std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingCopyRanges(std::shared_ptr<Resource> source,
+	std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination)
+{
+	if (m_shared) return m_shared->QueueTrackedStreamingCopyRanges(std::move(source), ranges, std::move(destination));
+	// As the signal: only on a queue of its own (the caller uploads instead).
+	if (!HasDedicatedStreamingQueue()) return {};
+	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
+	return m_copyQueueUploads->QueueBufferCopyRanges(std::move(source), ranges, std::move(destination));
+}
+
+std::shared_ptr<TrackedUploadTicket> UploadManager::QueueStreamingSignal(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value)
+{
+	if (m_shared) return m_shared->QueueStreamingSignal(std::move(timeline), value);
+	// Only from a queue of its own: the graph's copy queue may be its graphics queue, whose own waits would then wait on this.
+	if (!HasDedicatedStreamingQueue()) return {};
+	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
+	return m_copyQueueUploads->QueueSignal(std::move(timeline), value);
+}
+
+bool UploadManager::QueueStreamingWait(std::span<const std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> points)
+{
+	if (m_shared) return m_shared->QueueStreamingWait(points);
+	// As the signal: only from a queue of its own (a wait on the graph's queue would wait on itself).
+	if (!HasDedicatedStreamingQueue()) return false;
+	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
+	return m_copyQueueUploads->QueueWait(points);
 }
 
 
