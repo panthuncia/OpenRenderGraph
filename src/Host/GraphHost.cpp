@@ -3161,6 +3161,11 @@ bool GraphHost::EpochRecordingVersionsCurrent(const EpochRecording& recording, u
 	return copy < recording.copies.size() && recording.copies[copy] && RenderGraph::PersistentRecordingVersionsCurrent(*recording.copies[copy]);
 }
 
+std::string GraphHost::EpochRecordingStaleVersion(const EpochRecording& recording, uint32_t copy) const {
+	if (copy >= recording.copies.size() || !recording.copies[copy]) return "no copy " + std::to_string(copy);
+	return RenderGraph::PersistentRecordingStaleVersion(*recording.copies[copy]);
+}
+
 void GraphHost::StopAsync() {
 	BT_ZONE_SCOPE("ORG.Host.StopAsync");
 	if (!m_async) return;

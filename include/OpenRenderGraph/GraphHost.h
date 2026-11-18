@@ -700,6 +700,8 @@ public:
 	// not name versions checks this instead of counting NoteNewVersions: a version of a resource the epoch does not use leaves it
 	// true.
 	bool EpochRecordingVersionsCurrent(const EpochRecording& recording, uint32_t copy) const noexcept;
+	// Any thread: the versioned slot that makes copy `copy` of the recording not current, by name (empty when none).
+	std::string EpochRecordingStaleVersion(const EpochRecording& recording, uint32_t copy) const;
 	// Submitting thread: a versioned buffer (VersionedBuffer) published a new version. Nothing changed in place, so nothing waits;
 	// a ticket prepared before resolved the old version and is not current (it is prepared again, or takes a kept recording).
 	// Revision-driven epochs need no call: their recordings resolve the versions their revisions name.

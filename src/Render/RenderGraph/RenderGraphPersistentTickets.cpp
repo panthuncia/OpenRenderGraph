@@ -255,6 +255,17 @@ bool RenderGraph::PersistentRecordingVersionsCurrent(const PersistentRecording& 
 	return true;
 }
 
+std::string RenderGraph::PersistentRecordingStaleVersion(const PersistentRecording& recording) {
+	for (const auto& [versioned, number] : recording.versions) {
+		const auto current = versioned ? versioned->SelectVersion(nullptr) : nullptr;
+		if (current && current->number == number) continue;
+		const std::string name = current && current->resource ? current->resource->GetName() : std::string("?");
+		return "'" + name + "' (slot " + std::to_string(versioned ? versioned->SlotID() : 0) + ", version " + std::to_string(current ? current->number : 0)
+			+ ", recorded with " + std::to_string(number) + ")";
+	}
+	return {};
+}
+
 RenderGraph::PersistentTicketKey RenderGraph::PersistentTicketKeyOf(const PersistentTicket& ticket) noexcept {
 	PersistentTicketKey key;
 	const auto mix = [](uint64_t a_hash, const void* a_pointer) {
