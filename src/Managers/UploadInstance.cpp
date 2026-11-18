@@ -10,6 +10,13 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define ORG_DEBUG_BREAK() __debugbreak()
+#else
+#include <csignal>
+#define ORG_DEBUG_BREAK() std::raise(SIGTRAP)
+#endif
 
 #include <rhi_helpers.h>
 #include <spdlog/spdlog.h>
@@ -504,7 +511,7 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	MapUpload(uploadBuffer, &mapped);
 	if (mapped) std::memcpy(mapped + uploadOffset, data, size);
 	UnmapUpload(uploadBuffer, uploadOffset, size);
-	if (!mapped) __debugbreak();
+	if (!mapped) ORG_DEBUG_BREAK();
 
 	{
 		const auto rfound = std::ranges::find(m_resourceUpdates.rbegin(), m_resourceUpdates.rend(),
@@ -603,7 +610,7 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 		}
 	}
 	UnmapUpload(uploadBuffer, uploadOffset, totalBytes);
-	if (!mapped) __debugbreak();
+	if (!mapped) ORG_DEBUG_BREAK();
 
 	{
 		// The batch's entries are the newest staging entries with sequences in
