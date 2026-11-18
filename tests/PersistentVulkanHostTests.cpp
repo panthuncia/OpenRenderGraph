@@ -562,6 +562,13 @@ static int Run(int argc, char** argv) {
 	// "stream": an external epoch with its write on the compute queue (the family's second queue): batches off the host's stream,
 	// and the stream's segments.
 	const bool stream = argc > 1 && std::strcmp(argv[1], "stream") == 0;
+	// "segment-external": what a host's stage in another API's stream needs (CS's guest stages in DXVK's stream). One revision-driven
+	// epoch that is also external: open executions (entry barriers planned from the ledgers at each submission), external home states
+	// with a host-owned texture the write reads, the epoch's transients in alias pools of its own (SetPrivateAliasEpochs), each frame's
+	// values staged in its slot's staging run and copied into the pinned copy's run at the submission, the copy pass recorded at
+	// execution, each execution executed on a thread other than the submitting one (the host's worker), the host using the texture in
+	// its home state between the blocks, a description that turns the write off, and a staged build switched in.
+	const bool segmentExternal = argc > 1 && std::strcmp(argv[1], "segment-external") == 0;
 	// "leases": an external async epoch that runs many times a frame, its executions held, as a host's stream holds them, and
 	// executed only at the frame's end, before SealSubmitted. Each run takes a run lease of its own instead of waiting for a run of
 	// the same frame, and the leases retire once their runs complete. Also checks the frame arena's regions (LatchBlock).
@@ -1076,6 +1083,224 @@ static int Run(int argc, char** argv) {
 				else REQUIRE(splits == 0 && segments == 8, "an upload on the write's queue needs no segment of its own, and no split");
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				host.SetAsyncEpochs({});
+				host.DestroyGraph();
+			}
+			runtime.reset();
+		} else if (segmentExternal) {
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
+				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+			{
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0},
+					.closedExecutions = false, .externalHomeStates = true, .reuseRecordings = true});
+				host.SetPrivateAliasEpochs({0});
+				auto program = CreateProgram(device.Get());
+				REQUIRE(program, "compute program");
+				// A texture the host owns, exclusive (as DXVK's images are), home on the graphics queue in RenderTarget: a layout the write's read
+				// is not in, as DXVK rests a render target. Each block takes it out of its home state and must give it back.
+				rhi::ResourceDesc textureDesc{};
+				textureDesc.type = rhi::ResourceType::Texture2D;
+				textureDesc.debugName = "test.host-texture";
+				textureDesc.texture.format = rhi::Format::R8G8B8A8_UNorm;
+				textureDesc.texture.width = textureDesc.texture.height = 16;
+				textureDesc.texture.initialLayout = rhi::ResourceLayout::Common;
+				textureDesc.resourceFlags = rhi::ResourceFlags::RF_AllowRenderTarget;
+				rhi::ResourcePtr texture;
+				REQUIRE(device->CreateCommittedResource(textureDesc, texture) == rhi::Result::Ok, "host texture");
+				const auto textureHandle = texture->GetHandle();
+				org::TextureDescription description{};
+				description.imageDimensions = {{16, 16}};
+				description.channels = 4;
+				description.format = rhi::Format::R8G8B8A8_UNorm;
+				description.hasSRV = true;
+				description.hasRTV = true;
+				description.initialLayout = rhi::ResourceLayout::RenderTarget;
+				auto hostTexture = org::ExternalTextureResource::CreateShared(std::move(texture), description, false);
+				REQUIRE(hostTexture, "host texture resource");
+				hostTexture->SetName("test.host-texture");
+				// The transient the write fills and the copy reads: placed in an alias pool, which SetPrivateAliasEpochs keeps the graph's own.
+				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
+				org::BufferBase::DescriptorRequirements requirements{};
+				requirements.createUAV = true;
+				requirements.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+				scratch->SetDescriptorRequirements(requirements);
+				scratch->SetName("test.scratch");
+				scratch->SetAllowAlias(true);
+				scratch->SetAliasingPool(0xB7);
+				auto output = ImportHostBuffer(device.Get(), first, "test.host-output.first");
+				REQUIRE(output, "import host buffer");
+				auto input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+				org::BufferBase::DescriptorRequirements inputViews{};
+				inputViews.createSRV = true;
+				inputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+				input->SetDescriptorRequirements(inputViews);
+				input->SetName("test.input");
+				uint32_t value = 0;
+				const auto upload = [&](org::RenderGraph&) {
+					auto staged = org::runtime::StagedUploadBatch::Create(256);
+					staged->Stage(org::runtime::UploadTarget::FromShared(input), 0, &value, sizeof(value));
+					org::runtime::GetActiveUploadService()->SubmitStagedUploads(std::move(staged));
+				};
+				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+				host.AddExtension("test.host", [&] {
+					return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, nullptr, true, false, false, hostTexture);
+				});
+				host.SetExternalEpochs({0});
+				host.SetAsyncEpochs({0}, {0});
+				// A description's recording, made on the host's thread (a_generation: of a staged build).
+				const auto record = [&](bool a_skipWrite, uint64_t a_generation = 0) -> std::shared_ptr<const org::GraphHost::EpochRecording> {
+					auto data = std::make_shared<TestRevision>();
+					data->skipWrite = a_skipWrite;
+					std::atomic<int> state{0};
+					std::shared_ptr<const org::GraphHost::EpochRecording> result;
+					if (!host.RequestEpochRecording(0, data, [&](std::shared_ptr<const org::GraphHost::EpochRecording> a_recording, std::exception_ptr a_error) {
+							result = std::move(a_recording);
+							state.store(a_error ? 2 : 1, std::memory_order_release);
+						}, org::RunRef::kNoCopy, a_generation))
+						return nullptr;
+					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+					while (state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < deadline)
+						std::this_thread::yield();
+					return state.load(std::memory_order_acquire) == 1 ? result : nullptr;
+				};
+				SegmentExecutor executor{device.Get()};
+				// The host's own use of the texture between two blocks: a barrier that expects it in its home state (RenderTarget), out and back.
+				// Under the validation layer a texture left in another layout is an error.
+				rhi::CommandAllocatorPtr hostAllocator;
+				rhi::CommandListPtr hostList;
+				REQUIRE(device->CreateCommandAllocator(rhi::QueueKind::Graphics, hostAllocator) == rhi::Result::Ok &&
+					device->CreateCommandList(rhi::QueueKind::Graphics, hostAllocator.Get(), hostList) == rhi::Result::Ok, "the host's list");
+				hostList->End();
+				const auto hostUse = [&](bool a_first = false) -> bool {
+					hostAllocator->Recycle();
+					hostList->Recycle(hostAllocator.Get());
+					if (a_first) {
+						// The image is made in UNDEFINED: the host puts it in its home state once, as DXVK initializes its images.
+						rhi::TextureBarrier initial{};
+						initial.texture = textureHandle;
+						initial.afterSync = rhi::ResourceSyncState::All;
+						initial.beforeLayout = rhi::ResourceLayout::Undefined;
+						initial.afterLayout = rhi::ResourceLayout::RenderTarget;
+						initial.discard = true;
+						hostList->Barriers({.textures = {&initial, 1}});
+					}
+					rhi::TextureBarrier barriers[2]{};
+					barriers[0].texture = textureHandle;
+					barriers[0].range = {};
+					barriers[0].beforeSync = rhi::ResourceSyncState::All;
+					barriers[0].afterSync = rhi::ResourceSyncState::Copy;
+					barriers[0].beforeAccess = rhi::ResourceAccessType::None;
+					barriers[0].afterAccess = rhi::ResourceAccessType::CopyDest;
+					barriers[0].beforeLayout = rhi::ResourceLayout::RenderTarget;
+					barriers[0].afterLayout = rhi::ResourceLayout::CopyDest;
+					barriers[1] = barriers[0];
+					barriers[1].beforeSync = rhi::ResourceSyncState::Copy;
+					barriers[1].afterSync = rhi::ResourceSyncState::All;
+					barriers[1].beforeAccess = rhi::ResourceAccessType::CopyDest;
+					barriers[1].afterAccess = rhi::ResourceAccessType::None;
+					barriers[1].beforeLayout = rhi::ResourceLayout::CopyDest;
+					barriers[1].afterLayout = rhi::ResourceLayout::RenderTarget;
+					hostList->Barriers({.textures = {&barriers[0], 1}});
+					hostList->Barriers({.textures = {&barriers[1], 1}});
+					if (hostList->EndChecked() != rhi::Result::Ok) return false;
+					auto list = hostList.Get();
+					return device->GetQueue(rhi::QueueKind::Graphics).Submit({&list, 1}, {}) == rhi::Result::Ok;
+				};
+				REQUIRE(hostUse(true) && device->WaitIdle() == rhi::Result::Ok, "the texture in its home state before the first block");
+				auto staged = org::LatchBlock::Create("stage values", 16);
+				auto full = record(false);
+				REQUIRE(full && full->copies.size() == 3, "a description's recording, one copy per frame in flight");
+				size_t segments = 0, splits = 0;
+				// One frame: the slot's values staged, the pinned copy taken, the staged values copied into its run, the execution executed
+				// on another thread, then the host's own use of the texture.
+				const auto frame = [&](uint32_t a_frame, const std::shared_ptr<const org::GraphHost::EpochRecording>& a_recording, uint32_t a_value, bool a_writes) -> int {
+					const uint32_t slot = a_frame % 3;
+					const auto staging = host.EpochStagingRun(0, slot);
+					org::LatchBlock::ZeroStableRun(staging.lease);
+					host.UseRun(staging);
+					staged->WriteValue(host.CurrentRun(), 0, 0x5000u + a_frame);
+					host.EndHeldRun();
+					const uint32_t kept = first.mapped[0];
+					value = a_value;
+					host.SetEpochCopy(0, slot);
+					org::RunRef seen{};
+					uint32_t copied = 0;
+					host.SubmitEpoch(0, [&](org::RenderGraph& graph) {
+						upload(graph);
+						seen = host.CurrentRun();
+						org::LatchBlock::CopyStableRun(staging.lease, seen.lease);
+						std::memcpy(&copied, staged->Bytes(seen).data(), sizeof(copied));
+					}, {}, a_recording);
+					REQUIRE(seen == host.EpochCopyRun(0, slot), "the run is its frame slot's copy");
+					REQUIRE(copied == 0x5000u + a_frame, "the copy's run reads what the slot staged");
+					auto execution = host.TakeExternalExecution();
+					REQUIRE(execution && !execution->segments.empty(), "an external execution of the revision-driven epoch");
+					REQUIRE(!host.TakeExternalExecution(), "taken once");
+					segments += execution->segments.size();
+					for (const auto& segment : execution->segments) splits += segment.split ? 1 : 0;
+					const auto copies = g_copyRecords.load(std::memory_order_relaxed);
+					bool executed = false;
+					std::thread worker([&] { executed = executor.Execute(*execution); });
+					worker.join();
+					REQUIRE(executed, "the execution, on the host's worker thread");
+					REQUIRE(g_copyRecords.load(std::memory_order_relaxed) == copies + 1, "the copy pass recorded at execution, once a run");
+					REQUIRE(hostUse(), "the host's use of the texture in its home state");
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok, "the frame completes");
+					REQUIRE(a_writes ? Matches(first, a_value) : first.mapped[0] == kept, a_writes ? "the block writes and copies" : "a write the description turns off writes nothing");
+					return 0;
+				};
+				(void)host.TakeAsyncStats();
+				uint32_t frameIndex = 0;
+				for (; frameIndex < 9; ++frameIndex)
+					if (const int failed = frame(frameIndex, full, 80000u + 10u * frameIndex, true)) return failed;
+				// A description that turns the write off: the copy still runs and copies what the scratch holds, which is not this frame's.
+				// The transient's bytes are the pool's, so only the write's absence is checked: the output is not this frame's value.
+				{
+					auto skipped = record(true);
+					REQUIRE(skipped, "the skipped write's recording");
+					value = 0;
+					const uint32_t slot = frameIndex % 3;
+					host.SetEpochCopy(0, slot);
+					host.SubmitEpoch(0, upload, {}, skipped);
+					auto execution = host.TakeExternalExecution();
+					bool executed = false;
+					std::thread worker([&] { executed = execution && executor.Execute(*execution); });
+					worker.join();
+					REQUIRE(executed && hostUse() && device->WaitIdle() == rhi::Result::Ok, "the skipped write's block");
+					REQUIRE(!Matches(first, 0), "a write the description turns off writes nothing");
+					++frameIndex;
+				}
+				// A staged build: recorded for while the attached build's recordings still submit, then switched in with its recordings.
+				{
+					auto next = host.BuildEpochGraph(0, "test: a staged build of an external epoch");
+					REQUIRE(next && next->Built(), "the staged build");
+					const auto staging = host.StageEpochGraph(next);
+					REQUIRE(staging.staged && host.StagedGeneration(0) == staging.generation, "the build is staged");
+					auto stagedRecording = record(false, staging.generation);
+					REQUIRE(stagedRecording && !host.EpochRecordingCurrent(*stagedRecording), "a recording made on the staged build");
+					if (const int failed = frame(frameIndex, full, 81000u + frameIndex, true)) return failed;
+					++frameIndex;
+					REQUIRE(host.AttachStagedEpochGraph(0).attached && host.EpochRecordingCurrent(*stagedRecording), "the staged build switched in");
+					for (uint32_t i = 0; i < 6; ++i, ++frameIndex)
+						if (const int failed = frame(frameIndex, stagedRecording, 82000u + 10u * frameIndex, true)) return failed;
+				}
+				const auto stats = host.TakeAsyncStats();
+				// The epoch's transients are in pools of its own, not in the host's shared arena.
+				size_t owners = 0;
+				if (const auto pools = host.AliasArena()) {
+					std::lock_guard lock(pools->mutex);
+					for (const auto& [id, pool] : pools->pools) owners += pool.required.size();
+				}
+				std::printf("segment-external: %llu revision submissions, %llu prepared again, %llu copy waits, %llu copies busy; %zu segments, %zu split; "
+					"%zu graphs placed in the shared arena\n",
+					static_cast<unsigned long long>(stats.revisionSubmissions), static_cast<unsigned long long>(stats.stale),
+					static_cast<unsigned long long>(stats.copyWaits), static_cast<unsigned long long>(stats.copiesBusy), segments, splits, owners);
+				REQUIRE(stats.stale == 0 && stats.copiesBusy == 0, "every submission bound its description's recording; no copy was busy");
+				REQUIRE(owners == 0, "the epoch's transients stay in its own pools");
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.SetAsyncEpochs({});
+				host.SetExternalEpochs({});
 				host.DestroyGraph();
 			}
 			runtime.reset();
