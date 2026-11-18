@@ -1379,6 +1379,8 @@ inline size_t PreparedRhiExecutionBatch::RecordDeferredCommands(rhi::CommandList
 inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) const {
     if (!m_deferred) throw std::logic_error("Not a deferred packet");
     if (m_inline) throw std::logic_error("An inline late batch is recorded by its own submission");
+    // Recorded again, the batch runs on a copy whose last run is done, so what that recording retained goes, as RecordInline does.
+    if (m_deferredRecorded.load(std::memory_order_relaxed) && m_deferred->retention) m_deferred->retention->Release();
     RecordDeferredCommands(a_list);
     if (!m_replayable && !CommitEffectsSubmitted(m_deferredSignal)) throw std::logic_error("A deferred packet's passes could not be committed as submitted");
 }

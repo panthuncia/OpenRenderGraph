@@ -456,8 +456,8 @@ struct FramePreparationContext {
 
 // Ownership of the objects one recording's commands name: the pipelines it bound, and the command signatures and
 // work graphs it used. It is kept until the recording's GPU work retires, including every resubmission of a kept
-// recording. A late batch that is recorded again appends to the same retention, unless its list's last submission is
-// done: an inline late batch releases it before it records again (see Release).
+// recording. A late batch recorded again releases it first, inline or in a host's stream, since it runs on a copy whose
+// last submission is done (see Release).
 class RecordingRetention {
 public:
     void Retain(std::shared_ptr<const void> owner) {
