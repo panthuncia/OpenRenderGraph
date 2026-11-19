@@ -686,7 +686,8 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         const auto& step = graph.states.steps[index];
         if (step.previousBatch == UINT32_MAX) continue;  // an entry step, committed above
         const auto& captured = ordered[step.resource];
-        if (!captured.resource.valid()) continue;
+        // Externally immutable: it is never seeded, so never committed (as its entry steps are not).
+        if (!captured.resource.valid() || captured.exempt) continue;
         auto& output = result.batches[step.batch];
         output.committedResources.push_back(captured.resource);
         output.committedIndices.push_back(step.resource);
@@ -701,7 +702,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         for (uint32_t index = 0; index < graph.states.steps.size(); ++index) {
             const auto& step = graph.states.steps[index];
             const auto& captured = ordered[step.resource];
-            if (captured.deviceHandles.empty() || !captured.resource.valid()) continue;
+            if (captured.deviceHandles.empty() || !captured.resource.valid() || captured.exempt) continue;
             auto& cells = lastSteps[step.resource];
             if (cells.empty()) cells.assign(size_t{captured.shape.mips} * captured.shape.slices, UINT32_MAX);
             Visit(captured.shape, step.range, [&](uint32_t mip, uint32_t slice) { cells[CellIndex(captured.shape, mip, slice)] = index; });
