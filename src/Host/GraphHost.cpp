@@ -1432,11 +1432,13 @@ GraphHost::AttachResult GraphHost::AttachStagedEpochGraph(uint32_t epoch) {
 	auto& instance = m_instances[index];
 	if (!instance.staged) return Refuse(AttachRefusal::NotStaged, epoch, "no graph is staged");
 	auto& built = instance.staged;
-	if (built->m_hostConfiguration != m_hostConfiguration.load(std::memory_order_acquire)
-		|| built->m_epochConfiguration != instance.configuration->load(std::memory_order_acquire)) {
+	const bool hostChanged = built->m_hostConfiguration != m_hostConfiguration.load(std::memory_order_acquire);
+	if (hostChanged || built->m_epochConfiguration != instance.configuration->load(std::memory_order_acquire)) {
 		if (m_async && !m_async->holding) HoldAsync({}, [&] { RetireStaged(index); });
 		else RetireStaged(index);
 		MarkRebuild(instance, "its staged graph was dropped (the host's configuration changed)");
+		if (!hostChanged)
+			return Refuse(AttachRefusal::EpochConfiguration, epoch, "the epoch's extensions or external state changed since its build started");
 		return Refuse(AttachRefusal::HostConfiguration, epoch, "the host's configuration changed since its build started");
 	}
 	const auto epochName = instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch);
