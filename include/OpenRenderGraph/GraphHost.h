@@ -288,9 +288,29 @@ public:
 	 * (or a pool with workers to spare), never from the last free worker of a small pool.
 	 */
 	std::unique_ptr<EpochGraph> BuildEpochGraph(uint32_t epoch, std::string_view reason = {});
+	// Why a build was refused at its attach or staging. Counted per reason (AttachStats).
+	enum class AttachRefusal : uint8_t {
+		None,
+		NoGraph,             // no graph was given
+		UnknownEpoch,        // the epoch is not one of the host's
+		Duplicate,           // a set names the epoch twice
+		NotStaged,           // no graph is staged for the epoch
+		BuildFailed,         // the build failed
+		HostConfiguration,   // the host's configuration changed since the build started
+		EpochConfiguration,  // the epoch's extensions or external state changed since the build started
+		NewerAttached,       // the epoch runs a graph whose build started later
+		NewerStaged,         // a graph whose build started later is staged
+		BeingSubmitted,      // a ticket of the epoch is held, or the call is inside a submission
+		SharedSetupFailed,   // the graph's shared setup failed
+		Count
+	};
+	/** @brief A short fixed name for the reason, for counters and logs. */
+	static const char* AttachRefusalName(AttachRefusal refusal) noexcept;
 	struct AttachResult {
 		bool attached = false;
 		std::string reason;  // why it was rejected
+		AttachRefusal refusal = AttachRefusal::None;
+		uint32_t epoch = UINT32_MAX;  // the epoch refused (a set names its first refused epoch)
 	};
 	/**
 	 * @brief Owner thread, where the epoch is not being submitted: attaches a graph BuildEpochGraph made. On success `graph` is
@@ -328,6 +348,7 @@ public:
 		bool attached = false;    // no staging was needed: it was attached (no async epochs, or the epoch had no graph)
 		uint64_t generation = 0;  // the build generation it runs at once attached
 		std::string reason;       // why it was rejected (neither staged nor attached)
+		AttachRefusal refusal = AttachRefusal::None;
 	};
 	StageResult StageEpochGraph(std::unique_ptr<EpochGraph>& graph);
 	/**
@@ -340,6 +361,40 @@ public:
 	uint64_t StagedGeneration(uint32_t epoch) const noexcept;
 	/** @brief Owner thread: drops the epoch's staged graph (retired). The attached graph stays frozen until a graph replaces it. */
 	void DropStagedEpochGraph(uint32_t epoch);
+	/**
+	 * @brief Owner thread, at a frame boundary: swaps the staged graphs of several epochs in as one step (frame revisions, rule R3).
+	 *
+	 * Every epoch is checked before anything changes:
+	 * - it is one of the host's, and named once;
+	 * - a graph is staged for it;
+	 * - the host's and the epoch's configuration are unchanged since the staged build started;
+	 * - it runs no graph whose build started later;
+	 * - no ticket of it is held (HoldEpochTicket), and the call is not inside a submission.
+	 *
+	 * If any check fails, nothing is attached and the result names the first refused epoch and why. Unlike
+	 * AttachStagedEpochGraph, a refusal drops no staged graph: the caller decides what to do. Otherwise the host's thread is held
+	 * once and every staged graph is swapped in with its recordings, as AttachStagedEpochGraph does for one. An empty set attaches
+	 * nothing and succeeds.
+	 */
+	AttachResult AttachStagedEpochGraphs(std::span<const uint32_t> epochs);
+	/**
+	 * @brief Any thread: the epochs whose attached or staged graph declares any of `slots` (a closure's members). In the host's epoch
+	 * order, each once.
+	 *
+	 * A graph's declared versioned resources are set by its first build and kept current by its preparations
+	 * (RenderGraph::PersistentDeclaredVersions). A graph built on the owner thread declares nothing until its first preparation.
+	 * Resources match by IVersionedResource::Key, so a clone matches its original. Null entries are skipped.
+	 */
+	std::vector<uint32_t> EpochsDeclaring(std::span<const IVersionedResource* const> slots) const;
+	/** @brief Totals since the host was made: builds attached or staged, staged sets attached, and refusals by reason. */
+	struct AttachStats {
+		uint64_t attached = 0;    // AttachEpochGraph and AttachStagedEpochGraph(s), per epoch
+		uint64_t staged = 0;      // StageEpochGraph
+		uint64_t setsAttached = 0;  // AttachStagedEpochGraphs calls that attached
+		std::array<uint64_t, static_cast<size_t>(AttachRefusal::Count)> refusals{};
+	};
+	/** @brief Any thread. */
+	AttachStats AttachStatsTotal() const noexcept;
 	/**
 	 * @brief Owner thread: the epochs whose graph has alias placements in a pool generation another graph replaced (the pool
 	 * grew). With Desc::reportStaleAliasPlacements the application rebuilds them (BuildEpochGraph). Otherwise the next build point
@@ -1021,6 +1076,21 @@ private:
 	};
 	// Owner thread, the host's thread holding or stopped: retires the instance's staged graph and clears the host thread's view of it.
 	void RetireStaged(size_t index);
+	// Owner thread, the instance not in the host's thread's hands: swaps its staged graph in, with the recordings made on it.
+	bool SwapStagedIn(size_t index);
+	// Owner thread: publishes what the instance's attached and staged graphs declare, for EpochsDeclaring.
+	void PublishDeclared(size_t index);
+	// Counts a refusal and returns it as an AttachResult.
+	AttachResult Refuse(AttachRefusal refusal, uint32_t epoch, std::string reason) noexcept;
+	// EpochsDeclaring's view, per instance (index as m_instances). Written on the owner thread under the mutex.
+	struct DeclaredGraphs {
+		std::shared_ptr<const RenderGraph::DeclaredVersions> attached, staged;
+	};
+	mutable std::mutex m_declaredMutex;
+	std::vector<DeclaredGraphs> m_declared;
+	// AttachStatsTotal's counters.
+	std::atomic<uint64_t> m_attachCount{0}, m_stageCount{0}, m_setAttachCount{0};
+	std::array<std::atomic<uint64_t>, static_cast<size_t>(AttachRefusal::Count)> m_refusalCounts{};
 	// A graph an epoch's rebuild replaced, released once the work it submitted is done.
 	struct RetiredGraph {
 		std::unique_ptr<RenderGraph> graph;

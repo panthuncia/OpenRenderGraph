@@ -29,6 +29,7 @@
 #include "Render/Runtime/RuntimeDevice.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
 #include "Render/Runtime/ThreadPoolTaskService.h"
+#include "Resources/VersionedResource.h"
 #include "HostUploadExtension.h"
 #include "Resources/PixelBuffer.h"
 #include "../Render/RenderGraph/AliasPacking.h"
@@ -512,6 +513,7 @@ GraphHost::GraphHost(Desc desc)
 			throw std::invalid_argument("GraphHost: an epoch order names an epoch twice");
 		m_instances.emplace_back().epoch = epoch;
 	}
+	m_declared.resize(m_instances.size());
 	// Made with the host, so the queue's pointer never changes while another thread drains it.
 	if (m_desc.submissionThread) {
 		if (m_desc.mergeTicketSubmissions && m_desc.coalesceSubmissions) m_submitCarry = RenderGraph::MakeSubmitCarry();
@@ -986,6 +988,7 @@ void GraphHost::DestroyGraph() {
 		instance.graph.reset();
 		instance.rebuildRequested = true;
 	}
+	for (size_t index = 0; index < m_instances.size(); ++index) PublishDeclared(index);
 	ReleaseRetiredGraphs(true);
 }
 
@@ -1176,6 +1179,7 @@ void GraphHost::InstallGraph(size_t index, std::unique_ptr<RenderGraph> graph, u
 	instance.buildGeneration = generation ? generation : (std::max)(instance.buildGeneration, instance.lastGeneration) + 1;
 	instance.lastGeneration = (std::max)(instance.lastGeneration, instance.buildGeneration);
 	++m_buildGeneration;
+	PublishDeclared(index);
 }
 
 bool GraphHost::BuildInstance(size_t index) {
@@ -1262,17 +1266,18 @@ std::unique_ptr<GraphHost::EpochGraph> GraphHost::BuildEpochGraph(uint32_t epoch
 
 GraphHost::AttachResult GraphHost::AttachEpochGraph(std::unique_ptr<EpochGraph>& built) {
 	BT_ZONE_SCOPE("ORG.Host.AttachEpochGraph");
-	if (!built) return {false, "no graph"};
+	if (!built) return Refuse(AttachRefusal::NoGraph, UINT32_MAX, "no graph");
 	if (built->m_index >= m_instances.size() || m_instances[built->m_index].epoch != built->m_epoch)
-		return {false, "the graph is not one of this host's epochs"};
-	if (!built->m_graph) return {false, "its build failed: " + built->m_error};
+		return Refuse(AttachRefusal::UnknownEpoch, built->m_epoch, "the graph is not one of this host's epochs");
+	if (!built->m_graph) return Refuse(AttachRefusal::BuildFailed, built->m_epoch, "its build failed: " + built->m_error);
 	const auto index = built->m_index;
 	auto& instance = m_instances[index];
 	if (built->m_hostConfiguration != m_hostConfiguration.load(std::memory_order_acquire))
-		return {false, "the host's configuration changed since its build started"};
+		return Refuse(AttachRefusal::HostConfiguration, instance.epoch, "the host's configuration changed since its build started");
 	if (built->m_epochConfiguration != instance.configuration->load(std::memory_order_acquire))
-		return {false, "the epoch's extensions or external state changed since its build started"};
-	if (built->m_serial < instance.attachedSerial) return {false, "the epoch runs a graph whose build started later"};
+		return Refuse(AttachRefusal::EpochConfiguration, instance.epoch, "the epoch's extensions or external state changed since its build started");
+	if (built->m_serial < instance.attachedSerial)
+		return Refuse(AttachRefusal::NewerAttached, instance.epoch, "the epoch runs a graph whose build started later");
 	const auto epochName = instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch);
 	const auto begin = std::chrono::steady_clock::now();
 	const bool replacing = static_cast<bool>(instance.graph);
@@ -1304,7 +1309,8 @@ GraphHost::AttachResult GraphHost::AttachEpochGraph(std::unique_ptr<EpochGraph>&
 	};
 	if (m_async && !m_async->holding) ReplaceAsyncInstances({&index, 1}, replace);
 	else (void)replace(index);
-	if (!failure.empty()) return {false, std::move(failure)};
+	if (!failure.empty()) return Refuse(AttachRefusal::SharedSetupFailed, instance.epoch, std::move(failure));
+	m_attachCount.fetch_add(1, std::memory_order_relaxed);
 	spdlog::info("GraphHost: epoch {}'s graph {} (build {}): built in {:.2f} ms off the host, attached in {:.3f} ms; why: {}", epochName,
 		replacing ? "replaced" : "attached", instance.buildGeneration, built->m_buildMs,
 		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), built->m_reason);
@@ -1338,19 +1344,21 @@ void GraphHost::RetireStaged(size_t index) {
 	}
 	instance.staged.reset();
 	instance.stagedGeneration = 0;
+	PublishDeclared(index);
 }
 
 GraphHost::StageResult GraphHost::StageEpochGraph(std::unique_ptr<EpochGraph>& built) {
 	BT_ZONE_SCOPE("ORG.Host.StageEpochGraph");
 	StageResult result;
-	if (!built) {
-		result.reason = "no graph";
+	const auto refuse = [&](AttachRefusal refusal, std::string reason) {
+		auto refused = Refuse(refusal, built ? built->m_epoch : UINT32_MAX, std::move(reason));
+		result.reason = std::move(refused.reason);
+		result.refusal = refusal;
 		return result;
-	}
-	if (built->m_index >= m_instances.size() || m_instances[built->m_index].epoch != built->m_epoch) {
-		result.reason = "the graph is not one of this host's epochs";
-		return result;
-	}
+	};
+	if (!built) return refuse(AttachRefusal::NoGraph, "no graph");
+	if (built->m_index >= m_instances.size() || m_instances[built->m_index].epoch != built->m_epoch)
+		return refuse(AttachRefusal::UnknownEpoch, "the graph is not one of this host's epochs");
 	const auto index = built->m_index;
 	auto& instance = m_instances[index];
 	// Nothing runs that a staging would keep: attached at once.
@@ -1358,29 +1366,18 @@ GraphHost::StageResult GraphHost::StageEpochGraph(std::unique_ptr<EpochGraph>& b
 		const auto attached = AttachEpochGraph(built);
 		result.attached = attached.attached;
 		result.reason = attached.reason;
+		result.refusal = attached.refusal;
 		result.generation = instance.buildGeneration;
 		return result;
 	}
-	if (!built->m_graph) {
-		result.reason = "its build failed: " + built->m_error;
-		return result;
-	}
-	if (built->m_hostConfiguration != m_hostConfiguration.load(std::memory_order_acquire)) {
-		result.reason = "the host's configuration changed since its build started";
-		return result;
-	}
-	if (built->m_epochConfiguration != instance.configuration->load(std::memory_order_acquire)) {
-		result.reason = "the epoch's extensions or external state changed since its build started";
-		return result;
-	}
-	if (built->m_serial < instance.attachedSerial) {
-		result.reason = "the epoch runs a graph whose build started later";
-		return result;
-	}
-	if (instance.staged && built->m_serial < instance.staged->m_serial) {
-		result.reason = "a graph whose build started later is staged";
-		return result;
-	}
+	if (!built->m_graph) return refuse(AttachRefusal::BuildFailed, "its build failed: " + built->m_error);
+	if (built->m_hostConfiguration != m_hostConfiguration.load(std::memory_order_acquire))
+		return refuse(AttachRefusal::HostConfiguration, "the host's configuration changed since its build started");
+	if (built->m_epochConfiguration != instance.configuration->load(std::memory_order_acquire))
+		return refuse(AttachRefusal::EpochConfiguration, "the epoch's extensions or external state changed since its build started");
+	if (built->m_serial < instance.attachedSerial) return refuse(AttachRefusal::NewerAttached, "the epoch runs a graph whose build started later");
+	if (instance.staged && built->m_serial < instance.staged->m_serial)
+		return refuse(AttachRefusal::NewerStaged, "a graph whose build started later is staged");
 	const auto epochName = instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch);
 	const auto begin = std::chrono::steady_clock::now();
 	const auto generation = (std::max)(instance.buildGeneration, instance.lastGeneration) + 1;
@@ -1417,11 +1414,10 @@ GraphHost::StageResult GraphHost::StageEpochGraph(std::unique_ptr<EpochGraph>& b
 			instance.rebuildRequested = false;
 			instance.rebuildReasons.clear();
 		}
+		PublishDeclared(index);
 	});
-	if (!failure.empty()) {
-		result.reason = std::move(failure);
-		return result;
-	}
+	if (!failure.empty()) return refuse(AttachRefusal::SharedSetupFailed, std::move(failure));
+	m_stageCount.fetch_add(1, std::memory_order_relaxed);
 	result.staged = true;
 	result.generation = generation;
 	spdlog::info("GraphHost: epoch {}'s graph staged (build {}): built in {:.2f} ms off the host, staged in {:.3f} ms; why: {}", epochName, generation,
@@ -1432,46 +1428,173 @@ GraphHost::StageResult GraphHost::StageEpochGraph(std::unique_ptr<EpochGraph>& b
 GraphHost::AttachResult GraphHost::AttachStagedEpochGraph(uint32_t epoch) {
 	BT_ZONE_SCOPE("ORG.Host.AttachStagedEpochGraph");
 	const auto index = InstanceOf(epoch);
-	if (index == kNoInstance) return {false, "the epoch is not one of the host's"};
+	if (index == kNoInstance) return Refuse(AttachRefusal::UnknownEpoch, epoch, "the epoch is not one of the host's");
 	auto& instance = m_instances[index];
-	if (!instance.staged) return {false, "no graph is staged"};
+	if (!instance.staged) return Refuse(AttachRefusal::NotStaged, epoch, "no graph is staged");
 	auto& built = instance.staged;
 	if (built->m_hostConfiguration != m_hostConfiguration.load(std::memory_order_acquire)
 		|| built->m_epochConfiguration != instance.configuration->load(std::memory_order_acquire)) {
 		if (m_async && !m_async->holding) HoldAsync({}, [&] { RetireStaged(index); });
 		else RetireStaged(index);
 		MarkRebuild(instance, "its staged graph was dropped (the host's configuration changed)");
-		return {false, "the host's configuration changed since its build started"};
+		return Refuse(AttachRefusal::HostConfiguration, epoch, "the host's configuration changed since its build started");
 	}
 	const auto epochName = instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch);
 	const auto begin = std::chrono::steady_clock::now();
 	const auto generation = instance.stagedGeneration;
-	const auto replace = [&](size_t) {
-		if (built->m_uploads) built->m_uploads->ApplyResolveContext();
-		built->m_uploads = nullptr;
-		std::vector<std::weak_ptr<const EpochRecording>> recordings;
-		if (m_async)
-			for (uint32_t i = 0; i < m_async->epochs.size(); ++i) {
-				if (m_async->instanceOf[i] != index) continue;
-				recordings = std::move(m_async->stagedRecordings[i]);
-				m_async->stagedRecordings[i].clear();
-				m_async->stagedGraph[i] = nullptr;
-				m_async->stagedGeneration[i] = 0;
-			}
-		InstallGraph(index, std::move(built->m_graph), built->m_serial, generation);
-		// The recordings made on it are its tickets' candidates from now on.
-		if (m_async)
-			for (uint32_t i = 0; i < m_async->epochs.size(); ++i)
-				if (m_async->instanceOf[i] == index) m_async->liveRecordings[i] = recordings;
-		instance.staged.reset();
-		instance.stagedGeneration = 0;
-		return true;
-	};
-	if (m_async && !m_async->holding) ReplaceAsyncInstances({&index, 1}, replace);
-	else (void)replace(index);
+	if (m_async && !m_async->holding) ReplaceAsyncInstances({&index, 1}, [&](size_t i) { return SwapStagedIn(i); });
+	else (void)SwapStagedIn(index);
+	m_attachCount.fetch_add(1, std::memory_order_relaxed);
 	spdlog::info("GraphHost: epoch {}'s staged graph attached (build {}) in {:.3f} ms", epochName, generation,
 		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
 	return {true, {}};
+}
+
+bool GraphHost::SwapStagedIn(size_t index) {
+	auto& instance = m_instances[index];
+	auto& built = instance.staged;
+	const auto generation = instance.stagedGeneration;
+	if (built->m_uploads) built->m_uploads->ApplyResolveContext();
+	built->m_uploads = nullptr;
+	std::vector<std::weak_ptr<const EpochRecording>> recordings;
+	if (m_async)
+		for (uint32_t i = 0; i < m_async->epochs.size(); ++i) {
+			if (m_async->instanceOf[i] != index) continue;
+			recordings = std::move(m_async->stagedRecordings[i]);
+			m_async->stagedRecordings[i].clear();
+			m_async->stagedGraph[i] = nullptr;
+			m_async->stagedGeneration[i] = 0;
+		}
+	InstallGraph(index, std::move(built->m_graph), built->m_serial, generation);
+	// The recordings made on it are its tickets' candidates from now on.
+	if (m_async)
+		for (uint32_t i = 0; i < m_async->epochs.size(); ++i)
+			if (m_async->instanceOf[i] == index) m_async->liveRecordings[i] = recordings;
+	instance.staged.reset();
+	instance.stagedGeneration = 0;
+	PublishDeclared(index);
+	return true;
+}
+
+GraphHost::AttachResult GraphHost::AttachStagedEpochGraphs(std::span<const uint32_t> epochs) {
+	BT_ZONE_SCOPE("ORG.Host.AttachStagedEpochGraphs");
+	// Every epoch is checked before anything changes. A refusal leaves every staged graph staged.
+	// The set itself first: every epoch the host's, each once.
+	std::vector<size_t> indices;
+	indices.reserve(epochs.size());
+	for (const auto epoch : epochs) {
+		const auto index = InstanceOf(epoch);
+		if (index == kNoInstance) return Refuse(AttachRefusal::UnknownEpoch, epoch, "the epoch is not one of the host's");
+		if (std::ranges::find(indices, index) != indices.end()) return Refuse(AttachRefusal::Duplicate, epoch, "the set names the epoch twice");
+		indices.push_back(index);
+	}
+	for (const auto index : indices) {
+		const auto epoch = m_instances[index].epoch;
+		const auto& instance = m_instances[index];
+		if (!instance.staged) return Refuse(AttachRefusal::NotStaged, epoch, "no graph is staged");
+		const auto& built = *instance.staged;
+		if (built.m_hostConfiguration != m_hostConfiguration.load(std::memory_order_acquire))
+			return Refuse(AttachRefusal::HostConfiguration, epoch, "the host's configuration changed since its build started");
+		if (built.m_epochConfiguration != instance.configuration->load(std::memory_order_acquire))
+			return Refuse(AttachRefusal::EpochConfiguration, epoch, "the epoch's extensions or external state changed since its build started");
+		if (built.m_serial < instance.attachedSerial)
+			return Refuse(AttachRefusal::NewerAttached, epoch, "the epoch runs a graph whose build started later");
+		if (m_async)
+			for (uint32_t i = 0; i < m_async->epochs.size(); ++i)
+				if (m_async->instanceOf[i] == index && m_async->held[i])
+					return Refuse(AttachRefusal::BeingSubmitted, epoch, "a ticket of the epoch is held");
+	}
+	// Inside a submission callback on this thread the host's thread cannot be held.
+	if (!m_desc.submissionThread && m_submittingTicket && !indices.empty())
+		return Refuse(AttachRefusal::BeingSubmitted, epochs.front(), "called inside a submission");
+	if (indices.empty()) return {true, {}};
+	const auto begin = std::chrono::steady_clock::now();
+	std::string names;
+	for (const auto index : indices) {
+		const auto& instance = m_instances[index];
+		names += (names.empty() ? "" : ", ")
+			+ (instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch)) + " (build "
+			+ std::to_string(instance.stagedGeneration) + ")";
+	}
+	if (m_async && !m_async->holding) ReplaceAsyncInstances(indices, [&](size_t i) { return SwapStagedIn(i); });
+	else
+		for (const auto index : indices) (void)SwapStagedIn(index);
+	m_attachCount.fetch_add(indices.size(), std::memory_order_relaxed);
+	m_setAttachCount.fetch_add(1, std::memory_order_relaxed);
+	spdlog::info("GraphHost: staged graphs of epochs {} attached together in {:.3f} ms", names,
+		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+	return {true, {}};
+}
+
+std::vector<uint32_t> GraphHost::EpochsDeclaring(std::span<const IVersionedResource* const> slots) const {
+	std::vector<const void*> keys;
+	keys.reserve(slots.size());
+	for (const auto* slot : slots)
+		if (slot) keys.push_back(slot->Key());
+	std::vector<uint32_t> epochs;
+	if (keys.empty()) return epochs;
+	std::vector<DeclaredGraphs> declared;
+	{
+		std::scoped_lock lock(m_declaredMutex);
+		declared = m_declared;
+	}
+	const auto declares = [&](const std::shared_ptr<const RenderGraph::DeclaredVersions>& graph) {
+		if (!graph) return false;
+		const auto set = graph->Keys();
+		if (!set) return false;
+		for (const auto* key : keys)
+			if (std::binary_search(set->begin(), set->end(), key)) return true;
+		return false;
+	};
+	for (size_t index = 0; index < declared.size() && index < m_instances.size(); ++index)
+		if (declares(declared[index].attached) || declares(declared[index].staged)) epochs.push_back(m_instances[index].epoch);
+	return epochs;
+}
+
+GraphHost::AttachStats GraphHost::AttachStatsTotal() const noexcept {
+	AttachStats stats;
+	stats.attached = m_attachCount.load(std::memory_order_relaxed);
+	stats.staged = m_stageCount.load(std::memory_order_relaxed);
+	stats.setsAttached = m_setAttachCount.load(std::memory_order_relaxed);
+	for (size_t i = 0; i < stats.refusals.size(); ++i) stats.refusals[i] = m_refusalCounts[i].load(std::memory_order_relaxed);
+	return stats;
+}
+
+const char* GraphHost::AttachRefusalName(AttachRefusal refusal) noexcept {
+	switch (refusal) {
+	case AttachRefusal::None: return "none";
+	case AttachRefusal::NoGraph: return "no graph";
+	case AttachRefusal::UnknownEpoch: return "unknown epoch";
+	case AttachRefusal::Duplicate: return "epoch named twice";
+	case AttachRefusal::NotStaged: return "not staged";
+	case AttachRefusal::BuildFailed: return "build failed";
+	case AttachRefusal::HostConfiguration: return "host configuration changed";
+	case AttachRefusal::EpochConfiguration: return "epoch configuration changed";
+	case AttachRefusal::NewerAttached: return "newer build attached";
+	case AttachRefusal::NewerStaged: return "newer build staged";
+	case AttachRefusal::BeingSubmitted: return "being submitted";
+	case AttachRefusal::SharedSetupFailed: return "shared setup failed";
+	case AttachRefusal::Count: break;
+	}
+	return "?";
+}
+
+GraphHost::AttachResult GraphHost::Refuse(AttachRefusal refusal, uint32_t epoch, std::string reason) noexcept {
+	m_refusalCounts[static_cast<size_t>(refusal)].fetch_add(1, std::memory_order_relaxed);
+	AttachResult result;
+	result.reason = std::move(reason);
+	result.refusal = refusal;
+	result.epoch = epoch;
+	return result;
+}
+
+void GraphHost::PublishDeclared(size_t index) {
+	const auto& instance = m_instances[index];
+	DeclaredGraphs graphs;
+	if (instance.graph) graphs.attached = instance.graph->PersistentDeclaredVersions();
+	if (instance.staged && instance.staged->m_graph) graphs.staged = instance.staged->m_graph->PersistentDeclaredVersions();
+	std::scoped_lock lock(m_declaredMutex);
+	if (index < m_declared.size()) m_declared[index] = std::move(graphs);
 }
 
 uint64_t GraphHost::StagedGeneration(uint32_t epoch) const noexcept {

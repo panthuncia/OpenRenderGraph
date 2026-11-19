@@ -45,6 +45,7 @@ uint32_t DirectEntry(State& state, persistent::GraphEditTransaction& edit, uint6
 	entry.member = std::move(owner);
 	entry.resourceID = resourceID;
 	entry.shape = shape;
+	if (versioned) state.declaredVersionsChanged = true;
 	entry.versioned = std::move(versioned);
 	entry.slot = slot;
 	indices.push_back(slot.index);
@@ -461,6 +462,7 @@ void persistent_impl::InstallMainPass(RenderGraph& graph, State& state, persiste
 			if (found->second.empty()) state.entriesByResourceID.erase(found);
 		}
 		NoteRetiredDirectResource(state, entry);
+		if (entry.versioned) state.declaredVersionsChanged = true;
 		entry = {};
 		entry.retired = true;
 		basic_telemetry::AddCounter("ORG.Persistent.RetiredDirectSlots");
@@ -722,7 +724,25 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint32_t frameIndex
 	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
 	PlaceDeferredPersistentAliases();
 	BindPersistentFrame(options.ticket != nullptr, bootstrap);
+	PublishDeclaredVersions();
 	state.prepared = PreparePersistentExecution(device, frameIndex, hostData, deltaTime, options);
+}
+
+bool RenderGraph::DeclaredVersions::Declares(const void* key) const noexcept {
+	const auto keys = Keys();
+	return keys && std::binary_search(keys->begin(), keys->end(), key);
+}
+
+void RenderGraph::PublishDeclaredVersions() {
+	auto& state = *m_compilerState->persistent;
+	if (!state.declaredVersionsChanged) return;
+	state.declaredVersionsChanged = false;
+	auto keys = std::make_shared<std::vector<const void*>>();
+	for (const auto& entry : state.entries)
+		if (entry.versioned && !entry.retired) keys->push_back(entry.versioned->Key());
+	std::ranges::sort(*keys);
+	keys->erase(std::unique(keys->begin(), keys->end()), keys->end());
+	m_declaredVersions->m_keys.store(std::move(keys), std::memory_order_release);
 }
 
 void RenderGraph::FreezeAliasedBindings() {
@@ -745,6 +765,8 @@ void RenderGraph::PrepareFirstPersistentBuild() {
 		throw;
 	}
 	m_deferFirstAliasPlacement = false;
+	// A staged graph is asked what it declares before it is ever prepared.
+	PublishDeclaredVersions();
 }
 
 void RenderGraph::PlaceDeferredPersistentAliases() {

@@ -462,6 +462,25 @@ private:
 	std::shared_ptr<std::atomic<uint64_t>> m_outputRevision;
 };
 
+// "built", staged sets: a write into a versioned buffer, in one epoch only. GraphHost::EpochsDeclaring finds that epoch for it.
+class VersionedWriteExtension final : public org::RenderGraph::IRenderGraphExtension {
+public:
+	VersionedWriteExtension(uint32_t epoch, std::shared_ptr<org::Buffer> input, std::shared_ptr<const org::VersionedBuffer> target,
+		std::shared_ptr<const ComputeProgram> program)
+		: m_epoch(epoch), m_input(std::move(input)), m_target(std::move(target)), m_program(std::move(program)) {}
+	void PrepareForBuild(org::RenderGraph& graph) override { graph.RegisterResource(org::ResourceIdentifier("test.versioned.input"), m_input); }
+	void GatherStructuralPasses(org::RenderGraph&, std::vector<org::RenderGraph::ExternalPassDesc>& out) override {
+		out.push_back(org::RenderGraph::ExternalPassDesc::Compute("test.versioned.write",
+			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, nullptr, m_program, m_target)))
+			.Epoch(m_epoch));
+	}
+private:
+	uint32_t m_epoch;
+	std::shared_ptr<org::Buffer> m_input;
+	std::shared_ptr<const org::VersionedBuffer> m_target;
+	std::shared_ptr<const ComputeProgram> m_program;
+};
+
 // Executes an external execution's segments, each in its own submission of a primary of its own (a submission per segment
 // meets every segment's split). The caller waits for the device before executing the next.
 struct SegmentExecutor {
@@ -826,6 +845,83 @@ static int Run(int argc, char** argv) {
 					static_cast<unsigned long long>(stats.submitted), static_cast<unsigned long long>(stats.waited),
 					static_cast<unsigned long long>(stats.stale), static_cast<unsigned long long>(stats.rebuilds));
 				REQUIRE(stats.rebuilds == 2, "two graphs replaced by attaches");
+
+				// 5. Staged sets (GraphHost::AttachStagedEpochGraphs) and the closure query (EpochsDeclaring).
+				{
+					const auto refusalsBefore = host.AttachStatsTotal();
+					const auto stageBoth = [&](const char* why) -> bool {
+						auto zero = host.BuildEpochGraph(0, why);
+						auto one = host.BuildEpochGraph(1, why);
+						return zero->Built() && one->Built() && host.StageEpochGraph(zero).staged && host.StageEpochGraph(one).staged;
+					};
+					// a. Two staged epochs attach together.
+					REQUIRE(stageBoth("test: a staged set"), "both epochs staged");
+					const auto staged0 = host.StagedGeneration(0), staged1 = host.StagedGeneration(1);
+					const uint32_t both[] = {0, 1};
+					const auto attached = host.AttachStagedEpochGraphs(both);
+					REQUIRE(attached.attached, "a staged set attaches");
+					REQUIRE(host.BuildGeneration(0) == staged0 && host.BuildGeneration(1) == staged1, "both epochs run their staged builds");
+					REQUIRE(host.StagedGeneration(0) == 0 && host.StagedGeneration(1) == 0, "nothing is left staged");
+					for (int i = 0; i < 2; ++i)
+						if (const int failed = run()) return failed;
+					// An empty set attaches nothing. A set that names an epoch twice, or one with nothing staged, is refused.
+					REQUIRE(host.AttachStagedEpochGraphs({}).attached, "an empty set");
+					const uint32_t twice[] = {0, 0};
+					REQUIRE(host.AttachStagedEpochGraphs(twice).refusal == org::GraphHost::AttachRefusal::Duplicate, "an epoch named twice");
+					REQUIRE(host.AttachStagedEpochGraphs(both).refusal == org::GraphHost::AttachRefusal::NotStaged, "nothing staged");
+
+					// b. A configuration change of one epoch refuses the whole set and drops neither staged graph.
+					REQUIRE(stageBoth("test: a set one change spoils"), "both epochs staged again");
+					const auto kept0 = host.StagedGeneration(0), kept1 = host.StagedGeneration(1);
+					const auto running0 = host.BuildGeneration(0), running1 = host.BuildGeneration(1);
+					auto target = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
+					org::BufferBase::DescriptorRequirements targetViews{};
+					targetViews.createUAV = true;
+					targetViews.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+						.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+					target->SetDescriptorRequirements(targetViews);
+					target->SetName("test.versioned.target");
+					target->Materialize();
+					auto versioned = org::VersionedBuffer::Create(target);
+					auto unrelated = org::VersionedBuffer::Create(org::Buffer::CreateShared(rhi::HeapType::DeviceLocal, kBytes));
+					auto versionedInput = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+					org::BufferBase::DescriptorRequirements versionedInputViews{};
+					versionedInputViews.createSRV = true;
+					versionedInputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+						.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+					versionedInput->SetDescriptorRequirements(versionedInputViews);
+					versionedInput->SetName("test.versioned.input");
+					host.AddExtension("test.versioned", [=] { return std::make_unique<VersionedWriteExtension>(1, versionedInput, versioned, program); }, {1});
+					const auto refused = host.AttachStagedEpochGraphs(both);
+					std::printf("built: a staged set refused: %s (epoch %u)\n", refused.reason.c_str(), refused.epoch);
+					REQUIRE(!refused.attached && refused.refusal == org::GraphHost::AttachRefusal::EpochConfiguration && refused.epoch == 1,
+						"a set with one epoch's configuration changed is refused, naming that epoch");
+					REQUIRE(host.StagedGeneration(0) == kept0 && host.StagedGeneration(1) == kept1, "a refused set keeps both staged");
+					REQUIRE(host.BuildGeneration(0) == running0 && host.BuildGeneration(1) == running1, "a refused set attaches nothing");
+
+					// c. EpochsDeclaring: epoch 1's new build declares the versioned buffer while it is staged, and after its attach.
+					const org::IVersionedResource* slots[] = {versioned.get()};
+					const org::IVersionedResource* other[] = {unrelated.get(), nullptr};
+					REQUIRE(host.EpochsDeclaring(slots).empty(), "no graph declares the buffer before a build holds the new pass");
+					auto rebuilt = host.BuildEpochGraph(1, "test: a build with the versioned write");
+					REQUIRE(rebuilt->Built() && host.StageEpochGraph(rebuilt).staged, "epoch 1 staged again with the new pass");
+					REQUIRE(host.EpochsDeclaring(slots) == std::vector<uint32_t>{1}, "a staged graph's declaration is found");
+					REQUIRE(host.EpochsDeclaring(other).empty(), "a buffer no graph declares is in no epoch");
+					REQUIRE(host.AttachStagedEpochGraphs(both).attached, "the set attaches once both builds are current");
+					REQUIRE(host.EpochsDeclaring(slots) == std::vector<uint32_t>{1}, "an attached graph's declaration is found");
+					for (int i = 0; i < 3; ++i)
+						if (const int failed = run()) return failed;
+					REQUIRE(host.EpochsDeclaring(slots) == std::vector<uint32_t>{1}, "the declaration stays after preparations");
+					const auto totals = host.AttachStatsTotal();
+					const auto refusals = [&](org::GraphHost::AttachRefusal reason) {
+						const auto index = static_cast<size_t>(reason);
+						return totals.refusals[index] - refusalsBefore.refusals[index];
+					};
+					REQUIRE(totals.setsAttached - refusalsBefore.setsAttached == 2, "two sets attached");
+					REQUIRE(refusals(org::GraphHost::AttachRefusal::EpochConfiguration) == 1 && refusals(org::GraphHost::AttachRefusal::Duplicate) == 1
+							&& refusals(org::GraphHost::AttachRefusal::NotStaged) == 1,
+						"refusals are counted by reason");
+				}
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				host.SetAsyncEpochs({});
 				host.DestroyGraph();

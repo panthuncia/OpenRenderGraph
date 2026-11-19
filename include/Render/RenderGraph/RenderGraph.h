@@ -311,6 +311,18 @@ private:
 	// may move those transients, and this graph's kept recordings still bind the old backings. Its new preparations would read the
 	// moved resources' descriptors, so it records nothing new after this. Any thread that does not prepare the graph meanwhile.
 	void FreezeAliasedBindings();
+	// The versioned resources the graph's passes declare, by IVersionedResource::Key, sorted. The graph's first build sets them
+	// and each preparation keeps them current. Any thread may read them. Keys only: nothing is kept alive.
+	class DeclaredVersions {
+	public:
+		std::shared_ptr<const std::vector<const void*>> Keys() const noexcept { return m_keys.load(std::memory_order_acquire); }
+		bool Declares(const void* key) const noexcept;
+	private:
+		friend class RenderGraph;
+		std::atomic<std::shared_ptr<const std::vector<const void*>>> m_keys;
+	};
+	// Any thread. The same object for the graph's life.
+	std::shared_ptr<const DeclaredVersions> PersistentDeclaredVersions() const noexcept { return m_declaredVersions; }
 	// Owner thread: whether RecordPendingUploads would record anything now (IUploadService::HasPendingUploads). A host that
 	// gets false skips its upload lists and RecordPendingUploads for the ticket.
 	bool HasPendingUploads() const;
@@ -961,6 +973,9 @@ private:
 	void PublishPersistentScheduleSnapshot();
 	std::atomic<bool> m_scheduleTraceEnabled{false};
 	std::atomic<std::shared_ptr<const PersistentScheduleSnapshot>> m_scheduleSnapshot;
+	// PersistentDeclaredVersions. PublishDeclaredVersions refreshes it on the preparing thread when the versioned slots changed.
+	std::shared_ptr<DeclaredVersions> m_declaredVersions = std::make_shared<DeclaredVersions>();
+	void PublishDeclaredVersions();
 	std::vector<uint32_t> m_persistentEpochOrder;
 	bool m_persistentClosedExecutions = false;
 	bool m_persistentRestAtLastUse = false;

@@ -96,6 +96,25 @@ submission point is an **epoch**.
     -   Test: `PersistentVulkanHostTests segment` stages a build, records for it while the attached graph's recording still submits, checks
         that the attached graph records nothing meanwhile, attaches it and submits its recording, and replaces one staged graph with a later
         one.
+-   **Staged sets: several epochs switch in as one step.** `AttachStagedEpochGraphs(epochs)` attaches the staged graphs of several
+    epochs at one frame boundary, so a change that rebuilds several epochs never runs half of them on the old graphs.
+    -   Every epoch is checked first: each is the host's and named once, has a staged graph, its build saw the host's and the epoch's
+        configuration as they are now, no later build is attached, and no ticket of it is held. The call must not run inside a
+        submission on the same thread.
+    -   One failed check refuses the whole set. The result names the first refused epoch (`AttachResult::epoch`) and the reason
+        (`AttachResult::refusal`, `AttachRefusalName`). Unlike `AttachStagedEpochGraph`, a refusal drops no staged graph: the caller
+        decides.
+    -   Otherwise the host's thread is held once (`ReplaceAsyncInstances` over every epoch) and each staged graph is swapped in with its
+        recordings, exactly as the single form does.
+    -   `AttachStatsTotal()` counts attaches, stagings, sets attached and refusals by reason, over the host's life, on any thread.
+-   **The closure query.** `EpochsDeclaring(slots)` (any thread) returns the epochs whose attached or staged graph declares any of the
+    versioned resources (`IVersionedResource::Key`, so a clone matches). Each graph keeps the set of versioned resources its passes
+    declare (`RenderGraph::PersistentDeclaredVersions`): its first build sets it, and each preparation refreshes it when a versioned
+    slot was added or a slot retired. The host publishes each instance's attached and staged sets under a mutex whenever a graph is
+    installed, staged or retired. A graph built on the owner thread (`BuildIfRequested`) declares nothing until its first preparation.
+-   Test: `PersistentVulkanHostTests built` (step 5) attaches two staged epochs together; refuses a set when one epoch's extensions
+    changed, naming that epoch and keeping both staged; refuses a set with nothing staged or an epoch named twice; and finds a versioned buffer that
+    only one epoch's new pass declares, first in its staged graph and then in its attached one, and in no other epoch.
 -   **Rebuilding only what changed.** Each graph builds every extension made into it, so a rebuild costs every one of their
     gathers. An extension that only some epochs use names them (`AddExtension(id, factory, epochs)`): the other graphs
     never make it, and adding it again rebuilds only its epochs. An extension made into a graph of one epoch gathers only

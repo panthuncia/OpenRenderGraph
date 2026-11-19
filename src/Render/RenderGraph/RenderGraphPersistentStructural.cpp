@@ -554,6 +554,7 @@ void RenderGraph::UpdatePersistentFrameInterruptingPasses(
 				if (found->second.empty()) state.entriesByResourceID.erase(found);
 			}
 			persistent_impl::NoteRetiredDirectResource(state, entry);
+			if (entry.versioned) state.declaredVersionsChanged = true;
 			entry = {};
 			entry.retired = true;
 		}

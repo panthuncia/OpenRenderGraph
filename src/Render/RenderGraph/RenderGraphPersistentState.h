@@ -487,6 +487,8 @@ struct RenderGraph::PersistentInstanceState {
 	// RenderGraph::FreezeAliasedBindings: the graph keeps the backings it bound for the transients it placed, whatever they point at
 	// now (a staged build of the same epoch placed them elsewhere).
 	std::atomic<bool> freezeAliased{false};
+	// A versioned slot was added or a slot retired since RenderGraph::PublishDeclaredVersions last ran.
+	bool declaredVersionsChanged = true;
 	AutoAliasPackingStrategy aliasPackingStrategy = AutoAliasPackingStrategy::GreedySweepLine; // The latest plan's.
 	// Diagnostic: per-pass preparation cost (logged periodically).
 	std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> prepareCostByPass; // lowering: name -> (ns, calls)
