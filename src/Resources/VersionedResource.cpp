@@ -9,6 +9,14 @@
 
 namespace org {
 
+namespace {
+std::atomic<VersionedResource::AdoptionObserver> g_adoptionObserver{nullptr};
+}
+
+void VersionedResource::SetAdoptionObserver(AdoptionObserver observer) noexcept {
+    g_adoptionObserver.store(observer, std::memory_order_release);
+}
+
 VersionedResource::ShapeClass VersionedResource::ShapeClassOf(const Resource& resource) {
     ShapeClass shape;
     if (!resource.HasLayout()) return shape;
@@ -73,6 +81,7 @@ void VersionedResource::AdoptVersion(const std::shared_ptr<const ResourceVersion
         m_state->shaped = true;
     }
     m_state->current.store(version, std::memory_order_release);
+    if (const auto observer = g_adoptionObserver.load(std::memory_order_relaxed)) observer(*this, *version);
 }
 
 void VersionedResource::MakeLateBound(std::shared_ptr<Resource> standIn, bool frameWait) {

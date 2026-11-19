@@ -81,6 +81,12 @@ struct IResourceVersions {
 //   shared_ptr, read whole.
 class VersionedResource : public IResourceResolver, public IVersionedResource {
 public:
+    // A development check on version adoption. It runs on the adopting thread after `version` became current, for Publish,
+    // Adopt and Grow*. A late-bound version (VersionedBuffer::PublishLate) is late-bound by design and never reported.
+    using AdoptionObserver = void (*)(const VersionedResource& resource, const ResourceVersion& version) noexcept;
+    // Any thread: replaces the observer. Null removes it. Unset costs one relaxed atomic load per adoption.
+    static void SetAdoptionObserver(AdoptionObserver observer) noexcept;
+
     const void* Key() const noexcept final { return m_state->identity.get(); }
     uint64_t SlotID() const noexcept final { return m_state->slotID; }
     bool LateBound() const noexcept final { return m_state->standIn != nullptr; }
