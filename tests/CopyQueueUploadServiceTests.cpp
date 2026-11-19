@@ -6,12 +6,17 @@
 //  - tickets move Queued -> Submitted -> Completed, and cancellation before
 //    the submitter claims a copy never submits it;
 //  - staging pages are reused across rounds instead of created per upload,
-//    and oversize uploads take a dedicated page that is not recycled.
+//    and oversize uploads take a dedicated page that is not recycled;
+//  - a texture zero fill overwrites every mip, in bands where a mip is larger
+//    than the zero source, leaves the texture in Common and says so in its
+//    state tracker, and refuses an exclusive texture.
 
 #include <Render/Runtime/CopyQueueUploadService.h>
 #include "TestSupport.h"
 #include <Render/Runtime/RuntimeDevice.h>
 #include <Resources/ExternalBufferResource.h>
+#include <Resources/ExternalTextureResource.h>
+#include <Resources/ResourceStateTracker.h>
 #include <rhi.h>
 #include <rhi_helpers.h>
 #include <rhi_interop_dx12.h>
@@ -241,6 +246,129 @@ int TestSignalEntries(Harness& h) {
     return 0;
 }
 
+std::shared_ptr<org::ExternalTextureResource> MakeTexture(rhi::Device& device, uint32_t width, uint32_t height, uint16_t mips,
+    rhi::QueueSharing sharing, const char* name) {
+    auto desc = rhi::helpers::ResourceDesc::Tex2D(rhi::Format::R32G32B32A32_Float, rhi::HeapType::DeviceLocal, width, height, mips, 1, 1,
+        rhi::ResourceLayout::Undefined, nullptr, {}, name);
+    desc.queueSharing = sharing;
+    rhi::ResourcePtr resource;
+    if (rhi::Failed(device.CreateCommittedResource(desc, resource)) || !resource) return {};
+    org::TextureDescription description{};
+    description.format = rhi::Format::R32G32B32A32_Float;
+    description.queueSharing = sharing;
+    for (uint32_t mip = 0; mip < mips; ++mip) description.imageDimensions.push_back({ (std::max)(1u, width >> mip), (std::max)(1u, height >> mip), 0, 0 });
+    return org::ExternalTextureResource::CreateShared(std::move(resource), description);
+}
+
+// Graphics queue: copies every mip of `texture` (from `layout`) through `list` into a readback buffer, after `wait`.
+int ReadTexture(Harness& h, org::Resource& texture, uint32_t mips, rhi::ResourceLayout layout, uint8_t fill,
+    const org::TrackedUploadTicket* wait, uint64_t& nonZero) {
+    const auto handle = texture.GetAPIResource().GetHandle();
+    std::vector<rhi::CopyableFootprint> footprints(mips);
+    rhi::FootprintRangeDesc range{};
+    range.texture = handle;
+    range.mipCount = mips;
+    const auto info = h.device->GetCopyableFootprints(range, footprints.data(), mips);
+    CHECK(info.count == mips);
+    rhi::ResourcePtr staging;
+    CHECK(!rhi::Failed(h.device->CreateCommittedResource(rhi::helpers::ResourceDesc::Buffer(info.totalBytes,
+        fill ? rhi::HeapType::Upload : rhi::HeapType::Readback, {}, "CopyQueueTextureStaging"), staging)));
+    void* mapped = nullptr;
+    if (fill) {
+        staging->Map(&mapped, 0, info.totalBytes);
+        CHECK(mapped);
+        std::memset(mapped, fill, static_cast<size_t>(info.totalBytes));
+        staging->Unmap(0, info.totalBytes);
+    }
+    rhi::CommandAllocatorPtr allocator;
+    rhi::CommandListPtr list;
+    CHECK(!rhi::Failed(h.device->CreateCommandAllocator(rhi::QueueKind::Graphics, allocator)));
+    CHECK(!rhi::Failed(h.device->CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), list)));
+    const auto access = fill ? rhi::ResourceAccessType::CopyDest : rhi::ResourceAccessType::CopySource;
+    rhi::TextureBarrier barrier{};
+    barrier.texture = handle;
+    barrier.range = { 0, mips, 0, 1 };
+    barrier.beforeSync = rhi::ResourceSyncState::All;
+    barrier.afterSync = rhi::ResourceSyncState::Copy;
+    barrier.beforeAccess = layout == rhi::ResourceLayout::Undefined ? rhi::ResourceAccessType::None : rhi::ResourceAccessType::Common;
+    barrier.afterAccess = access;
+    barrier.beforeLayout = layout;
+    barrier.afterLayout = fill ? rhi::ResourceLayout::CopyDest : rhi::ResourceLayout::CopySource;
+    barrier.discard = layout == rhi::ResourceLayout::Undefined;
+    list->Barriers({ .textures = { &barrier, 1 } });
+    for (uint32_t mip = 0; mip < mips; ++mip) {
+        rhi::BufferTextureCopyFootprint copy{};
+        copy.texture = handle;
+        copy.buffer = staging->GetHandle();
+        copy.mip = mip;
+        copy.footprint = footprints[mip];
+        if (fill) list->CopyBufferToTexture(copy);
+        else list->CopyTextureToBuffer(copy);
+    }
+    // Back to Common, where a fresh texture's zero fill and the next read expect it.
+    barrier.beforeSync = rhi::ResourceSyncState::Copy;
+    barrier.afterSync = rhi::ResourceSyncState::All;
+    barrier.beforeAccess = access;
+    barrier.afterAccess = rhi::ResourceAccessType::Common;
+    barrier.beforeLayout = barrier.afterLayout;
+    barrier.afterLayout = rhi::ResourceLayout::Common;
+    barrier.discard = false;
+    list->Barriers({ .textures = { &barrier, 1 } });
+    list->End();
+    const rhi::CommandList lists[] = { list.Get() };
+    rhi::TimelinePoint point{};
+    if (wait) {
+        const auto owner = std::static_pointer_cast<const rhi::TimelinePtr>(wait->timelineOwner);
+        CHECK(owner && *owner);
+        point = { (*owner)->GetHandle(), wait->timelineValue };
+    }
+    CHECK(!rhi::Failed(h.graphics.Submit(lists, { .waits = { &point, wait ? 1u : 0u } })));
+    CHECK(!rhi::Failed(h.device->WaitIdle()));
+    nonZero = 0;
+    if (fill) return 0;
+    staging->Map(&mapped, 0, info.totalBytes);
+    CHECK(mapped);
+    for (const auto& footprint : footprints)
+        for (uint32_t row = 0; row < footprint.height; ++row) {
+            const auto* bytes = static_cast<const uint8_t*>(mapped) + footprint.offset + uint64_t{ row } * footprint.rowPitch;
+            for (uint32_t i = 0; i < footprint.width * 16u; ++i) nonZero += bytes[i] != 0;
+        }
+    staging->Unmap(0, 0);
+    return 0;
+}
+
+int TestTextureZeroFill(Harness& h) {
+    // Mip 0's rows (1024 texels of 16 bytes) times its height is past the 4 MB zero source, so it is copied in bands.
+    constexpr uint32_t kWidth = 1024, kHeight = 1100;
+    constexpr uint16_t kMips = 3;
+    auto texture = MakeTexture(h.device.Get(), kWidth, kHeight, kMips, rhi::QueueSharing::Concurrent, "CopyQueueZeroFillTarget");
+    CHECK(texture);
+    uint64_t nonZero = 0;
+    if (const auto failure = ReadTexture(h, *texture, kMips, rhi::ResourceLayout::Undefined, 0x5A, nullptr, nonZero)) return failure;
+    if (const auto failure = ReadTexture(h, *texture, kMips, rhi::ResourceLayout::Common, 0, nullptr, nonZero)) return failure;
+    CHECK(nonZero != 0);
+    const auto before = h.service.GetStats();
+    auto ticket = h.service.QueueTextureZeroFill(
+        org::WorkerOwnedDestination{ texture, org::WorkerOwnedDestination::Ownership::FreshTexture });
+    CHECK(ticket);
+    for (const auto& segment : texture->GetStateTracker()->GetSegments())
+        CHECK(segment.state.layout == rhi::ResourceLayout::Common && segment.state.access == rhi::ResourceAccessType::Common);
+    CHECK(WaitTicket(ticket, org::TrackedUploadTicketState::Completed));
+    if (const auto failure = ReadTexture(h, *texture, kMips, rhi::ResourceLayout::Common, 0, ticket.get(), nonZero)) return failure;
+    CHECK(nonZero == 0);
+    CHECK(h.service.WaitIdle(5000));
+    const auto after = h.service.GetStats();
+    // Mip 0 in 5 bands of 256 rows, mip 1 in 2, mip 2 whole. Nothing staged: no page was made.
+    CHECK(after.copiesSubmitted - before.copiesSubmitted == 8);
+    CHECK(after.pagesCreated == before.pagesCreated);
+    // An exclusive texture would need a queue ownership transfer: refused.
+    auto exclusive = MakeTexture(h.device.Get(), 64, 64, 1, rhi::QueueSharing::Exclusive, "CopyQueueZeroFillExclusive");
+    CHECK(exclusive);
+    CHECK(!h.service.QueueTextureZeroFill(
+        org::WorkerOwnedDestination{ exclusive, org::WorkerOwnedDestination::Ownership::FreshTexture }));
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -278,6 +406,7 @@ int main(int argc, char** argv) {
     if (const auto failure = TestOffsetAndOversize(h)) return failure;
     if (const auto failure = TestPageReuseAndCancel(h)) return failure;
     if (const auto failure = TestSignalEntries(h)) return failure;
+    if (const auto failure = TestTextureZeroFill(h)) return failure;
 
     h.service.Cleanup();
     CHECK(!h.service.Initialized());

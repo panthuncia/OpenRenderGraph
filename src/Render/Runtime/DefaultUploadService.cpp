@@ -136,6 +136,10 @@ public:
             std::move(source), ranges, std::move(destination));
     }
 
+    std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingTextureZeroFill(WorkerOwnedDestination destination) override {
+        return Manager().QueueTrackedStreamingTextureZeroFill(std::move(destination));
+    }
+
     bool HasDedicatedStreamingQueue() const override {
         return Manager().HasDedicatedStreamingQueue();
     }

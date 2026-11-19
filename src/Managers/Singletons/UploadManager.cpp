@@ -442,6 +442,13 @@ std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingUploadR
 	return m_copyQueueUploads->QueueBufferUploadRanges(ranges, std::move(destination));
 }
 
+std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingTextureZeroFill(WorkerOwnedDestination destination)
+{
+	if (m_shared) return m_shared->QueueTrackedStreamingTextureZeroFill(std::move(destination));
+	if (!m_copyQueueUploads || !m_copyQueueUploads->Initialized()) Initialize();
+	return m_copyQueueUploads->QueueTextureZeroFill(std::move(destination));
+}
+
 std::shared_ptr<TrackedUploadTicket> UploadManager::QueueTrackedStreamingCopyRanges(std::shared_ptr<Resource> source,
 	std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination)
 {

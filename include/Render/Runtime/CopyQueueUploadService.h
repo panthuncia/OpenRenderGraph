@@ -101,6 +101,14 @@ public:
     std::shared_ptr<TrackedUploadTicket> QueueBufferCopyRanges(std::shared_ptr<Resource> source,
         std::span<const StreamingCopyRange> ranges, org::WorkerOwnedDestination destination);
 
+    // Zero-fills every mip and slice of `destination`, a colour texture no queue has used yet
+    // (WorkerOwnedDestination::Ownership::FreshTexture). The copies read a zeroed buffer the service keeps, so nothing is
+    // staged per fill. The texture must be rhi::QueueSharing::Concurrent, single-sampled and not a depth format.
+    // The copies leave every subresource in the Common layout. This call sets the texture's state tracker to Common, so the
+    // graph's first use moves it out of Common and keeps the zeros. Ordered like the other entries of the calling thread.
+    // Returns null when the service is not initialized or the texture does not qualify.
+    std::shared_ptr<TrackedUploadTicket> QueueTextureZeroFill(org::WorkerOwnedDestination destination);
+
     // Signals `timeline` to `value` from the copy queue, once every copy the calling thread queued before this call is
     // done. This works because the intake is FIFO per producer, and batches go to the one queue in order. The batch
     // carrying the signal signals it with its own timeline.
@@ -138,6 +146,12 @@ private:
         std::atomic<bool> closed{ false };
     };
 
+    // The zeroed upload buffer that texture zero fills copy from. It is written once, at creation.
+    struct ZeroSource {
+        rhi::ResourcePtr buffer;
+        uint64_t bytes = 0;
+    };
+
     // One copy region of an entry.
     // - For a ranges entry (QueueBufferUploadRanges), it copies page bytes at srcOffset to the destination at dstOffset.
     // - For a buffer copy entry (QueueBufferCopyRanges), it copies source bytes at srcOffset.
@@ -165,6 +179,11 @@ private:
         uint64_t signalValue = 0;
         // A wait entry (QueueWait): no copy, the batch waits for these.
         std::vector<std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>> waits;
+        // A texture zero fill (QueueTextureZeroFill): `destination` is a texture, and these copies read `zeroSource`.
+        std::vector<rhi::BufferTextureCopyFootprint> textureCopies;
+        std::shared_ptr<const ZeroSource> zeroSource;
+        uint32_t textureMips = 0;
+        uint32_t textureSlices = 0;
     };
 
     // allocator is set only where lists cannot share one (D3D12). Otherwise the list records from m_listAllocator.
@@ -186,6 +205,7 @@ private:
     };
 
 
+    std::shared_ptr<const ZeroSource> AcquireZeroSource();
     std::shared_ptr<StagingPage> CreatePage(size_t capacity, bool dedicated);
     std::shared_ptr<StagingPage> AcquirePage();
     void ClosePage(std::shared_ptr<StagingPage> page);
@@ -224,6 +244,10 @@ private:
     std::vector<std::shared_ptr<StagingPage>> m_closedPages;
     std::vector<std::weak_ptr<StagingPage>> m_allPages;
     std::atomic<uint64_t> m_nextPageIndex{ 0 };
+
+    // Made on the first texture zero fill, released by Cleanup.
+    std::mutex m_zeroMutex;
+    std::shared_ptr<const ZeroSource> m_zeroSource;
 
     std::jthread m_submitter;
     std::mutex m_wakeMutex;

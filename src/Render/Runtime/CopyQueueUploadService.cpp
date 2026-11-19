@@ -9,7 +9,9 @@
 #include <BasicTelemetry/Telemetry.h>
 #include <BasicTelemetry/Tracy.h>
 
+#include "Resources/PixelBuffer.h"
 #include "Resources/Resource.h"
+#include "Resources/ResourceStateTracker.h"
 
 namespace org::runtime {
 
@@ -18,6 +20,72 @@ namespace {
 
 	size_t AlignUp(size_t value, size_t alignment) noexcept {
 		return (value + alignment - 1) & ~(alignment - 1);
+	}
+
+	// The zeroed buffer texture fills read. A band of rows of one subresource must fit in it.
+	constexpr uint64_t kZeroSourceBytes = uint64_t{ 4 } << 20;
+
+	bool IsDepthFormat(rhi::Format format) noexcept {
+		switch (format) {
+		case rhi::Format::D32_Float:
+		case rhi::Format::D24_UNorm_S8_UInt:
+		case rhi::Format::D32_Float_S8X24_UInt:
+		case rhi::Format::D16_UNorm:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	// Whether `texture` may be zero-filled on the copy queue. Its RHI description answers when it has one. A PixelBuffer of
+	// a kind that has none (a 3D texture) answers from its own description.
+	bool ZeroFillable(const Resource& texture) {
+		rhi::ResourceDesc desc{};
+		if (texture.TryGetRHIResourceDesc(desc)) {
+			return desc.type != rhi::ResourceType::Buffer && desc.queueSharing == rhi::QueueSharing::Concurrent &&
+				desc.texture.sampleCount <= 1 && !IsDepthFormat(desc.texture.format) &&
+				(desc.resourceFlags & rhi::RF_AllowDepthStencil) == 0;
+		}
+		const auto* pixels = dynamic_cast<const PixelBuffer*>(&texture);
+		if (!pixels) return false;
+		const auto& description = pixels->GetDescription();
+		return description.queueSharing == rhi::QueueSharing::Concurrent && description.sampleCount <= 1 && !description.hasDSV &&
+			!IsDepthFormat(description.format);
+	}
+
+	// The copies that zero one subresource from the zero source, in bands that each fit in it. A band's rows are a multiple of
+	// four, so a block-compressed texture is copied in whole blocks.
+	bool AppendZeroCopies(std::vector<rhi::BufferTextureCopyFootprint>& out, rhi::ResourceHandle texture, rhi::ResourceHandle zero,
+		uint32_t mip, uint32_t slice, const rhi::CopyableFootprint& footprint, uint64_t zeroBytes) {
+		if (!footprint.rowPitch || !footprint.width || !footprint.height || !footprint.depth) return false;
+		rhi::BufferTextureCopyFootprint copy{};
+		copy.texture = texture;
+		copy.buffer = zero;
+		copy.mip = mip;
+		copy.arraySlice = slice;
+		copy.footprint = { 0, footprint.rowPitch, footprint.width, footprint.height, 1 };
+		// Bytes are counted as rowPitch per texel row, which is more than a block-compressed row needs.
+		const uint64_t sliceBytes = uint64_t{ footprint.rowPitch } * footprint.height;
+		if (sliceBytes <= zeroBytes) {
+			const uint32_t perCopy = static_cast<uint32_t>((std::min<uint64_t>)(footprint.depth, zeroBytes / sliceBytes));
+			for (uint32_t z = 0; z < footprint.depth; z += perCopy) {
+				copy.z = z;
+				copy.footprint.depth = (std::min)(perCopy, footprint.depth - z);
+				out.push_back(copy);
+			}
+			return true;
+		}
+		const uint32_t band = static_cast<uint32_t>((zeroBytes / footprint.rowPitch) & ~uint64_t{ 3 });
+		if (band == 0) return false;
+		for (uint32_t z = 0; z < footprint.depth; ++z) {
+			for (uint32_t y = 0; y < footprint.height; y += band) {
+				copy.z = z;
+				copy.y = y;
+				copy.footprint.height = (std::min)(band, footprint.height - y);
+				out.push_back(copy);
+			}
+		}
+		return true;
 	}
 }
 
@@ -366,6 +434,82 @@ std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueBufferCopyRang
 	return ticket;
 }
 
+std::shared_ptr<const CopyQueueUploadService::ZeroSource> CopyQueueUploadService::AcquireZeroSource() {
+	std::lock_guard lock(m_zeroMutex);
+	if (m_zeroSource) return m_zeroSource;
+	auto source = std::make_shared<ZeroSource>();
+	source->bytes = kZeroSourceBytes;
+	auto desc = rhi::helpers::ResourceDesc::Buffer(source->bytes, rhi::HeapType::Upload, {}, "CopyQueueUploads zero source");
+	desc.queueSharing = rhi::QueueSharing::Concurrent;
+	if (rhi::Failed(m_device.CreateCommittedResource(desc, source->buffer)) || !source->buffer) {
+		spdlog::error("CopyQueueUploadService '{}': zero source creation failed bytes={}", m_config.debugName, source->bytes);
+		return {};
+	}
+	void* mapped = nullptr;
+	source->buffer->Map(&mapped, 0, source->bytes);
+	if (!mapped) {
+		spdlog::error("CopyQueueUploadService '{}': zero source map failed", m_config.debugName);
+		return {};
+	}
+	std::memset(mapped, 0, static_cast<size_t>(source->bytes));
+	source->buffer->Unmap(0, source->bytes);
+	m_zeroSource = std::move(source);
+	return m_zeroSource;
+}
+
+std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueTextureZeroFill(org::WorkerOwnedDestination destination) {
+	if (!Initialized() || !destination.resource || !destination.resource->HasLayout()) return {};
+	auto& texture = *destination.resource;
+	if (!ZeroFillable(texture)) {
+		spdlog::error("CopyQueueUploadService '{}': '{}' cannot be zero-filled on the copy queue. It must be a concurrent, "
+			"single-sampled colour texture", m_config.debugName, texture.GetName());
+		return {};
+	}
+	// A resource with representations on other devices would be filled on the primary device only.
+	const auto instances = texture.GetRepresentationInstances();
+	if (instances.size() != 1 || instances.front() != BackendInstanceId::Primary) return {};
+	const uint32_t mips = texture.GetMipLevels();
+	const uint32_t slices = texture.GetArraySize();
+	const auto handle = texture.GetAPIResource().GetHandle();
+	if (!mips || !slices || !handle.valid()) return {};
+	BT_ZONE_SCOPE("CopyQueueUploadService::QueueTextureZeroFill");
+
+	std::vector<rhi::CopyableFootprint> footprints(size_t{ mips } * slices);
+	rhi::FootprintRangeDesc range{};
+	range.texture = handle;
+	range.mipCount = mips;
+	range.arraySize = slices;
+	const auto info = m_device.GetCopyableFootprints(range, footprints.data(), static_cast<uint32_t>(footprints.size()));
+	if (info.count != footprints.size()) return {};
+	auto zero = AcquireZeroSource();
+	if (!zero) return {};
+
+	PendingCopy entry;
+	const auto zeroHandle = zero->buffer->GetHandle();
+	// Footprints come slice by slice, with each slice's mips in order (the D3D12 subresource order).
+	for (uint32_t slice = 0; slice < slices; ++slice) {
+		for (uint32_t mip = 0; mip < mips; ++mip) {
+			const auto& footprint = footprints[size_t{ slice } * mips + mip];
+			if (!AppendZeroCopies(entry.textureCopies, handle, zeroHandle, mip, slice, footprint, zero->bytes)) return {};
+			entry.size += uint64_t{ footprint.rowPitch } * footprint.height * footprint.depth;
+		}
+	}
+	BT_ZONE_VALUE(static_cast<int64_t>(entry.size));
+	// The texture is fresh, so nothing else reads its tracker now. The graph's first use starts where the copies leave it.
+	if (auto* tracker = texture.GetStateTracker())
+		tracker->Reset(RangeSpec{}, ResourceState{ rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
+	auto ticket = std::make_shared<TrackedUploadTicket>();
+	entry.destination = std::move(destination.resource);
+	entry.zeroSource = std::move(zero);
+	entry.textureMips = mips;
+	entry.textureSlices = slices;
+	entry.ticket = ticket;
+	entry.queued = std::chrono::steady_clock::now();
+	m_intake.Push(std::move(entry));
+	m_wake.notify_one();
+	return ticket;
+}
+
 // ---------------------------------------------------------------------------
 // Submitter
 
@@ -458,8 +602,10 @@ bool CopyQueueUploadService::CollectBatch(Batch& batch) {
 		}
 		// A wait also ends the batch: the whole batch waits for it, and the entries queued before it must not. Graph work may wait
 		// for those (their signals, the batch's value) and the wait may be for that graph work: a cycle (copy-queue-sealed-stall).
+		// A second zero fill of one texture would put two barriers from Undefined in one batch, so it ends the batch too.
 		if (!batch.copies.empty() && (!copy.waits.empty() || (copy.source && written.contains(copy.source.get())) ||
-				(copy.destination && read.contains(copy.destination.get())))) {
+				(copy.destination && read.contains(copy.destination.get())) ||
+				(!copy.textureCopies.empty() && written.contains(copy.destination.get())))) {
 			m_carried = std::move(copy);
 			m_hasCarried.store(true, std::memory_order_release);
 			break;
@@ -479,7 +625,7 @@ bool CopyQueueUploadService::CollectBatch(Batch& batch) {
 		if (copy.destination) written.insert(copy.destination.get());
 		if (copy.source) read.insert(copy.source.get());
 		batch.bytes += copy.size;
-		regions += copy.regions.empty() ? 1 : copy.regions.size();
+		regions += !copy.textureCopies.empty() ? copy.textureCopies.size() : copy.regions.empty() ? 1 : copy.regions.size();
 		batch.copies.push_back(std::move(copy));
 		if (batch.bytes >= m_config.maxBatchBytes) break;
 	}
@@ -514,16 +660,38 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 		barrier.afterAccess = access;
 		barriers.push_back(barrier);
 	};
+	// A zero-filled texture is fresh. It goes from Undefined to CopyDest, and on to Common after its copies.
+	std::vector<rhi::TextureBarrier> textureBarriers;
 	for (const auto& copy : batch.copies) {
+		if (!copy.textureCopies.empty()) {
+			rhi::TextureBarrier barrier{};
+			barrier.texture = copy.destination->GetAPIResource().GetHandle();
+			barrier.range = { 0, copy.textureMips, 0, copy.textureSlices };
+			barrier.beforeSync = rhi::ResourceSyncState::None;
+			barrier.afterSync = rhi::ResourceSyncState::Copy;
+			barrier.beforeAccess = rhi::ResourceAccessType::None;
+			barrier.afterAccess = rhi::ResourceAccessType::CopyDest;
+			barrier.beforeLayout = rhi::ResourceLayout::Undefined;
+			barrier.afterLayout = rhi::ResourceLayout::CopyDest;
+			barrier.discard = true;
+			textureBarriers.push_back(barrier);
+			continue;
+		}
 		addBarrier(copy.destination, rhi::ResourceAccessType::CopyDest);
 		if (copy.destination) addBarrier(copy.source, rhi::ResourceAccessType::CopySource);
 	}
-	if (!barriers.empty()) {
-		list.Barriers({ .buffers = { barriers.data(), static_cast<uint32_t>(barriers.size()) } });
+	if (!barriers.empty() || !textureBarriers.empty()) {
+		list.Barriers({ .textures = { textureBarriers.data(), static_cast<uint32_t>(textureBarriers.size()) },
+			.buffers = { barriers.data(), static_cast<uint32_t>(barriers.size()) } });
 	}
 	size_t regions = 0;
 	for (const auto& copy : batch.copies) {
 		if (!copy.destination) continue;
+		if (!copy.textureCopies.empty()) {
+			for (const auto& region : copy.textureCopies) list.CopyBufferToTexture(region);
+			regions += copy.textureCopies.size();
+			continue;
+		}
 		if (copy.source) {
 			// A buffer copy entry: its regions read the source.
 			const auto dst = copy.destination->GetAPIResource().GetHandle();
@@ -554,8 +722,18 @@ bool CopyQueueUploadService::RecordAndSubmit(Batch& batch) {
 		barrier.beforeAccess = barrier.afterAccess; // CopyDest or CopySource
 		barrier.afterAccess = rhi::ResourceAccessType::Common;
 	}
-	if (!barriers.empty()) {
-		list.Barriers({ .buffers = { barriers.data(), static_cast<uint32_t>(barriers.size()) } });
+	for (auto& barrier : textureBarriers) {
+		barrier.beforeSync = rhi::ResourceSyncState::Copy;
+		barrier.afterSync = rhi::ResourceSyncState::All;
+		barrier.beforeAccess = rhi::ResourceAccessType::CopyDest;
+		barrier.afterAccess = rhi::ResourceAccessType::Common;
+		barrier.beforeLayout = rhi::ResourceLayout::CopyDest;
+		barrier.afterLayout = rhi::ResourceLayout::Common;
+		barrier.discard = false;
+	}
+	if (!barriers.empty() || !textureBarriers.empty()) {
+		list.Barriers({ .textures = { textureBarriers.data(), static_cast<uint32_t>(textureBarriers.size()) },
+			.buffers = { barriers.data(), static_cast<uint32_t>(barriers.size()) } });
 	}
 	list.End();
 
@@ -776,6 +954,10 @@ void CopyQueueUploadService::Cleanup() {
 	}
 	m_freePairs.clear();
 	m_listAllocator = {};
+	{
+		std::lock_guard lock(m_zeroMutex);
+		m_zeroSource.reset();
+	}
 	m_epoch.fetch_add(1, std::memory_order_acq_rel); // invalidate every thread's open page
 	{
 		std::lock_guard lock(m_pageMutex);

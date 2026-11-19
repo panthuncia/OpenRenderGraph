@@ -193,6 +193,15 @@ public:
         (void)source; (void)ranges; (void)destination;
         return {};
     }
+    // The same path, a zero fill of every mip and slice of a texture no queue has used yet
+    // (CopyQueueUploadService::QueueTextureZeroFill). One ticket, completed after every copy. The texture must be
+    // rhi::QueueSharing::Concurrent, single-sampled and not a depth format. The copies leave it in the Common layout, and the
+    // call sets its state tracker to Common, so the graph's first use keeps the zeros. Null: the texture does not qualify, or
+    // the path cannot fill textures.
+    virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingTextureZeroFill(WorkerOwnedDestination destination) {
+        (void)destination;
+        return {};
+    }
     // Whether that path has a queue of its own (the dedicated uploader of graph work). Without one its copies go to the graph's
     // copy queue, which a host may alias to its graphics queue: a producer that relies on running beside the frame checks this.
     virtual bool HasDedicatedStreamingQueue() const { return false; }
