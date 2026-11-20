@@ -2,7 +2,6 @@
 #include "OpenRenderGraph/ExternalClient.h"
 #include "RenderGraphPersistentState.h"
 #include "Render/CommandListPool.h"
-#include "OpenRenderGraph/Trace.h"
 
 namespace org {
 
@@ -281,10 +280,6 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 		for (const auto& [owner, points] : relayed) {
 			const auto relay = m_desc.runtime->RelayWaits(owner, device, points);
 			waitPoints.push_back(relay.point);
-			if (trace::Enabled(trace::Category::Submission)) {
-				ORG_TRACE(Submission, "client-relay-submitted").Add("client", m_desc.name)
-					.Add("signal", std::to_string(relay.identity) + "@" + std::to_string(relay.point.value));
-			}
 			basic_telemetry::AddCounter("ORG.ExternalClient.CrossDeviceRelays");
 		}
 		// The caller's own waits, already on this queue's device.
@@ -301,14 +296,6 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 			--slot.next; // Nothing will signal this value, and shutdown waits for the last one taken.
 			throw std::runtime_error(std::string("ExternalClient submission failed: ") + rhi::ResultName(submitted));
 		}
-		}
-		if (trace::Enabled(trace::Category::Submission)) {
-			std::string waited;
-			for (const auto wait : waits)
-				if (wait.timeline != slot.identity) waited += (waited.empty() ? "" : ",") + std::to_string(wait.timeline) + "@" + std::to_string(wait.value);
-			ORG_TRACE(Submission, "client-submitted").Add("client", m_desc.name).Add("slot", static_cast<uint64_t>(slotIndex))
-				.Add("waits", waited).Add("signal", std::to_string(slot.identity) + "@" + std::to_string(value))
-				.Add("relays", static_cast<uint64_t>(relayed.size()));
 		}
 		compiler::GraphExecutionTimeline receipt;
 		receipt.batches.resize(1);

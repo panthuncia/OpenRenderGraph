@@ -1,5 +1,4 @@
 // Persistent execution, the synchronous route: admission, recording and submission of a frame's segment, and retirement.
-#include "OpenRenderGraph/Trace.h"
 #include "RenderGraphPersistentState.h"
 
 namespace org {
@@ -453,13 +452,6 @@ std::vector<std::vector<compiler::ExecutionTimelinePoint>> RenderGraph::RelayCro
 			relayed.push_back({handle, pointValue});
 		}
 		const auto relay = m_runtime->RelayWaits(group.owner, group.consumer, relayed);
-		if (trace::Enabled(trace::Category::Submission)) {
-			std::string waited, batches;
-			for (const auto& [identity, pointValue] : group.points) waited += (waited.empty() ? "" : ",") + std::to_string(identity) + "@" + std::to_string(pointValue);
-			for (const auto batch : group.batches) batches += (batches.empty() ? "" : ",") + std::to_string(batch);
-			ORG_TRACE(Submission, "relay-submitted").Add("waits", waited)
-				.Add("signal", std::to_string(relay.identity) + "@" + std::to_string(relay.point.value)).Add("consumerBatches", batches);
-		}
 		basic_telemetry::AddCounter("ORG.Persistent.CrossDeviceRelays");
 		for (const auto batch : group.batches) {
 			auto& batchWaits = result[batch];
@@ -547,13 +539,6 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 					throw std::runtime_error("Handoff release submission failed");
 				m_queueRegistry.EnsureNextFenceValueAtLeast(index, signal.value + 1);
 				for (const auto consumer : release.consumers) admission.incomingWaits.at(consumer).push_back(signal);
-				if (trace::Enabled(trace::Category::Submission)) {
-					std::string consumers;
-					for (const auto consumer : release.consumers) consumers += (consumers.empty() ? "" : ",") + std::to_string(consumer);
-					ORG_TRACE(Submission, "release-list-submitted").Add("queue", release.queue)
-						.Add("signal", std::to_string(signal.timeline) + "@" + std::to_string(signal.value))
-						.Add("textures", static_cast<uint64_t>(release.textures.size())).Add("consumerBatches", consumers);
-				}
 				handoffLeases.push_back(std::move(allocation));
 				basic_telemetry::AddCounter("ORG.Persistent.HandoffReleases");
 			}

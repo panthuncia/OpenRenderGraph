@@ -1,6 +1,5 @@
 // Persistent execution, frame preparation: installing passes into the program, polling declarations, resolver groups and
 // backings, and preparing the frame's invocations and dynamic segments. See RenderGraphPersistentState.h.
-#include "OpenRenderGraph/Trace.h"
 #include "RenderGraphPersistentState.h"
 #include "Render/PipelineLibrary.h"
 

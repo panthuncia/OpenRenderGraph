@@ -1,4 +1,3 @@
-#include "OpenRenderGraph/Trace.h"
 #include "OpenRenderGraph/Runtime.h"
 
 #include <BasicTelemetry/Tracy.h>
@@ -213,8 +212,6 @@ std::shared_ptr<Runtime> Runtime::Create(Desc desc) {
 	if (desc.backend == rhi::Backend::Null) throw std::invalid_argument("Runtime requires a device backend");
 	if (desc.slots == 0 || desc.slots > kMaxSlots)
 		throw std::invalid_argument("Runtime slots must be 1-" + std::to_string(kMaxSlots) + ", not " + std::to_string(desc.slots));
-	static std::once_flag traceFromEnvironment;
-	std::call_once(traceFromEnvironment, [] { trace::ConfigureFromEnvironment(); });
 	Runtime* expected = nullptr;
 	std::shared_ptr<Runtime> runtime(new Runtime(std::move(desc)));
 	if (!g_current.compare_exchange_strong(expected, runtime.get()))

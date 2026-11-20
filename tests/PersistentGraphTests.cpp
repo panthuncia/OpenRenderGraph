@@ -1,4 +1,3 @@
-#include "OpenRenderGraph/Trace.h"
 #include <filesystem>
 #include <fstream>
 #include "Render/RenderGraph/PersistentGraph.h"
@@ -278,11 +277,6 @@ int main() {
         CHECK(graph.batches.size() == 4);
         SynchronousAdmission admission(4, {}, sequencer);
         const std::array<ExecutionTimelinePoint,2> queues{{{51,0},{52,0}}};
-        // The decision trace records why each barrier is what it is.
-        auto sink = std::make_shared<org::trace::MemorySink>();
-        org::trace::SetSink(sink);
-        org::trace::SetCategories(org::trace::Category::Barriers | org::trace::Category::Handoff
-            | org::trace::Category::Admission);
         const auto layoutOf = [](const CompileResourceState& use) { return static_cast<rhi::ResourceLayout>(use.layout); };
         for (uint64_t frame = 1; frame <= 3; ++frame) {
             auto admitted = admission.Prepare(selected,queues);
@@ -313,55 +307,6 @@ int main() {
             admission.Readmit(admitted);
             admission.Commit(admitted,receipt);
         }
-        org::trace::SetSink(nullptr);
-        // Per execution, Prepare and Readmit each plan the four steps: the in-batch steps cross queues, and the entry step takes
-        // the ledger's state from the second execution on, which hands off from the compute queue it was left on.
-        const auto steps = sink->Of("state-step");
-        CHECK(steps.size() == 3 * 2 * 4);
-        for (size_t i = 0; i < steps.size(); ++i) {
-            const auto& step = steps[i];
-            const auto position = i % 4;
-            const bool firstExecution = i < 8;
-            CHECK(step.Text("resource") == "Alternating");
-            CHECK(step.Text("path") == (position == 0 ? (firstExecution ? "entry-seeded" : "entry-ledger") : "body-cross-queue"));
-            if (position == 0 && !firstExecution) CHECK(step.Text("ledgerQueue") == "1");
-        }
-        const auto planned = sink->Of("handoff-planned");
-        CHECK(planned.size() == 2 * 2);
-        for (const auto& handoff : planned) CHECK(handoff.Text("fromQueue") == "1" && handoff.Text("toQueue") == "0");
-        CHECK(sink->Of("ledger-commit").size() == 3 * 4);
-        // Every barrier the plan holds is traced where it is recorded; a body barrier on the consumer's queue never names
-        // the producer queue's layout.
-        for (const auto& barrier : sink->Of("barrier"))
-            if (barrier.Text("list") == "before-pass") CHECK(barrier.Text("beforeLayout") == "COMMON");
-    }
-    {
-        // The decision trace: off without a sink, the resource filter, and JSON lines.
-        auto sink = std::make_shared<org::trace::MemorySink>();
-        org::trace::SetCategories(org::trace::Category::Barriers);
-        CHECK(!org::trace::Enabled(org::trace::Category::Barriers));
-        org::trace::SetSink(sink);
-        CHECK(org::trace::Enabled(org::trace::Category::Barriers) && !org::trace::Enabled(org::trace::Category::Handoff));
-        org::trace::SetResourceFilter("Visibility");
-        ORG_TRACE(Barriers, "kept").Resource("Visibility Buffer").Add("n", uint32_t{1});
-        ORG_TRACE(Barriers, "filtered").Resource("GTAO Output");
-        ORG_TRACE(Barriers, "unnamed").Add("n", uint32_t{2});
-        ORG_TRACE(Handoff, "off").Resource("Visibility Buffer");
-        const auto events = sink->Take();
-        CHECK(events.size() == 2 && events[0].decision == "kept" && events[1].decision == "unnamed");
-        CHECK(events[0].Text("n") == "1" && events[0].Text("resource") == "Visibility Buffer");
-        org::trace::SetResourceFilter({});
-        const auto path = (std::filesystem::temp_directory_path() / "org_trace_test.jsonl").string();
-        org::trace::SetSink(org::trace::MakeJsonLinesSink(path));
-        ORG_TRACE(Barriers, "line").Resource("A \"quoted\" name").Add("flag", true).Add("value", int32_t{-3});
-        org::trace::SetSink(nullptr);
-        std::ifstream file(path);
-        std::string line;
-        std::getline(file, line);
-        CHECK(line.find("\"decision\":\"line\"") != std::string::npos
-            && line.find("\"resource\":\"A \\\"quoted\\\" name\"") != std::string::npos
-            && line.find("\"flag\":true") != std::string::npos && line.find("\"value\":-3") != std::string::npos);
-        org::trace::SetCategories(org::trace::Category::None);
     }
     {
         // An admission keeps a single pending frame: a second Prepare before the first commits or is abandoned throws.

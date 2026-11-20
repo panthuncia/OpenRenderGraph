@@ -14,7 +14,6 @@
 //
 // RenderGraphPersistentState.h: what the persistent route's units share (the execution state, tickets and
 // recordings, and the helpers over them). Private to src/Render/RenderGraph.
-#include "OpenRenderGraph/Trace.h"
 #include "Render/RenderGraph/RenderGraph.h"
 #include "OpenRenderGraph/Runtime.h"
 #include "RenderGraphCompilerState.h"
@@ -111,7 +110,6 @@ inline PreparedBackingState BackingStateOf(Resource& concrete, const ResourceBin
 	CompileResourceShape shape) {
 	PreparedBackingState initial;
 	initial.graphResourceID = uint64_t{slotIndex} + 1;
-	if (trace::Any()) initial.debugName = concrete.GetName();
 	initial.resource = snapshot.resource.GetHandle();
 	initial.shape = shape;
 	initial.regions = CaptureRegions(concrete, shape);
