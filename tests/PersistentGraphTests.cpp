@@ -254,7 +254,7 @@ int main() {
         const CompileResourceState home{static_cast<uint64_t>(rhi::ResourceAccessType::Common),
             static_cast<uint64_t>(rhi::ResourceLayout::Common), static_cast<uint64_t>(rhi::ResourceSyncState::None), false};
         auto state = std::make_shared<PreparedBackingState>();
-        state->graphResourceID = 1; state->resource = {95,1}; state->shape = {1,1,true}; state->debugName = "Alternating";
+        state->graphResourceID = 1; state->resource = {95,1}; state->shape = {1,1,true};
         state->regions = std::make_shared<const std::vector<PreparedStateRegion>>(std::vector<PreparedStateRegion>{{{0,1,0,1}, home}});
         GraphProgram program;
         auto edit = program.BeginEdit();
