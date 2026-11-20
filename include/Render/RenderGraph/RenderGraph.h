@@ -803,6 +803,10 @@ public:
 	// persistent::AllEpochs (the default) takes every pass.
 	void SetPassEpochFilter(uint32_t epoch) noexcept { m_passEpochFilter = epoch; }
 	uint32_t PassEpochFilter() const noexcept { return m_passEpochFilter; }
+	// The owner's value that every recording of this graph carries (RecordingContext::Tag), such as the pipeline versions its
+	// passes bind. Set while the graph is built (an extension's PrepareForBuild), before it first executes. One owner sets it.
+	void SetRecordingTag(std::shared_ptr<const void> tag) noexcept { m_recordingTag = std::move(tag); }
+	const std::shared_ptr<const void>& RecordingTag() const noexcept { return m_recordingTag; }
 	// Whether the graph's epoch (PassEpochFilter) is an external one, whose graphics work the host runs in its own stream. Its
 	// extensions may then declare passes recorded at execution (ExternalPassDesc::RecordAtExecution). GraphHost sets this before
 	// it builds the graph, so an extension can read it while it gathers its passes.
@@ -996,6 +1000,7 @@ private:
 	bool m_mergeHandoffs = false;        // SetMergedHandoffs
 	bool m_uploadsWithBatches = false;   // SetUploadsWithBatches
 	bool m_keepGatedInline = false;      // SetKeptGatedInline
+	std::shared_ptr<const void> m_recordingTag;  // SetRecordingTag
 	std::mutex m_externalSecondaryPoolsMutex;
 	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;
 	bool m_persistentRecordingReuse = false;

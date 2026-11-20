@@ -504,6 +504,9 @@ public:
     // LatchBlock region and a run's CPU payload are per run. It must not depend on anything else about the frame.
     const RunRef& Run() const noexcept { return m_run; }
     void SetRun(const RunRef& run) noexcept { m_run = run; }
+    // The recording's graph's tag (RenderGraph::SetRecordingTag), null without one. The recording holds it.
+    const void* Tag() const noexcept { return m_tag.get(); }
+    void SetTag(std::shared_ptr<const void> tag) noexcept { m_tag = std::move(tag); }
     // A context to ask passes whether they skip a run (PreparedPass::SkipsAtExecution) before their list is begun. It has the
     // run and nothing else: a SkipsAtExecution may read only Run().
     static RecordingContext ForSkipQuestions(const RunRef& run) {
@@ -632,6 +635,7 @@ private:
     explicit RecordingContext(SkipQuestionsTag) {}
     std::shared_ptr<const persistent::SelectedPublication> m_persistentPublication;
     RunRef m_run{};
+    std::shared_ptr<const void> m_tag;
     rhi::CommandList m_commands;
     std::shared_ptr<const FrozenExecutionBindings> m_bindings;
     std::shared_ptr<const std::vector<ExternalDescriptorBindingValue>> m_externalBindings;
