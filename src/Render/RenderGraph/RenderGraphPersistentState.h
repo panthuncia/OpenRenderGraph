@@ -477,7 +477,7 @@ struct RenderGraph::PersistentInstanceState {
 	std::unordered_map<Resource*, std::pair<size_t, bool>> sharedAliasEligibility;
 	std::vector<std::pair<uint32_t, uint32_t>> aliasEdges;          // Installed placement orderings (logical pass slots).
 	uint64_t aliasPlans = 0, aliasRematerializations = 0;
-	bool forceNewAliasHeaps = false; // Diagnostic (ORG_PERSISTENT_FORCE_REALIAS): next plan re-places every pool.
+	bool forceNewAliasHeaps = false; // the next plan re-places every pool (a packing strategy change)
 	// Built off the owner thread (PrepareFirstPersistentBuild) without its alias placement: the first preparation places.
 	bool deferAliasPlacement = false;
 	bool aliasPlacementDeferred = false;
@@ -768,34 +768,6 @@ using lowering::DescribeDeclaration;
 using lowering::LoweredGroup;
 using lowering::LoweredPass;
 using lowering::LoweredUse;
-} // namespace
-
-// ---------------------------------------------------------------------------
-// Diagnostic: forced alias re-placement
-//
-// ORG_PERSISTENT_FORCE_REALIAS realizes every alias pool on a fresh heap, which
-// rematerializes every placed resource and rotates its descriptor slots: the
-// event a pool growth causes once at startup, made repeatable so consumers of
-// descriptor indices can be tested on the exact frame it happens.
-//   interval:N  every N frames (a structural build each time)
-//   captures    in the build that hosts frame-interrupting passes, so a
-//               mid-frame readback observes the rotation frame itself
-
-namespace persistent_impl {
-struct ForcedRealiasConfig { uint64_t interval = 0; bool withCaptures = false; };
-inline const ForcedRealiasConfig& ForcedRealias() {
-	static const ForcedRealiasConfig config = [] {
-		ForcedRealiasConfig result;
-		const char* value = std::getenv("ORG_PERSISTENT_FORCE_REALIAS");
-		if (!value) return result;
-		const std::string text(value);
-		if (text == "captures") result.withCaptures = true;
-		else if (text.rfind("interval:", 0) == 0) result.interval = std::strtoull(text.c_str() + 9, nullptr, 10);
-		if (result.interval || result.withCaptures) spdlog::warn("Persistent graph: forced alias re-placement enabled ({})", text);
-		return result;
-	}();
-	return config;
-}
 } // namespace
 
 namespace persistent_impl {

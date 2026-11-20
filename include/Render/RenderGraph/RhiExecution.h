@@ -278,7 +278,6 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayload(
         std::move(initialStates));
     result->externalWaitsByPreparedPass = std::move(externalWaitsByPreparedPass);
     result->leases = std::move(leases);
-    TraceBindingHolder(result->bindings->PublicationRoot(), result, "PreparedFramePayload", frameNumber);
     return result;
 }
 
@@ -304,7 +303,6 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayloadWith
     result->leases = resources->leases;
     result->resources = std::move(resources);
     result->frameData = std::move(frameData);
-    TraceBindingHolder(result->bindings->PublicationRoot(), result, "PreparedFramePayload", frameNumber);
     return result;
 }
 
@@ -329,7 +327,6 @@ inline std::shared_ptr<const PreparedFramePayload> BuildPreparedFramePayload(
     result->leases = resources->leases;
     result->resources = std::move(resources);
     result->frameData = std::move(frameData);
-    TraceBindingHolder(result->bindings->PublicationRoot(), result, "PreparedFramePayload", frameNumber);
     return result;
 }
 

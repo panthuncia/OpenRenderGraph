@@ -437,8 +437,6 @@ int main() {
         auto execution = std::make_shared<int>(5);
         std::weak_ptr<const PublicationBindingBundle> rootLifetime = root;
         std::weak_ptr<int> payloadLifetime = payload, executionLifetime = execution;
-        TraceBindingHolder(root, payload, "TestPayload", 7);
-        TraceBindingHolderFromOwner(payload.get(), execution, "TestExecution");
         root.reset(); payload.reset(); execution.reset(); version.reset();
         ENSURE(rootLifetime.expired() && payloadLifetime.expired() && executionLifetime.expired());
     }

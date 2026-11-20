@@ -12,74 +12,6 @@
 #include <tuple>
 
 namespace org {
-namespace {
-struct BindingHolderObservation {
-    std::weak_ptr<const PublicationBindingBundle> bundle;
-    std::weak_ptr<const void> holder;
-    const void* identity;
-    const char* role;
-    uint64_t frame;
-};
-std::mutex g_bindingHolderMutex;
-std::vector<BindingHolderObservation> g_bindingHolders;
-std::vector<std::weak_ptr<const ResourceBindingSnapshot>> g_producerSnapshots;
-}
-bool BindingLifetimeTraceEnabled() {
-    static const bool enabled = [] {
-        const auto* value = std::getenv("ORG_RESOURCE_LIFETIME_TRACE");
-        return value && value[0] == '1';
-    }();
-    return enabled;
-}
-void TraceBindingHolder(const std::shared_ptr<const PublicationBindingBundle>& bundle,
-    std::shared_ptr<const void> holder, const char* role, uint64_t frame) {
-    if (!BindingLifetimeTraceEnabled() || !bundle || !holder) return;
-    std::lock_guard lock(g_bindingHolderMutex);
-    std::erase_if(g_bindingHolders, [](const auto& entry) { return entry.holder.expired(); });
-    for (auto& entry : g_bindingHolders) if (entry.identity == holder.get()) {
-        entry = {bundle, holder, holder.get(), role, frame};
-        return;
-    }
-    g_bindingHolders.push_back({bundle, holder, holder.get(), role, frame});
-}
-void TraceBindingHolderFromOwner(const void* source, std::shared_ptr<const void> holder, const char* role) {
-    if (!BindingLifetimeTraceEnabled() || !holder) return;
-    std::shared_ptr<const PublicationBindingBundle> bundle;
-    uint64_t frame = 0;
-    {
-        std::lock_guard lock(g_bindingHolderMutex);
-        for (const auto& entry : g_bindingHolders) if (entry.identity == source && !entry.holder.expired()) {
-            bundle = entry.bundle.lock(); frame = entry.frame; break;
-        }
-    }
-    TraceBindingHolder(bundle, std::move(holder), role, frame);
-}
-void DumpBindingHolders(uint64_t resourceID, std::ostream& out) {
-    std::vector<BindingHolderObservation> observations;
-    std::vector<std::weak_ptr<const ResourceBindingSnapshot>> snapshots;
-    { std::lock_guard lock(g_bindingHolderMutex); observations = g_bindingHolders; snapshots = g_producerSnapshots; }
-    for (const auto& weak : snapshots) {
-        const auto snapshot = weak.lock();
-        if (!snapshot || snapshot->resourceID != resourceID) continue;
-        const auto handle = snapshot->resource.GetHandle();
-        out << "snapshot," << resourceID << ',' << snapshot.get() << ',' << snapshot->backingGeneration
-            << ',' << handle.index << ',' << handle.generation << ',' << snapshot->views.get()
-            << ',' << weak.use_count() - 1 << ',' << snapshot->semanticConsumer.get()
-            << ',' << snapshot->semanticConsumer.use_count() << '\n';
-    }
-    for (const auto& entry : observations) {
-        const auto holder = entry.holder.lock();
-        const auto bundle = entry.bundle.lock();
-        if (!holder || !bundle) continue;
-        const auto* binding = bundle->Find(resourceID);
-        if (!binding) continue;
-        const auto& snapshot = **binding;
-        out << "holder," << resourceID << ',' << snapshot.backingGeneration << ','
-            << entry.role << ',' << entry.frame << ',' << holder.get() << ',' << bundle.get()
-            << ',' << entry.holder.use_count() - (holder.get() == bundle.get() ? 2 : 1) << ',' << entry.bundle.use_count() - (holder.get() == bundle.get() ? 2 : 1)
-            << ',' << binding->use_count() << ',' << snapshot.semanticConsumer.use_count() << '\n';
-    }
-}
 PublicationBindingBundle::PublicationBindingBundle(std::vector<Snapshot> bindings,
     std::vector<std::shared_ptr<const void>> semanticOwners,
     std::vector<std::shared_ptr<const PublicationBindingBundle>> parents)
@@ -166,11 +98,6 @@ PublicationBindingBundle::Snapshot PublicationBindingBundle::Capture(Resource& r
     result->bindingTable = resource.GetBindingTableVersion();
     result->recordingOwner = std::make_shared<const std::tuple<std::shared_ptr<const void>, std::shared_ptr<const void>,
         std::shared_ptr<const BindingTableVersion>>>(result->allocationOwner, result->descriptorOwner, result->bindingTable);
-    if (BindingLifetimeTraceEnabled()) {
-        std::lock_guard lock(g_bindingHolderMutex);
-        std::erase_if(g_producerSnapshots, [](const auto& entry) { return entry.expired(); });
-        g_producerSnapshots.push_back(result);
-    }
     return result;
 }
 }

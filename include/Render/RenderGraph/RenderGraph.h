@@ -886,7 +886,7 @@ private:
 	void SubmitPersistentSegment(PersistentSegmentRun& run);
 	// skipAliasCandidates leaves alias-eligible transients unmaterialized so the
 	// structural build can place them (see PlanPersistentAliasPlacement).
-	void MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates = false, const char* site = nullptr);
+	void MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates = false);
 	// A resource a pass on another device uses: one shared D3D12 allocation, imported into Vulkan, as its representation on
 	// every device (the primary's included). Its descriptors on each device name that device's representation. Kept while
 	// the backing lives; the resource's next materialization clears them and the next binding makes new ones.

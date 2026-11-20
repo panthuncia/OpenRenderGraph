@@ -193,12 +193,7 @@ rhi::ResourceAllocationInfo RenderGraph::SharedAliasAllocationInfo(Resource* con
 	return result;
 }
 
-void RenderGraph::MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates, const char* site) {
-	// ORG_TRACE_STANDALONE=<name part>: each standalone backing of a matching resource is logged with its graph and call site.
-	static const std::string trace = [] {
-		const char* value = std::getenv("ORG_TRACE_STANDALONE");
-		return std::string(value ? value : "");
-	}();
+void RenderGraph::MaterializePersistentStandalone(std::span<Resource* const> resources, bool skipAliasCandidates) {
 	for (auto* resource : resources) {
 		auto* concrete = UnwrapDynamic(resource);
 		auto* backed = concrete ? dynamic_cast<BackedResource*>(concrete) : nullptr;
@@ -207,9 +202,6 @@ void RenderGraph::MaterializePersistentStandalone(std::span<Resource* const> res
 		if (auto* texture = dynamic_cast<PixelBuffer*>(concrete)) texture->Materialize();
 		else if (auto* buffer = dynamic_cast<BufferBase*>(concrete)) buffer->Materialize();
 		else continue;
-		if (!trace.empty() && (trace == "*" || concrete->GetName().find(trace) != std::string::npos))
-			spdlog::info("Persistent standalone backing: '{}' epoch={} graph={} site={}", concrete->GetName(), m_passEpochFilter,
-				static_cast<const void*>(this), site ? site : "?");
 		TrackTransientFrameResource(concrete);
 		basic_telemetry::AddCounter("ORG.Persistent.StandaloneMaterializations");
 	}
@@ -249,7 +241,7 @@ void RenderGraph::BindUnboundPersistentEntries(persistent::GraphEditTransaction&
 		auto* backed = concrete ? dynamic_cast<BackedResource*>(concrete) : nullptr;
 		if (backed && !backed->IsMaterialized()) {
 			if (entry.direct && unboundSlotsByConcrete[concrete] <= 1 && IsPersistentAliasCandidate(concrete)) continue;
-			MaterializePersistentStandalone(std::span<Resource* const>{&entry.resource, 1}, false, "bind unbound");
+			MaterializePersistentStandalone(std::span<Resource* const>{&entry.resource, 1}, false);
 		}
 		BindEntry(state, edit, index);
 	}
@@ -387,7 +379,7 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 				std::vector<Resource*> resources;
 				for (const auto& use : lowered.entries) resources.push_back(use.resource);
 				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource.get());
-				MaterializePersistentStandalone(resources, true, "structural relower");
+				MaterializePersistentStandalone(resources, true);
 				auto views = std::move(main.declaredViews);
 				auto bindings = std::move(main.declaredBindings);
 				auto preparedUses = main.preparedResourceUses;
@@ -607,7 +599,7 @@ void RenderGraph::UpdatePersistentFrameInterruptingPasses(
 				std::vector<Resource*> resources;
 				for (const auto& use : lowered.entries) resources.push_back(use.resource);
 				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource.get());
-				MaterializePersistentStandalone(resources, true, "install main pass");
+				MaterializePersistentStandalone(resources, true);
 				InstallMainPass(*this, state, edit, main, std::move(lowered), mainIndex, false, order);
 			}
 		}, any.pass);
@@ -615,10 +607,7 @@ void RenderGraph::UpdatePersistentFrameInterruptingPasses(
 		for (const auto b : before) edit.AddOrdering(main.id, state.mainPasses[b].id);
 		state.hostedMainPasses.push_back(mainIndex);
 	}
-	state.forceNewAliasHeaps = ForcedRealias().withCaptures && !state.hostedMainPasses.empty();
 	auto ready = BuildPersistentStructural(edit);
-	if (state.forceNewAliasHeaps) spdlog::info("Persistent forced alias re-placement with frame-interrupting passes: frame={}", state.frameNumber);
-	state.forceNewAliasHeaps = false;
 	if (!ready || !state.program.Install(edit, ready)) throw std::runtime_error("Persistent frame-interrupting pass edit failed to install");
 	++state.structuralBuilds;
 	basic_telemetry::AddCounter("ORG.Persistent.StructuralBuilds");
@@ -850,42 +839,17 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	constexpr uint64_t kAutoPoolGlobal = 0xA171000000000000ull;
 	const float threshold = mode == AutoAliasMode::Conservative ? 1.0f : mode == AutoAliasMode::Balanced ? 0.25f
 		: mode == AutoAliasMode::Aggressive ? -0.5f : std::numeric_limits<float>::infinity();
-	// Diagnostic bisection: comma-separated name substrings kept out of the pools ("*": every resource).
-	static const std::vector<std::string> diagnosticExclusions = [] {
-		std::vector<std::string> out;
-		if (const char* list = std::getenv("ORG_PERSISTENT_ALIAS_EXCLUDE")) {
-			std::string text(list);
-			for (size_t pos = 0; pos < text.size();) {
-				const auto next = text.find(',', pos);
-				auto token = text.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
-				if (!token.empty()) out.push_back(std::move(token));
-				pos = next == std::string::npos ? text.size() : next + 1;
-			}
-		}
-		return out;
-	}();
 	// Each epoch's graph packs its transients from offset 0, so the epochs sharing an arena overlap in memory. The alias ledger
 	// orders that: a run whose transient overlaps another epoch's committed use enters it from Undefined, after that use (a wait
-	// on another timeline, sync All on its own queue). ORG_VALIDATE_ALIAS_ADMISSION=1 checks at each commit that the ledger still
-	// agrees with what the run was admitted with.
+	// on another timeline, sync All on its own queue).
 	// A transient holds nothing from one run to the next, and with shared pools its memory holds another epoch's data in between.
 	// A pass that reads texels no pass wrote in that run shows the other epoch's data. CS's Screen Space GI did (its radiance
 	// prefilter read past the frame), which gave the green streaks once blamed on sharing.
-	// ORG_PERSISTENT_ALIAS_SHARE_EPOCHS=0 gives each epoch pools of its own (more memory; for A/B runs).
-	static const bool shareAcrossEpochs = [] {
-		const char* value = std::getenv("ORG_PERSISTENT_ALIAS_SHARE_EPOCHS");
-		return !(value && value[0] == '0');
-	}();
-	const uint64_t aliasDomain = shareAcrossEpochs ? 0 : uint64_t{m_passEpochFilter} + 1;
 	size_t excludedCount = 0;
 	for (auto& c : candidates) {
 		std::sort(c.users.begin(), c.users.end());
 		c.users.erase(std::unique(c.users.begin(), c.users.end()), c.users.end());
-		const auto& name = c.concrete->GetName();
-		if (std::any_of(diagnosticExclusions.begin(), diagnosticExclusions.end(),
-				[&](const std::string& token) { return token == "*" || name.find(token) != std::string::npos; }))
-			c.exclusion = "ORG_PERSISTENT_ALIAS_EXCLUDE";
-		else if (c.firstUse == UINT32_MAX) { c.exclusion = "unused"; }
+		if (c.firstUse == UINT32_MAX) { c.exclusion = "unused"; }
 		else if (!c.direct) { c.exclusion = "group member"; }
 		else if (c.manualPool) {
 			if (!c.firstUseIsWrite)
@@ -912,7 +876,6 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			boost::hash_combine(c.poolID, c.resourceClass);
 			if (std::popcount(c.backendMask) > 1) { c.pooled = false; c.exclusion = "multi-backend placement unsupported"; }
 		}
-		if (c.pooled && aliasDomain) boost::hash_combine(c.poolID, aliasDomain);
 		if (c.exclusion) ++excludedCount;
 	}
 
@@ -1174,7 +1137,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			// Placed by another graph of the arena and standalone in this one: it leaves that placement for a backing of its own.
 			if (NoteAliasPlaced(c.concrete, false) && backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
 			if (!backed->IsMaterialized()) {
-				MaterializePersistentStandalone(std::span<Resource* const>{&c.concrete, 1}, false, "alias plan (not pooled)");
+				MaterializePersistentStandalone(std::span<Resource* const>{&c.concrete, 1}, false);
 				++standalone;
 				rebind(c.concrete);
 			}
@@ -1241,9 +1204,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	}
 	if (rematerialized) basic_telemetry::AddCounter("ORG.Persistent.AliasRematerializations", static_cast<int64_t>(rematerialized));
 	if (logging || state.aliasPlans <= 2 || rematerialized)
-		spdlog::info("Persistent alias plan #{}: epoch={} inHostStream={} poolsPerEpoch={} candidates={} placed={} excluded={} pools={} overlapPairs={} "
+		spdlog::info("Persistent alias plan #{}: epoch={} inHostStream={} candidates={} placed={} excluded={} pools={} overlapPairs={} "
 			"orderings={} rematerialized={} standalone={} independentMB={:.2f} requiredMB={:.2f} reservedMB={:.2f} rebuild={}",
-			state.aliasPlans, m_passEpochFilter, PassEpochInHostStream(), aliasDomain != 0, candidates.size(), placed, excludedCount, byPool.size(),
+			state.aliasPlans, m_passEpochFilter, PassEpochInHostStream(), candidates.size(), placed, excludedCount, byPool.size(),
 			overlapPairs, edges.size(), rematerialized, standalone, independentBytes / (1024.0 * 1024.0), requiredBytes / (1024.0 * 1024.0),
 			reservedBytes / (1024.0 * 1024.0), changed);
 	// Which queue slots this epoch's batches use, once per plan under logging: with inHostStream, which of them are in the host's stream.

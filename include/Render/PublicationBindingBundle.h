@@ -53,10 +53,4 @@ private:
     std::unordered_multimap<uint64_t, size_t> m_nativeIndices;
     std::vector<std::shared_ptr<const PublicationBindingBundle>> m_parents;
 };
-// Explicit diagnostics only. Weak observations never become lifetime owners.
-bool BindingLifetimeTraceEnabled();
-void TraceBindingHolder(const std::shared_ptr<const PublicationBindingBundle>&,
-    std::shared_ptr<const void> holder, const char* role, uint64_t frame = 0);
-void TraceBindingHolderFromOwner(const void* source, std::shared_ptr<const void> holder, const char* role);
-void DumpBindingHolders(uint64_t resourceID, std::ostream&);
 }

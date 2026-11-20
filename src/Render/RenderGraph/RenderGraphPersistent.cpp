@@ -880,7 +880,7 @@ void RenderGraph::BootstrapPersistentGraph() {
 		}
 		std::sort(usedResources.begin(), usedResources.end());
 		usedResources.erase(std::unique(usedResources.begin(), usedResources.end()), usedResources.end());
-		MaterializePersistentStandalone(usedResources, true, "first build");
+		MaterializePersistentStandalone(usedResources, true);
 		const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
 		auto edit = state.program.BeginEdit();
 		edit.SetQueues(RegistryQueues(m_queueRegistry, m_runtime->Backend()));
@@ -978,25 +978,6 @@ void RenderGraph::BootstrapPersistentGraph() {
 			spdlog::info("Persistent slot directory: resources={} sharedAcrossGroups={} directAndGroup={}", state.entriesByResourceID.size(),
 				std::count_if(groupsByResource.begin(), groupsByResource.end(), [](const auto& kv) { return kv.second.size() > 1; }), directAndGroup);
 		}
-		if (const char* dump = std::getenv("ORG_PERSISTENT_DUMP_SLOTS")) {
-			std::string list(dump);
-			for (size_t pos = 0; pos < list.size();) {
-				const auto next = list.find(',', pos);
-				const auto index = static_cast<uint32_t>(std::stoul(list.substr(pos, next == std::string::npos ? std::string::npos : next - pos)));
-				pos = next == std::string::npos ? list.size() : next + 1;
-				if (index >= state.entries.size()) continue;
-				const auto& entry = state.entries[index];
-				std::string subs; for (const auto sub : entry.subscribers) subs += state.mainPasses[sub].name + ",";
-				std::string groupName = "-";
-				for (uint32_t g = 0; g < state.groups.size(); ++g)
-					if (std::find(state.groups[g].memberEntries.begin(), state.groups[g].memberEntries.end(), index) != state.groups[g].memberEntries.end()) {
-						const IResourceResolver* resolver = state.groups[g].resolver.get();
-						groupName = std::to_string(g) + ":" + (resolver ? typeid(*resolver).name() : "?") + "(members=" + std::to_string(state.groups[g].memberIndexByID.size()) + ")";
-					}
-				spdlog::info("Persistent slot {}: resource='{}' id={} direct={} group={} subs=[{}]", index,
-					entry.resource ? entry.resource->GetName() : "-", entry.resourceID, entry.direct, groupName, subs);
-			}
-		}
 		spdlog::info("Persistent graph bootstrap: mainPasses={} uploads={} slots={} groups={} batches={} build_ms={:.2f}",
 			state.mainPasses.size(), state.uploadMasterIndices.size(), state.entries.size(), state.groups.size(),
 			ready->executable->graph->batches.size(),
@@ -1029,12 +1010,9 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 		std::optional<persistent::GraphEditTransaction> edit;
 		AdvancePersistentStructuralBuild(structural);
 		UpdatePersistentFrameInterruptingPasses(std::move(interrupting), primaryBackend);
-		// Alias re-placement: on the ORG_PERSISTENT_FORCE_REALIAS interval, or when the packing strategy changed since the
-		// latest plan (plans run only on structural builds).
-		const auto interval = ForcedRealias().interval;
-		const bool realiasInterval = interval && state.frameNumber % interval == 0;
+		// Alias re-placement when the packing strategy changed since the latest plan (plans run only on structural builds).
 		const bool packingChanged = m_getAutoAliasPackingStrategy && m_getAutoAliasPackingStrategy() != state.aliasPackingStrategy;
-		if ((realiasInterval || packingChanged) && !state.pending) {
+		if (packingChanged && !state.pending) {
 			BT_ZONE_SCOPE("ORG.Persistent.ForcedRealias");
 			auto forced = state.program.BeginEdit();
 			// Re-placement is only valid in a structural edit (the executable must
@@ -1202,7 +1180,7 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 				BT_ZONE_SCOPE("ORG.Persistent.PollGroups.Diff.Materialize");
 				std::vector<Resource*> arriving;
 				for (const auto& [id, member] : members) if (!group.memberIndexByID.contains(id)) arriving.push_back(member.get());
-				MaterializePersistentStandalone(arriving, false, "group members");
+				MaterializePersistentStandalone(arriving, false);
 			}
 			const auto counts = SyncGroupMembers(state, transaction, group, members);
 			added = counts.added;
@@ -1248,7 +1226,7 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 				auto& transaction = ensureEdit();
 				// Rotated backings may not be materialized yet (per-frame presentation
 				// targets are realized lazily by the legacy path).
-				MaterializePersistentStandalone(std::span<Resource* const>{&entry.resource, 1}, false, "poll backings");
+				MaterializePersistentStandalone(std::span<Resource* const>{&entry.resource, 1}, false);
 				// Slot maps are keyed by resource IDs: only a wrapper whose concrete
 				// backing object changed exposes a new ID to its subscribers.
 				const bool concreteChanged = key.concreteID != entry.bound.concreteID;
@@ -1729,7 +1707,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 						resources.push_back(resource);
 						upload.accesses.push_back({resource, requirement.resourceHandleAndRange.range, requirement.state});
 					}
-					MaterializePersistentStandalone(resources, false, "pre pass");
+					MaterializePersistentStandalone(resources, false);
 					upload.bytecode = std::move(frame.bytecode);
 					upload.keepAlive = std::shared_ptr<org::imm::KeepAliveBag>(std::move(frame.keepAlive));
 					if (effect) {

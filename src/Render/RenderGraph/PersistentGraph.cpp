@@ -342,8 +342,7 @@ bool SharingValidationEnabled() noexcept {
     auto value = g_sharingValidation.load(std::memory_order_relaxed);
     if (value < 0) {
 #ifdef NDEBUG
-        const char* env = std::getenv("ORG_VALIDATE_SHARING");
-        value = env && env[0] == '1' ? 1 : 0;
+        value = 0;
 #else
         value = 1;
 #endif
@@ -351,62 +350,6 @@ bool SharingValidationEnabled() noexcept {
     }
     return value != 0;
 }
-namespace {
-// ORG_VALIDATE_ALIAS_ADMISSION=1: each commit checks that the alias ledger would still make the same backings enter from
-// Undefined as it did at admission (another graph's commit in between can add one).
-bool AliasAdmissionValidationEnabled() noexcept {
-    static const bool enabled = [] {
-        const char* env = std::getenv("ORG_VALIDATE_ALIAS_ADMISSION");
-        return env && env[0] == '1';
-    }();
-    return enabled;
-}
-
-void ValidateAliasAdmission(const ResourceSequencer& sequencer, const FrameAdmission& frame) {
-    const auto& ledger = sequencer.aliases;
-    const auto& graph = *frame.publication->executable->graph;
-    const auto now = ledger.ApplyInitialStates(graph, frame.backings);
-    std::string missed;
-    size_t count = 0;
-    for (const auto handle : now) {
-        if (std::ranges::any_of(frame.aliasActivations, [&](rhi::ResourceHandle admitted) {
-                return admitted.index == handle.index && admitted.generation == handle.generation; }))
-            continue;
-        ++count;
-        for (const auto& backing : frame.backings)
-            if (backing.resource.index == handle.index && backing.resource.generation == handle.generation) {
-                missed += (missed.empty() ? "" : ", ") + (backing.graphResourceKey.empty() ? std::to_string(handle.index) : backing.graphResourceKey);
-                break;
-            }
-    }
-    static std::atomic<uint32_t> logged{0};
-    if (count) {
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 50)
-            spdlog::error("ORG alias admission: {} aliased backing(s) of admission {} had another occupant commit into their memory "
-                "after admission, so they do not enter from Undefined: {}", count, frame.sequence, missed);
-        basic_telemetry::AddCounter("ORG.Persistent.AliasAdmissionMissed", static_cast<int64_t>(count));
-    }
-    // The waits: every previous occupant's latest access the ledger holds now, against the waits the admission recorded.
-    if (frame.queuePoints.size() != graph.structure->queues.size()) return;
-    std::vector<std::vector<compiler::ExecutionTimelinePoint>> fresh(graph.batches.size());
-    ledger.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, fresh);
-    for (uint32_t batch = 0; batch < fresh.size() && batch < frame.incomingWaits.size(); ++batch) {
-        for (const auto point : fresh[batch]) {
-            const bool covered = std::ranges::any_of(frame.incomingWaits[batch], [&](compiler::ExecutionTimelinePoint wait) {
-                return wait.timeline == point.timeline && wait.value >= point.value; });
-            if (covered || sequencer.Reached(point)) continue;
-            uint64_t had = 0;
-            for (const auto wait : frame.incomingWaits[batch]) if (wait.timeline == point.timeline) had = (std::max)(had, wait.value);
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 50)
-                spdlog::error("ORG alias admission: admission {} batch {} (queue timeline {}) needs timeline {} at {} for an aliased "
-                    "occupant's access committed after admission; it waits for {}", frame.sequence, batch,
-                    frame.queuePoints[graph.batches[batch].queue].timeline, point.timeline, point.value, had);
-            basic_telemetry::AddCounter("ORG.Persistent.AliasAdmissionStaleWait");
-        }
-    }
-}
-}
-
 void ValidateSharedBackings(const ExecutableGeneration& executable, const BindingTable& bindings) {
     BT_ZONE_SCOPE("ORG.Persistent.ValidateSharedBackings");
     // Compiled resource -> the identity of the first bound slot found for it, and identity -> its compiled resource.
@@ -2087,7 +2030,6 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const compiler::G
         m_sequencer->incomingRevisions.insert_or_assign((uint64_t{effect.resource.generation} << 32) | effect.resource.index,
             ResourceSequencer::IncomingRevision{effect.revision,effect.completion});
     m_sequencer->accesses.Commit(graph, frame.backings, receipt, count, frame.backings.Id(), frame.stream);
-    if (AliasAdmissionValidationEnabled()) ValidateAliasAdmission(*m_sequencer, frame);
     m_sequencer->aliases.Commit(graph, frame.backings, receipt, count);
     m_submitted = std::move(submitted);
     ErasePendingOwner(frame.sequence);

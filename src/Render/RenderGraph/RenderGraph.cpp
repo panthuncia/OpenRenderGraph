@@ -32,20 +32,6 @@ std::shared_ptr<const ResolverDeclarationState> RenderGraph::CaptureResolverDecl
 namespace {
 std::atomic_bool g_loggedLegacyPacketRecording{false};
 
-size_t PassRecordingConcurrency()
-{
-	static const size_t value = [] {
-		const char* configured = std::getenv("ORG_PASS_RECORD_CONCURRENCY");
-		if (!configured || !*configured) return (std::numeric_limits<size_t>::max)();
-		char* end = nullptr;
-		const auto parsed = std::strtoull(configured, &end, 10);
-		return end != configured && *end == '\0' && parsed > 0
-			? static_cast<size_t>(parsed)
-			: (std::numeric_limits<size_t>::max)();
-	}();
-	return value;
-}
-
 }
 
 namespace {

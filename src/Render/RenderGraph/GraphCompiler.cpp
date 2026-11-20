@@ -263,7 +263,6 @@ void ExecutionTimelineAdmission::CommitBatch(uint64_t submission, uint32_t batch
     const auto queue = m_pending->bundle->graph->batches.at(batch).queue;
     m_submitted.at(queue) = m_pending->batches.at(batch).signal;
     if (++m_nextBatch == m_pending->batches.size()) {
-        TraceBindingHolderFromOwner(m_pending->bundle->input->executionPayload.get(), m_pending, "SubmittedExecution");
         m_retained.push_back(std::move(m_pending));
     }
 }
@@ -329,7 +328,6 @@ size_t ExecutionTimelineAdmission::RetireCompleted(std::span<const ExecutionTime
         BT_ZONE_SCOPE("ORG.Frame.Retire");
         for (const auto& packet : execution->preparedBatches)
             if (packet) packet->Complete(execution->submission);
-        TraceBindingHolderFromOwner(execution->bundle->input->executionPayload.get(), execution, "RetiredExecution");
         m_retiredGarbage.push_back(std::move(*iterator));
         iterator = m_retained.erase(iterator);
     }
@@ -360,13 +358,6 @@ bool ExecutionTimelineAdmission::LowestRetainedSignals(std::span<uint64_t> lowes
 
 std::vector<std::shared_ptr<GraphExecutionTimeline>>
 ExecutionTimelineAdmission::TakeRetiredGarbage() {
-    // Explicit diagnostic reproduction of the old synchronous retention bug.
-    // Never enabled by normal tracing or normal execution.
-    static const bool holdRetired = [] {
-        const auto* value = std::getenv("ORG_RESOURCE_LIFETIME_TRACE_HOLD_RETIRED");
-        return BindingLifetimeTraceEnabled() && value && value[0] == '1';
-    }();
-    if (holdRetired) return {};
     return std::exchange(m_retiredGarbage, {});
 }
 

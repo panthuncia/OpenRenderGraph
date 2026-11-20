@@ -394,7 +394,7 @@ private:
 // are one compiled resource, and one compiled resource is one backing. Also checks each epoch executable. Throws
 // std::logic_error naming the slots when not. SynchronousAdmission::Prepare runs it while sharing validation is on.
 void ValidateSharedBackings(const ExecutableGeneration& executable, const BindingTable& bindings);
-// Sharing validation at admission. On by default in debug builds, or with ORG_VALIDATE_SHARING=1 in the environment.
+// Sharing validation at admission. On by default in debug builds; SetSharingValidation turns it on or off.
 void SetSharingValidation(bool enabled) noexcept;
 bool SharingValidationEnabled() noexcept;
 
@@ -470,7 +470,7 @@ struct FrameAdmission {
     // (swapchain images and similar late-bound imports), not the publication.
     std::vector<uint32_t> rebound;
     // The aliased backings the alias ledger made enter from Undefined (AliasAccessAdmissionLedger::ApplyInitialStates) when it
-    // was admitted. ORG_VALIDATE_ALIAS_ADMISSION=1 checks at commit that no other commit since added one.
+    // was admitted.
     std::vector<rhi::ResourceHandle> aliasActivations;
     // Admitted for a body recorded already (SynchronousAdmission::PrepareAtSubmission): the plan has the entry barriers, releases
     // and the ledger's commits, not the body's barriers.
