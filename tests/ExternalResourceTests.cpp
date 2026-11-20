@@ -10,7 +10,6 @@
 #include <Render/RenderGraph/ExecutionState.h>
 #include <Render/RenderGraph/PersistentGraph.h>
 #include <Render/BufferBarrierHelpers.h>
-#include <Render/DescriptorSnapshots.h>
 #include <Render/Runtime/FrameWorkQueue.h>
 #include <Render/Runtime/ExternalSignalReservation.h>
 #include <Resources/TrackedAllocation.h>
@@ -764,99 +763,6 @@ int TestPreparedGpuSubmission(rhi::Device device, ID3D12Device* nativeDevice) {
     return 0;
 }
 
-int TestDescriptorSnapshots(const rhi::DeviceCreateInfo& create) {
-    auto deviceOwner = std::make_shared<rhi::DevicePtr>();
-    CHECK(rhi::CreateD3D12Device(create, *deviceOwner) == rhi::Result::Ok);
-    auto device = deviceOwner->Get();
-    struct Backing {
-        std::shared_ptr<rhi::DevicePtr> device;
-        Microsoft::WRL::ComPtr<ID3D12Resource> native;
-        rhi::ResourcePtr resource;
-    };
-    auto backing = std::make_shared<Backing>(); backing->device = deviceOwner;
-    backing->native = MakeResource(rhi::dx12::get_device(device), false, 4096);
-    CHECK(rhi::dx12::import_resource(device, backing->native.Get(), backing->resource) == rhi::Result::Ok);
-    auto writes = std::make_shared<unsigned>(0);
-    struct View { std::shared_ptr<Backing> backing; std::shared_ptr<unsigned> writes; bool fail; };
-    const auto encode = +[](const View& view, rhi::Device target, rhi::DescriptorSlot slot) noexcept {
-        ++*view.writes;
-        if (view.fail) return rhi::Result::Failed;
-        rhi::SrvDesc desc{}; desc.dimension = rhi::SrvDim::Buffer; desc.buffer.numElements = 1024;
-        return target.CreateShaderResourceView(slot, view.backing->resource.Get().GetHandle(), desc);
-    };
-    auto original = org::OwnedDescriptorWrite::Make(View{backing,writes,false}, encode);
-    org::DescriptorContentJournal journal({rhi::DescriptorHeapType::CbvSrvUav,130,true});
-    journal.Write(3, original); journal.Write(129, original);
-    auto old = journal.CaptureContents();
-    CHECK(old == journal.CaptureContents());
-    journal.Write(3, original);
-    CHECK(old == journal.CaptureContents());
-    org::DescriptorSnapshotPool pool(device, deviceOwner, 2);
-    auto first = pool.Assemble(0, old);
-    CHECK(first && *writes == 2 && first->Resolve(129).index == 129);
-    const auto firstHeap = first->Heap().GetHandle();
-    journal.Write(3, org::OwnedDescriptorWrite::Make(View{backing,writes,false}, encode));
-    auto newer = journal.CaptureContents();
-    CHECK(!pool.Assemble(0, newer)); // Recording/GPU lease blocks mutation.
-    auto second = pool.Assemble(1, newer);
-    CHECK(second && *writes == 4);
-    CHECK(rhi::HandleEqual<rhi::DescriptorHeapHandle>{}(firstHeap, first->Heap().GetHandle()));
-    second.reset();
-    second = pool.Assemble(1, newer); CHECK(*writes == 4); // No static-frame writes.
-    second.reset();
-    second = pool.Assemble(1, old); CHECK(*writes == 5); // Historical contents, not latest publication.
-    second.reset();
-    second = pool.Assemble(1, newer); CHECK(*writes == 6); // One dirty slot, not 130.
-    second.reset();
-    journal.Write(3, {});
-    auto removed = journal.CaptureContents();
-    second = pool.Assemble(1, removed); CHECK(*writes == 6);
-    bool denied = false;
-    try { second->Resolve(3); } catch (const std::out_of_range&) { denied = true; }
-    CHECK(denied);
-    second.reset();
-    journal.Write(3, org::OwnedDescriptorWrite::Make(View{backing,writes,true}, encode));
-    bool failed = false;
-    try { pool.Assemble(1, journal.CaptureContents()); } catch (const std::runtime_error&) { failed = true; }
-    CHECK(failed && first->Resolve(3).index == 3); // Selected heap survives failed candidate population.
-    second = pool.Assemble(1, old); CHECK(second && *writes == 9);
-    org::DescriptorContentJournal other({rhi::DescriptorHeapType::CbvSrvUav,130,true});
-    bool wrongGeneration = false;
-    try { pool.Assemble(0, other.CaptureContents()); } catch (const std::invalid_argument&) { wrongGeneration = true; }
-    CHECK(wrongGeneration);
-    // Version-sensitive CPU views use the same journal/pool contract.
-    org::DescriptorContentJournal cpuJournal({rhi::DescriptorHeapType::CbvSrvUav,130,false});
-    cpuJournal.Write(3, original);
-    org::DescriptorSnapshotPool cpuPool(device, deviceOwner, 1);
-    auto cpu = cpuPool.Assemble(0, cpuJournal.CaptureContents());
-    CHECK(cpu && cpu->Resolve(3).index == 3);
-    CHECK(!cpuPool.Assemble(0, cpuJournal.CaptureContents()));
-
-    // Heap creation failure cannot destroy a different selected execution slot.
-    struct AllocationProbe { rhi::Device device; std::shared_ptr<rhi::DevicePtr> owner; bool fail = false; };
-    auto probe = std::make_shared<AllocationProbe>(); probe->device = device; probe->owner = deviceOwner;
-    auto faultTable = *device.vt;
-    faultTable.createDescriptorHeap = +[](rhi::Device* wrapped, const rhi::DescriptorHeapDesc& desc,
-        rhi::DescriptorHeapPtr& heap) noexcept {
-        auto& p = *static_cast<AllocationProbe*>(wrapped->impl);
-        return p.fail ? rhi::Result::Failed : p.device.CreateDescriptorHeap(desc, heap);
-    };
-    faultTable.createShaderResourceView = +[](rhi::Device* wrapped, rhi::DescriptorSlot slot,
-        const rhi::ResourceHandle& resource, const rhi::SrvDesc& desc) noexcept {
-        return static_cast<AllocationProbe*>(wrapped->impl)->device.CreateShaderResourceView(slot, resource, desc);
-    };
-    auto faultDevice = device; faultDevice.impl = probe.get(); faultDevice.vt = &faultTable;
-    org::DescriptorSnapshotPool faultPool(faultDevice, probe, 2);
-    auto selected = faultPool.Assemble(0, old);
-    probe->fail = true;
-    bool allocationFailed = false;
-    try { faultPool.Assemble(1, newer); } catch (const std::runtime_error&) { allocationFailed = true; }
-    CHECK(allocationFailed && selected->Resolve(3).index == 3);
-    probe->fail = false;
-    auto recovered = faultPool.Assemble(1, newer); CHECK(recovered);
-    return 0;
-}
-
 // Persistent passes declared straight into a graph edit. Their packets name the publication they were prepared
 // for by identity only (the frame recorder roots it) and resolve every token through the recording context.
 struct PersistentNativeClear {
@@ -934,9 +840,6 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         } catch (const std::runtime_error&) { rejected = true; }
         CHECK(rejected);
     }
-    org::DescriptorContentJournal gpuJournal({rhi::DescriptorHeapType::CbvSrvUav,16,true});
-    org::DescriptorContentJournal cpuJournal({rhi::DescriptorHeapType::CbvSrvUav,16,false});
-    org::DescriptorSnapshotPool gpuPool(device, runtime, 1), cpuPool(device, runtime, 1);
     GraphCompileInput input;
     input.structure.generation = input.structure.registryGeneration = 1;
     input.structure.resourceIDs = {1,2}; input.structure.resourceShapes.resize(2);
@@ -996,19 +899,23 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
             CHECK(rhi::dx12::import_resource(device, backing->native[i].Get(), backing->resource[i]) == rhi::Result::Ok);
         }
         auto readbackResource = backing->native[1];
-        auto recipe = org::OwnedDescriptorWrite::Make(std::shared_ptr<const Backing>(backing),
-            +[](const std::shared_ptr<const Backing>& data, rhi::Device target, rhi::DescriptorSlot slot) noexcept {
-                rhi::UavDesc desc{}; desc.buffer.numElements = 1024;
-                return target.CreateUnorderedAccessView(slot, data->resource[0].Get().GetHandle(), desc);
-            });
-        gpuJournal.Write(7, recipe); cpuJournal.Write(7, recipe);
-        recipe.reset();
-        auto gpuContents = gpuJournal.CaptureContents(), cpuContents = cpuJournal.CaptureContents();
-        auto gpu = gpuPool.Assemble(0,gpuContents), cpu = cpuPool.Assemble(0,cpuContents);
-        CHECK(gpu && cpu);
-        // Descriptor tables are publication-owned; no per-leaf frozen table
-        // participates in this persistent-only recording path.
-        std::shared_ptr<const void> descriptorOwner = std::make_shared<const decltype(std::make_pair(gpu,cpu))>(gpu,cpu);
+        // The descriptors live in two test heaps. Their owner holds the backing, as a published binding does.
+        struct Descriptors {
+            std::shared_ptr<const Backing> backing;
+            rhi::DescriptorHeapPtr gpu, cpu;
+        };
+        auto descriptors = std::make_shared<Descriptors>(); descriptors->backing = backing;
+        CHECK(device.CreateDescriptorHeap({rhi::DescriptorHeapType::CbvSrvUav, 16, true, "Owned execution descriptors"},
+            descriptors->gpu) == rhi::Result::Ok);
+        CHECK(device.CreateDescriptorHeap({rhi::DescriptorHeapType::CbvSrvUav, 16, false, "Owned execution descriptors"},
+            descriptors->cpu) == rhi::Result::Ok);
+        const rhi::DescriptorSlot gpuSlot{descriptors->gpu.Get().GetHandle(), 7}, cpuSlot{descriptors->cpu.Get().GetHandle(), 7};
+        {
+            rhi::UavDesc desc{}; desc.buffer.numElements = 1024;
+            CHECK(device.CreateUnorderedAccessView(gpuSlot, backing->resource[0].Get().GetHandle(), desc) == rhi::Result::Ok);
+            CHECK(device.CreateUnorderedAccessView(cpuSlot, backing->resource[0].Get().GetHandle(), desc) == rhi::Result::Ok);
+        }
+        std::shared_ptr<const void> descriptorOwner = std::move(descriptors);
         std::vector<PreparedBackingState> initial(2);
         for (uint32_t resource = 0; resource < 2; ++resource) {
             initial[resource].graphResourceID = resource + 1;
@@ -1049,8 +956,8 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
                     snapshot->descriptorOwner = descriptorOwner;
                     auto views = std::make_shared<org::BindlessResourceViews>();
                     views->description = snapshot->description;
-                    views->views.push_back({org::BindlessViewKind::UnorderedAccess,UINT32_MAX,0,0,gpu->Resolve(7)});
-                    views->views.push_back({org::BindlessViewKind::NonShaderVisibleUnorderedAccess,UINT32_MAX,0,0,cpu->Resolve(7)});
+                    views->views.push_back({org::BindlessViewKind::UnorderedAccess,UINT32_MAX,0,0,gpuSlot});
+                    views->views.push_back({org::BindlessViewKind::NonShaderVisibleUnorderedAccess,UINT32_MAX,0,0,cpuSlot});
                     snapshot->views = std::move(views);
                 }
                 snapshot->aliasHeap = initial[resource].aliasHeap;
@@ -1146,7 +1053,7 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         std::weak_ptr<const void> bindingLease = descriptorOwner;
         std::weak_ptr<const org::persistent::SelectedPublication> publicationLease = selected;
         selected.reset();
-        gpu.reset(); cpu.reset(); backing.reset(); descriptorOwner.reset();
+        backing.reset(); descriptorOwner.reset();
         auto execution = std::move(*recorded).Submit(admission);
         persistentAdmission.Commit(frame,*execution);
         frame = {};
@@ -1161,7 +1068,6 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         CHECK(!bindingLease.expired());
         CHECK(!publicationLease.expired());
         CHECK(commandPool->GetDiagnostics().checkedOutCount == 1);
-        CHECK(!gpuPool.Assemble(0,gpuContents) && !cpuPool.Assemble(0,cpuContents));
         CHECK(runtime->timeline.Get().HostWait(iteration,10000) == rhi::Result::Ok);
         void* mapped = nullptr; CHECK(SUCCEEDED(readbackResource->Map(0,nullptr,&mapped)));
         for (size_t i = 0; i != 1024; ++i) CHECK(static_cast<const uint32_t*>(mapped)[i] == iteration);
@@ -1177,7 +1083,6 @@ int TestOwnedDescriptorGpuExecution(const rhi::DeviceCreateInfo& create) {
         CHECK(publicationLease.expired());
         CHECK(commandPool->GetDiagnostics().checkedOutCount == 0);
         CHECK(commandPool->GetDiagnostics().totalOwnedCount >= 1);
-        CHECK(gpuPool.Assemble(0,gpuContents) && cpuPool.Assemble(0,cpuContents));
     }
     return 0;
 }
@@ -1386,7 +1291,6 @@ int main(int argc, char** argv) {
         CHECK(SUCCEEDED(factory->EnumWarpAdapter(IID_PPV_ARGS(&warp))));
     }
 	rhi::DeviceCreateInfo create{}; create.backend = rhi::Backend::D3D12; create.nativeAdapter = warp.Get(); create.framesInFlight = 2;
-    if (const auto failure = TestDescriptorSnapshots(create)) return failure;
     if (const auto failure = TestOwnedDescriptorGpuExecution(create)) return failure;
     if (const auto failure = TestAliasHeapOwnership(create)) return failure;
 	rhi::DevicePtr device; CHECK(!rhi::Failed(rhi::CreateD3D12Device(create, device)) && device);

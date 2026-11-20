@@ -2,7 +2,7 @@
 #define OPEN_RENDER_GRAPH_TYPES_H
 
 /* Basic types every OpenRenderGraph C interface shares: the calling convention, status codes, backends and formats.
- * The contributor ABI (ContributorAPI.h) and the shader compiler service (ShaderCompilerService.h) build on it. */
+ * The contributor ABI (ContributorAPI.h) builds on it. */
 
 #include <stdint.h>
 

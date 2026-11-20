@@ -1,5 +1,4 @@
 #include <OpenRenderGraph/ContributorAPI.h>
-#include <OpenRenderGraph/ShaderCompilerService.h>
 #include <stddef.h>
 
 _Static_assert(sizeof(ORGRegistrationHandle) == 8, "registration handles must be 64-bit");
@@ -17,7 +16,6 @@ _Static_assert(offsetof(ORGPipelineService, structSize) == 0, "pipeline service 
 int main(void)
 {
 	ORGRenderGraphAPI graph = { sizeof(graph), ORG_RENDER_GRAPH_API_CURRENT };
-	ORGShaderCompilerServiceAPI shaders = { sizeof(shaders), ORG_SHADER_COMPILER_SERVICE_VERSION_1 };
 	ORGPipelineService pipelines = { sizeof(pipelines), ORG_PIPELINE_SERVICE_VERSION_1 };
-	return graph.apiVersion == 2 && shaders.apiVersion == 1 && pipelines.apiVersion == 1 ? 0 : 1;
+	return graph.apiVersion == 2 && pipelines.apiVersion == 1 ? 0 : 1;
 }

@@ -35,7 +35,6 @@ extern "C" {
 
 #define ORG_RENDER_GRAPH_API_VERSION_2 2u
 #define ORG_RENDER_GRAPH_API_CURRENT ORG_RENDER_GRAPH_API_VERSION_2
-#define ORG_SHADER_COMPILER_SERVICE_ID "org.shader-compiler"
 /* The host's device. Query it with QueryService(ORG_PIPELINE_SERVICE_ID, ORG_PIPELINE_SERVICE_VERSION_1,
  * ORGPipelineService*, sizeof). */
 #define ORG_PIPELINE_SERVICE_ID "org.pipelines"
