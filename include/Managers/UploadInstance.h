@@ -20,7 +20,7 @@
 
 #include "Render/Runtime/UploadTypes.h"
 #include "Render/Runtime/ITaskService.h"
-#include "Render/Runtime/MpscQueue.h"
+#include "Render/Runtime/EventQueue.h"
 
 namespace org::imm { class ImmediateCommandList; }
 namespace org::runtime { class StagedUploadBatch; }
@@ -351,9 +351,9 @@ private:
 		const char* file = nullptr;
 		int line = 0;
 	};
-	org::runtime::MpscQueue<PostedTextureUpload> m_postedTextureUploads;
-	org::runtime::MpscQueue<PostedBufferUpload> m_postedBufferUploads;
-	org::runtime::MpscQueue<UploadPagePtr> m_readyPageInbox;
+	org::runtime::EventQueue<PostedTextureUpload, 1024> m_postedTextureUploads;
+	org::runtime::EventQueue<PostedBufferUpload, 1024> m_postedBufferUploads;
+	org::runtime::EventQueue<UploadPagePtr, 256> m_readyPageInbox;
 
 	std::mutex m_workerMutex; // page-preparation task lifetime only (start/stop)
 	std::shared_ptr<org::runtime::ITaskService> m_taskService;

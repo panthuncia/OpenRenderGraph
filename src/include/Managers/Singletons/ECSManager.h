@@ -8,7 +8,7 @@
 
 #include <flecs.h>
 
-#include "Render/Runtime/MpscQueue.h"
+#include "Render/Runtime/EventQueue.h"
 #include "Resources/MemoryStatisticsComponents.h"
 #include "Resources/ResourceIdentifier.h"
 #include "Resources/TrackedAllocation.h"
@@ -168,7 +168,7 @@ private:
 	}
 
 	flecs::world m_world;
-	runtime::MpscQueue<std::function<void(flecs::world&)>> m_commands;
+	runtime::EventQueue<std::function<void(flecs::world&)>, 1024> m_commands;
 	// The number of commands posted and not yet applied. It is signed because a command can be popped between its push
 	// and its count. The count then dips below zero for a moment, and the poster's increment brings it back.
 	std::atomic<std::int64_t> m_pending{ 0 };

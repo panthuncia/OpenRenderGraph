@@ -16,7 +16,7 @@
 
 #include <rhi.h>
 
-#include "Render/Runtime/MpscQueue.h"
+#include "Render/Runtime/EventQueue.h"
 #include "Render/Runtime/StreamingUploadTypes.h"
 
 namespace org { class Resource; }
@@ -238,7 +238,7 @@ private:
     std::atomic<uint64_t> m_lastSubmittedValue{ 0 };
 
     // Lock-free MPSC intake: producers push, the submitter pops.
-    MpscQueue<PendingCopy> m_intake;
+    EventQueue<PendingCopy, 1024> m_intake;
     // Owned by the submitter. The entry that ended the last batch because of a read/write hazard. It goes first in the
     // next batch. The flag mirrors it for WaitIdle.
     std::optional<PendingCopy> m_carried;
