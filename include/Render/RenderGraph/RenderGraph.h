@@ -710,6 +710,9 @@ public:
 	// Both passes must exist when the graph is compiled.
 	void AddExplicitPassDependency(std::string beforePass, std::string afterPass);
 
+	// The resource registered under rid (RegisterResource), or null. Unlike RequestResourcePtr it asks no provider and is not
+	// a lookup (WasLookedUp), so a host can check a registration before it adds its own. The building thread only.
+	std::shared_ptr<Resource> RegisteredResource(ResourceIdentifier const& rid) const { return _registry.RequestShared(rid); }
 	std::shared_ptr<Resource> RequestResourcePtr(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(Resource* const& pResource, bool allowFailure = false);
