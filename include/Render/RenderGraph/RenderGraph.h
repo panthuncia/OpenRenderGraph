@@ -494,18 +494,6 @@ private:
 	static TicketUploadStats PersistentTicketUploadStats(const PersistentTicket& ticket) noexcept;
 	// Every pass it prepared would still prepare the same invocation (RenderGraphPass::RevisionHash).
 	static bool PersistentTicketCurrent(const PersistentTicket& ticket);
-	// What a segment list's signature would take from an admitted ticket: its recordings (each a kept or new recording's
-	// identity) and its admission plans. planned is false when a segment of it was admitted against the ledgers, not by a plan
-	// it predicted: such a ticket's barriers would differ from a kept segment list's.
-	struct PersistentTicketKey {
-		uint64_t recordings = 0;
-		uint64_t plans = 0;
-		bool planned = true;
-		// Barriers (diagnostics): the entry barriers its admission planned (handoffs, releases and acquires), and the barriers its
-		// recordings' bodies record (PersistentRecording::bodyBarriers, bodyFullBarriers).
-		uint64_t entryBarriers = 0, bodyBarriers = 0, bodyFullBarriers = 0;
-	};
-	static PersistentTicketKey PersistentTicketKeyOf(const PersistentTicket& ticket) noexcept;
 	// Why a ticket is not current (diagnostics): the first unchecked pass, or the first pass whose revision changed.
 	static std::string PersistentTicketStaleReason(const PersistentTicket& ticket);
 	// Submits the packets with values from nextQueueValues (the last value assigned per queue slot, advanced

@@ -399,7 +399,6 @@ struct GraphHost::TicketCommit {
 	std::shared_ptr<void> retired;
 	std::shared_ptr<const void> resourceOwner;
 	uint64_t number = 0;     // the submission's number (SubmissionsMade)
-	uint32_t segment = 0;    // the frame segment the host named for it (SetSubmissionSegment)
 	uint64_t seal = 0;       // the seals before it (Seals)
 	uint64_t frameWait = 0;  // what its batches wait for (SetFrameWaitValue), as it was at the commit
 	// The uploads the commit queued, taken from the upload service at its end (RenderGraph::TakePendingUploads). Uploads the render
@@ -482,26 +481,8 @@ struct GraphHost::RecordingQueue {
 	}
 };
 
-// The segment census's state, on the submitting thread (the submission thread, or the render thread without one).
-struct GraphHost::SegmentCensusState {
-	struct Signature {
-		uint64_t order = 0, recordings = 0, plans = 0;
-		uint32_t executions = 0, unplanned = 0;
-		bool open = false;
-	};
-	uint32_t current = UINT32_MAX;  // the open segment
-	Signature open;
-	// The last few signatures each segment ran with: a segment list kept per signature would be found again among them.
-	static constexpr size_t kKept = 4;
-	std::array<std::array<Signature, kKept>, GraphHost::kCensusSegments> kept{};
-	std::array<Signature, GraphHost::kCensusSegments> thisFrame{};
-	std::array<std::array<uint64_t, kKept>, 64> epochRecordings{};  // each epoch's last recordings, most recent first
-	std::mutex statsMutex;
-	GraphHost::SegmentStats stats;
-};
-
 GraphHost::GraphHost(Desc desc)
-	: m_desc(std::move(desc)), m_recordingQueue(std::make_unique<RecordingQueue>()), m_segmentCensus(std::make_unique<SegmentCensusState>()) {
+	: m_desc(std::move(desc)), m_recordingQueue(std::make_unique<RecordingQueue>()) {
 	if (!m_desc.runtime) throw std::invalid_argument("GraphHost requires a runtime");
 	m_device = m_desc.runtime->Device();
 	m_leaseTable = std::make_unique<std::atomic<RunLease*>[]>(Runtime::kMaxSlots);
@@ -1717,7 +1698,6 @@ void GraphHost::SealSubmitted() {
 }
 
 void GraphHost::PassSeal(const std::shared_ptr<GpuPoint::Pending>& a_marker) {
-	if (m_segmentCensusOn.load(std::memory_order_relaxed)) CloseSegment(true);
 	auto point = SubmittedPointNow();
 	if (a_marker) {
 		a_marker->points = point.points;
@@ -1734,90 +1714,6 @@ void GraphHost::PassSeal(const std::shared_ptr<GpuPoint::Pending>& a_marker) {
 	// An epoch whose copies were busy with unsealed runs can take one again: the host's thread prepares its ticket now. The flag is
 	// set before the host's thread reads the seals again, so either it sees this count or this sees its flag.
 	if (m_async && m_async->anyCopiesBusy.exchange(false, std::memory_order_seq_cst)) (void)m_async->completionWake->Notify();
-}
-
-void GraphHost::NoteSegmentTicket(uint32_t a_segment, uint32_t a_epoch, const RenderGraph::PersistentTicketKey& a_key) {
-	auto& census = *m_segmentCensus;
-	const auto mix = [](uint64_t a_hash, uint64_t a_value) { return (a_hash ^ a_value) * 1099511628211ull; };
-	if (census.current != a_segment) {
-		CloseSegment(false);
-		census.current = a_segment;
-		census.open = {1469598103934665603ull, 1469598103934665603ull, 1469598103934665603ull, 0, 0, true};
-	}
-	const auto& key = a_key;
-	if (a_epoch < census.stats.barriers.size()) {
-		std::scoped_lock lock(census.statsMutex);
-		auto& barriers = census.stats.barriers[a_epoch];
-		++barriers.tickets;
-		barriers.entry += a_key.entryBarriers;
-		barriers.body += a_key.bodyBarriers;
-		barriers.full += a_key.bodyFullBarriers;
-	}
-	if (a_epoch < census.epochRecordings.size()) {
-		auto& recent = census.epochRecordings[a_epoch];
-		const auto same = std::ranges::find(recent, key.recordings);
-		if (same == recent.end()) {
-			std::scoped_lock lock(census.statsMutex);
-			++census.stats.newRecordings[a_epoch];
-		}
-		const auto last = same != recent.end() ? same : recent.end() - 1;
-		std::rotate(recent.begin(), last, last + 1);
-		recent.front() = key.recordings;
-	}
-	census.open.order = mix(census.open.order, a_epoch);
-	census.open.recordings = mix(census.open.recordings, key.recordings);
-	census.open.plans = mix(census.open.plans, key.plans);
-	++census.open.executions;
-	census.open.unplanned += key.planned ? 0 : 1;
-}
-
-void GraphHost::CloseSegment(bool a_frameEnd) {
-	auto& census = *m_segmentCensus;
-	// The open segment ends: compared with the same segment's last run in the frame before.
-	if (census.current != UINT32_MAX && census.open.open) {
-		const auto index = census.current;
-		auto& kept = census.kept[index];
-		const auto& open = census.open;
-		const bool found = std::ranges::any_of(kept, [&](const SegmentCensusState::Signature& a_kept) {
-			return a_kept.open && a_kept.order == open.order && a_kept.recordings == open.recordings && a_kept.plans == open.plans;
-		});
-		std::scoped_lock lock(census.statsMutex);
-		auto& out = census.stats.segments[index];
-		++out.runs;
-		out.executions += open.executions;
-		out.unplanned += open.unplanned;
-		if (!found) {
-			// What differs from the most recent kept signature.
-			const auto& before = kept.front();
-			out.changed += 1;
-			out.order += before.order != open.order ? 1 : 0;
-			out.recordings += before.recordings != open.recordings ? 1 : 0;
-			out.plans += before.plans != open.plans ? 1 : 0;
-		}
-		census.thisFrame[index] = census.open;
-		census.open.open = false;
-	}
-	census.current = UINT32_MAX;
-	if (!a_frameEnd) return;
-	// The frame's end: its segments are what the next frame compares with. A segment the frame did not run keeps its older one.
-	for (uint32_t i = 0; i < kCensusSegments; ++i) {
-		if (!census.thisFrame[i].open) continue;
-		auto& kept = census.kept[i];
-		const auto& now = census.thisFrame[i];
-		const auto same = std::ranges::find_if(kept, [&](const SegmentCensusState::Signature& a_kept) {
-			return a_kept.open && a_kept.order == now.order && a_kept.recordings == now.recordings && a_kept.plans == now.plans;
-		});
-		// Most recent first. A signature found again moves to the front.
-		std::rotate(kept.begin(), same != kept.end() ? same : kept.end() - 1, (same != kept.end() ? same : kept.end() - 1) + 1);
-		kept.front() = std::exchange(census.thisFrame[i], {});
-	}
-	std::scoped_lock lock(census.statsMutex);
-	++census.stats.frames;
-}
-
-GraphHost::SegmentStats GraphHost::TakeSegmentStats() {
-	std::scoped_lock lock(m_segmentCensus->statsMutex);
-	return std::exchange(m_segmentCensus->stats, {});
 }
 
 GraphHost::GpuPoint GraphHost::PassedSealedPoint() const {
@@ -3836,7 +3732,6 @@ GraphHost::TicketCommit GraphHost::CommitTicket(Async& async, uint32_t index, st
 	commit.retired = std::move(retired);
 	commit.resourceOwner = std::move(resourceOwner);
 	commit.number = ++m_submissions;
-	commit.segment = m_submissionSegment;
 	// The frame boundaries before it, queued seals included: a later seal flushed it (a published copy waits for its run only then).
 	commit.seal = m_sealsPushed.load(std::memory_order_relaxed);
 	commit.frameWait = m_frameWaitValue;
@@ -3854,9 +3749,6 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	// The epoch, so a capture can attribute the submission thread's time to it.
 	BT_ZONE_VALUE(async.epochs[commit.index]);
 	const TraceTicketScope traceScope(async.epochs[commit.index]);
-	using Census = diagnostics::SubmissionCensus;
-	auto& census = diagnostics::Census();
-	census.BeginTicket();
 	const auto index = commit.index;
 	auto& ticket = commit.ticket;
 	// A submission's completion message wakes the host's thread lazily (wakesOnGpu); a discard always wakes it.
@@ -3913,11 +3805,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	// Admitted now, against the ledgers as they are: the upload plan by queue and the submission's handoff read it. The sequencer
 	// stays held until the ticket is submitted and committed, so no other admission comes between.
 	auto sequencer = graph.HoldPersistentSequencer();
-	const auto heldFrom = census.On() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 	graph.AdmitPersistentTicket(*ticket, async.queueValues);
-	// The segment census reads the admission's plan here: the submission's commit lets go of it.
-	const bool segmentCensus = m_segmentCensusOn.load(std::memory_order_relaxed);
-	const auto ticketKey = segmentCensus ? RenderGraph::PersistentTicketKeyOf(*ticket) : RenderGraph::PersistentTicketKey{};
 	struct AbandonUnsubmitted {
 		RenderGraph& graph;
 		RenderGraph::PersistentTicket* ticket;
@@ -3970,14 +3858,6 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		for (auto& queueUploads : queueUploadLists) queueUploads.EndRecording();
 	}
 	stats.queueUploadCopies += queueCopies;
-	if (census.On() && !external && hasUploads) {
-		census.Add(Census::List::Upload);
-		if (!recorded && recordedLists.empty()) census.Add(Census::List::UploadEmpty);
-		// By ticket: a ticket with no routed copy left every queue list empty.
-		const auto queueLists = static_cast<uint64_t>(std::ranges::count_if(queueUploadLists, [](const auto& queueUploads) { return static_cast<bool>(queueUploads.list); }));
-		census.Add(Census::List::QueueUpload, queueLists);
-		if (!queueCopies) census.Add(Census::List::QueueUploadEmpty, queueLists);
-	}
 	if (external && !recordedLists.empty()) {
 		recordedLists.clear();
 		abandonBeforeDiscard();
@@ -4042,9 +3922,6 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	// Published: the frontier covers this ticket's work from here on.
 	commit.assigned.reset();
 	sequencer.unlock();
-	if (census.On())
-		census.sequencerHeldNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-			std::chrono::steady_clock::now() - heldFrom).count()), std::memory_order_relaxed);
 	lap(timings.submitUs);
 	// The handoff and release lists the submission recorded: kept until the run completes, with the uploads' staging.
 	if (!submitted.submission.leases.empty()) {
@@ -4072,7 +3949,6 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		stats.lateUploadWaits += uploads.lateWaits;
 		stats.undeclaredUploads += uploads.undeclared;
 	}
-	if (segmentCensus) NoteSegmentTicket(commit.segment, async.epochs[commit.index], ticketKey);
 	submitted.ticket = std::move(ticket);
 	if (posts) {
 		// Posted by the caller once the group's held submission is on its queue: the host's thread then never handles a ticket

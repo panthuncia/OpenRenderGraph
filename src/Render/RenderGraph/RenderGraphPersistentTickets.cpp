@@ -266,29 +266,6 @@ std::string RenderGraph::PersistentRecordingStaleVersion(const PersistentRecordi
 	return {};
 }
 
-RenderGraph::PersistentTicketKey RenderGraph::PersistentTicketKeyOf(const PersistentTicket& ticket) noexcept {
-	PersistentTicketKey key;
-	const auto mix = [](uint64_t a_hash, const void* a_pointer) {
-		return (a_hash ^ reinterpret_cast<uintptr_t>(a_pointer)) * 1099511628211ull;
-	};
-	key.recordings = key.plans = 1469598103934665603ull;
-	const auto add = [&](const PersistentTicket::Segment& a_segment) {
-		key.recordings = mix(key.recordings, a_segment.recording.get());
-		key.plans = mix(key.plans, a_segment.admission.sharedBarriers.get());
-		key.planned = key.planned && a_segment.admission.predicted;
-		const auto& plan = a_segment.admission.Barriers();
-		for (const auto& batch : plan.batches) key.entryBarriers += batch.textures.size() + batch.buffers.size() + batch.acquired.size();
-		for (const auto& release : plan.releases) key.entryBarriers += release.textures.size();
-		if (a_segment.recording) {
-			key.bodyBarriers += a_segment.recording->bodyBarriers;
-			key.bodyFullBarriers += a_segment.recording->bodyFullBarriers;
-		}
-	};
-	// A bound candidate's segment is in segments by now (its own went to displaced).
-	for (const auto& segment : ticket.segments) add(segment);
-	return key;
-}
-
 bool RenderGraph::PersistentTicketCurrent(const PersistentTicket& ticket) {
 	BT_ZONE_SCOPE("ORG.Persistent.CheckTicket");
 	if (ticket.uncheckable) return false;
@@ -378,21 +355,11 @@ bool RenderGraph::FlushSubmitCarry(SubmitCarry& carry, uint32_t* merged) {
 	if (merged) *merged = carry.tickets;
 	if (!carry.Active()) return true;
 	BT_ZONE_SCOPE("ORG.Persistent.FlushSubmitCarry");
-	auto& census = diagnostics::Census();
 	const auto submitted = carry.queue.Submit({carry.gathered.lists.data(), static_cast<uint32_t>(carry.gathered.lists.size())},
 		{{carry.gathered.waits.data(), static_cast<uint32_t>(carry.gathered.waits.size())},
 		 {carry.gathered.signals.data(), static_cast<uint32_t>(carry.gathered.signals.size())}});
 	const bool ok = submitted == rhi::Result::Ok;
-	if (ok) {
-		basic_telemetry::AddCounter("ORG.Persistent.CoalescedSubmissions");
-		if (census.On()) {
-			// Its waits are all on other timelines than its queue's (the held group's own were dropped), so they count as such.
-			std::vector<diagnostics::SubmissionCensus::Wait> waits;
-			for (const auto& wait : carry.gathered.waits)
-				waits.push_back({(uint64_t{wait.t.index} << 32) | wait.t.generation, wait.value, diagnostics::SubmissionCensus::WaitKind::Other});
-			census.Submitted(diagnostics::SubmissionCensus::Submission::Batches, carry.queueSlot, static_cast<uint32_t>(carry.gathered.lists.size()), waits);
-		}
-	}
+	if (ok) basic_telemetry::AddCounter("ORG.Persistent.CoalescedSubmissions");
 	carry.Clear();
 	return ok;
 }
@@ -402,8 +369,6 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 	BT_ZONE_SCOPE("ORG.Persistent.SubmitTicket");
 	out = {};
 	auto& state = *m_compilerState->persistent;
-	using Census = diagnostics::SubmissionCensus;
-	auto& census = diagnostics::Census();
 	// The admission (AdmitPersistentTicket), the handoff and the commit with nothing admitted in between.
 	auto hold = state.admission->HoldSequencer();
 	struct AbandonUncommitted {
@@ -437,7 +402,6 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			rhi::SubmitDesc submit{};
 			submit.signals = {&uploads->signal, 1u};
 			if (uploads->queue.Submit({uploads->lists.data(), static_cast<uint32_t>(uploads->lists.size())}, submit) != rhi::Result::Ok) return false;
-			census.Submitted(Census::Submission::Uploads, uploads->queueSlot, static_cast<uint32_t>(uploads->lists.size()), {});
 		}
 	}
 	for (auto& segment : ticket.segments) {
@@ -572,8 +536,6 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				// Every submission of this ticket comes after the group an earlier ticket left held.
 				if (carry && !FlushSubmitCarry(*carry)) return false;
 				if (m_queueRegistry.GetQueue(index).Submit({&list, 1u}, submit) != rhi::Result::Ok) return false;
-				census.Add(Census::List::Release);
-				census.Submitted(Census::Submission::Release, release.queue, 1, {});
 				m_queueRegistry.EnsureNextFenceValueAtLeast(index, value + 1);
 				for (const auto consumer : release.consumers) incoming.at(consumer).push_back({admission.queueTimelines.at(release.queue), value});
 				out.leases.push_back(std::move(allocation));
@@ -642,9 +604,6 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			}
 			if (leftOut) diagnostics::UntouchedEntryBarriers().fetch_add(leftOut, std::memory_order_relaxed);
 			PersistentExecutionsState::HandoffCache* cache = nullptr;
-			auto miss = !admission.sharedBarriers ? Census::HandoffMiss::Planned
-				: ticket.segments.size() != 1 ? Census::HandoffMiss::Segments : Census::HandoffMiss::NewPlan;
-			uint32_t recordedHandoffs = 0;
 			if (admission.sharedBarriers && ticket.segments.size() == 1) {
 				if (state.handoffCache.size() <= ticket.slot) state.handoffCache.resize(size_t{ticket.slot} + 1);
 				auto& entries = state.handoffCache[ticket.slot];
@@ -666,7 +625,6 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					streamHandoff = cache->streamHandoff;
 					out.leases.insert(out.leases.end(), cache->allocations.begin(), cache->allocations.end());
 					basic_telemetry::AddCounter("ORG.Persistent.HandoffListsReused");
-					census.Add(Census::List::HandoffReused, static_cast<uint64_t>(std::ranges::count_if(handoff, [](rhi::CommandList list) { return static_cast<bool>(list); })));
 				}
 			}
 			for (uint32_t batch = 0; batch < batchCount && !(cache && cache->plan); ++batch) {
@@ -705,13 +663,10 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				}();
 				if (closed != rhi::Result::Ok) throw std::runtime_error("A ticket's handoff list could not close");
 				allocation->Close();
-				census.Add(Census::List::Handoff);
-				++recordedHandoffs;
 				(inStream(batch) ? streamHandoff : handoff)[batch] = list;
 				if (cache) cache->allocations.push_back(allocation);
 				out.leases.push_back(std::move(allocation));
 			}
-			if (recordedHandoffs) census.Miss(miss);
 			if (cache && !cache->plan) {
 				cache->plan = admission.sharedBarriers;
 				cache->external = ticket.external;
@@ -784,22 +739,6 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 		// the runtime; its handoff goes ahead of it, and so do the uploads recorded on its queue (on the queue just ahead of
 		// it, so it needs no wait for them: the list ends with a full barrier), with the waits their destinations need.
 		std::vector<std::vector<compiler::PreparedTimelineBinding>> extra(packets.size());
-		// The census's view of a submission's waits: those off its own queue's timeline, by kind.
-		std::vector<Census::Wait> censusWaits;
-		const auto censusWait = [&](rhi::TimelineHandle handle, uint64_t value, uint32_t queue) {
-			const auto own = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(queue))).GetHandle();
-			if (!handle.valid() || (handle.index == own.index && handle.generation == own.generation)) return;
-			auto kind = Census::WaitKind::Other;
-			if (m_frameWaitTimeline && *m_frameWaitTimeline) {
-				const auto frame = (*m_frameWaitTimeline)->GetHandle();
-				if (frame.index == handle.index && frame.generation == handle.generation) kind = Census::WaitKind::FrameWait;
-			}
-			for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && kind == Census::WaitKind::Other; ++slot) {
-				const auto fence = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot))).GetHandle();
-				if (fence.index == handle.index && fence.generation == handle.generation) kind = Census::WaitKind::OtherQueue;
-			}
-			censusWaits.push_back({(uint64_t{handle.index} << 32) | handle.generation, value, kind});
-		};
 		const auto submitPacket = [&](uint32_t i) -> bool {
 			if (carry && !FlushSubmitCarry(*carry)) return false;
 			const auto* packet = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[i].get());
@@ -817,26 +756,8 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				if (!packet) throw std::logic_error("Queue-scoped uploads ahead of a packet that cannot take them");
 				auto list = leading.list;
 				if (!packet->SubmitLeading({&list, 1}, leading.waits)) return false;
-				if (census.On()) {
-					censusWaits.clear();
-					for (const auto wait : leading.waits) censusWait(m_runtime->TimelineHandleOf(wait.timeline), wait.value, graph.batches[i].queue);
-					census.Submitted(Census::Submission::Leading, graph.batches[i].queue, 1, censusWaits);
-				}
 			}
-			if (!packets[i]->Submit(batches[i])) return false;
-			if (census.On()) {
-				const auto queue = graph.batches[i].queue;
-				censusWaits.clear();
-				for (const auto wait : batches[i].waits) {
-					auto handle = packet ? packet->ResolveTimeline(wait.timeline) : rhi::TimelineHandle{};
-					if (!handle.valid()) handle = m_runtime->TimelineHandleOf(wait.timeline);
-					censusWait(handle, wait.value, queue);
-				}
-				const uint32_t lists = packet && !packet->Inline() ? static_cast<uint32_t>(packet->Lists().size()) : 1u;
-				if (packet && !packet->Inline()) census.Add(Census::List::Batch, lists);
-				census.Submitted(Census::Submission::Batches, queue, lists + (handoff[i] ? 1u : 0u), censusWaits);
-			}
-			return true;
+			return packets[i]->Submit(batches[i]);
 		};
 		if (ticket.external) {
 			// The batches on the graphics queue are not submitted: the host executes them in its own stream, segment by segment
@@ -1081,17 +1002,12 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					gathered.Clear();
 					return committed;
 				}
-				if (census.On()) {
-					censusWaits.clear();
-					for (const auto& wait : gathered.waits) censusWait(wait.t, wait.value, groupQueue);
-				}
 				const auto submitted = groupRhiQueue.Submit({gathered.lists.data(), static_cast<uint32_t>(gathered.lists.size())},
 					{{gathered.waits.data(), static_cast<uint32_t>(gathered.waits.size())},
 					 {gathered.signals.data(), static_cast<uint32_t>(gathered.signals.size())}});
 				basic_telemetry::AddCounter("ORG.Persistent.CoalescedSubmissions");
 				basic_telemetry::AddCounter("ORG.Persistent.CoalescedBatches", group.size());
 				const bool ok = submitted == rhi::Result::Ok;
-				if (ok) census.Submitted(Census::Submission::Batches, groupQueue, static_cast<uint32_t>(gathered.lists.size()), censusWaits);
 				// Each batch the queue accepted commits its passes, even when another one's commit failed.
 				bool committed = true;
 				if (joined) {
@@ -1136,7 +1052,6 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					(void)flush(false);
 					return false;
 				}
-				if (!packet->Inline()) census.Add(Census::List::Batch, packet->Lists().size());
 				group.push_back(i);
 			}
 			if (!flush(true)) return false;
@@ -1178,12 +1093,6 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			submit.signals = {&point, 1u};
 			if (carry && !FlushSubmitCarry(*carry)) return false;
 			if (m_queueRegistry.GetQueue(index).Submit({&list, 1u}, submit) != rhi::Result::Ok) return false;
-			census.Add(Census::List::HomeAcquire);
-			if (census.On()) {
-				censusWaits.clear();
-				for (const auto& wait : waits) censusWait(wait.t, wait.value, graphicsSlot);
-				census.Submitted(Census::Submission::HomeAcquire, graphicsSlot, 1, censusWaits);
-			}
 			m_queueRegistry.EnsureNextFenceValueAtLeast(index, value + 1);
 			state.admission->ExtendSubmitted({admission.queueTimelines.at(graphicsSlot), value});
 			out.leases.push_back(std::move(allocation));

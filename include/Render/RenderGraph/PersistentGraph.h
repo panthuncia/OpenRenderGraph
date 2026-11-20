@@ -4,7 +4,6 @@
 
 #include "Render/RenderGraph/GraphCompiler.h"
 #include "Render/RenderGraph/ExecutionState.h"
-#include "Render/RenderGraph/SubmissionCensus.h"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -625,19 +624,8 @@ public:
     void Readmit(FrameAdmission& frame);
     // Every call of the admission takes the sequencer's lock (recursive): a host prepares tickets on one thread and admits and
     // commits them on another.
-    // A hold that had to wait for another thread is counted (diagnostics::Census).
     std::unique_lock<std::recursive_mutex> HoldSequencer() const {
-        std::unique_lock lock(m_sequencer->mutex, std::try_to_lock);
-        if (lock.owns_lock()) return lock;
-        auto& census = diagnostics::Census();
-        const auto start = census.On() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        lock.lock();
-        if (census.On()) {
-            census.sequencerWaits.fetch_add(1, std::memory_order_relaxed);
-            census.sequencerWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
-        }
-        return lock;
+        return std::unique_lock(m_sequencer->mutex);
     }
     void Commit(const FrameAdmission& frame, const compiler::GraphExecutionTimeline& receipt,
         uint32_t signaledBatches = UINT32_MAX);

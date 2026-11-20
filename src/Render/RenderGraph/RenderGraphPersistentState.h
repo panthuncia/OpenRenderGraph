@@ -214,9 +214,6 @@ struct RenderGraph::PersistentRecording {
 	mutable std::vector<uint8_t> untouchedSkips;
 	mutable uint64_t untouchedBackings = 0;
 	mutable compiler::UntouchedResources untouched;
-	// The barriers its body records (diagnostics, the segment census): the barriers before and after its passes, and the full
-	// memory barriers a closed execution starts each batch with.
-	uint64_t bodyBarriers = 0, bodyFullBarriers = 0;
 	// The reuse key.
 	uint64_t hostTag = 0;
 	std::shared_ptr<const persistent::SelectedPublication> publication;
@@ -686,8 +683,6 @@ struct RenderGraph::PersistentSegmentRun {
 	// Set by recording.
 	std::shared_ptr<const compiler::RenderFrameSnapshot> sealed;
 	std::vector<compiler::FrameRecordingJob> jobs;
-	// The body barriers the jobs record (their lists' per-pass batches, after FoldSkippedPassBarriers).
-	uint64_t bodyBarriers = 0;
 	// An open ticket's resources every use of which is skipped ahead: its lists leave out their barriers (compiler::UntouchedResources).
 	std::shared_ptr<const compiler::UntouchedResources> ahead;
 	std::vector<std::shared_ptr<compiler::OwnedRecordingStatistics>> recordingStatistics;

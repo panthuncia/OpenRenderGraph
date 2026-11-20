@@ -1878,10 +1878,6 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
     // An entry-only admission of an executable admitted before: its plan stands while the ledger holds what that one found (a frame
     // repeats). Otherwise planned below and kept as the prediction for the next.
     PredictionSlot* predictionSlot = nullptr;
-    using Census = diagnostics::SubmissionCensus;
-    auto& census = diagnostics::Census();
-    if (!frame.entryOnly) census.Admitted(Census::Admission::NotEntryOnly);
-    else if (!invalidated.empty()) census.Admitted(Census::Admission::AliasInvalidated);
     // A plan stands only for the activations it was made with: an executable whose transients share memory activates the same
     // backings at every execution, which its prediction then covers.
     const auto sameActivations = [&](const compiler::StatePrediction& a_prediction) {
@@ -1900,7 +1896,6 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         auto& slot = m_predictions[executable.get()];
         if (slot.executable.lock() != executable || slot.backings != frame.backings.Id() || slot.closed != m_closed
             || !slot.prediction) {
-            census.Admitted(Census::Admission::NewSlot);
             ClosePrediction(slot);
             slot = {executable, frame.backings.Id(), m_closed, std::make_shared<compiler::StatePrediction>()};
         }
@@ -1918,7 +1913,6 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
             frame.prediction = slot.prediction;
             frame.predicted = true;
             ++m_predicted;
-            census.Admitted(Census::Admission::Predicted);
         } else {
             for (auto& earlier : slot.earlier) {
                 if (!sameActivations(*earlier) || !states.Predicts(*earlier, frame.backings, frame.backings.Id())) continue;
@@ -1927,10 +1921,8 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
                 frame.prediction = slot.prediction;
                 frame.predicted = true;
                 ++m_predicted;
-                census.Admitted(Census::Admission::PredictedEarlier);
                 break;
             }
-            if (!frame.sharedBarriers && slot.prediction->plan) census.Admitted(Census::Admission::StatesDiffer);
         }
     }
     // A closed execution's plan is a function of its executable and backings alone, unless the frame brings

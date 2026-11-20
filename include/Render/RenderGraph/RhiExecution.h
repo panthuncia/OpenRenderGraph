@@ -5,7 +5,6 @@
 #include "Render/RenderGraph/ExecutionState.h"
 #include "Render/PreparedPass.h"
 #include "Render/RenderGraph/PersistentGraph.h"
-#include "Render/RenderGraph/SubmissionCensus.h"
 #include "Render/BufferBarrierHelpers.h"
 #include "Render/CommandListPool.h"
 #include "Render/Runtime/IStatisticsService.h"
@@ -1392,7 +1391,6 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline(std::span<const 
     BT_ZONE_SCOPE("ORG.Execution.RecordInline");
     try {
         auto& allocation = *m_deferred->allocation;
-        auto& census = diagnostics::Census();
         // A batch keyed by its passes' skip answers: the list recorded for the same answers is submitted again as it is. Its
         // last submission is done (see below), and nothing else in it depends on the run.
         // The answers are asked before the passes are recorded: SkipsAtExecution only before a pass's first recording,
@@ -1404,7 +1402,6 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline(std::span<const 
         const uint64_t untouched = a_untouched ? a_untouched->signature : 0;
         if (m_keyedBySkips && m_keptList && allocation.closed && allocation.pool && allocation.pair.list) {
             if (skips == m_keptSkips && untouched == m_keptUntouched) {
-                census.Add(diagnostics::SubmissionCensus::List::InlineKept);
                 return allocation.pair.list.Get();
             }
         }
@@ -1418,20 +1415,7 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline(std::span<const 
         // by pending work. It goes now; the new recording retains its own.
         if (m_deferredRecorded.load(std::memory_order_relaxed) && m_deferred->retention) m_deferred->retention->Release();
         auto list = allocation.pair.list.Get();
-        const size_t recorded = RecordDeferredCommands(list, skips, a_untouched);
-        census.Add(diagnostics::SubmissionCensus::List::Inline);
-        if (!recorded) census.Add(diagnostics::SubmissionCensus::List::InlineBarriersOnly);
-        if (census.On()) {
-            // Why this one was recorded: its first pass not keyed by its skip answer, else the answers changed.
-            std::string_view why = !m_replayable ? std::string_view("not replayable") : !m_deferred->keepBySkips ? std::string_view("keeping off") : std::string_view();
-            if (why.empty())
-                for (const auto& pass : m_deferred->passes)
-                    if (!pass.KeyedBySkip()) {
-                        why = pass.DebugName();
-                        break;
-                    }
-            census.NoteInlineRecorded(why.empty() ? std::string_view(m_keptSkips.empty() ? "keyed: first recording" : "keyed: answers changed") : why);
-        }
+        (void)RecordDeferredCommands(list, skips, a_untouched);
         const auto closed = [&] {
             BT_ZONE_SCOPE("ORG.Execution.RecordInline.End");
             return list.EndChecked();

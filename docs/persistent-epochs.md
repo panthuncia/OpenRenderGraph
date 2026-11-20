@@ -432,9 +432,6 @@ recording per frame slot. These options serve it; each is independent of the oth
     commits of neighbouring mips of a slice that end in the same state in the same batch are now one range, and seeds no longer
     send a batch's commits to the slower keyed path (`BackingStateAdmissionLedger::SeedBatch`). The deferred segment's commits:
     71 us a run before, 15 us after.
--   **Barrier census.** With the segment census on, `SegmentStats::barriers` counts, per epoch, its tickets, the entry barriers
-    their admissions planned, the barriers their recordings' bodies hold (`PersistentRecording::bodyBarriers`) and a closed
-    execution's full barriers.
 -   **Test.** `PersistentVulkanHostTests segment`: a revision-driven epoch closed by `SetClosedEpochs` in an open host, runs
     pinned to their slots, a re-pin after a skipped slot, a revision that turns the write off, a one-copy recording, and held
     tickets of pinned copies (the held run is the copy's, a second hold returns it, the submission takes it, and a hold given
