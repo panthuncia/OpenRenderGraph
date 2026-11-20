@@ -1387,6 +1387,32 @@ GraphHost::StageResult GraphHost::StageEpochGraph(std::unique_ptr<EpochGraph>& b
 	return result;
 }
 
+bool GraphHost::SwapStagedIn(size_t index) {
+	auto& instance = m_instances[index];
+	auto& built = instance.staged;
+	const auto generation = instance.stagedGeneration;
+	if (built->m_uploads) built->m_uploads->ApplyResolveContext();
+	built->m_uploads = nullptr;
+	std::vector<std::weak_ptr<const EpochRecording>> recordings;
+	if (m_async)
+		for (uint32_t i = 0; i < m_async->epochs.size(); ++i) {
+			if (m_async->instanceOf[i] != index) continue;
+			recordings = std::move(m_async->stagedRecordings[i]);
+			m_async->stagedRecordings[i].clear();
+			m_async->stagedGraph[i] = nullptr;
+			m_async->stagedGeneration[i] = 0;
+		}
+	InstallGraph(index, std::move(built->m_graph), built->m_serial, generation);
+	// The recordings made on it are its tickets' candidates from now on.
+	if (m_async)
+		for (uint32_t i = 0; i < m_async->epochs.size(); ++i)
+			if (m_async->instanceOf[i] == index) m_async->liveRecordings[i] = recordings;
+	instance.staged.reset();
+	instance.stagedGeneration = 0;
+	PublishDeclared(index);
+	return true;
+}
+
 GraphHost::AttachResult GraphHost::AttachStagedEpochGraphs(std::span<const uint32_t> epochs) {
 	BT_ZONE_SCOPE("ORG.Host.AttachStagedEpochGraphs");
 	// Every epoch is checked before anything changes. A refusal leaves every staged graph staged.
