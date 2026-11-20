@@ -300,7 +300,7 @@ public:
 		EpochConfiguration,  // the epoch's extensions or external state changed since the build started
 		NewerAttached,       // the epoch runs a graph whose build started later
 		NewerStaged,         // a graph whose build started later is staged
-		BeingSubmitted,      // a ticket of the epoch is held, or the call is inside a submission
+		BeingSubmitted,      // the call is inside a submission
 		SharedSetupFailed,   // the graph's shared setup failed
 		Count
 	};
@@ -369,7 +369,7 @@ public:
 	 * - a graph is staged for it;
 	 * - the host's and the epoch's configuration are unchanged since the staged build started;
 	 * - it runs no graph whose build started later;
-	 * - no ticket of it is held (HoldEpochTicket), and the call is not inside a submission.
+	 * - the call is not inside a submission.
 	 *
 	 * If any check fails, nothing is attached and the result names the first refused epoch and why. Unlike
 	 * AttachStagedEpochGraph, a refusal drops no staged graph: the caller decides what to do. Otherwise the host's thread is held
@@ -692,35 +692,11 @@ public:
 	// stays).
 	bool ReleaseEpochTicket(uint32_t epoch);
 	/**
-	 * @brief Render thread, for an async live epoch, or a revision-driven one whose copy is pinned (SetEpochCopy): takes its next
-	 * ticket now and keeps it for the epoch's next SubmitEpoch. A revision-driven epoch's held ticket is the pinned copy's: its run
-	 * is EpochCopyRun of that copy, and the copy's last run is done once the ticket is held. The
-	 * caller can then write the run's values (LatchBlock regions, run gates) at several points before the submission, each inside
-	 * UseHeldRun. Waits for the ticket as SubmitEpoch does and throws as it does (EpochFailedError when the epoch failed). Returns the
-	 * held ticket's run. A second call before the submission returns the same run.
-	 *
-	 * Uploads queued meanwhile are recorded by the next submission of any epoch, as always: submit the held epoch before another
-	 * epoch's work that must come after what its run uploads.
-	 *
-	 * A build of the epoch's graph (RequestRebuild's, AttachEpochGraph) first gives the held ticket back unsubmitted. What was written
-	 * for its run is dropped, and HoldsEpochTicket turns false: the next SubmitEpoch takes a new ticket. Build only where nothing is held.
-	 */
-	RunRef HoldEpochTicket(uint32_t epoch);
-	/** @brief Render thread: whether the epoch holds a ticket (HoldEpochTicket) that was not submitted or given back. */
-	bool HoldsEpochTicket(uint32_t epoch) const noexcept;
-	/**
-	 * @brief Render thread: CurrentRun() is the epoch's held ticket's run from now until EndHeldRun, outside a ticket's
-	 * beforeSubmit. Nothing when the epoch holds no ticket.
-	 */
-	void UseHeldRun(uint32_t epoch) noexcept;
-	/**
 	 * @brief Render thread: CurrentRun() is `run` from now until EndHeldRun, outside a ticket's beforeSubmit. For a staging run
 	 * (EpochStagingRun): what is written for CurrentRun() meanwhile goes to its regions.
 	 */
 	void UseRun(const RunRef& run) noexcept { m_heldRun = run; }
 	void EndHeldRun() noexcept { m_heldRun.reset(); }
-	/** @brief Render thread: gives the held ticket back unsubmitted (its lease freed, what was written for its run dropped). */
-	bool ReleaseHeldEpochTicket(uint32_t epoch);
 	// Submits the epoch at the current point of the host's queue stream. Builds the epoch's graph first when its rebuild is due.
 	// Waits for its ticket if the host's thread has not finished it; runs beforeSubmit with the graphs' services active and
 	// CurrentRun() the ticket's run (write latches and queue uploads there); has the ticket prepared again (and waits)
@@ -836,8 +812,8 @@ public:
 	std::shared_ptr<PersistentAliasArena> AliasArena() const noexcept { return m_aliasArena; }
 	/**
 	 * @brief Submitting thread: the run the host may write per-run data for now (LatchBlock regions, CPU payloads). Inside
-	 * SubmitEpoch's beforeSubmit, the ticket's run; inside ExecuteFrame's beforePrepare, the execution's run; otherwise the held
-	 * ticket's run (UseHeldRun); otherwise the external run (BeginExternalRun) when one is active; otherwise the last run submitted.
+	 * SubmitEpoch's beforeSubmit, the ticket's run; inside ExecuteFrame's beforePrepare, the execution's run; otherwise the run
+	 * UseRun named; otherwise the external run (BeginExternalRun) when one is active; otherwise the last run submitted.
 	 * RecordingContext::Run names the same run.
 	 */
 	RunRef CurrentRun() const noexcept {
@@ -1213,7 +1189,7 @@ private:
 	// Submitting thread: CurrentRun's sources.
 	RunRef m_syncRun{}, m_asyncRun{};
 	std::optional<RunRef> m_externalRun;
-	std::optional<RunRef> m_heldRun;  // UseHeldRun's, until EndHeldRun
+	std::optional<RunRef> m_heldRun;  // UseRun's, until EndHeldRun
 	// Submitting thread, with async epochs: what releases at an external run's start retired, handed to the host's thread with the
 	// next submission (its driver frees take the device's memory locks).
 	std::vector<std::shared_ptr<void>> m_externalRetired;

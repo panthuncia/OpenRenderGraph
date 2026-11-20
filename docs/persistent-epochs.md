@@ -241,13 +241,6 @@ thread calls `SubmitEpoch(epoch, beforeSubmit)` at each point instead of `Execut
     (`relativeWaits` are only between queues), so nothing that synchronized before is lost.
     -   Each batch's passes are committed as submitted once the queue accepted the group
         (`PreparedRhiExecutionBatch::Gather`, `CommitGathered`).
--   **Held tickets.** `HoldEpochTicket(epoch)` takes a live epoch's next ticket ahead of its `SubmitEpoch`, so a host can write
-    one run's values at several points of its frame and submit them once. Inside `UseHeldRun(epoch)` ... `EndHeldRun()`,
-    `CurrentRun()` is the held ticket's run. The next `SubmitEpoch` of the epoch submits the held ticket (its revisions are
-    checked then, as always). Uploads queued meanwhile go with the next submission of any epoch, so a host submits the held
-    epoch before other work that must follow it. A build of the epoch's graph gives the held ticket back first (what was
-    written for its run is dropped; `HoldsEpochTicket` turns false), and `ReleaseHeldEpochTicket` gives it back on purpose.
-    Community Shaders' frame regions use this: consecutive anchor runs share one execution of their region's epoch.
 -   **Uploads.** The uploads go to the graphics queue, ahead of the ticket. A batch on another queue waits for them only
     when it uses what they write.
     -   **Queue-scoped uploads** (`Desc::queueScopedUploads`, default on). A staged upload whose destination the ticket first
@@ -418,24 +411,13 @@ recording per frame slot. These options serve it; each is independent of the oth
 -   **Passes the host data turns off.** `RenderGraphPass::SetSkipWhen(predicate)` is asked at each preparation with the
     preparation's host data. True marks the prepared pass skipped ahead (`PreparedPass::SkippedAhead`): its recorder records
     only the barriers around it, whether it is recorded ahead or at execution. The answer must depend on the host data alone.
--   **Held tickets of pinned copies.** `HoldEpochTicket` takes a revision-driven epoch's ticket when its copy is pinned
-    (`SetEpochCopy` first). The held ticket is the pinned copy's: its run is `EpochCopyRun` of that copy, and holding it means
-    the copy's last run is done. A host that commits at several points of its frame before the submission (Community Shaders'
-    segments with several taps) writes the run's latch regions and gates inside `UseHeldRun` at each point, and the next
-    `SubmitEpoch` takes the held ticket. Without a pinned copy the hold throws: the run is not known ahead.
 -   **Repeated alias activations are predicted.** A graph whose transients share memory activates the same aliased backings at
     each execution (the last transient of one execution occupies what the first of the next one takes). Such an admission used
     to plan against the ledger every time. A prediction now keeps the activations it was made with
     (`StatePrediction::activations`), and stands for an admission that activates the same backings. Community Shaders' deferred
     segment: admission 103 us a run before, 8 us after.
--   **A closed execution commits ranges.** Its exit commits (the ledger's record of where each cell rests) are made per cell. The
-    commits of neighbouring mips of a slice that end in the same state in the same batch are now one range, and seeds no longer
-    send a batch's commits to the slower keyed path (`BackingStateAdmissionLedger::SeedBatch`). The deferred segment's commits:
-    71 us a run before, 15 us after.
--   **Test.** `PersistentVulkanHostTests segment`: a revision-driven epoch closed by `SetClosedEpochs` in an open host, runs
-    pinned to their slots, a re-pin after a skipped slot, a revision that turns the write off, a one-copy recording, and held
-    tickets of pinned copies (the held run is the copy's, a second hold returns it, the submission takes it, and a hold given
-    back leaves the copy free).
+-   **Test.** `PersistentVulkanHostTests segment`: a revision-driven epoch, runs pinned to their slots, a re-pin after a
+    skipped slot, a revision that turns the write off, and a one-copy recording.
 
 ### Versioned resources
 

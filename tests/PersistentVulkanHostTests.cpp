@@ -1768,25 +1768,6 @@ static int Run(int argc, char** argv) {
 					host.SetEpochCopy(0, 2);
 					host.SubmitEpoch(0, upload, {}, slotted);
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the other slots go on with their recordings");
-					// A held ticket of a pinned copy (a host that commits at several points before the submission): the held run is the
-					// copy's run, a second hold returns it again, and the submission takes the held ticket.
-					for (uint32_t slot : {0u, 2u}) {
-						value = 76000u + slot;
-						host.SetEpochCopy(0, slot);
-						const auto held = host.HoldEpochTicket(0);
-						REQUIRE(held == host.EpochCopyRun(0, slot) && host.HoldsEpochTicket(0), "a held ticket of a pinned copy is the copy's run");
-						host.UseHeldRun(0);
-						REQUIRE(host.CurrentRun() == held, "the held run is CurrentRun while it is used");
-						host.EndHeldRun();
-						REQUIRE(host.HoldEpochTicket(0) == held, "a second hold returns the same run");
-						org::RunRef seen{};
-						host.SubmitEpoch(0, [&](org::RenderGraph& graph) {
-							upload(graph);
-							seen = host.CurrentRun();
-						}, {}, slotted);
-						REQUIRE(seen == held && !host.HoldsEpochTicket(0), "the submission takes the held ticket");
-						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a held pinned copy's recording writes every element");
-					}
 					// A staging run per copy (a host that gathers its values at several points and takes the copy once): its own lease
 					// index, CurrentRun while it is used, and copied whole into the copy's run inside the copy's beforeSubmit.
 					{
@@ -1833,14 +1814,6 @@ static int Run(int argc, char** argv) {
 								"the copy's run reads exactly what was staged since the staging run was cleared");
 						}
 					}
-					// A held ticket given back unsubmitted: the next submission of the copy takes a new one.
-					host.SetEpochCopy(0, 1);
-					(void)host.HoldEpochTicket(0);
-					REQUIRE(host.ReleaseHeldEpochTicket(0) && !host.HoldsEpochTicket(0), "a held pinned ticket goes back");
-					value = 77000u;
-					host.SetEpochCopy(0, 1);
-					host.SubmitEpoch(0, upload, {}, slotted);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the copy runs again after a given-back hold");
 					// A staged graph (StageEpochGraph): recorded for before it runs, while the attached graph's recordings still submit, then
 					// swapped in with its recordings at one point.
 					{
