@@ -73,7 +73,7 @@ submission point is an **epoch**.
     -   The staged graph gets the next build generation at once (`StageResult::generation`, `StagedGeneration(epoch)`). A recording
         request that names it (`RequestEpochRecording(..., copy, generation)`) is recorded on the staged graph. Its recording carries that
         generation, so it is not current until the attach.
-    -   `AttachStagedEpochGraph(epoch)` swaps the staged graph in at a point the caller picks (a frame boundary). The recordings made on it
+    -   `AttachStagedEpochGraphs(epochs)` swaps the staged graphs in at a point the caller picks (a frame boundary). The recordings made on it
         become the epoch's candidates, and requests still queued for it go on as requests for the attached graph. A caller that waits
         until every copy it needs is recorded switches graph and recordings in one step: the epoch is never without a recording.
     -   The staged graph's first recording places its transients. That may move a transient the attached graph binds. So staging
@@ -102,8 +102,7 @@ submission point is an **epoch**.
         configuration as they are now, no later build is attached, and no ticket of it is held. The call must not run inside a
         submission on the same thread.
     -   One failed check refuses the whole set. The result names the first refused epoch (`AttachResult::epoch`) and the reason
-        (`AttachResult::refusal`, `AttachRefusalName`). Unlike `AttachStagedEpochGraph`, a refusal drops no staged graph: the caller
-        decides.
+        (`AttachResult::refusal`, `AttachRefusalName`). A refusal drops no staged graph: the caller decides.
     -   Otherwise the host's thread is held once (`ReplaceAsyncInstances` over every epoch) and each staged graph is swapped in with its
         recordings, exactly as the single form does.
     -   `AttachStatsTotal()` counts attaches, stagings, sets attached and refusals by reason, over the host's life, on any thread.
@@ -363,7 +362,7 @@ revision the host's scene supplies (CS's DCLF scene revision), and nothing about
     request for a live epoch completes with an error.
 -   **Candidates are recordings.** A revision-driven ticket prepares nothing from live state. The revision recordings its
     caller still holds are its candidates (their copy for the ticket's run), and `SubmitEpoch(epoch, beforeSubmit, owner,
-    recording)` binds one, or the one `beforeSubmit` chose (`UseEpochRecording`, checked with `CanUseEpochRecording`).
+    recording)` binds one, or the one `beforeSubmit` chose (`UseEpochRecording`).
 -   **Immutable inputs.** A recording for a revision resolves the graph's resolvers through it (`ResolverCaptureContext` of
     `IHostExecutionData`), and its frozen bindings hold the backings and descriptors it was recorded with. A buffer that
     grows does so by versions (`VersionedBuffer`, below), never in place.

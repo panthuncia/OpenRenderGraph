@@ -198,35 +198,6 @@ bool RenderGraph::BindPersistentTicketRecording(PersistentTicket& ticket, std::s
 	return true;
 }
 
-bool RenderGraph::CanBindPersistentTicketRecording(const PersistentTicket& ticket, const PersistentRecording& recording, uint64_t hostTag,
-	std::string* why) {
-	auto fail = [&](const char* reason) {
-		if (why) *why = reason;
-		return false;
-	};
-	const auto admitted = [&] {
-		for (const auto* candidate = ticket.candidates.load(std::memory_order_acquire); candidate; candidate = candidate->next)
-			if (candidate->segment.recording.get() == &recording) return true;
-		return false;
-	};
-	if (ticket.revision) {
-		if (!ticket.segments.empty()) return fail("the ticket already has a recording");
-		return admitted() || fail("the ticket admitted no candidate for this recording (made after the ticket, and not added to it)");
-	}
-	if (admitted()) return !ticket.chosen || fail("the ticket already took a candidate");
-	if (ticket.segments.size() != 1) return fail("the ticket has no single segment");
-	const auto& segment = ticket.segments.front();
-	if (segment.recording) return fail("the ticket already has a recording");
-	if (!recording.replayable) return fail("the recording is not replayable");
-	if (recording.publication != segment.admission.publication) return fail("recorded for another publication");
-	if (recording.bindings != segment.bindings) return fail("recorded for other bindings");
-	if (recording.resourceHeap.index != segment.resourceHeap.index || recording.resourceHeap.generation != segment.resourceHeap.generation
-		|| recording.samplerHeap.index != segment.samplerHeap.index || recording.samplerHeap.generation != segment.samplerHeap.generation)
-		return fail("recorded for other descriptor heaps");
-	if (recording.hostTag != hostTag) return fail("recorded under another backing version");
-	return true;
-}
-
 RenderGraph::PersistentRecordingStats RenderGraph::TakePersistentRecordingStats() noexcept {
 	PersistentRecordingStats stats;
 	stats.recorded = m_recordingsRecorded.exchange(0, std::memory_order_relaxed);

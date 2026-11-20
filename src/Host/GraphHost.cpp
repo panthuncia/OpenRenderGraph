@@ -1403,59 +1403,6 @@ GraphHost::StageResult GraphHost::StageEpochGraph(std::unique_ptr<EpochGraph>& b
 	return result;
 }
 
-GraphHost::AttachResult GraphHost::AttachStagedEpochGraph(uint32_t epoch) {
-	BT_ZONE_SCOPE("ORG.Host.AttachStagedEpochGraph");
-	const auto index = InstanceOf(epoch);
-	if (index == kNoInstance) return Refuse(AttachRefusal::UnknownEpoch, epoch, "the epoch is not one of the host's");
-	auto& instance = m_instances[index];
-	if (!instance.staged) return Refuse(AttachRefusal::NotStaged, epoch, "no graph is staged");
-	auto& built = instance.staged;
-	const bool hostChanged = built->m_hostConfiguration != m_hostConfiguration.load(std::memory_order_acquire);
-	if (hostChanged || built->m_epochConfiguration != instance.configuration->load(std::memory_order_acquire)) {
-		if (m_async && !m_async->holding) HoldAsync({}, [&] { RetireStaged(index); });
-		else RetireStaged(index);
-		MarkRebuild(instance, "its staged graph was dropped (the host's configuration changed)");
-		if (!hostChanged)
-			return Refuse(AttachRefusal::EpochConfiguration, epoch, "the epoch's extensions or external state changed since its build started");
-		return Refuse(AttachRefusal::HostConfiguration, epoch, "the host's configuration changed since its build started");
-	}
-	const auto epochName = instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch);
-	const auto begin = std::chrono::steady_clock::now();
-	const auto generation = instance.stagedGeneration;
-	if (m_async && !m_async->holding) ReplaceAsyncInstances({&index, 1}, [&](size_t i) { return SwapStagedIn(i); });
-	else (void)SwapStagedIn(index);
-	m_attachCount.fetch_add(1, std::memory_order_relaxed);
-	spdlog::info("GraphHost: epoch {}'s staged graph attached (build {}) in {:.3f} ms", epochName, generation,
-		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
-	return {true, {}};
-}
-
-bool GraphHost::SwapStagedIn(size_t index) {
-	auto& instance = m_instances[index];
-	auto& built = instance.staged;
-	const auto generation = instance.stagedGeneration;
-	if (built->m_uploads) built->m_uploads->ApplyResolveContext();
-	built->m_uploads = nullptr;
-	std::vector<std::weak_ptr<const EpochRecording>> recordings;
-	if (m_async)
-		for (uint32_t i = 0; i < m_async->epochs.size(); ++i) {
-			if (m_async->instanceOf[i] != index) continue;
-			recordings = std::move(m_async->stagedRecordings[i]);
-			m_async->stagedRecordings[i].clear();
-			m_async->stagedGraph[i] = nullptr;
-			m_async->stagedGeneration[i] = 0;
-		}
-	InstallGraph(index, std::move(built->m_graph), built->m_serial, generation);
-	// The recordings made on it are its tickets' candidates from now on.
-	if (m_async)
-		for (uint32_t i = 0; i < m_async->epochs.size(); ++i)
-			if (m_async->instanceOf[i] == index) m_async->liveRecordings[i] = recordings;
-	instance.staged.reset();
-	instance.stagedGeneration = 0;
-	PublishDeclared(index);
-	return true;
-}
-
 GraphHost::AttachResult GraphHost::AttachStagedEpochGraphs(std::span<const uint32_t> epochs) {
 	BT_ZONE_SCOPE("ORG.Host.AttachStagedEpochGraphs");
 	// Every epoch is checked before anything changes. A refusal leaves every staged graph staged.
@@ -1576,13 +1523,6 @@ void GraphHost::PublishDeclared(size_t index) {
 uint64_t GraphHost::StagedGeneration(uint32_t epoch) const noexcept {
 	const auto index = InstanceOf(epoch);
 	return index == kNoInstance || !m_instances[index].staged ? 0 : m_instances[index].stagedGeneration;
-}
-
-void GraphHost::DropStagedEpochGraph(uint32_t epoch) {
-	const auto index = InstanceOf(epoch);
-	if (index == kNoInstance || !m_instances[index].staged) return;
-	if (m_async && !m_async->holding) HoldAsync({}, [&] { RetireStaged(index); });
-	else RetireStaged(index);
 }
 
 bool GraphHost::BuildDueInstances(bool all) {
@@ -3066,21 +3006,6 @@ void GraphHost::AddRevisionCandidate(Async& state, uint32_t epochIndex, RenderGr
 	m_instances[state.instanceOf[epochIndex]].graph->AddPersistentTicketCandidate(ticket, recording.copies[run.copy]);
 }
 
-bool GraphHost::CanUseEpochRecording(const EpochRecording& recording, std::string* why) const {
-	auto fail = [&](const char* reason) {
-		if (why) *why = reason;
-		return false;
-	};
-	if (!m_async || !m_submittingTicket) return fail("not inside an async epoch's submission");
-	const auto& async = *m_async;
-	if (!async.revisionDriven[m_submittingIndex]) return fail("a live epoch records every run (it takes no revision recording)");
-	if (recording.epoch != async.epochs[m_submittingIndex]) return fail("recorded for another epoch");
-	const auto run = RenderGraph::PersistentTicketRun(*m_submittingTicket);
-	if (!run.Published() || run.copy >= recording.copies.size() || !recording.copies[run.copy]) return fail("no copy for the ticket's run");
-	return RenderGraph::CanBindPersistentTicketRecording(*m_submittingTicket, *recording.copies[run.copy],
-		async.backingVersion.load(std::memory_order_acquire), why);
-}
-
 void GraphHost::NoteNewVersions() noexcept {
 	// After the version's publication (release), so a preparation that reads the new value resolves the new version.
 	if (m_async) m_async->backingVersion.fetch_add(1, std::memory_order_acq_rel);
@@ -3558,7 +3483,6 @@ GraphHost::TicketCommit GraphHost::CommitTicket(Async& async, uint32_t index, st
 			~Submitting() { host.m_submittingTicket = nullptr; }
 		} submitting{*this};
 		m_submittingTicket = ticket.get();
-		m_submittingIndex = index;
 		beforeSubmit(graph);
 	}
 	lap(m_lastTimings.beforePrepareUs);

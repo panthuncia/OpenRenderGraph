@@ -12,6 +12,7 @@
 //     frame (a binding-only edit, no rebuild), and a requested rebuild keeps working;
 //   - shutdown leaves the host's device and buffers intact.
 
+#include <array>
 #include "rhi.h"
 #include "TestSupport.h"
 #include "Render/RenderGraph/ScheduleTrace.h"
@@ -1377,7 +1378,7 @@ static int Run(int argc, char** argv) {
 					REQUIRE(stagedRecording && !host.EpochRecordingCurrent(*stagedRecording), "a recording made on the staged build");
 					if (const int failed = frame(frameIndex, full, 81000u + frameIndex, true)) return failed;
 					++frameIndex;
-					REQUIRE(host.AttachStagedEpochGraph(0).attached && host.EpochRecordingCurrent(*stagedRecording), "the staged build switched in");
+					REQUIRE(host.AttachStagedEpochGraphs(std::array<uint32_t, 1>{0}).attached && host.EpochRecordingCurrent(*stagedRecording), "the staged build switched in");
 					for (uint32_t i = 0; i < 6; ++i, ++frameIndex)
 						if (const int failed = frame(frameIndex, stagedRecording, 82000u + 10u * frameIndex, true)) return failed;
 				}
@@ -1832,7 +1833,7 @@ static int Run(int argc, char** argv) {
 						host.SetEpochCopy(0, 2);
 						host.SubmitEpoch(0, upload, {}, slotted);
 						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the attached graph's recording submits while staged");
-						REQUIRE(host.AttachStagedEpochGraph(0).attached, "the staged graph is attached");
+						REQUIRE(host.AttachStagedEpochGraphs(std::array<uint32_t, 1>{0}).attached, "the staged graph is attached");
 						REQUIRE(host.BuildGeneration(0) == staging.generation && host.StagedGeneration(0) == 0, "the epoch runs the staged build");
 						REQUIRE(host.EpochRecordingCurrent(*stagedRecording) && !host.EpochRecordingCurrent(*slotted), "its recordings are current, the old ones not");
 						for (uint32_t frame = 0; frame < 3; ++frame) {
@@ -1849,7 +1850,7 @@ static int Run(int argc, char** argv) {
 						REQUIRE(stagedOne.staged && stagedTwo.staged && stagedTwo.generation > stagedOne.generation, "a later staging replaces an earlier one");
 						REQUIRE(!record(kCount, versions->Current(), false, org::RunRef::kNoCopy, stagedOne.generation), "a replaced staged graph records nothing");
 						auto last = record(kCount, versions->Current(), false, org::RunRef::kNoCopy, stagedTwo.generation);
-						REQUIRE(last && host.AttachStagedEpochGraph(0).attached, "the last staged graph is attached");
+						REQUIRE(last && host.AttachStagedEpochGraphs(std::array<uint32_t, 1>{0}).attached, "the last staged graph is attached");
 						value = 79500u;
 						host.SetEpochCopy(0, 0);
 						host.SubmitEpoch(0, upload, {}, last);

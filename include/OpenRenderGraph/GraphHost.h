@@ -334,7 +334,7 @@ public:
 	 * Owner thread, where the epoch is not being submitted. The graph is checked as AttachEpochGraph checks it, then handed to the host's
 	 * thread as the epoch's staged graph. The attached graph keeps preparing and submitting. A recording request that names the staged
 	 * generation (RequestEpochRecording's generation) is recorded on the staged graph. Its recording is current once
-	 * AttachStagedEpochGraph swaps the graph in, so a caller can switch graph and recordings in one step at a frame boundary.
+	 * AttachStagedEpochGraphs swaps the graph in, so a caller can switch graph and recordings in one step at a frame boundary.
 	 *
 	 * From the staged graph's first recording, its alias placement may move transients the attached graph binds. So while a graph is
 	 * staged, the attached graph keeps the backings it bound (RenderGraph::FreezeAliasedBindings) and takes no new recording: a request
@@ -351,16 +351,8 @@ public:
 		AttachRefusal refusal = AttachRefusal::None;
 	};
 	StageResult StageEpochGraph(std::unique_ptr<EpochGraph>& graph);
-	/**
-	 * @brief Owner thread, at a frame boundary where the epoch is not being submitted: swaps the staged graph in. The recordings made for it
-	 * since it was staged become the epoch's current ones. Rejected, and the staged graph dropped, when the host's configuration changed
-	 * since its build started.
-	 */
-	AttachResult AttachStagedEpochGraph(uint32_t epoch);
 	/** @brief Owner thread: the staged graph's build generation (0 with none). */
 	uint64_t StagedGeneration(uint32_t epoch) const noexcept;
-	/** @brief Owner thread: drops the epoch's staged graph (retired). The attached graph stays frozen until a graph replaces it. */
-	void DropStagedEpochGraph(uint32_t epoch);
 	/**
 	 * @brief Owner thread, at a frame boundary: swaps the staged graphs of several epochs in as one step (frame revisions, rule R3).
 	 *
@@ -371,10 +363,9 @@ public:
 	 * - it runs no graph whose build started later;
 	 * - the call is not inside a submission.
 	 *
-	 * If any check fails, nothing is attached and the result names the first refused epoch and why. Unlike
-	 * AttachStagedEpochGraph, a refusal drops no staged graph: the caller decides what to do. Otherwise the host's thread is held
-	 * once and every staged graph is swapped in with its recordings, as AttachStagedEpochGraph does for one. An empty set attaches
-	 * nothing and succeeds.
+	 * If any check fails, nothing is attached and the result names the first refused epoch and why. A refusal drops no staged
+	 * graph: the caller decides what to do. Otherwise the host's thread is held once and every staged graph is swapped in with its
+	 * recordings. An empty set attaches nothing and succeeds.
 	 */
 	AttachResult AttachStagedEpochGraphs(std::span<const uint32_t> epochs);
 	/**
@@ -388,7 +379,7 @@ public:
 	std::vector<uint32_t> EpochsDeclaring(std::span<const IVersionedResource* const> slots) const;
 	/** @brief Totals since the host was made: builds attached or staged, staged sets attached, and refusals by reason. */
 	struct AttachStats {
-		uint64_t attached = 0;    // AttachEpochGraph and AttachStagedEpochGraph(s), per epoch
+		uint64_t attached = 0;    // AttachEpochGraph and AttachStagedEpochGraphs, per epoch
 		uint64_t staged = 0;      // StageEpochGraph
 		uint64_t setsAttached = 0;  // AttachStagedEpochGraphs calls that attached
 		std::array<uint64_t, static_cast<size_t>(AttachRefusal::Count)> refusals{};
@@ -713,11 +704,6 @@ public:
 	// ticket's candidates: RequestEpochRecording) when SubmitEpoch was given none. A recording the ticket did not admit makes
 	// SubmitEpoch throw.
 	void UseEpochRecording(std::shared_ptr<const EpochRecording> recording) noexcept { m_chosenRecording = std::move(recording); }
-	// Submitting thread, inside SubmitEpoch's beforeSubmit for a revision-driven epoch: whether the ticket being submitted would take
-	// this recording (UseEpochRecording) - false, with why, for one of another epoch or one the ticket did not admit (recorded for a
-	// graph since rebuilt, or made after the ticket). A caller that writes values into what the recording reads decides by this
-	// before writing, so SubmitEpoch never throws for it.
-	bool CanUseEpochRecording(const EpochRecording& recording, std::string* why = nullptr) const;
 	// Owner thread: moves with every graph build, of any epoch.
 	uint64_t BuildGeneration() const noexcept { return m_buildGeneration; }
 	// Owner thread: moves with every build of the epoch's graph: a recording (RequestEpochRecording) is of the build it was made on,
@@ -806,7 +792,6 @@ public:
 	runtime::IDescriptorService* Descriptors() noexcept;
 	// The same, kept alive by the caller: a producer on another thread (growth as graph work, its worker upload path).
 	std::shared_ptr<runtime::IUploadService> RetainUploads() noexcept;
-	uint64_t FramesExecuted() const noexcept { return m_frameNumber; }
 	bool ClosedExecutions() const noexcept { return m_desc.closedExecutions; }
 	// The epochs' graphs' shared alias pools (Desc::sharedAliasArena), made with the first graph; null without.
 	std::shared_ptr<PersistentAliasArena> AliasArena() const noexcept { return m_aliasArena; }
@@ -832,7 +817,6 @@ public:
 	 */
 	RunRef BeginExternalRun(std::shared_ptr<rhi::TimelinePtr> timeline, uint64_t value);
 	void EndExternalRun() noexcept { m_externalRun.reset(); }
-	bool ExternalRunActive() const noexcept { return m_externalRun.has_value(); }
 	// The host frame number of the last execution (ExecuteFrame or SubmitEpoch); the completed-frame
 	// callback reports frames by it.
 	uint64_t LastHostFrame() const noexcept { return m_lastHostFrame; }
@@ -1212,9 +1196,8 @@ private:
 	bool m_inlineAtExecution = false;        // SetInlineAtExecution; set on every build's graph
 	std::shared_ptr<ExternalEpochExecution> m_externalExecution;  // submitting thread: the last external SubmitEpoch's
 	std::shared_ptr<const EpochRecording> m_chosenRecording;  // submitting thread: UseEpochRecording's, until SubmitEpoch takes it
-	// Submitting thread, during SubmitTicket's beforeSubmit: the ticket being submitted and its epoch's index (CanUseEpochRecording).
+	// Submitting thread, during SubmitTicket's beforeSubmit: the ticket being submitted.
 	const RenderGraph::PersistentTicket* m_submittingTicket = nullptr;
-	uint32_t m_submittingIndex = 0;
 	AsyncStats m_asyncStats{};
 	void StartAsync();
 	void StopAsync();
