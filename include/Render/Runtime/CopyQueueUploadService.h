@@ -109,6 +109,11 @@ public:
     // Returns null when the service is not initialized or the texture does not qualify.
     std::shared_ptr<TrackedUploadTicket> QueueTextureZeroFill(org::WorkerOwnedDestination destination);
 
+    // QueueTextureZeroFill with contents: `writer` writes each subresource into a staging buffer made for this fill, on the
+    // calling thread, before this returns. The buffer is as large as the texture's footprints and is freed with its batch.
+    // The same rules and layouts as the zero fill. Returns null when the texture does not qualify or the writer failed.
+    std::shared_ptr<TrackedUploadTicket> QueueTextureFill(org::WorkerOwnedDestination destination, const org::TextureFillWriter& writer);
+
     // Signals `timeline` to `value` from the copy queue, once every copy the calling thread queued before this call is
     // done. This works because the intake is FIFO per producer, and batches go to the one queue in order. The batch
     // carrying the signal signals it with its own timeline.
@@ -146,7 +151,8 @@ private:
         std::atomic<bool> closed{ false };
     };
 
-    // The zeroed upload buffer that texture zero fills copy from. It is written once, at creation.
+    // The upload buffer a texture fill copies from: the zeroed one the service keeps, written once at creation, or one
+    // made for a single fill (QueueTextureFill).
     struct ZeroSource {
         rhi::ResourcePtr buffer;
         uint64_t bytes = 0;

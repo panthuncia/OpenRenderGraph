@@ -102,6 +102,8 @@ public:
 		std::span<const StreamingUploadRange> ranges, WorkerOwnedDestination destination);
 	// A zero fill of a fresh texture on that path (IUploadService::QueueTrackedStreamingTextureZeroFill).
 	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingTextureZeroFill(WorkerOwnedDestination destination);
+	// A fill of a fresh texture with contents on that path (IUploadService::QueueTrackedStreamingTextureFill).
+	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingTextureFill(WorkerOwnedDestination destination, TextureFillWriter writer);
 	// A GPU copy between two buffers on that path (IUploadService::QueueTrackedStreamingCopyRanges); null without a queue of its own.
 	std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingCopyRanges(std::shared_ptr<Resource> source,
 		std::span<const StreamingCopyRange> ranges, WorkerOwnedDestination destination);

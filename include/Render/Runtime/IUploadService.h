@@ -202,6 +202,13 @@ public:
         (void)destination;
         return {};
     }
+    // The same path, every mip and slice of a texture no queue has used yet filled with what `writer` writes
+    // (CopyQueueUploadService::QueueTextureFill). The rules are those of QueueTrackedStreamingTextureZeroFill. Null: the texture
+    // does not qualify, the writer failed, or the path cannot fill textures.
+    virtual std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingTextureFill(WorkerOwnedDestination destination, TextureFillWriter writer) {
+        (void)destination; (void)writer;
+        return {};
+    }
     // Whether that path has a queue of its own (the dedicated uploader of graph work). Without one its copies go to the graph's
     // copy queue, which a host may alias to its graphics queue: a producer that relies on running beside the frame checks this.
     virtual bool HasDedicatedStreamingQueue() const { return false; }

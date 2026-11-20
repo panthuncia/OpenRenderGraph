@@ -140,6 +140,10 @@ public:
         return Manager().QueueTrackedStreamingTextureZeroFill(std::move(destination));
     }
 
+    std::shared_ptr<TrackedUploadTicket> QueueTrackedStreamingTextureFill(WorkerOwnedDestination destination, TextureFillWriter writer) override {
+        return Manager().QueueTrackedStreamingTextureFill(std::move(destination), std::move(writer));
+    }
+
     bool HasDedicatedStreamingQueue() const override {
         return Manager().HasDedicatedStreamingQueue();
     }

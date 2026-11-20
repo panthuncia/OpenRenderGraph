@@ -510,6 +510,92 @@ std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueTextureZeroFil
 	return ticket;
 }
 
+std::shared_ptr<TrackedUploadTicket> CopyQueueUploadService::QueueTextureFill(org::WorkerOwnedDestination destination,
+	const org::TextureFillWriter& writer) {
+	if (!Initialized() || !writer || !destination.resource || !destination.resource->HasLayout()) return {};
+	auto& texture = *destination.resource;
+	if (!ZeroFillable(texture)) {
+		spdlog::error("CopyQueueUploadService '{}': '{}' cannot be filled on the copy queue. It must be a concurrent, "
+			"single-sampled colour texture", m_config.debugName, texture.GetName());
+		return {};
+	}
+	// A resource with representations on other devices would be filled on the primary device only.
+	const auto instances = texture.GetRepresentationInstances();
+	if (instances.size() != 1 || instances.front() != BackendInstanceId::Primary) return {};
+	const uint32_t mips = texture.GetMipLevels();
+	const uint32_t slices = texture.GetArraySize();
+	const auto handle = texture.GetAPIResource().GetHandle();
+	if (!mips || !slices || !handle.valid()) return {};
+	BT_ZONE_SCOPE("CopyQueueUploadService::QueueTextureFill");
+
+	std::vector<rhi::CopyableFootprint> footprints(size_t{ mips } * slices);
+	rhi::FootprintRangeDesc range{};
+	range.texture = handle;
+	range.mipCount = mips;
+	range.arraySize = slices;
+	const auto info = m_device.GetCopyableFootprints(range, footprints.data(), static_cast<uint32_t>(footprints.size()));
+	if (info.count != footprints.size() || !info.totalBytes) return {};
+
+	// A staging buffer of its own, laid out as the footprints say, so each subresource is one copy. Its batch frees it.
+	auto source = std::make_shared<ZeroSource>();
+	source->bytes = info.totalBytes;
+	auto desc = rhi::helpers::ResourceDesc::Buffer(source->bytes, rhi::HeapType::Upload, {}, "CopyQueueUploads texture fill");
+	desc.queueSharing = rhi::QueueSharing::Concurrent;
+	if (rhi::Failed(m_device.CreateCommittedResource(desc, source->buffer)) || !source->buffer) {
+		spdlog::error("CopyQueueUploadService '{}': the fill buffer of '{}' could not be made ({} bytes)", m_config.debugName, texture.GetName(),
+			source->bytes);
+		return {};
+	}
+	void* mapped = nullptr;
+	source->buffer->Map(&mapped, 0, source->bytes);
+	if (!mapped) {
+		spdlog::error("CopyQueueUploadService '{}': the fill buffer of '{}' could not be mapped", m_config.debugName, texture.GetName());
+		return {};
+	}
+	bool written = true;
+	PendingCopy entry;
+	const auto sourceHandle = source->buffer->GetHandle();
+	// Footprints come slice by slice, with each slice's mips in order (the D3D12 subresource order).
+	for (uint32_t slice = 0; slice < slices && written; ++slice) {
+		for (uint32_t mip = 0; mip < mips && written; ++mip) {
+			const auto& footprint = footprints[size_t{ slice } * mips + mip];
+			if (!footprint.rowPitch || !footprint.width || !footprint.height || !footprint.depth) {
+				written = false;
+				break;
+			}
+			written = writer(mip, slice, footprint.width, footprint.height, footprint.depth, footprint.rowPitch,
+				static_cast<std::byte*>(mapped) + footprint.offset);
+			rhi::BufferTextureCopyFootprint copy{};
+			copy.texture = handle;
+			copy.buffer = sourceHandle;
+			copy.mip = mip;
+			copy.arraySlice = slice;
+			copy.footprint = footprint;
+			entry.textureCopies.push_back(copy);
+			entry.size += uint64_t{ footprint.rowPitch } * footprint.height * footprint.depth;
+		}
+	}
+	source->buffer->Unmap(0, source->bytes);
+	if (!written) {
+		spdlog::error("CopyQueueUploadService '{}': the contents of '{}' could not be written", m_config.debugName, texture.GetName());
+		return {};
+	}
+	BT_ZONE_VALUE(static_cast<int64_t>(entry.size));
+	// The texture is fresh, so nothing else reads its tracker now. The graph's first use starts where the copies leave it.
+	if (auto* tracker = texture.GetStateTracker())
+		tracker->Reset(RangeSpec{}, ResourceState{ rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All });
+	auto ticket = std::make_shared<TrackedUploadTicket>();
+	entry.destination = std::move(destination.resource);
+	entry.zeroSource = std::move(source);
+	entry.textureMips = mips;
+	entry.textureSlices = slices;
+	entry.ticket = ticket;
+	entry.queued = std::chrono::steady_clock::now();
+	m_intake.Push(std::move(entry));
+	m_wake.notify_one();
+	return ticket;
+}
+
 // ---------------------------------------------------------------------------
 // Submitter
 

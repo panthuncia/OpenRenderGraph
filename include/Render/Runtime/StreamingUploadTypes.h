@@ -122,5 +122,13 @@ struct WorkerOwnedDestination {
     Ownership ownership = Ownership::PooledBackingLease;
 };
 
+/**
+ * @brief Writes one subresource of a texture fill (IUploadService::QueueTrackedStreamingTextureFill) into staging memory.
+ * `rowPitch` is the staging buffer's bytes per row: `depth` slices of `rows` rows of `width` texels, one slice after another
+ * at rowPitch * rows. It runs on the thread that queues the fill, before the call returns. False fails the fill.
+ */
+using TextureFillWriter = std::function<bool(uint32_t mip, uint32_t slice, uint32_t width, uint32_t rows, uint32_t depth, uint32_t rowPitch,
+    std::byte* destination)>;
+
 
 } // namespace org
