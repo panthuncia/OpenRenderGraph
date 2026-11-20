@@ -480,7 +480,7 @@ public:
 	// (RenderGraph::PreparePersistentTicket), on a thread of its own - which from then on is the only thread
 	// that touches the graphs: it waits for frame slots, prepares, admits and records tickets, completes them
 	// in submission order and retires finished work. The render thread calls SubmitEpoch instead of
-	// ExecuteFrame. Each ticket is admitted when it is submitted, open or closed. Empty stops it (and waits for the thread); an
+	// ExecuteFrame. Each ticket is admitted when it is submitted. Empty stops it (and waits for the thread); an
 	// epoch's rebuild pauses that epoch alone.
 	// revisionEpochs (a subset of epochs): recorded ahead for a revision (RequestEpochRecording) and submitted with that
 	// recording (SubmitEpoch's recording). Their tickets carry the admission alone; nothing about them is recorded or prepared
