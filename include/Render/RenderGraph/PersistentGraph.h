@@ -451,7 +451,7 @@ struct FrameAdmission {
     // Per batch, (compiler resource index, wait): every earlier access (writer and readers, any queue) the ledger holds of each
     // resource the batch uses first and that some batch off the upload queue uses (SynchronousAdmission::SetUploadQueue; empty
     // without one). What an upload into the resource recorded on another queue than the upload queue, ahead of the execution,
-    // must wait for (RenderGraph::RecordPendingUploads' queue-scoped uploads); incomingWaits gives a read only the writer. A resource
+    // must wait for (RenderGraph::RecordTakenUploads' queue-scoped uploads); incomingWaits gives a read only the writer. A resource
     // may name a timeline more than once: its waits are the latest value per timeline.
     compiler::BackingAccessAdmissionLedger::ResourceWaits boundaryAccessWaits;
     std::vector<uint64_t> queueTimelines;

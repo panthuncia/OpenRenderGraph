@@ -15,7 +15,7 @@ struct BufferVersion : ResourceVersion {
 
 namespace detail {
 // Late-bound versions' backings, by the stand-in their readers declare (VersionedBuffer::CreateLateBound). The upload planner
-// (RenderGraph::RecordPendingUploads' queue-scoped uploads) reads it. Any thread.
+// (RenderGraph::RecordTakenUploads' queue-scoped uploads) reads it. Any thread.
 // - BindLateBacking: names `backing` as content of `standIn` until the returned token is released. Binding a backing again
 //   replaces its stand-in, and releasing the older token then keeps the newer entry. Invalid handles bind nothing (null).
 // - LateStandInOf: the stand-in `backing` is bound to, or an invalid handle.

@@ -240,38 +240,9 @@ void UploadManager::SetStagedUploadsRecordedDirectly(bool direct)
 	}
 }
 
-size_t UploadManager::RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork)
-{
-	return m_uploadInstance ? m_uploadInstance->RecordStagedUploads(list, frameIndex, afterWork) : 0;
-}
-
-bool UploadManager::SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch)
-{
-	if (!m_uploadInstance) {
-		Initialize();
-	}
-	bool nothingQueued = false;
-	{
-		std::lock_guard<std::mutex> lock(m_uploadQueueMutex);
-		nothingQueued = queuedResourceCopies.empty();
-	}
-	return m_uploadInstance->SubmitRecordedUploads(std::move(batch), nothingQueued);
-}
-
-size_t UploadManager::TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex)
-{
-	return m_uploadInstance ? m_uploadInstance->TakeRecordedUploads(out, frameIndex) : 0;
-}
-
 bool UploadManager::TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out)
 {
 	return m_uploadInstance ? m_uploadInstance->TakeStagedUploads(frameIndex, out) : true;
-}
-
-bool UploadManager::TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
-	std::vector<rhi::ResourceHandle>& destinations)
-{
-	return m_uploadInstance ? m_uploadInstance->TakeRecordedUploadsWithDestinations(out, frameIndex, destinations) : true;
 }
 
 bool UploadManager::HasPendingUploads() const
@@ -281,18 +252,6 @@ bool UploadManager::HasPendingUploads() const
 		if (!queuedResourceCopies.empty()) return true;
 	}
 	return m_uploadInstance && m_uploadInstance->HasPendingUploads();
-}
-
-bool UploadManager::StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const
-{
-	return m_uploadInstance ? m_uploadInstance->StagedUploadDestinations(out) : true;
-}
-
-size_t UploadManager::RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
-	const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed)
-{
-	routed = 0;
-	return m_uploadInstance ? m_uploadInstance->RecordStagedUploadsRouted(list, frameIndex, afterWork, route, routed) : 0;
 }
 
 void UploadManager::ProcessDeferredReleases(uint32_t frameIndex)

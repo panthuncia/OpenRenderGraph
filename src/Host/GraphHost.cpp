@@ -316,7 +316,7 @@ struct GraphHost::Async {
 	// queue of the graphics queue's device.
 	std::vector<std::optional<rhi::QueueKind>> queueUploadKinds;
 	std::vector<rhi::CommandList> queueLists;     // SubmitTicket's scratch: the run's queue upload lists, by queue slot
-	std::vector<rhi::CommandList> recordedLists;  // SubmitTicket's scratch: the producers' recorded upload lists, then the run's
+	std::vector<rhi::CommandList> uploadLists;    // SubmitTicket's scratch: the run's upload list, which TicketUploads names
 	uint32_t graphicsSlot = 0;
 	rhi::Queue graphicsQueue;
 	rhi::TimelineHandle graphicsFence{};
@@ -2233,7 +2233,7 @@ void GraphHost::StartAsync() {
 		if (!pool) pool = std::make_shared<CommandListPool>(m_device, queueKind);
 	}
 	async->queueLists.resize(queues.SlotCount());
-	// Staged uploads go straight into each submission's upload list (RenderGraph::RecordPendingUploads).
+	// Staged uploads go straight into each submission's upload list (RenderGraph::RecordTakenUploads).
 	if (auto* uploads = firstGraph->GetUploadService()) uploads->SetStagedUploadsRecordedDirectly(true);
 	auto* state = async.get();
 	state->thread = std::thread([this, state] {
@@ -3085,7 +3085,6 @@ GraphHost::AsyncStats GraphHost::TakeAsyncStats() noexcept {
 		std::scoped_lock lock(m_threadStatsMutex);
 		m_asyncStats.submitted += m_threadStats.submitted;
 		m_asyncStats.uploads += m_threadStats.uploads;
-		m_asyncStats.recordedUploadLists += m_threadStats.recordedUploadLists;
 		m_asyncStats.queueUploadCopies += m_threadStats.queueUploadCopies;
 		m_asyncStats.sparedUploadWaits += m_threadStats.sparedUploadWaits;
 		m_asyncStats.lateRoutedUploads += m_threadStats.lateRoutedUploads;
@@ -3282,7 +3281,6 @@ void GraphHost::RunSubmitThread() {
 			std::scoped_lock lock(m_threadStatsMutex);
 			m_threadStats.submitted += stats.submitted;
 			m_threadStats.uploads += stats.uploads;
-			m_threadStats.recordedUploadLists += stats.recordedUploadLists;
 			m_threadStats.queueUploadCopies += stats.queueUploadCopies;
 			m_threadStats.sparedUploadWaits += stats.sparedUploadWaits;
 			m_threadStats.lateRoutedUploads += stats.lateRoutedUploads;
@@ -3643,7 +3641,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 			throw std::runtime_error("An external epoch's uploads secondary could not begin");
 	}
 	auto commands = external ? secondary.list.Get() : list.list.Get();
-	auto& recordedLists = async.recordedLists;
+	auto& uploadLists = async.uploadLists;
 	// Queue-scoped uploads (Desc::queueScopedUploads): the run's open lists of the other queues, which take the uploads their
 	// queue uses first, and go to it just ahead of the ticket's first batch there (SubmitPersistentTicket).
 	auto& queueUploadLists = lease.queueUploads;
@@ -3652,10 +3650,10 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		async.queueLists[queue] = queueScoped && queue < queueUploadLists.size() && queueUploadLists[queue].list
 			? queueUploadLists[queue].list.Get() : rhi::CommandList{};
 	size_t queueCopies = 0;
-	recordedLists.clear();
+	uploadLists.clear();
 	// BasicRHI's command census names the upload lists (diagnostics).
 	if (rhi::census::Enabled()) rhi::census::SetLabel("upload");
-	const bool supported = !hasUploads || graph.RecordTakenUploads(commit.uploads, commands, keepAlive, recorded, recordedLists,
+	const bool supported = !hasUploads || graph.RecordTakenUploads(commit.uploads, commands, keepAlive, recorded,
 		queueScoped ? ticket.get() : nullptr, queueScoped ? std::span<rhi::CommandList>(async.queueLists) : std::span<rhi::CommandList>{}, &queueCopies);
 	if (hasUploads) {
 		BT_ZONE_SCOPE("ORG.Host.CloseUploadList");
@@ -3669,16 +3667,6 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		for (auto& queueUploads : queueUploadLists) queueUploads.EndRecording();
 	}
 	stats.queueUploadCopies += queueCopies;
-	if (external && !recordedLists.empty()) {
-		recordedLists.clear();
-		abandonBeforeDiscard();
-		Async::Message discard;
-		discard.kind = Async::Message::Kind::Discard;
-		discard.epochIndex = index;
-		discard.ticket = std::move(ticket);
-		postControl(discard);
-		throw std::runtime_error("An external epoch's uploads include producer-recorded lists, which its execution cannot run");
-	}
 	if (!supported) {
 		abandonBeforeDiscard();
 		Async::Message discard;
@@ -3698,17 +3686,15 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	submitted.keepAlive = std::move(keepAlive);
 	submitted.retired = std::move(commit.retired);
 	submitted.resourceOwner = std::move(commit.resourceOwner);
-	if (!external && (recorded || !recordedLists.empty())) {
+	if (!external && recorded) {
 		BT_ZONE_SCOPE("ORG.Host.EnqueueUploads");
 		++stats.uploads;
-		stats.recordedUploadLists += recordedLists.size();
 		const auto value = ++async.queueValues.at(async.graphicsSlot);
 		const rhi::TimelinePoint signal{async.graphicsFence, value};
-		// The producers' recorded lists, then this thread's (an empty one costs nothing but its begin and end).
-		recordedLists.push_back(commands);
-		// SubmitPersistentTicket submits them, after the group an earlier ticket left held (the submission thread's carry): in the
+		uploadLists.push_back(commands);
+		// SubmitPersistentTicket submits it, after the group an earlier ticket left held (the submission thread's carry): in the
 		// ticket's first queue submission when it can (Desc::uploadsWithBatches), otherwise on their own first.
-		uploads.lists = {recordedLists.data(), recordedLists.size()};
+		uploads.lists = {uploadLists.data(), uploadLists.size()};
 		uploads.queue = async.graphicsQueue;
 		uploads.queueSlot = async.graphicsSlot;
 		uploads.signal = signal;

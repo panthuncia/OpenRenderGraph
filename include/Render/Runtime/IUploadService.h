@@ -92,70 +92,20 @@ public:
         (void)batch;
         throw std::logic_error("This upload service does not take staged uploads");
     }
-    // Owner thread. Direct: staged batches wait for RecordStagedUploads instead of joining the upload pass's
-    // queue - for a host that records the frame's uploads itself (RenderGraph::RecordPendingUploads), where
+    // Owner thread. Direct: staged batches wait for TakeStagedUploads instead of joining the upload pass's
+    // queue - for a host that records the frame's uploads itself (RenderGraph::TakePendingUploads), where
     // every entry is then one copy with no further bookkeeping. Switching it off queues what is waiting.
     virtual void SetStagedUploadsRecordedDirectly(bool direct) { (void)direct; }
-    // Owner thread: records the waiting staged batches' copies into `list` (whose frame slot is frameIndex:
-    // the batches live until it retires), in submission order: a copy that overlaps one recorded before it in
-    // these batches waits for it. afterWork: the copies follow work they must wait for (copies earlier in the
-    // list, or the previous execution's): one full barrier ahead of the first, recorded only when there is a
-    // copy, so an epoch with no batch pays nothing. Returns the number of copies.
-    virtual size_t RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork) {
-        (void)list; (void)frameIndex; (void)afterWork;
-        return 0;
-    }
-    // Owner thread, direct mode: queues a batch its producer already recorded (StagedUploadBatch::Record), whose list
-    // the host submits as it is, ahead of the copies it records itself - so only when that is the batch's place: nothing
-    // staged, queued or posted before it is waiting, and no backing was released since it was recorded. False leaves the
-    // batch with the caller, which submits it as staged (SubmitStagedUploads) instead.
-    virtual bool SubmitRecordedUploads(std::shared_ptr<StagedUploadBatch> batch) {
-        (void)batch;
-        return false;
-    }
-    // Owner thread: the accepted recorded batches' lists, in order, for frame slot frameIndex (the batches live until it
-    // retires). Call before RecordStagedUploads: a batch whose recording a backing release has since outdated goes back
-    // to be recorded there, first, and none is returned.
-    virtual size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex) {
-        (void)out; (void)frameIndex;
-        return 0;
-    }
-    // Where the uploads go, for a host that splits them between queues (RenderGraph::RecordPendingUploads' queue-scoped uploads).
-    // TakeRecordedUploads, also appending to `destinations` every buffer backing the taken lists write. False when that is not
-    // known (the default, unless nothing was taken): the caller then treats the lists as writing anything.
-    virtual bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
-        std::vector<rhi::ResourceHandle>& destinations) {
-        (void)destinations;
-        const size_t before = out.size();
-        TakeRecordedUploads(out, frameIndex);
-        return out.size() == before;
-    }
-    // Owner thread, direct mode: appends the destination backing of every copy RecordStagedUploads would record now, one per copy
-    // in recording order. False when one is not known (the default): the caller then records them with RecordStagedUploads.
-    virtual bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const {
-        (void)out;
-        return false;
-    }
-    // RecordStagedUploads, with each copy recorded into the list `route` names for its destination backing (null: `list`) instead:
-    // the copies of one destination all go to the same list, in order. Each list that takes a copy starts with afterWork's barrier.
-    // Returns the copies recorded in all; routed counts those that went elsewhere than `list`. Only a service whose
-    // StagedUploadDestinations answers routes (the default records everything into `list`).
-    virtual size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
-        const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) {
-        (void)route;
-        routed = 0;
-        return RecordStagedUploads(list, frameIndex, afterWork);
-    }
     // Owner thread, direct mode: hands the waiting staged batches over to `out` instead of recording them, for a host that records
-    // them on another thread (RenderGraph::TakePendingUploads). They live until frame slot frameIndex retires, as recorded ones do.
+    // them on another thread (RenderGraph::TakePendingUploads). They live until frame slot frameIndex retires.
     // Batches staged after this call wait for the next one. False when the service cannot hand them over (the default, unless
     // none are waiting).
     virtual bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<StagedUploadBatch>>& out) {
         (void)frameIndex; (void)out;
         return !HasPendingUploads();
     }
-    // Owner thread: whether a host's upload list would record anything now (queued or posted uploads, copies, staged or
-    // recorded batches). False lets a host skip the list. A post from another thread after the call goes with the next one.
+    // Owner thread: whether a host's upload list would record anything now (queued or posted uploads, copies, staged
+    // batches). False lets a host skip the list. A post from another thread after the call goes with the next one.
     virtual bool HasPendingUploads() const { return true; }
     // Owner thread: the slot's previous execution completed, so its upload pages are reused. GPU objects retire through the
     // runtime (Runtime::Retire), not here.

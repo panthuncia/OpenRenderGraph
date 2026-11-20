@@ -209,9 +209,6 @@ public:
     static void UnregisterConcurrentBackingCapture();
     // Throws when a concurrent capture owner is registered and this thread is outside a backing mutation scope.
     void RequireBackingMutationAllowed(const char* operation, uint64_t newSize) const;
-    // How many backings all buffers have released, process-wide. A copy recorded ahead (StagedUploadBatch::Record)
-    // names its targets' backings as they were then. It stays valid while this number has not changed.
-    static uint64_t BackingReleaseSerial() noexcept;
 
     virtual ~BufferBase();
 

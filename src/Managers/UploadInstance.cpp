@@ -814,151 +814,23 @@ void UploadInstance::SetStagedUploadsRecordedDirectly(bool direct) {
 	if (m_stagedDirect == direct) return;
 	m_stagedDirect = direct;
 	if (!direct) {
-		// Recorded batches came first: queued first, as staged ones.
-		auto waiting = std::move(m_directRecorded);
-		m_directRecorded.clear();
-		waiting.insert(waiting.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
+		auto waiting = std::move(m_directStaged);
 		m_directStaged.clear();
 		for (auto& batch : waiting) SubmitStagedUploads(std::move(batch));
 	}
-}
-
-bool UploadInstance::SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch, bool a_nothingQueued) {
-	NoteOffOwnerCall("SubmitRecordedUploads");
-	// Its copies go to the GPU ahead of everything the owner records itself, so it is taken only when that is its place
-	// in submission order: nothing staged, queued or posted before it is still waiting.
-	if (!batch || !m_stagedDirect || !batch->Recorded() || batch->RecordedSerial() != BufferBase::BackingReleaseSerial() ||
-		!a_nothingQueued || !m_directStaged.empty() || HasPendingWork())
-		return false;
-	m_currentFrameUploadBytes += batch->Bytes();
-	m_directRecorded.push_back(std::move(batch));
-	basic_telemetry::AddCounter("ORG.Upload.FrameInstance.RecordedBatches");
-	return true;
-}
-
-size_t UploadInstance::TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex) {
-	NoteOffOwnerCall("TakeRecordedUploads");
-	if (m_directRecorded.empty()) return 0;
-	// A backing released since a batch was recorded: its copies name the old one. The owner records them instead, first.
-	if (std::ranges::any_of(m_directRecorded, [](const auto& batch) { return batch->RecordedSerial() != BufferBase::BackingReleaseSerial(); })) {
-		m_directStaged.insert(m_directStaged.begin(), std::make_move_iterator(m_directRecorded.begin()), std::make_move_iterator(m_directRecorded.end()));
-		m_directRecorded.clear();
-		basic_telemetry::AddCounter("ORG.Upload.FrameInstance.RecordedBatchesRerecorded");
-		return 0;
-	}
-	for (const auto& batch : m_directRecorded) out.push_back(batch->RecordedList());
-	const size_t taken = m_directRecorded.size();
-	if (m_numFramesInFlight != 0) {
-		auto& retained = FrameStaged(frameIndex);
-		retained.insert(retained.end(), std::make_move_iterator(m_directRecorded.begin()), std::make_move_iterator(m_directRecorded.end()));
-	}
-	m_directRecorded.clear();
-	return taken;
-}
-
-size_t UploadInstance::RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork) {
-	BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads");
-	NoteOffOwnerCall("RecordStagedUploads");
-	uint64_t bytes = 0;
-	for (const auto& batch : m_directStaged) bytes += batch->Bytes();
-	// After the work before them (the list's own copies, the previous execution), the batches' first copy waits for it:
-	// one barrier, and none without a batch.
-	if (afterWork && !m_directStaged.empty()) {
-		const auto full = rhi::FullMemoryBarrier();
-		rhi::BarrierBatch barriers{};
-		barriers.globals = {&full, 1u};
-		list.Barriers(barriers);
-	}
-	const size_t copies = org::runtime::StagedUploadBatch::RecordCopies(list, m_directStaged, m_debugName);
-	{
-		BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploads.Retain");
-		if (!m_directStaged.empty() && m_numFramesInFlight != 0) {
-			auto& retained = FrameStaged(frameIndex);
-			retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
-		}
-		m_directStaged.clear();
-	}
-	BT_ZONE_VALUE(copies);
-	BT_PLOT("ORG.Upload.StagedCopies", static_cast<int64_t>(copies));
-	BT_PLOT("ORG.Upload.StagedBytes", static_cast<int64_t>(bytes));
-	return copies;
-}
-
-bool UploadInstance::TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
-	std::vector<rhi::ResourceHandle>& destinations) {
-	// Read before the take: the batches move to the slot's retained list. A batch the take sends back to be recorded as
-	// staged (an outdated recording) returns no list, and its destinations are then the staged ones.
-	std::vector<rhi::ResourceHandle> written;
-	const bool known = org::runtime::StagedUploadBatch::AppendDestinations(m_directRecorded, written);
-	if (!TakeRecordedUploads(out, frameIndex)) return true;
-	destinations.insert(destinations.end(), written.begin(), written.end());
-	return known;
 }
 
 bool UploadInstance::TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out) {
 	NoteOffOwnerCall("TakeStagedUploads");
 	if (m_directStaged.empty()) return true;
 	out.insert(out.end(), m_directStaged.begin(), m_directStaged.end());
-	// Kept with the slot until it retires, as RecordStagedUploads keeps the batches it records.
+	// Kept with the slot until it retires.
 	if (m_numFramesInFlight != 0) {
 		auto& retained = FrameStaged(frameIndex);
 		retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
 	}
 	m_directStaged.clear();
 	return true;
-}
-
-bool UploadInstance::StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const {
-	return org::runtime::StagedUploadBatch::AppendDestinations(m_directStaged, out);
-}
-
-size_t UploadInstance::RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
-	const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) {
-	routed = 0;
-	if (!route || m_directStaged.empty()) return RecordStagedUploads(list, frameIndex, afterWork);
-	BT_ZONE_SCOPE("ORG.Upload.RecordStagedUploadsRouted");
-	NoteOffOwnerCall("RecordStagedUploadsRouted");
-	std::vector<rhi::ResourceHandle> destinations;
-	if (!org::runtime::StagedUploadBatch::AppendDestinations(m_directStaged, destinations))
-		return RecordStagedUploads(list, frameIndex, afterWork);
-	// Each destination's list, asked once; the lists in the order their first copy comes. Every copy of one destination goes to
-	// the same list, so the batches' order between overlapping copies (the later write wins) holds within it.
-	auto key = [](rhi::ResourceHandle handle) { return (uint64_t{handle.generation} << 32) | handle.index; };
-	std::unordered_map<uint64_t, rhi::CommandList*> byDestination;
-	std::vector<rhi::CommandList*> targets;
-	for (const auto destination : destinations) {
-		const auto found = byDestination.find(key(destination));
-		if (found != byDestination.end()) continue;
-		auto* target = route(destination);
-		if (!target) target = &list;
-		byDestination.emplace(key(destination), target);
-		if (std::ranges::find(targets, target) == targets.end()) targets.push_back(target);
-	}
-	uint64_t bytes = 0;
-	for (const auto& batch : m_directStaged) bytes += batch->Bytes();
-	size_t copies = 0;
-	for (auto* target : targets) {
-		// After the work before them on the target's queue (its earlier copies, the previous execution): one barrier per list.
-		if (afterWork) {
-			const auto full = rhi::FullMemoryBarrier();
-			rhi::BarrierBatch barriers{};
-			barriers.globals = {&full, 1u};
-			target->Barriers(barriers);
-		}
-		const size_t recorded = org::runtime::StagedUploadBatch::RecordCopies(*target, m_directStaged, m_debugName,
-			[&](rhi::ResourceHandle destination) { return byDestination.at(key(destination)) == target; });
-		copies += recorded;
-		if (target != &list) routed += recorded;
-	}
-	if (m_numFramesInFlight != 0) {
-		auto& retained = FrameStaged(frameIndex);
-		retained.insert(retained.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
-	}
-	m_directStaged.clear();
-	BT_ZONE_VALUE(copies);
-	BT_PLOT("ORG.Upload.StagedCopies", static_cast<int64_t>(copies));
-	BT_PLOT("ORG.Upload.StagedBytes", static_cast<int64_t>(bytes));
-	return copies;
 }
 
 void UploadInstance::DrainPostedUploads() {
@@ -1405,7 +1277,7 @@ bool UploadInstance::HasPendingWork() const {
 }
 
 bool UploadInstance::HasPendingUploads() const {
-	return HasPendingWork() || !m_directStaged.empty() || !m_directRecorded.empty() || !m_pendingStaged.empty();
+	return HasPendingWork() || !m_directStaged.empty() || !m_pendingStaged.empty();
 }
 
 uint64_t UploadInstance::CapturePendingUploadSequence() {

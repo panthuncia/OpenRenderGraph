@@ -169,19 +169,8 @@ public:
 	// Owner thread: queues a producer's staged batch (IUploadService::SubmitStagedUploads).
 	void SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
 	void SetStagedUploadsRecordedDirectly(bool direct);
-	size_t RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork);
-	// IUploadService::SubmitRecordedUploads and TakeRecordedUploads (direct mode). a_nothingQueued tells whether the
-	// manager's own queue of resource copies is empty.
-	bool SubmitRecordedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch, bool a_nothingQueued);
-	size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex);
-	// The IUploadService calls that split uploads between queues: TakeRecordedUploadsWithDestinations,
-	// StagedUploadDestinations and RecordStagedUploadsRouted.
-	bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex, std::vector<rhi::ResourceHandle>& destinations);
-	bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const;
 	// IUploadService::TakeStagedUploads (direct mode).
 	bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out);
-	size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
-		const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed);
 
 	// Configuration
 
@@ -281,11 +270,9 @@ private:
 	// Staged batches submitted since the last upload pass. Also, per frame slot, the batches that the slot's pass
 	// recorded. Those are released with the slot.
 	std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>> m_pendingStaged;
-	// Direct mode: submitted batches waiting for RecordStagedUploads.
+	// Direct mode: submitted batches waiting for TakeStagedUploads.
 	bool m_stagedDirect = false;
 	std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>> m_directStaged;
-	// Direct mode: recorded batches accepted ahead of every other upload of the frame, waiting for TakeRecordedUploads.
-	std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>> m_directRecorded;
 	std::vector<std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>> m_frameStaged;
 	// A frame index's lists. An index is a host's run lease, so the lists grow to the most runs in flight instead of
 	// being taken modulo a fixed count. Owner thread.

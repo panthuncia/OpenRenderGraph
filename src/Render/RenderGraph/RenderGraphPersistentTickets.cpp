@@ -673,7 +673,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			batches[batch].signal = {admission.queueTimelines.at(queue), ++nextQueueValues[queue]};
 			if (batch < incoming.size()) batches[batch].waits = incoming[batch];
 			// The uploads ahead of the ticket order only the batches on their own queue (its entry barrier): any other queue
-			// would otherwise read what this epoch's uploads write before they land. Planned by queue (RecordPendingUploads),
+			// would otherwise read what this epoch's uploads write before they land. Planned by queue (RecordTakenUploads),
 			// only the batches that use what they write wait (the rest of theirs went to their own queue, ahead of them).
 			if (uploadsDone.second && queue != uploadsDone.first && usesUploads(batch))
 				batches[batch].waits.push_back({admission.queueTimelines.at(uploadsDone.first), uploadsDone.second});
@@ -1084,7 +1084,7 @@ ResourceRegistry::RegistryHandle TicketUploadResolveByPtr(void*, Resource* resou
 
 uint64_t UploadBufferKey(rhi::ResourceHandle handle) { return (uint64_t{handle.generation} << 32) | handle.index; }
 
-// Queue-scoped ticket uploads (RenderGraph::RecordPendingUploads): the staged destinations recorded on the queue that first uses
+// Queue-scoped ticket uploads (RenderGraph::RecordTakenUploads): the staged destinations recorded on the queue that first uses
 // them instead of the graphics list, and the batches off the graphics queue that use what stays there.
 struct TicketUploadRouting {
 	std::unordered_map<uint64_t, uint32_t> routed;  // destination backing -> the queue slot its copies go to
@@ -1265,21 +1265,10 @@ bool RenderGraph::HasPendingUploads() const {
 	return m_uploadService && m_uploadService->HasPendingUploads();
 }
 
-bool RenderGraph::RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint32_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
-	std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket, std::span<rhi::CommandList> queueLists, size_t* queueCopies) {
-	BT_ZONE_SCOPE("ORG.Persistent.RecordPendingUploads");
-	auto taken = TakePendingUploads(device, slot);
-	return RecordTakenUploads(taken, list, keepAlive, recorded, recordedLists, ticket, queueLists, queueCopies);
-}
-
 RenderGraph::TakenUploads RenderGraph::TakePendingUploads(rhi::Device device, uint32_t slot) {
 	BT_ZONE_SCOPE("ORG.Persistent.TakePendingUploads");
 	TakenUploads taken;
 	if (!m_uploadService) return taken;
-	// Before the staged batches: an outdated recording goes back among them, first. What the lists write is taken too, in case
-	// the ticket's uploads are planned by queue.
-	if (m_queueRegistry.SlotCount()) taken.graphicsKnown = m_uploadService->TakeRecordedUploadsWithDestinations(taken.recordedLists, slot, taken.graphicsBuffers);
-	else m_uploadService->TakeRecordedUploads(taken.recordedLists, slot);
 	const auto pass = m_uploadService->GetUploadPass();
 	if (auto* immediate = dynamic_cast<IHasImmediateModeCommands*>(pass.get())) {
 		try {
@@ -1292,7 +1281,7 @@ RenderGraph::TakenUploads RenderGraph::TakePendingUploads(rhi::Device device, ui
 			auto effect = immediate->TakeOwnedImmediateSubmissionEffect();
 			auto frame = context.list.Finalize();
 			if (effect) {
-				taken.supported = false;  // tracked uploads signal their completion: the synchronous path's job
+				taken.supported = false;  // tracked uploads signal their completion, which a ticket cannot do
 				return taken;
 			}
 			if (!frame.bytecode.empty()) {
@@ -1328,15 +1317,13 @@ RenderGraph::TakenUploads RenderGraph::TakePendingUploads(rhi::Device device, ui
 }
 
 bool RenderGraph::RecordTakenUploads(TakenUploads& taken, rhi::CommandList& list, std::shared_ptr<void>& keepAlive, bool& recorded,
-	std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket, std::span<rhi::CommandList> queueLists, size_t* queueCopies) {
+	PersistentTicket* ticket, std::span<rhi::CommandList> queueLists, size_t* queueCopies) {
 	BT_ZONE_SCOPE("ORG.Persistent.RecordTakenUploads");
 	recorded = false;
-	recordedLists = std::move(taken.recordedLists);
-	taken.recordedLists.clear();
 	if (queueCopies) *queueCopies = 0;
 	if (ticket) ticket->queueUploads = {};
 	if (!taken.supported) return false;
-	// Queue-scoped (see RecordPendingUploads' declaration): everything the graphics list and the recorded lists touch is known.
+	// Queue-scoped (see RecordTakenUploads' declaration): everything the graphics list touches is known.
 	const bool scoped = ticket && !queueLists.empty() && m_queueRegistry.SlotCount();
 	constexpr std::string_view kOwner = "ORG ticket uploads";
 	// A list of copies starts with one full barrier against the work before it on its queue, and only when it has a copy.
@@ -1369,11 +1356,11 @@ bool RenderGraph::RecordTakenUploads(TakenUploads& taken, rhi::CommandList& list
 		std::vector<rhi::ResourceHandle> staged;
 		TicketUploadRouting routing;
 		const auto graphicsQueue = scoped ? static_cast<uint32_t>(ToUnderlying(m_queueRegistry.FindGraphicsSlot())) : UINT32_MAX;
-		if (!scoped || !taken.graphicsKnown || !org::runtime::StagedUploadBatch::AppendDestinations(taken.staged, staged)
+		if (!scoped || !org::runtime::StagedUploadBatch::AppendDestinations(taken.staged, staged)
 			|| !PlanTicketUploads(*ticket, graphicsQueue, queueLists, taken.graphicsBuffers, staged, routing)) {
 			// Not planned: every batch off the graphics queue waits for the uploads.
 			if (recordAllInto(list)) recorded = true;
-			if (recorded || !recordedLists.empty()) orderBeforeLaterWork(list);
+			if (recorded) orderBeforeLaterWork(list);
 			return true;
 		}
 		// Planned by queue: each routed destination's copies into its queue's list (behind that list's own barrier against the
@@ -1421,7 +1408,7 @@ bool RenderGraph::RecordTakenUploads(TakenUploads& taken, rhi::CommandList& list
 			plan.leading.push_back({routing.firstOnQueue[queue], queueLists[queue], routing.copies[queue], std::move(routing.waits[queue])});
 		}
 		if (queueCopies) *queueCopies = routed;
-		if (recorded || !recordedLists.empty()) orderBeforeLaterWork(list);
+		if (recorded) orderBeforeLaterWork(list);
 		for (uint32_t queue = 0; queue < routing.copies.size(); ++queue)
 			if (routing.copies[queue] && queue < queueLists.size() && queueLists[queue]) orderBeforeLaterWork(queueLists[queue]);
 		return true;

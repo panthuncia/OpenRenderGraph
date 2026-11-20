@@ -620,13 +620,9 @@ pass whose recording would otherwise bake a per-frame value (a count, a matrix, 
 mapped upload pages: `Stage(target, dstOffset, size[, data])`. `IUploadService::SubmitStagedUploads` hands a batch over on
 the owner thread.
 
--   **Async epochs.** The host records the waiting batches straight into the ticket's upload list
-    (`RecordStagedUploads`), one copy per entry. A copy that overlaps an earlier one in the same list waits for it through
-    a barrier.
--   **Recorded ahead by the producer.** `StagedUploadBatch::Record(device)` writes the copies into a command list of the
-    batch's own, on the producer's thread. `IUploadService::SubmitRecordedUploads` hands it over when that is its place in
-    submission order. A batch whose targets' backings changed since (`BufferBase::BackingReleaseSerial`) is recorded by the
-    owner instead.
+-   **Async epochs.** The host takes the waiting batches at the commit (`TakeStagedUploads`) and records them into the
+    ticket's upload list (`RenderGraph::RecordTakenUploads`), one copy per entry. A copy that overlaps an earlier one in the
+    same list waits for it through a barrier.
 -   **Lifetime.** A batch is held until the run whose submission recorded it has retired.
 
 ## Command lists and allocators

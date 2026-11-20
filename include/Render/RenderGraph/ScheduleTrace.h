@@ -106,7 +106,7 @@ struct ScheduleSubmissionWaits {
     struct Batch {
         std::vector<Point> points;
         bool externalEntryBarrier = false, externalExitBarrier = false;
-        // Queue-scoped uploads (RenderGraph::RecordPendingUploads). queueUploadCopies counts the copies recorded on this
+        // Queue-scoped uploads (RenderGraph::RecordTakenUploads). queueUploadCopies counts the copies recorded on this
         // batch's queue and submitted just ahead of it. queueUploadWaits are that submission's own waits: Incoming points
         // for earlier executions' use of the copy destinations.
         uint64_t queueUploadCopies = 0;

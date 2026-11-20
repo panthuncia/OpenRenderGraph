@@ -844,7 +844,7 @@ void RenderGraph::BootstrapPersistentGraph() {
 		state.admission->SetExternalHomeStates(m_persistentExternalHomeStates);
 		state.ensureRepresentations = [this](Resource& resource) { EnsurePersistentRepresentations(resource); };
 		state.deferAliasPlacement = m_deferFirstAliasPlacement;
-		// Tickets record their uploads on the graphics queue, or on the queue that first uses them (RecordPendingUploads).
+		// Tickets record their uploads on the graphics queue, or on the queue that first uses them (RecordTakenUploads).
 		if (m_queueRegistry.SlotCount())
 			state.admission->SetUploadQueue(static_cast<uint32_t>(ToUnderlying(m_queueRegistry.FindGraphicsSlot())));
 		// Passes with immediate-mode commands are uploads; every other pass is a main pass.

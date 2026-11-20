@@ -25,7 +25,6 @@ StagedUploadBatch::~StagedUploadBatch() {
 
 std::byte* StagedUploadBatch::Stage(UploadTarget target, size_t dstOffset, size_t size) {
     if (!size) return nullptr;
-    m_recorded = false;  // the recording no longer covers every entry
     // Copies want 16-byte aligned sources for every backend's fast path.
     const auto aligned = (size + 15) & ~size_t{15};
     while (m_current < m_pages.size() && m_pages[m_current].capacity - m_pages[m_current].used < aligned) ++m_current;
@@ -72,52 +71,6 @@ void StagedUploadBatch::Reset() {
     m_current = 0;
     m_entries.clear();
     m_bytes = 0;
-    m_recorded = false;
-}
-
-rhi::CommandList StagedUploadBatch::RecordedList() const noexcept {
-    return m_recorded && m_list ? m_list.Get() : rhi::CommandList{};
-}
-
-bool StagedUploadBatch::Record(rhi::Device device) {
-    BT_ZONE_SCOPE("ORG.Upload.RecordBatch");
-    m_recorded = false;
-    if (m_entries.empty() || !device) return false;
-    // Read the serial before resolving any target. A release after this point moves the serial, and the owner then
-    // refuses the list.
-    const uint64_t serial = BufferBase::BackingReleaseSerial();
-    // GetAPIResource throws for a target without a backing. Then the batch is left to the owner's recording.
-    try {
-        for (const auto& entry : m_entries)
-            if (entry.target.kind != UploadTarget::Kind::PinnedShared || !entry.target.pinned || !entry.page ||
-                !entry.target.pinned->GetAPIResource().GetHandle().valid())
-                return false;
-    } catch (const std::exception&) {
-        return false;
-    }
-    if (!m_list) {
-        if (!rhi::IsOk(device.CreateCommandAllocator(rhi::QueueKind::Graphics, m_allocator)) ||
-            !rhi::IsOk(device.CreateCommandList(rhi::QueueKind::Graphics, m_allocator.Get(), m_list))) {
-            m_allocator = {};
-            m_list = {};
-            return false;
-        }
-    } else {
-        m_allocator->Recycle();
-        m_list->Recycle(m_allocator.Get());
-    }
-    auto list = m_list.Get();
-    // The copies overwrite buffers the work before them may still read.
-    const auto full = rhi::FullMemoryBarrier();
-    rhi::BarrierBatch barriers{};
-    barriers.globals = {&full, 1u};
-    list.Barriers(barriers);
-    const std::shared_ptr<StagedUploadBatch> self(std::shared_ptr<StagedUploadBatch>{}, this);  // non-owning, for the span
-    RecordCopies(list, {&self, 1}, "a recorded batch");
-    list.End();
-    m_recordedSerial = serial;
-    m_recorded = true;
-    return true;
 }
 
 bool StagedUploadBatch::AppendDestinations(std::span<const std::shared_ptr<StagedUploadBatch>> a_batches, std::vector<rhi::ResourceHandle>& a_out) {

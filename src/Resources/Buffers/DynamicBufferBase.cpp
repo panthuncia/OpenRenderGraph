@@ -31,8 +31,6 @@ namespace {
     thread_local uint32_t g_backingMutationScopeDepth = 0;
     // The number of owners that capture backings on their own threads. See BufferBase::RegisterConcurrentBackingCapture.
     std::atomic<uint32_t> g_concurrentBackingCaptures{0};
-    // BufferBase::BackingReleaseSerial.
-    std::atomic<uint64_t> g_backingReleases{0};
     std::mutex g_deferredBackingResizeClientsMutex;
     std::vector<IDeferredBackingResizeClient*> g_deferredBackingResizeClients;
     std::mutex g_asyncResizeSchedulerMutex;
@@ -618,11 +616,6 @@ void BufferBase::Dematerialize() {
     m_dataBuffer.reset();
     ++m_backingGeneration;
     ForgetPublishedAllocation();
-    g_backingReleases.fetch_add(1u, std::memory_order_acq_rel);
-}
-
-uint64_t BufferBase::BackingReleaseSerial() noexcept {
-    return g_backingReleases.load(std::memory_order_acquire);
 }
 
 void BufferBase::SetDescriptorRequirements(const DescriptorRequirements& requirements) {
@@ -774,8 +767,6 @@ void BufferBase::SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t 
             DescriptorHeapManager::GetInstance().RetireDescriptorSlots(DetachDescriptorSlotsForDeferredRelease());
         }
         DescriptorHeapManager::GetInstance().RetireBufferBacking(std::move(m_dataBuffer));
-        // A staged-upload batch recorded before this names the retired backing (StagedUploadBatch::RecordedSerial).
-        g_backingReleases.fetch_add(1u, std::memory_order_acq_rel);
     }
     m_dataBuffer = std::move(backing);
     m_bufferSize = bufferSize;

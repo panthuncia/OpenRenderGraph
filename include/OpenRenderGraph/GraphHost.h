@@ -116,7 +116,7 @@ public:
 		// Async epochs: a ticket's staged uploads whose destination it first uses on another queue than graphics (async compute)
 		// are recorded on that queue, just ahead of the ticket's first batch there, instead of on the graphics queue; and a batch
 		// on another queue waits for the graphics queue's uploads only when it uses what they write (RenderGraph::
-		// RecordPendingUploads' queue-scoped uploads). Off: every upload on the graphics queue, and every batch on another queue
+		// RecordTakenUploads' queue-scoped uploads). Off: every upload on the graphics queue, and every batch on another queue
 		// waits for them.
 		bool queueScopedUploads = true;
 		// A batch waits for the frame wait (SetFrameWaitValue) only when one of its passes declares a late-bound buffer whose
@@ -702,7 +702,6 @@ public:
 		uint64_t waited = 0;   // the ticket was not ready yet
 		uint64_t stale = 0;    // prepared again after beforeSubmit
 		uint64_t uploads = 0;  // submissions that carried uploads
-		uint64_t recordedUploadLists = 0;  // producers' recorded upload lists submitted as they were (IUploadService::SubmitRecordedUploads)
 		// Desc::queueScopedUploads: staged copies recorded on another queue than graphics, ahead of the batch that first uses them;
 		// and batches off the graphics queue spared the wait for the graphics queue's uploads (they use nothing those write).
 		uint64_t queueUploadCopies = 0, sparedUploadWaits = 0;

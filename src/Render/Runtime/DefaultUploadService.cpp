@@ -81,35 +81,9 @@ public:
         Manager().SetStagedUploadsRecordedDirectly(direct);
     }
 
-    size_t RecordStagedUploads(rhi::CommandList& list, uint32_t frameIndex, bool afterWork) override {
-        return Manager().RecordStagedUploads(list, frameIndex, afterWork);
-    }
-
-    bool SubmitRecordedUploads(std::shared_ptr<StagedUploadBatch> batch) override {
-        return Manager().SubmitRecordedUploads(std::move(batch));
-    }
-
-    size_t TakeRecordedUploads(std::vector<rhi::CommandList>& out, uint32_t frameIndex) override {
-        return Manager().TakeRecordedUploads(out, frameIndex);
-    }
-
     bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<StagedUploadBatch>>& out) override {
         return Manager().TakeStagedUploads(frameIndex, out);
     }
-    bool TakeRecordedUploadsWithDestinations(std::vector<rhi::CommandList>& out, uint32_t frameIndex,
-        std::vector<rhi::ResourceHandle>& destinations) override {
-        return Manager().TakeRecordedUploadsWithDestinations(out, frameIndex, destinations);
-    }
-
-    bool StagedUploadDestinations(std::vector<rhi::ResourceHandle>& out) const override {
-        return Manager().StagedUploadDestinations(out);
-    }
-
-    size_t RecordStagedUploadsRouted(rhi::CommandList& list, uint32_t frameIndex, bool afterWork,
-        const std::function<rhi::CommandList*(rhi::ResourceHandle)>& route, size_t& routed) override {
-        return Manager().RecordStagedUploadsRouted(list, frameIndex, afterWork, route, routed);
-    }
-
     bool HasPendingUploads() const override {
         return Manager().HasPendingUploads();
     }

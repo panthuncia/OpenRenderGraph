@@ -313,8 +313,8 @@ private:
 	};
 	// Any thread. The same object for the graph's life.
 	std::shared_ptr<const DeclaredVersions> PersistentDeclaredVersions() const noexcept { return m_declaredVersions; }
-	// Owner thread: whether RecordPendingUploads would record anything now (IUploadService::HasPendingUploads). A host that
-	// gets false skips its upload lists and RecordPendingUploads for the ticket.
+	// Owner thread: whether RecordTakenUploads would record anything now (IUploadService::HasPendingUploads). A host that
+	// gets false skips its upload lists and RecordTakenUploads for the ticket.
 	bool HasPendingUploads() const;
 
 	// Tickets (async epochs, GraphHost::EnableAsyncEpochs). The graph's owner thread prepares an
@@ -322,7 +322,7 @@ private:
 	// frame slot it has waited for; its body is recorded from a plan (SynchronousAdmission::PreparePlan), not an
 	// admission. The host's submitting thread later checks the ticket is still current, admits it
 	// (AdmitPersistentTicket: against the ledgers as they are then, under the sequencer, which it holds through
-	// the submission), records the uploads queued since (RecordPendingUploads) and submits the ticket
+	// the submission), records the uploads queued since (RecordTakenUploads) and submits the ticket
 	// (SubmitPersistentTicket: the execution's handoff and release lists, then its packets, then the commit),
 	// assigning timeline values in submission order. The owner then completes the ticket (its statistics and
 	// retirement). No upload pass but the host's.
@@ -468,10 +468,10 @@ private:
 	// prepared under). Set by the owner thread before the ticket is published.
 	static uint64_t PersistentTicketHostTag(const PersistentTicket& ticket) noexcept;
 	static void SetPersistentTicketHostTag(PersistentTicket& ticket, uint64_t tag) noexcept;
-	// After RecordPendingUploads planned the ticket's uploads by queue: its batches off the graphics queue that will not wait for
+	// After RecordTakenUploads planned the ticket's uploads by queue: its batches off the graphics queue that will not wait for
 	// the graphics queue's uploads (statistics); 0 when not planned.
 	static uint32_t PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept;
-	// After RecordPendingUploads planned the ticket's uploads by queue (statistics; zeros when not planned):
+	// After RecordTakenUploads planned the ticket's uploads by queue (statistics; zeros when not planned):
 	// - lateRouted, lateWaits: its destinations that are a late-bound version's backing (VersionedBuffer::CreateLateBound) that went to a
 	//   declaring batch's queue, and those a batch off the graphics queue waits for;
 	// - undeclared: its destinations no batch declares. Each one made every batch off the graphics queue wait.
@@ -485,9 +485,9 @@ private:
 	static std::string PersistentTicketStaleReason(const PersistentTicket& ticket);
 	// Submits the packets with values from nextQueueValues (the last value assigned per queue slot, advanced
 	// here). Returns false when a packet failed.
-	// uploadsDone: the queue slot and value that signal the uploads recorded ahead of the ticket (RecordPendingUploads), when
+	// uploadsDone: the queue slot and value that signal the uploads recorded ahead of the ticket (RecordTakenUploads), when
 	// there are any. They precede the ticket on their own queue only, so a batch on another queue waits for them: every such
-	// batch, unless RecordPendingUploads planned the ticket's uploads by queue (queueLists), and then only a batch that uses
+	// batch, unless RecordTakenUploads planned the ticket's uploads by queue (queueLists), and then only a batch that uses
 	// what they write. The uploads it recorded on another queue go to that queue just ahead of its first batch there.
 	// frameWait: the frame-wait timeline's value (SetFrameWaitTimeline) every batch waits for; 0 for none.
 	// An external epoch's ticket (out.external) submits its batches off the graphics queue here and gives the rest to its host
@@ -524,45 +524,33 @@ private:
 	// An admitted ticket that will not be submitted: its admissions go (holding the sequencer).
 	void AbandonPersistentTicketAdmission(PersistentTicket& ticket);
 	std::unique_lock<std::recursive_mutex> HoldPersistentSequencer() const;
-	// Submitting thread (the upload service's owner): records the uploads queued since the last call into
-	// `list` as plain buffer copies, without the graph's registry or admission: a full barrier (against the
-	// work before them), then the copies, whose destinations are left for the next execution's entry
-	// barrier. The list ends with a full barrier, so the execution after it on its queue sees the copies.
-	// keepAlive owns the staging they read until the GPU is done with the slot. False when an upload is not
-	// a pointer-targeted buffer copy (the caller must use the synchronous path).
-	// recordedLists receives, first, the lists of batches their producers recorded (IUploadService::SubmitRecordedUploads),
-	// which go to the queue ahead of `list`, as they are: each starts with its own full barrier, and `list` starts with one
-	// whenever it records a copy.
+	// Ticket uploads, in two parts, for a host whose submissions run on another thread than the commits that queue uploads.
+	// TakePendingUploads runs on the upload service's owner thread, right after the commit: it takes everything the service holds
+	// for the next submission. Uploads queued later wait for the next take.
+	// RecordTakenUploads then records what was taken, later and on any thread, into `list` as plain buffer copies, without the
+	// graph's registry or admission: a full barrier (against the work before them), then the copies, whose destinations are left
+	// for the next execution's entry barrier. The list ends with a full barrier, so the execution after it on its queue sees the
+	// copies. keepAlive owns the staging they read until the GPU is done with the slot. False when an upload is not a
+	// pointer-targeted buffer copy: the host fails the ticket.
 	// Queue-scoped uploads (ticket and queueLists given): queueLists holds, per queue slot, an open list of that queue (an empty
 	// handle for none; the graphics slot's is ignored). A staged upload whose destination the ticket first uses on another queue -
-	// with every batch that uses it ordered after that queue's first batch, and nothing in `list` or the recorded lists touching it -
-	// is recorded into that queue's list instead (after a full barrier against the work before it on that queue), which
-	// SubmitPersistentTicket submits just ahead of the queue's first batch, with the waits a write into the destination needs
-	// against earlier executions. The plan also records which batches on other queues use what `list` and the recorded lists
-	// write: only they wait for uploadsDone (all of them when a destination there is not known). `recorded` then means that
-	// `list` itself took a copy; queueCopies, when given, receives the copies recorded into queueLists. Without a ticket or
-	// queueLists, everything goes into `list` and every batch on another queue waits, as before.
-	bool RecordPendingUploads(rhi::Device device, rhi::CommandList& list, uint32_t slot, std::shared_ptr<void>& keepAlive, bool& recorded,
-		std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket = nullptr, std::span<rhi::CommandList> queueLists = {},
-		size_t* queueCopies = nullptr);
-	// RecordPendingUploads in two parts, for a host whose submissions run on another thread than the commits that queue uploads.
-	// TakePendingUploads runs on the upload service's owner thread, right after the commit: it takes everything the service holds
-	// for the next submission. Uploads queued later wait for the next take. RecordTakenUploads records what was taken, later and
-	// on any thread, by RecordPendingUploads' rules.
+	// with every batch that uses it ordered after that queue's first batch, and nothing in `list` touching it - is recorded into
+	// that queue's list instead (after a full barrier against the work before it on that queue), which SubmitPersistentTicket
+	// submits just ahead of the queue's first batch, with the waits a write into the destination needs against earlier
+	// executions. The plan also records which batches on other queues use what `list` writes: only they wait for uploadsDone.
+	// `recorded` then means that `list` itself took a copy; queueCopies, when given, receives the copies recorded into
+	// queueLists. Without a ticket or queueLists, everything goes into `list` and every batch on another queue waits.
 	struct TakenUploads {
-		std::vector<rhi::CommandList> recordedLists;       // the producers' recorded lists
-		std::vector<rhi::ResourceHandle> graphicsBuffers;  // what those lists and the upload pass's copies write
-		bool graphicsKnown = true;                         // false: those lists may write anything
+		std::vector<rhi::ResourceHandle> graphicsBuffers;  // what the upload pass's copies write
 		std::function<void(rhi::CommandList&)> recordCopies;  // records the upload pass's copies; null when it queued none
 		std::shared_ptr<void> keepAlive;                      // the staging those copies read
 		std::vector<std::shared_ptr<runtime::StagedUploadBatch>> staged;  // the staged batches, in order
 		bool supported = true;  // false: an upload is not a pointer-targeted buffer copy
-		bool Any() const noexcept { return !recordedLists.empty() || recordCopies || !staged.empty(); }
+		bool Any() const noexcept { return recordCopies || !staged.empty(); }
 	};
 	TakenUploads TakePendingUploads(rhi::Device device, uint32_t slot);
 	bool RecordTakenUploads(TakenUploads& taken, rhi::CommandList& list, std::shared_ptr<void>& keepAlive, bool& recorded,
-		std::vector<rhi::CommandList>& recordedLists, PersistentTicket* ticket = nullptr, std::span<rhi::CommandList> queueLists = {},
-		size_t* queueCopies = nullptr);
+		PersistentTicket* ticket = nullptr, std::span<rhi::CommandList> queueLists = {}, size_t* queueCopies = nullptr);
 	// The epoch the next Update/Execute runs; persistent::AllEpochs runs every pass.
 	void SetPersistentEpoch(uint32_t epoch) noexcept { m_persistentEpoch = epoch; }
 	uint32_t PersistentEpoch() const noexcept { return m_persistentEpoch; }

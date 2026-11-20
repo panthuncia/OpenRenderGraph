@@ -285,7 +285,7 @@ struct RenderGraph::PersistentTicket {
 	// What SubmitPersistentTicket added to every batch's waits (schedule introspection, read when the owner completes it).
 	std::pair<uint32_t, uint64_t> submittedUploads{UINT32_MAX, 0};
 	uint64_t submittedFrameWait = 0;
-	// The ticket's uploads planned by queue (RecordPendingUploads with queue lists), for SubmitPersistentTicket; written by the
+	// The ticket's uploads planned by queue (RecordTakenUploads with queue lists), for SubmitPersistentTicket; written by the
 	// submitting thread before it submits, read by the owner after the ticket's Submitted message (schedule introspection).
 	struct QueueUploads {
 		bool planned = false;  // false: every batch off the uploads' queue waits for them
