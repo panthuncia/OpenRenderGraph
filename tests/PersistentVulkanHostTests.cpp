@@ -554,8 +554,7 @@ static int Run(int argc, char** argv) {
 	const bool reuse = externalReuse || (argc > 1 && std::strcmp(argv[1], "reuse") == 0);
 	// "revision": a revision-driven epoch, set through the revisionEpochs of SetAsyncEpochs. It is recorded ahead for
 	// each revision (RequestEpochRecording) and submitted with that recording.
-	// "segment": "revision" with the epoch closed by SetClosedEpochs (the host's other executions open), its copies taken by the
-	// caller's frame slot (SetEpochCopy, EpochCopyRun), and a revision that turns the write pass off (SetSkipWhen).
+	// "segment": "revision" with its copies taken by the caller's frame slot (SetEpochCopy, EpochCopyRun), and a revision that turns the write pass off (SetSkipWhen).
 	const bool segment = argc > 1 && std::strcmp(argv[1], "segment") == 0;
 	const bool revision = segment || (argc > 1 && std::strcmp(argv[1], "revision") == 0);
 	// "external": an async epoch that the test executes itself (GraphHost::SetExternalEpochs). Its copy pass is
@@ -595,7 +594,7 @@ static int Run(int argc, char** argv) {
 	const bool leases = argc > 1 && (std::strcmp(argv[1], "leases") == 0 || std::strcmp(argv[1], "leases-wide") == 0);
 	// "leases-wide": the same, with 260 runs a frame, so lease indices pass 255, and with replayable recordings.
 	const bool wide = argc > 1 && std::strcmp(argv[1], "leases-wide") == 0;
-	// "open" after the mode: async epochs on open executions, admitted at submission (no closed executions).
+	// "open" after the mode: the name the mode's output gives. Every execution is open, admitted at submission.
 	const bool open = argc > 2 && std::strcmp(argv[2], "open") == 0;
 	// "stream open home": the write also reads a host-owned texture, under external home states.
 	const bool home = open && argc > 3 && std::strcmp(argv[3], "home") == 0;
@@ -657,8 +656,7 @@ static int Run(int argc, char** argv) {
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
 				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
 			{
-				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1},
-					.closedExecutions = !open});
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1}});
 				auto program = CreateProgram(device.Get());
 				REQUIRE(program, "compute program");
 				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
@@ -722,7 +720,7 @@ static int Run(int argc, char** argv) {
 				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
 			{
 				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1},
-					.closedExecutions = !open, .reportStaleAliasPlacements = true});
+					.reportStaleAliasPlacements = true});
 				// Only the test's attaches change graphs: a request alone builds nothing.
 				host.SetExplicitBuilds(true);
 				auto program = CreateProgram(device.Get());
@@ -1098,7 +1096,7 @@ static int Run(int argc, char** argv) {
 			// and the copy's segment split from it. With them the upload goes to the compute queue, ahead of the write.
 			for (const bool scopedUploads : {false, true}) {
 				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0},
-					.closedExecutions = !open, .externalHomeStates = home, .queueScopedUploads = scopedUploads});
+					.externalHomeStates = home, .queueScopedUploads = scopedUploads});
 				auto program = CreateProgram(device.Get());
 				REQUIRE(program, "compute program");
 				// "home": a texture the host owns, home in Common on the graphics queue.
@@ -1188,7 +1186,7 @@ static int Run(int argc, char** argv) {
 				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
 			{
 				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0},
-					.closedExecutions = false, .externalHomeStates = true, .reuseRecordings = true});
+					.externalHomeStates = true, .reuseRecordings = true});
 				host.SetPrivateAliasEpochs({0});
 				auto program = CreateProgram(device.Get());
 				REQUIRE(program, "compute program");
@@ -1407,7 +1405,7 @@ static int Run(int argc, char** argv) {
 				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
 			{
 				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0},
-					.closedExecutions = !open, .reuseRecordings = wide});
+					.reuseRecordings = wide});
 				// The frame arena. A leased run's region is found again by every call for the run, zeroed when allocated, and freed
 				// with its lease. Two runs in flight have two regions. A published copy's region is pinned to its index.
 				{
@@ -1565,8 +1563,7 @@ static int Run(int argc, char** argv) {
 		auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
 			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
 		org::GraphHost host({.runtime = runtime,
-			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .closedExecutions = async && !open && !segment, .reuseRecordings = reuse || revision});
-		if (segment) host.SetClosedEpochs({0});
+			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .reuseRecordings = reuse || revision});
 		if (inlineLate) host.SetInlineAtExecution(true);
 		{
 			auto program = CreateProgram(device.Get());
@@ -1710,7 +1707,6 @@ static int Run(int argc, char** argv) {
 				REQUIRE(stats.revisionSubmissions == 13 && stats.stale == 0 && stats.revisionRecordings == 3 && stats.revisionCopiesRecorded == 9,
 					"every submission bound a revision's recording; nothing prepared again");
 				if (segment) {
-					REQUIRE(host.ClosedEpoch(0), "SetClosedEpochs closes the epoch while the host's executions are open");
 					// Pinned copies: each submission names its frame slot, and its run is that slot's copy.
 					const auto current = versions->Current();
 					auto slotted = record(kCount, current);

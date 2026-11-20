@@ -78,10 +78,6 @@ public:
 		// theirs with ExternalPassDesc::Epoch (untagged ones run in every epoch); ExecuteFrame and SubmitEpoch name the one
 		// to run.
 		std::vector<uint32_t> epochOrder;
-		// RenderGraph::SetPersistentClosedExecutions, an interop option: every execution leaves its resources in their home
-		// states and starts with a full barrier, so its admission is independent of what ran before. Nothing in the host
-		// requires it: async epochs and recording reuse work with open executions, admitted at submission.
-		bool closedExecutions = false;
 		// RenderGraph::SetPersistentExternalHomeStates, an interop option: every execution gives each host-owned texture it
 		// touches (ExternalTextureResource) back in its home state on the graphics queue, so the host finds its own resources
 		// where it left them. Everything else flows through the ledgers.
@@ -507,29 +503,6 @@ public:
 	 */
 	void SetEpochTicketsAhead(uint32_t epoch, uint32_t most);
 	/**
-	 * @brief Owner thread, before the listed epochs' graphs are built: their executions are closed
-	 * (RenderGraph::SetPersistentClosedExecutions), whatever Desc::closedExecutions says for the other epochs.
-	 *
-	 * A closed execution starts with a full memory barrier and leaves every resource it touches in its home state. Its entry
-	 * barriers still come from the ledgers, so it may follow open executions. The epochs after it find each resource at home.
-	 * A host that closes a fixed set of its epochs gets the same entry plan for each of them every frame, once the work before
-	 * them settles. Every resource of a closed epoch must be used from one queue. Kept across rebuilds.
-	 */
-	void SetClosedEpochs(std::vector<uint32_t> epochs);
-	/** @brief Whether the epoch's executions are closed: Desc::closedExecutions, or listed by SetClosedEpochs. */
-	bool ClosedEpoch(uint32_t epoch) const noexcept;
-	/**
-	 * @brief Owner thread, before the listed epochs' graphs are built: their closed executions rest each resource in the state its
-	 * last use in the execution left it, instead of going back home (RenderGraph::SetPersistentRestAtLastUse).
-	 *
-	 * The resting state is then fixed by the epoch's graph alone. A closed execution of it costs no exit barriers, and the
-	 * execution after it finds each resource in the same state every time the same graph ran before it. Only for closed epochs
-	 * (SetClosedEpochs). Kept across rebuilds.
-	 */
-	void SetRestAtLastUseEpochs(std::vector<uint32_t> epochs);
-	/** @brief Whether the epoch's closed executions rest at last use (SetRestAtLastUseEpochs). */
-	bool RestsAtLastUse(uint32_t epoch) const noexcept;
-	/**
 	 * @brief Owner thread, before the listed epochs' graphs are built: their transients get pools of their own instead of the shared
 	 * alias arena (Desc::sharedAliasArena). Another epoch's transient then never takes their memory between two of their
 	 * executions, so their admissions find no alias activation and can take a predicted plan. Kept across rebuilds.
@@ -792,7 +765,6 @@ public:
 	runtime::IDescriptorService* Descriptors() noexcept;
 	// The same, kept alive by the caller: a producer on another thread (growth as graph work, its worker upload path).
 	std::shared_ptr<runtime::IUploadService> RetainUploads() noexcept;
-	bool ClosedExecutions() const noexcept { return m_desc.closedExecutions; }
 	// The epochs' graphs' shared alias pools (Desc::sharedAliasArena), made with the first graph; null without.
 	std::shared_ptr<PersistentAliasArena> AliasArena() const noexcept { return m_aliasArena; }
 	/**
@@ -1180,8 +1152,6 @@ private:
 	std::vector<uint32_t> m_asyncEpochs;  // restarted with these after a rebuild
 	std::vector<uint32_t> m_revisionEpochs;
 	std::vector<std::pair<uint32_t, uint32_t>> m_ticketsAhead;  // SetEpochTicketsAhead: (epoch, most)
-	std::vector<uint32_t> m_closedEpochs;  // SetClosedEpochs: read by builds on any thread, written only before them
-	std::vector<uint32_t> m_restEpochs;    // SetRestAtLastUseEpochs: the same
 	std::vector<uint32_t> m_privateAliasEpochs;  // SetPrivateAliasEpochs, under m_configMutex
 	std::vector<FramePosition> m_framePositions;         // SetFramePositions, under m_configMutex
 	std::shared_ptr<FrameAliasArena> m_frameAliasArena;  // made by SetFramePositions, under m_configMutex

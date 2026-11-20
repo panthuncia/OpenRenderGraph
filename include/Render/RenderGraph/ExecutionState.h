@@ -248,28 +248,20 @@ UntouchedResources FindUntouched(const Schedule& graph, std::span<const Prepared
 // transactional; CommitBatch is called only for work known to have submitted.
 class BackingStateAdmissionLedger {
 public:
-    // closeToHome: the execution is closed. Every resource it touches leaves it in its home state - the
-    // backing's seeded region state, or the state its first access in the graph expects - so the next
-    // execution's entry states are the same whatever ran before it (or whether anything did). Textures get
-    // a layout transition after their last access; the ledger records home as their final state. Closed
-    // executions provide their own memory visibility (a full barrier at entry, see FrameAdmission::closed),
-    // so buffers need no exit barrier. Every resource must be used from a single queue.
     // entryOnly: for an execution whose body is recorded already (from an earlier plan of the same executable and backings): the
     // entry barriers, releases, seeds and committed states alone, from the plan's entry and exit steps (SymbolicStatePlan); the
     // body's barriers (beforePass, afterPass) are left out. validated: the backings were checked against the graph's resource order
     // (ValidatePreparedBackingOrder) when they were made.
     // backingSet: the backings' set (AdmissionBackingSet::Id), whose ledger entries are found once; 0 for none.
     // externalHome: external home states, an interop option. Every host-owned texture (PreparedBackingState::hostOwned) the
-    // execution touches leaves it in its home state (as closeToHome's) on the graphics queue (slot 0), so the host finds it where
+    // execution touches leaves it in its home state (the backing's seeded region state, or the state its first access in the graph
+    // expects) on the graphics queue (slot 0), so the host finds it where
     // it left it. A last use on another queue releases it to the graphics queue (homeAcquires). Other resources are left as the
     // execution leaves them, for the ledger to hand off.
-    // restAtLastUse: with closeToHome, each resource rests in the state its last use in the execution left it, instead of its home
-    // state. Its resting state then depends on the graph alone, and closing costs no exit barriers. It stays on the queue of its
-    // last use, as a closed execution's resources always do.
     PreparedExecutionBarrierPlan Prepare(
         const Schedule& graph, std::span<const PreparedBackingState> initial,
-        std::span<const rhi::ResourceHandle> invalidated = {}, bool closeToHome = false, bool entryOnly = false,
-        bool validated = false, uint64_t backingSet = 0, bool externalHome = false, bool restAtLastUse = false) const;
+        std::span<const rhi::ResourceHandle> invalidated = {}, bool entryOnly = false,
+        bool validated = false, uint64_t backingSet = 0, bool externalHome = false) const;
     void CommitBatch(const PreparedBatchBarriers&);
     // The same, each commit's entry found by its compiler resource index (PreparedBatchBarriers::committedIndices) in the backings'
     // set (backingSet as for Prepare). unmoved: compiler resource indices (ascending) no running pass touched

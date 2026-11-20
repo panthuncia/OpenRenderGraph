@@ -151,8 +151,8 @@ void ValidatePreparedBackingOrder(const GraphCompileStructure& structure, std::s
 
 PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
     const Schedule& graph, std::span<const PreparedBackingState> initial,
-    std::span<const rhi::ResourceHandle> invalidated, bool closeToHome, bool entryOnly, bool validated, uint64_t backingSet,
-    bool externalHome, bool restAtLastUse) const {
+    std::span<const rhi::ResourceHandle> invalidated, bool entryOnly, bool validated, uint64_t backingSet,
+    bool externalHome) const {
     BT_ZONE_SCOPE("ORG.Execution.ResolveBackingStates");
     if (!graph.structure || !graph.states.complete || initial.size() != graph.structure->resourceIDs.size())
         throw std::invalid_argument("Incomplete symbolic state admission input");
@@ -241,13 +241,12 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         barrier.externalOwnership = direction == rhi::QueueOwnership::Release ? External::Release : External::Acquire;
     };
     // A texture an earlier execution left on another queue of this graph's: released there (result.releases) from the state it left
-    // in to Common, and acquired here from Common. Not for a closed execution (its textures stay on one queue), across devices
+    // in to Common, and acquired here from Common. Not across devices
     // (the external ownership handoff covers it) or from a queue this graph does not have. The ledger names queues by slot, the same
     // native queue in every graph on the runtime.
     const auto handOff = [&](rhi::TextureBarrier& barrier, const PreparedBackingState& captured, uint32_t previousQueue,
         uint32_t consumerQueue, uint32_t batch) {
-        const char* skipped = closeToHome ? "closed-execution"
-            : barrier.discard ? "discarded"
+        const char* skipped = barrier.discard ? "discarded"
             : previousQueue == UINT32_MAX ? "previous-queue-unknown"
             : previousQueue == consumerQueue ? "same-queue"
             : previousQueue >= graph.structure->queues.size() ? "previous-queue-not-in-graph"
@@ -355,7 +354,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         const bool useSubmittedState = boundaryStep
             && existing && !invalidatedState && !authoritativeState;
         // A host-owned texture under external home states that enters from its seeded (home) state is on the graphics queue.
-        const bool homeSeeded = boundaryStep && externalHome && !closeToHome && captured.hostOwned && captured.shape.hasLayout
+        const bool homeSeeded = boundaryStep && externalHome && captured.hostOwned && captured.shape.hasLayout
             && !multiDevice && !useSubmittedState && !invalidatedState;
         if (trace::Enabled(trace::Category::Barriers)) {
             const auto consumerQueue = graph.batches[step.batch].queue;
@@ -373,7 +372,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 .Add("mips", std::to_string(step.range.mip) + "+" + std::to_string(step.range.mips))
                 .Add("slices", std::to_string(step.range.slice) + "+" + std::to_string(step.range.slices))
                 .Add("compiledBeforeLayout", TraceLayout(step.before.layout)).Add("afterLayout", TraceLayout(step.after.layout))
-                .Add("aliased", aliasedBacking).Add("closeToHome", closeToHome);
+                .Add("aliased", aliasedBacking);
             if (useSubmittedState && !existing->cells.empty()) {
                 const auto cell = CellIndex(existing->shape, step.range.mip, step.range.slice);
                 event.Add("ledgerLayout", TraceLayout(existing->cells[cell].layout))
@@ -746,19 +745,15 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                 }
         }
     }
-    // A host-owned texture under external home states goes home as a closed execution's resources do, on the graphics queue.
+    // A host-owned texture under external home states goes home, on the graphics queue.
     const auto goesHomeExternally = [&](const PreparedBackingState& captured) {
-        return !closeToHome && externalHome && captured.hostOwned && captured.shape.hasLayout && captured.deviceHandles.empty();
+        return externalHome && captured.hostOwned && captured.shape.hasLayout && captured.deviceHandles.empty();
     };
-    if (closeToHome || externalHome) {
+    if (externalHome) {
         // Per resource and cell: the first step (its entry state is home when the backing seeds nothing
         // for the cell) and the last (where the resource leaves the execution).
         //
-        // Closed: a resource without a layout (a buffer) may be used from several queues: the execution's relative waits order
-        // its uses inside it, and the host orders whole executions against each other on every queue
-        // (ExternalQueueBoundary). It goes home on the queue of its last use. A texture's home layout would need a
-        // queue-family ownership transfer back, so a texture stays on one queue.
-        // External home: a host-owned texture may be used from any queue. A cell last used on another queue than graphics is
+        // A host-owned texture may be used from any queue. A cell last used on another queue than graphics is
         // released there and acquired on graphics (homeAcquires). Its body barriers (the transition and the release) are the
         // full plan's; an entry-only plan has the commits and the acquires.
         struct Cells { std::vector<uint32_t> first, last; uint32_t queue = UINT32_MAX; };
@@ -767,18 +762,14 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
             const auto& step = graph.states.steps[index];
             const auto& captured = ordered[step.resource];
             if (!captured.resource.valid() || captured.exempt) continue;
-            const bool external = goesHomeExternally(captured);
-            if (!closeToHome && !external) continue;
+            if (!goesHomeExternally(captured)) continue;
             auto& cells = byResource[step.resource];
             if (cells.first.empty()) {
                 const size_t count = size_t{captured.shape.mips} * captured.shape.slices;
                 cells.first.assign(count, UINT32_MAX);
                 cells.last.assign(count, UINT32_MAX);
             }
-            const auto queue = graph.batches[step.batch].queue;
-            if (!external && cells.queue != UINT32_MAX && cells.queue != queue && captured.shape.hasLayout)
-                throw std::invalid_argument("A closed execution uses a texture from more than one queue");
-            cells.queue = external ? 0u : queue;
+            cells.queue = 0u;
             Visit(captured.shape, step.range, [&](uint32_t mip, uint32_t slice) {
                 const auto cell = CellIndex(captured.shape, mip, slice);
                 if (cells.first[cell] == UINT32_MAX) cells.first[cell] = index;
@@ -812,10 +803,7 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
                     }
                     const auto& last = graph.states.steps[cells.last[cell]];
                     CompileResourceState home = graph.states.steps[cells.first[cell]].before;
-                    // Resting at last use: the cell stays as its last use left it. No exit barrier, and the ledger records that state.
-                    const bool rests = restAtLastUse && closeToHome && !external;
-                    if (rests) home = last.after;
-                    if (captured.regions && !rests) for (const auto& region : *captured.regions)
+                    if (captured.regions) for (const auto& region : *captured.regions)
                         if (mip >= region.range.mip && mip < region.range.mip + region.range.mips
                             && slice >= region.range.slice && slice < region.range.slice + region.range.slices) {
                             home = region.state;

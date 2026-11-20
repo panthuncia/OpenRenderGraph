@@ -355,7 +355,6 @@ ExternalClient& RenderGraph::GetExternalClient() {
 		ExternalClient::Desc desc;
 		desc.runtime = m_runtime;
 		desc.name = "ORG.External";
-		desc.closed = m_persistentClosedExecutions;
 		desc.entryFullBarrier = m_externalQueueBoundary.entry;
 		for (size_t slot = 0; slot < m_queueRegistry.SlotCount(); ++slot) {
 			const auto index = static_cast<QueueSlotIndex>(static_cast<uint32_t>(slot));

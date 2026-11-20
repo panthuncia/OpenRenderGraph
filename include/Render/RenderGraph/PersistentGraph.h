@@ -469,11 +469,6 @@ struct FrameAdmission {
     // Compiler resource indices whose backing was supplied by the frame
     // (swapchain images and similar late-bound imports), not the publication.
     std::vector<uint32_t> rebound;
-    // A closed execution (SynchronousAdmission::SetClosedExecutions): its recording must begin with a full
-    // memory barrier on each queue, which is what makes the previous execution's writes visible to it.
-    bool closed = false;
-    // The barrier plan came from the admission's cache rather than the ledgers.
-    bool cachedPlan = false;
     // The aliased backings the alias ledger made enter from Undefined (AliasAccessAdmissionLedger::ApplyInitialStates) when it
     // was admitted. ORG_VALIDATE_ALIAS_ADMISSION=1 checks at commit that no other commit since added one.
     std::vector<rhi::ResourceHandle> aliasActivations;
@@ -566,20 +561,6 @@ public:
     SynchronousAdmission(const SynchronousAdmission&) = delete;
     SynchronousAdmission& operator=(const SynchronousAdmission&) = delete;
     const std::shared_ptr<ResourceSequencer>& Sequencer() const noexcept { return m_sequencer; }
-    // Closed executions: every resource an execution touches leaves it in its home state
-    // (BackingStateAdmissionLedger::Prepare closeToHome) and every execution starts with a full memory
-    // barrier (FrameAdmission::closed). An execution's barrier plan then depends only on its executable and
-    // backings, not on what ran before it; the admission caches it per executable, and allows several
-    // admissions to be prepared before the earlier ones commit, and to commit or be abandoned in any order
-    // (a commit's signals must still rise on each timeline: they commit in submission order).
-    // Requires every resource of an execution to be used from one queue. Set before the first Prepare.
-    void SetClosedExecutions(bool closed);
-    bool ClosedExecutions() const noexcept { return m_closed; }
-    // Resting at last use, for closed executions (BackingStateAdmissionLedger::Prepare restAtLastUse): each resource rests in the
-    // state its last use in the execution left it, instead of its home state. The closed plan cache is not used then: its entry
-    // barriers assume every closed execution before it left its resources at home. Set before the first Prepare.
-    void SetRestAtLastUse(bool rest);
-    bool RestAtLastUse() const noexcept { return m_restAtLastUse; }
     // External home states, an interop option (BackingStateAdmissionLedger::Prepare externalHome): every host-owned texture an
     // execution touches leaves it in its home state on the graphics queue. Set before the first Prepare.
     void SetExternalHomeStates(bool externalHome);
@@ -589,8 +570,6 @@ public:
     // on those queues instead. UINT32_MAX (the default): none.
     void SetUploadQueue(uint32_t queueSlot) noexcept { m_uploadQueue = queueSlot; }
     size_t PendingAdmissions() const noexcept { return m_pending.size(); }
-    uint64_t PlanCacheHits() const noexcept { return m_planCacheHits; }
-    uint64_t PlanCacheMisses() const noexcept { return m_planCacheMisses; }
     // Entry-only admissions (PrepareAtSubmission) whose plan was the prediction's (the ledger held what the same executable found
     // last), and those planned against the ledger. Since the last call.
     std::pair<uint64_t, uint64_t> TakePredictionCounts() noexcept {
@@ -603,9 +582,8 @@ public:
         std::span<const FrameIncomingState> incomingStates = {},
         std::span<const FrameRebinding> rebindings = {});
     // An admission to record an execution's body from, which is never committed: it does not count as pending, can be made
-    // while another admission is, and needs no Abandon (it is ignored). An open execution's body depends only on its compiled
-    // graph (its entry barriers are recorded at submission), and a closed one's on its executable and backings, so a body
-    // recorded from it stands when the execution is admitted with Prepare at submission. A ticket's body (prepared ahead on
+    // while another admission is, and needs no Abandon (it is ignored). An execution's body depends only on its compiled
+    // graph (its entry barriers are recorded at submission), so a body recorded from it stands when the execution is admitted with Prepare at submission. A ticket's body (prepared ahead on
     // a host's thread) is recorded from one.
     FrameAdmission PreparePlan(std::shared_ptr<const SelectedPublication> publication,
         std::span<const compiler::ExecutionTimelinePoint> queues,
@@ -650,7 +628,7 @@ private:
     void AdmitLedger(FrameAdmission& frame, bool cacheEligible, bool plan = false);
     std::shared_ptr<ResourceSequencer> m_sequencer;
     uint64_t m_nextSequence = 1;
-    // Admissions prepared and not yet committed or abandoned, in sequence order (at most one unless closed).
+    // Admissions prepared and not yet committed or abandoned, in sequence order (at most one).
     std::vector<uint64_t> m_pending;
     // Who prepared each pending admission, for the error when an open one is still pending (PendingOwners).
     struct PendingOwner {
@@ -662,18 +640,8 @@ private:
     std::vector<PendingOwner> m_pendingOwners;
     std::string PendingOwners() const;
     void ErasePendingOwner(uint64_t sequence);
-    bool m_closed = false;
     bool m_externalHome = false;
-    bool m_restAtLastUse = false;
     uint32_t m_uploadQueue = UINT32_MAX;  // SetUploadQueue
-    struct CachedPlan {
-        std::weak_ptr<const ExecutableGeneration> executable;
-        std::vector<rhi::ResourceHandle> resources;
-        std::vector<const void*> regions;
-        compiler::PreparedExecutionBarrierPlan barriers;
-    };
-    std::vector<CachedPlan> m_planCache;
-    uint64_t m_planCacheHits = 0, m_planCacheMisses = 0;
     // The barrier plans that open plan admissions (PreparePlan) recorded bodies from, by backing set. A body uses only the plan's
     // barriers before and after each pass. Those depend on the compiled graph, the backings and the execution kind, never on
     // the ledgers, so every ticket of an unchanged graph shares one plan. Its entry barriers are the ledger's of the first
@@ -700,7 +668,6 @@ private:
     struct PredictionSlot {
         std::weak_ptr<const ExecutableGeneration> executable;
         uint64_t backings = 0;  // AdmissionBackingSet::Id
-        bool closed = false;
         std::shared_ptr<compiler::StatePrediction> prediction;
         // Earlier plans, most recent first: tried when the last one does not hold.
         static constexpr size_t kEarlier = 3;

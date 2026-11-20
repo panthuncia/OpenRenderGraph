@@ -205,7 +205,6 @@ public:
 		double submitUs = 0.0;     // queue submission of the recorded batches
 		double commitUs = 0.0;     // admission commit, statistics publication, fence bookkeeping
 		uint32_t segments = 0;
-		uint32_t cachedAdmissions = 0;  // segments whose barrier plan came from the admission cache
 		uint32_t batches = 0;
 	};
 	const PersistentExecuteTimings& LastPersistentExecuteTimings() const noexcept { return m_lastPersistentExecuteTimings; }
@@ -274,15 +273,6 @@ private:
 	// prepares, admits, records and submits only the current epoch's passes (and the
 	// untagged ones). Changing the order is structural.
 	void SetPersistentEpochOrder(std::vector<uint32_t> order) { m_persistentEpochOrder = std::move(order); }
-	// Closed executions (persistent::SynchronousAdmission::SetClosedExecutions): each segment the host
-	// executes leaves every resource it touches in its home state and starts with a full memory barrier, so
-	// its admission does not depend on what ran before. Set before the first frame.
-	void SetPersistentClosedExecutions(bool closed) noexcept { m_persistentClosedExecutions = closed; }
-	bool PersistentClosedExecutions() const noexcept { return m_persistentClosedExecutions; }
-	// Resting at last use (persistent::SynchronousAdmission::SetRestAtLastUse), for closed executions: each resource rests in the
-	// state its last use left it, not at home. Set before the first persistent preparation.
-	void SetPersistentRestAtLastUse(bool rest) noexcept { m_persistentRestAtLastUse = rest; }
-	bool PersistentRestAtLastUse() const noexcept { return m_persistentRestAtLastUse; }
 	// External home states (persistent::SynchronousAdmission::SetExternalHomeStates), an interop option: every execution gives
 	// each host-owned texture it touches (Resource::HostOwned) back in its home state on the graphics queue. Set before the first
 	// frame.
@@ -333,9 +323,9 @@ private:
 	// admission. The host's submitting thread later checks the ticket is still current, admits it
 	// (AdmitPersistentTicket: against the ledgers as they are then, under the sequencer, which it holds through
 	// the submission), records the uploads queued since (RecordPendingUploads) and submits the ticket
-	// (SubmitPersistentTicket: an open execution's handoff and release lists, then its packets, then the commit),
+	// (SubmitPersistentTicket: the execution's handoff and release lists, then its packets, then the commit),
 	// assigning timeline values in submission order. The owner then completes the ticket (its statistics and
-	// retirement). Closed and open executions both work; no upload pass but the host's.
+	// retirement). No upload pass but the host's.
 	/**
 	 * @brief Owner thread, while no ticket is prepared (the host's async epochs stopped): the persistent epochs whose graphics
 	 * work the host executes itself, in its own command buffers (ExternalEpochExecution). Their tickets record their graphics
@@ -421,7 +411,7 @@ private:
 	// submitting thread (an append-only list); a recording published to that thread after this call is always found.
 	void AddPersistentTicketCandidate(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording);
 	// Replayable recordings. A ticket's recording, when every pass of it is replayable (PreparedPass::IsReplayable) and its
-	// execution closed with nothing late-bound, is recorded for resubmission. Only a recording made for host data (a revision's
+	// execution has nothing late-bound, is recorded for resubmission. Only a recording made for host data (a revision's
 	// published copy, GraphHost::RequestEpochRecording) is submitted again. A live ticket's recording is used once, and nothing
 	// keeps it. Replayable recordings have no profiler GPU zones, and no GPU statistics queries in the shared pool (recreated
 	// as passes register, and indexed by run): with SetPersistentRecordingTimestamps, each records into queries of its own.
@@ -969,8 +959,6 @@ private:
 	std::shared_ptr<DeclaredVersions> m_declaredVersions = std::make_shared<DeclaredVersions>();
 	void PublishDeclaredVersions();
 	std::vector<uint32_t> m_persistentEpochOrder;
-	bool m_persistentClosedExecutions = false;
-	bool m_persistentRestAtLastUse = false;
 	bool m_persistentExternalHomeStates = false;
 	std::shared_ptr<PersistentAliasArena> m_persistentAliasArena;
 	std::shared_ptr<FrameAliasArena> m_frameAliasArena;  // SetFrameAliasRegion

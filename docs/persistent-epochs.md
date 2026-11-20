@@ -369,7 +369,7 @@ revision the host's scene supplies (CS's DCLF scene revision), and nothing about
 -   **Statistics.** `AsyncStats::revisionCopiesRecorded`, `revisionRecordings`, `revisionSubmissions`, `copyWaits` and
     `copiesBusy`.
 
-### Segments: copies by frame slot, closed epochs, host-data skips
+### Segments: copies by frame slot, host-data skips
 
 A host that declares its frame (Community Shaders' declared frame) records an epoch once per description of it and keeps the
 recording per frame slot. These options serve it; each is independent of the others.
@@ -389,18 +389,6 @@ recording per frame slot. These options serve it; each is independent of the oth
 -   **One copy at a time.** `RequestEpochRecording(epoch, hostData, done, copy)` records that copy alone. The other copies of
     the recording stay null, and it is a candidate only for runs of that copy. A host that asks for the copy its next run
     takes waits for no GPU work: the copy's last run is a whole cycle of slots old.
--   **Closed epochs.** `SetClosedEpochs(epochs)` closes the listed epochs alone (`RenderGraph::SetPersistentClosedExecutions`).
-    A closed execution still takes its entry barriers from the ledgers, so it may follow open ones. It leaves every resource
-    at home, which costs exit barriers in its body. A closed execution's recording holds its entry barriers, made from the
-    ledgers when it was recorded: a kept recording of a closed epoch next to open ones goes stale when a neighbour leaves a
-    resource in another state, and its submission then enters from the wrong layout (Community Shaders saw it at the first
-    frame its DCLF epochs drew). Keep such epochs open until every neighbour is closed too.
--   **Resting at last use.** `SetRestAtLastUseEpochs(epochs)` makes the listed closed epochs leave each resource in the state its
-    last use in the execution left it, instead of at home (`RenderGraph::SetPersistentRestAtLastUse`, the ledger's
-    `restAtLastUse`). The resting state then depends on the epoch's graph alone, so the execution after it finds the same states
-    whenever the same graph ran before it, and closing costs no exit barriers (Community Shaders' pre-depth segment: 279 body
-    barriers a run going home, 43 resting). The closed plan cache is off for such an epoch: its entry barriers assume every closed
-    execution before it went home. Test: `PersistentGraphTests`, "Resting at last use".
 -   **Private alias pools.** `SetPrivateAliasEpochs(epochs)` keeps the listed epochs' transients out of the shared alias
     arena. In the shared arena another epoch's transients took their memory between two of their executions, so every
     admission found alias activations and planned against the ledgers instead of taking its predicted plan.
@@ -598,13 +586,6 @@ the graphs.
     -   On Vulkan, a pass that touches an exclusive resource stays on the graphics queue anyway. So the queue transfer
         applies to textures the host shares concurrently, and to D3D12.
     -   Everything else flows through the ledgers.
--   **Closed executions** (`Desc::closedExecutions`, `RenderGraph::SetPersistentClosedExecutions`). The fallback for a host
-    that cannot tolerate any state carried between executions.
-    -   Every resource an execution touches returns to its home state after its last use.
-    -   Every execution starts with a full barrier on each queue's first batch.
-    -   An execution's admission is then independent of what ran before, and cached per executable. Several admissions may
-        be pending and committed or abandoned in any order.
-    -   A texture used from more than one queue inside one closed execution is rejected.
 
 ## Shared alias arena
 
@@ -684,7 +665,7 @@ keeps a shard of its own, and Begin resets the whole allocator.
 
 -   `tests/PersistentGraphTests.cpp`:
     -   epoch splits and their admission through one `SynchronousAdmission`;
-    -   closed executions (closure, plan caching, out-of-order commit and abandon);
+    -   one pending admission at a time;
     -   graphs sharing a sequencer;
     -   external home states: a host-owned texture used on the compute queue is taken from and given back to the graphics
         queue each execution.

@@ -272,10 +272,8 @@ void RenderGraph::AdmitPersistentTicket(PersistentTicket& ticket, std::span<cons
 	auto& state = *m_compilerState->persistent;
 	const size_t slotCount = m_queueRegistry.SlotCount();
 	if (queueValues.size() < slotCount) throw std::logic_error("A ticket admitted without every queue's submitted value");
-	// An open admission commits before the next is prepared: a ticket's segments are admitted together, so only closed
-	// executions can have several.
-	if (!state.admission->ClosedExecutions() && ticket.segments.size() > 1)
-		throw std::logic_error("An open execution's ticket with several segments");
+	// An admission commits before the next is prepared, and a ticket's segments are admitted together: it can have only one.
+	if (ticket.segments.size() > 1) throw std::logic_error("A ticket with several segments");
 	std::vector<compiler::ExecutionTimelinePoint> queues;
 	queues.reserve(slotCount);
 	for (size_t slot = 0; slot < slotCount; ++slot) queues.push_back({QueueTimelineIdentity(*m_runtime, m_queueRegistry, slot), queueValues[slot]});
@@ -386,7 +384,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 		// ledger state as it was (FrameAdmission::unmoved). The late batches' answers are asked once, here, and passed on.
 		std::vector<std::vector<uint8_t>> skips(batchCount);
 		compiler::UntouchedResources untouched;
-		if (!ticket.external && !admission.closed && !state.admission->ExternalHomeStates()
+		if (!ticket.external && !state.admission->ExternalHomeStates()
 			&& !diagnostics::DiagnosticKeepSkippedPassBarriers().load(std::memory_order_relaxed)) {
 			BT_ZONE_SCOPE("ORG.Persistent.TicketUntouched");
 			const auto& packets = segment.recording->packets;
@@ -469,7 +467,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				throw std::runtime_error("An external ticket's secondary could not begin");
 			return allocation;
 		};
-		if (!admission.closed) {
+		{
 			BT_ZONE_SCOPE("ORG.Persistent.TicketHandoff");
 			for (const auto& release : admission.Barriers().releases) {
 				if (release.queue >= nextQueueValues.size()) throw std::logic_error("A ticket's release has no queue value to signal");

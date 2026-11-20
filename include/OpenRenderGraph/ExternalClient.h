@@ -48,9 +48,6 @@ public:
 		std::string name = "ExternalClient";
 		// How many submissions can be in flight. When it is reached, Submit waits for the oldest one to finish.
 		size_t capacity = 64;
-		// Set this when the host's graphs use closed executions (SynchronousAdmission::SetClosedExecutions).
-		// Each submission then starts with a full memory barrier and returns every texture it uses to its home state.
-		bool closed = false;
 		// Start each submission with a full memory barrier. Set this when the queue is shared with another API whose
 		// earlier work the ledgers don't know about (for example DXVK's).
 		bool entryFullBarrier = false;

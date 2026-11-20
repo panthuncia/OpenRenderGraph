@@ -312,7 +312,7 @@ void RenderGraph::RecordPersistentTicketScheduleSubmissions(const PersistentTick
 	const size_t slotCount = m_queueRegistry.SlotCount();
 	// The boundary barriers ExecutePersistentFrame records a ticket's segments with (a ticket has only its main segments, so they are
 	// its execution's only ones; a kept or revision recording was recorded as a ticket's too): the host's queue boundary at each
-	// queue's first and last batch across them, and a closed execution's full barrier at each queue's first batch of a segment.
+	// queue's first and last batch across them.
 	using Position = std::pair<size_t, uint32_t>;
 	std::vector<Position> first(slotCount, {SIZE_MAX, 0}), last(slotCount, {SIZE_MAX, 0});
 	for (size_t segmentIndex = 0; segmentIndex < ticket.segments.size(); ++segmentIndex) {
@@ -326,7 +326,6 @@ void RenderGraph::RecordPersistentTicketScheduleSubmissions(const PersistentTick
 			last[slot] = {segmentIndex, batch};
 		}
 	}
-	std::vector<uint8_t> closedEntryDone(slotCount);
 	for (size_t segmentIndex = 0; segmentIndex < ticket.segments.size(); ++segmentIndex) {
 		const auto& segment = ticket.segments[segmentIndex];
 		if (!segment.recording) continue;
@@ -335,17 +334,11 @@ void RenderGraph::RecordPersistentTicketScheduleSubmissions(const PersistentTick
 		auto& waits = state.scheduleTraces.scratch;
 		FillScheduleSubmissionWaits(waits, graph, segment.admission.incomingWaits, ticket.submittedUploads, ticket.submittedFrameWait,
 			&ticket.queueUploads);
-		std::fill(closedEntryDone.begin(), closedEntryDone.end(), uint8_t{0});
 		for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 			const auto slot = graph.batches[batch].queue;
 			if (slot >= slotCount) continue;
 			const Position position{segmentIndex, batch};
-			bool entry = m_externalQueueBoundary.entry && first[slot] == position;
-			if (segment.admission.closed && !closedEntryDone[slot]) {
-				entry = true;
-				closedEntryDone[slot] = 1;
-			}
-			waits.batches[batch].externalEntryBarrier = entry;
+			waits.batches[batch].externalEntryBarrier = m_externalQueueBoundary.entry && first[slot] == position;
 			waits.batches[batch].externalExitBarrier = m_externalQueueBoundary.exit && last[slot] == position;
 		}
 		RecordPersistentScheduleSubmission(executable, ticket.hostFrame);

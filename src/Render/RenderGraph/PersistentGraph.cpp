@@ -1691,10 +1691,9 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
     BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
     std::lock_guard lock(m_sequencer->mutex);
     Require(publication && publication->executable && publication->executable->graph, "No executable publication");
-    if (pending && !m_pending.empty() && !(m_closed && m_pending.size() < m_capacity))
+    if (pending && !m_pending.empty())
         throw std::logic_error("Previous synchronous admission has not terminated (" + PendingOwners() + "; this one on thread "
-            + std::to_string(CurrentThreadNumber()) + (entryOnly ? ", at submission" : "")
-            + ", closed " + (m_closed ? "true" : "false") + ")");
+            + std::to_string(CurrentThreadNumber()) + (entryOnly ? ", at submission" : "") + ")");
     Require(m_nextSequence != UINT64_MAX, "Admission sequence exhausted");
     Require(m_retained.size() < m_capacity, "Synchronous frame capacity exhausted");
     if (SharingValidationEnabled()) ValidateSharedBackings(*publication->executable, publication->bindings);
@@ -1868,10 +1867,8 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
     const auto& graph = *frame.publication->executable->graph;
     frame.incomingWaits = frame.ownWaits;
     frame.boundaryAccessWaits.clear();
-    frame.cachedPlan = false;
     const auto invalidated = m_sequencer->aliases.ApplyInitialStates(graph, frame.backings);
     frame.aliasActivations = invalidated;
-    frame.closed = m_closed;
     frame.sharedBarriers.reset();
     frame.prediction.reset();
     frame.stream = 0;
@@ -1894,10 +1891,9 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
                 return true;
             });
         auto& slot = m_predictions[executable.get()];
-        if (slot.executable.lock() != executable || slot.backings != frame.backings.Id() || slot.closed != m_closed
-            || !slot.prediction) {
+        if (slot.executable.lock() != executable || slot.backings != frame.backings.Id() || !slot.prediction) {
             ClosePrediction(slot);
-            slot = {executable, frame.backings.Id(), m_closed, std::make_shared<compiler::StatePrediction>()};
+            slot = {executable, frame.backings.Id(), std::make_shared<compiler::StatePrediction>()};
         }
         predictionSlot = &slot;
         // The publication's own backings (none of the frame's): the same accesses to the same backings each time, an access stream.
@@ -1925,29 +1921,8 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
             }
         }
     }
-    // A closed execution's plan is a function of its executable and backings alone, unless the frame brings
-    // states of its own (rebindings, incoming states, alias invalidation). An entry-only admission never takes a cached plan (it has the
-    // body's barriers): none is looked for.
-    const bool cacheable = m_closed && !m_restAtLastUse && cacheEligible && invalidated.empty() && !frame.entryOnly;
-    CachedPlan* cached = nullptr;
-    if (cacheable) {
-        std::erase_if(m_planCache, [](const CachedPlan& entry) { return entry.executable.expired(); });
-        for (auto& entry : m_planCache) {
-            if (entry.executable.lock() != frame.publication->executable || entry.resources.size() != frame.backings.size()) continue;
-            bool same = true;
-            for (size_t i = 0; i < frame.backings.size() && same; ++i)
-                same = entry.resources[i].index == frame.backings[i].resource.index
-                    && entry.resources[i].generation == frame.backings[i].resource.generation
-                    && entry.regions[i] == frame.backings[i].regions.get();
-            if (same) { cached = &entry; break; }
-        }
-    }
     if (frame.sharedBarriers) {
         // The prediction's plan.
-    } else if (cached) {
-        frame.barriers = cached->barriers;
-        frame.cachedPlan = true;
-        ++m_planCacheHits;
     } else if (predictionSlot) {
         // Planned against the ledger, and kept as the prediction for the next admission of this executable.
         // The last plan is kept among the earlier ones (PredictionSlot::earlier).
@@ -1959,13 +1934,13 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         }
         auto& prediction = *predictionSlot->prediction;
         prediction.plan = std::make_shared<const compiler::PreparedExecutionBarrierPlan>(m_sequencer->states.Prepare(graph, frame.backings,
-            invalidated, m_closed, true, frame.backings.Validated(), frame.backings.Id(), m_externalHome, m_restAtLastUse));
+            invalidated, true, frame.backings.Validated(), frame.backings.Id(), m_externalHome));
         m_sequencer->states.Capture(prediction, graph, frame.backings, frame.backings.Id());
         prediction.activations = invalidated;
         frame.sharedBarriers = prediction.plan;
         frame.prediction = predictionSlot->prediction;
         ++m_planned;
-    } else if (plan && !m_closed && cacheEligible) {
+    } else if (plan && cacheEligible) {
         // An open ticket's body plan: shared by every plan of the same backings (CachedBody).
         BT_ZONE_SCOPE("ORG.Persistent.BodyPlan");
         const auto& executable = frame.publication->executable;
@@ -1982,25 +1957,13 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
             std::erase_if(m_bodyCache, [](const CachedBody& entry) { return entry.executable.expired(); });
             if (m_bodyCache.size() >= 64) m_bodyCache.erase(m_bodyCache.begin());
             auto made = std::make_shared<const compiler::PreparedExecutionBarrierPlan>(m_sequencer->states.Prepare(graph, frame.backings,
-                invalidated, m_closed, false, frame.backings.Validated(), id, m_externalHome, m_restAtLastUse));
+                invalidated, false, frame.backings.Validated(), id, m_externalHome));
             m_bodyCache.push_back({executable, id, m_externalHome, made});
             frame.sharedBarriers = std::move(made);
         }
     } else {
-        frame.barriers = m_sequencer->states.Prepare(graph, frame.backings, invalidated, m_closed, frame.entryOnly, frame.backings.Validated(),
-            frame.backings.Id(), m_externalHome, m_restAtLastUse);
-        if (cacheable) {
-            ++m_planCacheMisses;
-            if (m_planCache.size() >= 64) m_planCache.erase(m_planCache.begin());
-            CachedPlan entry;
-            entry.executable = frame.publication->executable;
-            for (const auto& backing : frame.backings) {
-                entry.resources.push_back(backing.resource);
-                entry.regions.push_back(backing.regions.get());
-            }
-            entry.barriers = frame.barriers;
-            m_planCache.push_back(std::move(entry));
-        }
+        frame.barriers = m_sequencer->states.Prepare(graph, frame.backings, invalidated, frame.entryOnly, frame.backings.Validated(),
+            frame.backings.Id(), m_externalHome);
     }
     // The access waits: an access stream's, from its last capture while the ledger holds what that one found (a frame repeats).
     if (!frame.stream || !m_sequencer->accesses.PredictedWaits(predictionSlot->access, graph, frame.backings, frame.queuePoints,
@@ -2013,7 +1976,7 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         std::erase_if(waits, [&](compiler::ExecutionTimelinePoint point) { return m_sequencer->Reached(point); });
     if (trace::Enabled(trace::Category::Admission)) {
         trace::Builder admitted(trace::Category::Admission, "admitted");
-        admitted.Add("sequence", frame.sequence).Add("closed", frame.closed).Add("cachedPlan", frame.cachedPlan)
+        admitted.Add("sequence", frame.sequence)
             .Add("invalidatedBackings", static_cast<uint64_t>(invalidated.size())).Add("batches", static_cast<uint64_t>(graph.batches.size()));
         for (uint32_t batch = 0; batch < frame.incomingWaits.size(); ++batch) {
             std::string waits;
@@ -2055,31 +2018,14 @@ void SynchronousAdmission::Readmit(FrameAdmission& frame) {
     BT_ZONE_SCOPE("ORG.Persistent.Readmit");
     std::lock_guard lock(m_sequencer->mutex);
     Require(frame.domain == m_domain && frame.sequence && std::ranges::find(m_pending, frame.sequence) != m_pending.end()
-        && !frame.closed, "Readmission of a stale or closed admission");
+, "Readmission of a stale admission");
     AdmitLedger(frame, false);
-}
-void SynchronousAdmission::SetClosedExecutions(bool closed) {
-    std::lock_guard lock(m_sequencer->mutex);
-    Require(m_pending.empty(), "Closed executions changed during a pending admission");
-    if (m_closed != closed) m_planCache.clear();
-    m_closed = closed;
-}
-void SynchronousAdmission::SetRestAtLastUse(bool rest) {
-    std::lock_guard lock(m_sequencer->mutex);
-    if (m_restAtLastUse != rest) {
-        m_planCache.clear();
-        m_bodyCache.clear();
-    }
-    m_restAtLastUse = rest;
 }
 
 void SynchronousAdmission::SetExternalHomeStates(bool externalHome) {
     std::lock_guard lock(m_sequencer->mutex);
     Require(m_pending.empty(), "External home states changed during a pending admission");
-    if (m_externalHome != externalHome) {
-        m_planCache.clear();
-        m_predictions.clear();
-    }
+    if (m_externalHome != externalHome) m_predictions.clear();
     m_externalHome = externalHome;
 }
 SynchronousAdmission::SynchronousAdmission(size_t frameCapacity,
@@ -2108,7 +2054,7 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const compiler::G
     std::lock_guard lock(m_sequencer->mutex);
     const auto pending = std::ranges::find(m_pending, frame.sequence);
     Require(frame.domain == m_domain && frame.sequence && pending != m_pending.end()
-        && (m_closed || pending == m_pending.begin()), "Stale synchronous admission");
+        && pending == m_pending.begin(), "Stale synchronous admission");
     const auto& graph = *frame.publication->executable->graph;
     Require(receipt.batches.size() == graph.batches.size(), "Invalid admission receipt");
     const auto count = signaledBatches == UINT32_MAX ? static_cast<uint32_t>(graph.batches.size()) : signaledBatches;
@@ -2152,8 +2098,7 @@ void SynchronousAdmission::Abandon(const FrameAdmission& frame) {
     std::lock_guard lock(m_sequencer->mutex);
     const auto found = std::ranges::find(m_pending, frame.sequence);
     Require(frame.domain == m_domain && frame.sequence && found != m_pending.end(), "Stale synchronous abandonment");
-    // Only a closed admission can be abandoned out of order: nothing prepared after it depended on it.
-    Require(m_closed || found == m_pending.begin(), "Out-of-order abandonment of an open admission");
+    Require(found == m_pending.begin(), "Out-of-order abandonment of an admission");
     ErasePendingOwner(frame.sequence);
     m_pending.erase(found);
 }

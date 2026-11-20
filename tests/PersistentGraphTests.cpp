@@ -245,12 +245,6 @@ int main() {
         CHECK(acquired.beforeLayout == rhi::ResourceLayout::Common && acquired.afterLayout == rhi::ResourceLayout::ShaderResource
             && acquired.queueOwnership == rhi::QueueOwnership::None);
         reads.Abandon(across);
-        // A closed admission is never readmitted.
-        SynchronousAdmission closed(4, {}, sequencer);
-        closed.SetClosedExecutions(true);
-        auto prepared = closed.Prepare(reader,readerQueue);
-        CHECK(Rejects([&] { closed.Readmit(prepared); }));
-        closed.Abandon(prepared);
     }
     {
         // A texture alternating queues within each execution (written on graphics, read on compute, twice), and across
@@ -370,9 +364,7 @@ int main() {
         org::trace::SetCategories(org::trace::Category::None);
     }
     {
-        // Closed executions: a texture written in one epoch and read in another leaves each execution in its
-        // home state, so an epoch's barrier plan does not depend on whether the other ran, is cached, and
-        // admissions can be prepared ahead of commits and abandoned out of order.
+        // An admission keeps a single pending frame: a second Prepare before the first commits or is abandoned throws.
         GraphProgram program; CompileWorkspace workspace; std::atomic_bool cancelled{false};
         auto edit = program.BeginEdit();
         auto binding = Binding(96); binding.identity = (uint64_t{1} << 32) | 96; binding.shape = {1,1,true};
@@ -395,84 +387,13 @@ int main() {
         CHECK(selected && program.Install(selected));
         const auto readEpoch = selected->ForEpoch(3), writeEpoch = selected->ForEpoch(7);
         CHECK(readEpoch && writeEpoch);
-        SynchronousAdmission admission(8);
-        admission.SetClosedExecutions(true);
         const std::array<ExecutionTimelinePoint,1> queues{{{12,0}}};
-        auto commit = [&](const FrameAdmission& frame, uint64_t value) {
-            GraphExecutionTimeline receipt; receipt.batches.resize(frame.publication->executable->graph->batches.size());
-            for (auto& batch : receipt.batches) batch.signal = {12,value};
-            admission.Commit(frame,receipt);
-        };
-        // The texture's home is Common: each execution transitions it back after its last use.
-        auto exitsHome = [](const FrameAdmission& frame) {
-            for (const auto& batch : frame.barriers.batches)
-                for (const auto& after : batch.afterPass)
-                    for (const auto& barrier : after.textures)
-                        if (barrier.afterLayout == rhi::ResourceLayout::Common) return true;
-            return false;
-        };
-        // The handoff into the execution: its batches' entry barriers.
-        auto entryLayout = [](const FrameAdmission& frame) {
-            for (const auto& batch : frame.barriers.batches)
-                for (const auto& barrier : batch.textures) return barrier.beforeLayout;
-            return rhi::ResourceLayout::Undefined;
-        };
-        auto first = admission.Prepare(readEpoch,queues);
-        CHECK(first.closed && !first.cachedPlan && exitsHome(first));
-        CHECK(entryLayout(first) == rhi::ResourceLayout::Common);
-        commit(first,1);
-        auto write = admission.Prepare(writeEpoch,queues);
-        CHECK(exitsHome(write) && entryLayout(write) == rhi::ResourceLayout::Common);
-        // Prepared before the write commits, and after it: the same plan, from the cache.
-        auto again = admission.Prepare(readEpoch,queues);
-        CHECK(admission.PendingAdmissions() == 2 && again.cachedPlan && entryLayout(again) == rhi::ResourceLayout::Common);
-        // Closed admissions abandon out of order; the later one still commits.
-        admission.Abandon(write);
-        commit(again,2);
-        auto after = admission.Prepare(writeEpoch,queues);
-        CHECK(after.cachedPlan && entryLayout(after) == rhi::ResourceLayout::Common);
-        commit(after,3);
-        CHECK(admission.PlanCacheHits() == 2 && admission.PlanCacheMisses() == 2);
-        // Closed admissions commit in submission order, not preparation order.
-        auto earlier = admission.Prepare(writeEpoch,queues), later = admission.Prepare(readEpoch,queues);
-        commit(later,4);
-        commit(earlier,5);
-        CHECK(admission.PendingAdmissions() == 0);
-        // An open admission keeps its single pending frame.
         SynchronousAdmission open(8);
         auto single = open.Prepare(readEpoch,queues);
         bool threw = false;
         try { (void)open.Prepare(writeEpoch,queues); } catch (const std::exception&) { threw = true; }
-        CHECK(threw && !single.closed);
+        CHECK(threw);
         open.Abandon(single);
-        // Resting at last use (SetRestAtLastUse): the same epochs closed, but each texture rests where its last use left it. No
-        // execution has an exit barrier, the next execution enters from that state, and the closed plan cache is not used.
-        SynchronousAdmission resting(8);
-        resting.SetClosedExecutions(true);
-        resting.SetRestAtLastUse(true);
-        auto commitResting = [&](const FrameAdmission& frame, uint64_t value) {
-            GraphExecutionTimeline receipt; receipt.batches.resize(frame.publication->executable->graph->batches.size());
-            for (auto& batch : receipt.batches) batch.signal = {12,value};
-            resting.Commit(frame,receipt);
-        };
-        auto exitBarriers = [](const FrameAdmission& frame) {
-            size_t count = 0;
-            for (const auto& batch : frame.Barriers().batches)
-                for (const auto& after : batch.afterPass) count += after.textures.size();
-            return count;
-        };
-        auto restWrite = resting.Prepare(writeEpoch,queues);
-        CHECK(restWrite.closed && exitBarriers(restWrite) == 0 && entryLayout(restWrite) == rhi::ResourceLayout::Common);
-        commitResting(restWrite,10);
-        // The reader finds the texture as the writer left it, in UnorderedAccess.
-        auto restRead = resting.Prepare(readEpoch,queues);
-        CHECK(exitBarriers(restRead) == 0 && !restRead.cachedPlan && entryLayout(restRead) == rhi::ResourceLayout::UnorderedAccess);
-        commitResting(restRead,11);
-        // And the next writer finds it in ShaderResource, where the reader left it.
-        auto restAgain = resting.Prepare(writeEpoch,queues);
-        CHECK(!restAgain.cachedPlan && entryLayout(restAgain) == rhi::ResourceLayout::ShaderResource);
-        commitResting(restAgain,12);
-        CHECK(resting.PlanCacheHits() == 0 && resting.PlanCacheMisses() == 0);
     }
     {
         // External home states: a host-owned texture used on the compute queue is taken from the graphics queue at entry and

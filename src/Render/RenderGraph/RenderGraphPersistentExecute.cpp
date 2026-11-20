@@ -163,7 +163,7 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 			for (size_t batch = 0; batch < set->size(); ++batch)
 				if (readers.empty() || (batch < readers.size() && readers[batch])) (*set)[batch].push_back({kFrameWaitTimelineIdentity, m_frameWaitValue});
 	}
-	// Replayable recordings (SetPersistentRecordingReuse): a ticket's closed execution with nothing late-bound, whose passes all
+	// Replayable recordings (SetPersistentRecordingReuse): a ticket's execution with nothing late-bound, whose passes all
 	// report their revisions, is recorded for resubmission. Only a revision's published copies are submitted again.
 	auto* const ticketTarget = options.ticket;
 	if (ticketTarget && options.admissionOnly) {
@@ -186,8 +186,8 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 			lateUnreplayable = lateUnreplayable || prepared >= segment.invocations.size() || !segment.invocations[prepared].IsReplayable();
 		}
 	run.external = ticketTarget && ticketTarget->external;
-	// A body depends only on the compiled graph (open: its entry barriers are recorded at submission) or on the executable and
-	// backings (closed), so a ticket's recording can be replayable, open or closed.
+	// A body depends only on the compiled graph (its entry barriers are recorded at submission), so a ticket's recording can be
+	// replayable.
 	// A recording made with versions keeps its frame rebindings and is admitted with them again. A per-frame resource's
 	// version (a swapchain image) must be the frame's own, so such a recording is never kept.
 	run.keepable = ticketTarget && m_persistentRecordingReuse && !segment.perFrame
@@ -211,15 +211,12 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 		run.sealed = compiler::SealPersistentFrame(run.execution.number, admission, std::move(segment.invocations));
 	} catch (...) { state.admission->Abandon(admission); throw; }
 	const auto& graph = *segment.publication->executable->graph;
-	timings.cachedAdmissions += admission.cachedPlan ? 1u : 0u;
-	// A closed execution starts with a full memory barrier on each of its queues.
-	std::vector<uint8_t> closedEntryDone(slotCount, 0);
 	auto& jobs = run.jobs;
 	jobs.resize(graph.batches.size());
 	// An open ticket's resources every use of which is skipped ahead: no list records their barriers, and every execution of the
 	// recording leaves them where it found them (SubmitPersistentTicket's untouched resources hold them).
 	run.ahead.reset();
-	if (ticketTarget && !external && !admission.closed && !state.admission->ExternalHomeStates()
+	if (ticketTarget && !external && !state.admission->ExternalHomeStates()
 		&& !diagnostics::DiagnosticKeepSkippedPassBarriers().load(std::memory_order_relaxed)) {
 		std::vector<std::vector<uint8_t>> skippedAhead(graph.batches.size());
 		bool any = false;
@@ -281,13 +278,11 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 		}
 		job.deferred = late;
 		job.recording = compiler::BuildPersistentRecordingList(run.sealed, batch, run.ahead.get());
-		// An open admission's handoff into the execution (its batches' entry barriers) is recorded when it submits, against the
-		// ledger as it is then: the body has none.
-		if (!admission.closed) {
-			job.recording.textureBarriers.clear();
-			job.recording.bufferBarriers.clear();
-			job.recording.acquiredBarriers.clear();
-		}
+		// The handoff into the execution (its batches' entry barriers) is recorded when it submits, against the ledger as it is
+		// then: the body has none.
+		job.recording.textureBarriers.clear();
+		job.recording.bufferBarriers.clear();
+		job.recording.acquiredBarriers.clear();
 		job.recording.external = inStream;
 		// Inline: the packet records the batch when it submits it, from the queue's shared pool (AcquireCommandLists skips it).
 		job.recording.inlineAtExecution = late && !external;
@@ -297,10 +292,6 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 		job.recording.run = run.execution.options.run.value_or(RunRef::Unleased(frameIndex));
 		job.recording.tag = m_recordingTag;
 		job.recording.externalEntryBarrier = m_externalQueueBoundary.entry && run.firstBatchOnSlot[slot] == batch;
-		if (admission.closed && !closedEntryDone[slot]) {
-			job.recording.externalEntryBarrier = true;
-			closedEntryDone[slot] = 1;
-		}
 		job.recording.externalExitBarrier = m_externalQueueBoundary.exit && run.lastBatchOnSlot[slot] == batch;
 		job.recording.replayable = keepable;
 		if (queueKind != QueueKind::Copy && device == BackendInstanceId::Primary) {
@@ -531,7 +522,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 		std::vector<rhi::CommandList> handoffLists(graph.batches.size());
 		std::vector<std::span<const rhi::CommandList>> leading;
 		std::vector<std::shared_ptr<const void>> handoffLeases;
-		if (!admission.closed) {
+		{
 			state.admission->Readmit(admission);
 			// Textures an earlier execution left on another queue: released there first, the consumers waiting for it.
 			for (const auto& release : admission.barriers.releases) {

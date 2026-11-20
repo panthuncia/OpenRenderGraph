@@ -54,7 +54,7 @@ org::GraphHost host({
 
 `Desc` also takes the host's epochs (`epochOrder`), frames in flight, recording reuse, the shared alias arena and the interop
 options for a host that shares its queues and resources with another API, as Community Shaders shares DXVK's: the external
-queue boundary, external home states and closed executions. [docs/persistent-epochs.md](docs/persistent-epochs.md)
+queue boundary and external home states. [docs/persistent-epochs.md](docs/persistent-epochs.md)
 describes embedding ORG: epochs as graphs, open executions, tickets, in-stream execution and the interop options.
 
 ### 2) Write a pass

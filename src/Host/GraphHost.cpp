@@ -1099,8 +1099,6 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		graph->GetMemorySnapshotProvider().SetProvider(memory::CreateECSMemorySnapshotProvider());
 		graph->CompileStructural();
 		if (inputs.epoch != persistent::AllEpochs) graph->SetPersistentEpochOrder({inputs.epoch});
-		graph->SetPersistentClosedExecutions(ClosedEpoch(inputs.epoch));
-		graph->SetPersistentRestAtLastUse(ClosedEpoch(inputs.epoch) && RestsAtLastUse(inputs.epoch));
 		graph->SetPersistentExternalHomeStates(m_desc.externalHomeStates);
 		if (inputs.aliasArena) graph->SetPersistentAliasArena(inputs.aliasArena);
 		// Lane: the epoch plus one, so the epoch's builds may share bytes (lane 0 shares with nothing whose span overlaps).
@@ -1906,10 +1904,6 @@ void GraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vector<uint32_
 	StartAsync();
 }
 
-void GraphHost::SetClosedEpochs(std::vector<uint32_t> epochs) {
-	m_closedEpochs = std::move(epochs);
-}
-
 void GraphHost::SetPrivateAliasEpochs(std::vector<uint32_t> epochs) {
 	std::scoped_lock lock(m_configMutex);
 	m_privateAliasEpochs = std::move(epochs);
@@ -2075,18 +2069,6 @@ std::vector<GraphHost::FrameTransientGroup> GraphHost::FrameTransientGroups() co
 		out.push_back(std::move(info));
 	}
 	return out;
-}
-
-bool GraphHost::ClosedEpoch(uint32_t epoch) const noexcept {
-	return m_desc.closedExecutions || std::ranges::find(m_closedEpochs, epoch) != m_closedEpochs.end();
-}
-
-void GraphHost::SetRestAtLastUseEpochs(std::vector<uint32_t> epochs) {
-	m_restEpochs = std::move(epochs);
-}
-
-bool GraphHost::RestsAtLastUse(uint32_t epoch) const noexcept {
-	return std::ranges::find(m_restEpochs, epoch) != m_restEpochs.end();
 }
 
 void GraphHost::SetEpochCopy(uint32_t epoch, uint32_t copy) {

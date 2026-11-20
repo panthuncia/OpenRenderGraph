@@ -42,7 +42,6 @@ ExternalClient::ExternalClient(Desc desc) : m_desc(std::move(desc)) {
 	m_admission = std::make_unique<persistent::SynchronousAdmission>(m_desc.capacity,
 		std::function<void(std::shared_ptr<const void>)>{},
 		m_desc.runtime->Sequencer());
-	m_admission->SetClosedExecutions(m_desc.closed);
 	m_workspace = std::make_unique<compiler::CompileWorkspace>();
 	m_workspace->SetScheduleCache(m_desc.runtime->Schedules());
 	m_slots.resize(m_desc.queues.size());
@@ -188,8 +187,10 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 	auto admission = [&] { BT_ZONE_SCOPE("ORG.ExternalClient.Prepare"); return m_admission->Prepare(publication, points); }();
 	try {
 		auto hold = m_admission->HoldSequencer();
-		// A closed admission depends on nothing admitted before it: there is nothing to readmit.
-		if (!admission.closed) { BT_ZONE_SCOPE("ORG.ExternalClient.Readmit"); m_admission->Readmit(admission); }
+		{
+			BT_ZONE_SCOPE("ORG.ExternalClient.Readmit");
+			m_admission->Readmit(admission);
+		}
 		auto& waits = admission.incomingWaits.at(0);
 		// A texture last used on another queue must be released on that queue first.
 		// We submit the release there with its own signal, and this submission waits for it.
@@ -216,10 +217,9 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 		// Before the caller's commands, record:
 		// - the entry barriers that hand each resource over from its previous user,
 		// - for textures acquired from another queue family, the barriers that move them out of Common,
-		// - a full memory barrier when executions are closed or the queue is shared with another API,
+		// - a full memory barrier when the queue is shared with another API,
 		// - the pass's own barriers.
-		// After the caller's commands, record the pass's closing barriers (declared final states, or the return to
-		// home states for closed executions).
+		// After the caller's commands, record the pass's closing barriers (declared final states).
 		const auto& entry = admission.barriers.batches.at(0);
 		const auto* before = entry.beforePass.empty() ? nullptr : &entry.beforePass.front();
 		const auto* after = entry.afterPass.empty() ? nullptr : &entry.afterPass.front();
@@ -232,7 +232,7 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 		};
 		std::vector<rhi::CommandList> lists;
 		CommandListPair entryPair, exitPair;
-		const bool fullBarrier = admission.closed || m_desc.entryFullBarrier;
+		const bool fullBarrier = m_desc.entryFullBarrier;
 		const bool entryWork = !entry.textures.empty() || !entry.buffers.empty() || !entry.acquired.empty() || fullBarrier
 			|| (before && (!before->textures.empty() || !before->buffers.empty()));
 		if (entryWork) {
