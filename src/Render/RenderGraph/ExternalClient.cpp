@@ -113,7 +113,7 @@ void ExternalClient::RetireLocked() {
 
 ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<const Access> accesses,
 	const std::function<void(rhi::CommandList&)>& record, std::span<const rhi::TimelinePoint> signals,
-	std::shared_ptr<const void> keepAlive) {
+	std::shared_ptr<const void> keepAlive, std::span<const rhi::TimelinePoint> extraWaits) {
 	BT_ZONE_SCOPE("ORG.ExternalClient.Submit");
 	std::lock_guard lock(m_mutex);
 	auto& slot = Slot(slotIndex);
@@ -287,6 +287,8 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 			}
 			basic_telemetry::AddCounter("ORG.ExternalClient.CrossDeviceRelays");
 		}
+		// The caller's own waits, already on this queue's device.
+		waitPoints.insert(waitPoints.end(), extraWaits.begin(), extraWaits.end());
 		const auto value = slot.next++;
 		std::vector<rhi::TimelinePoint> signalPoints{{slot.timeline->GetHandle(), value}};
 		signalPoints.insert(signalPoints.end(), signals.begin(), signals.end());

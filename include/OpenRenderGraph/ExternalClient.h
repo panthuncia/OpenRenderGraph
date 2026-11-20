@@ -79,8 +79,10 @@ public:
 	// Throws if the submission fails. Nothing is recorded in the ledgers in that case.
 	// `signals` are extra timeline points the submission signals when it finishes.
 	// `keepAlive` is held until the submission finishes (for example the staging memory its commands read).
+	// `waits` are extra timeline points on this queue's device that the submission waits for before it runs.
 	Signal Submit(uint32_t slot, std::span<const Access> accesses, const std::function<void(rhi::CommandList&)>& record,
-		std::span<const rhi::TimelinePoint> signals = {}, std::shared_ptr<const void> keepAlive = {});
+		std::span<const rhi::TimelinePoint> signals = {}, std::shared_ptr<const void> keepAlive = {},
+		std::span<const rhi::TimelinePoint> waits = {});
 
 	// Frees what finished submissions held. Submit also does this.
 	void Retire();
