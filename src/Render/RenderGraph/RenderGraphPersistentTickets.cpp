@@ -726,7 +726,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				auto list = leading.list;
 				if (!packet->SubmitLeading({&list, 1}, leading.waits)) return false;
 			}
-			return packets[i]->Submit(batches[i]);
+			return static_cast<bool>(packets[i]->Submit(batches[i]));
 		};
 		if (ticket.external) {
 			// The batches on the graphics queue are not submitted: the host executes them in its own stream, segment by segment
