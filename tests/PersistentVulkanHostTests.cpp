@@ -1433,6 +1433,21 @@ static int Run(int argc, char** argv) {
 					runtime->Arena()->ReleaseRun(3, 2);
 					runtime->Arena()->ReleaseRun(4, 1);
 				}
+				// An oversize region has a chunk of its own at offset 0, and its chunk comes back once its last holder lets it go.
+				{
+					const auto& arena = runtime->Arena();
+					const auto before = arena->TakeStats().oversizeChunks;
+					auto large = arena->AcquireOversize(org::FrameArena::kChunkBytes + 1);
+					REQUIRE(large && large->offset == 0 && large->size >= org::FrameArena::kChunkBytes + 1, "an oversize region starts its own chunk");
+					auto small = arena->AcquireOversize(16);
+					REQUIRE(small && small->offset == 0 && small->buffer != large->buffer, "each oversize region has its own chunk");
+					const auto* largeBuffer = large->buffer;
+					large.reset();
+					arena->Trim();
+					auto again = arena->AcquireOversize(org::FrameArena::kChunkBytes + 1);
+					REQUIRE(again && again->buffer == largeBuffer, "a freed oversize chunk is reused by the next region that fits");
+					REQUIRE(arena->TakeStats().oversizeChunks == before + 2, "no chunk is made for a reused region");
+				}
 				auto program = CreateProgram(device.Get());
 				REQUIRE(program, "compute program");
 				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
