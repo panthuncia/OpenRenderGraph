@@ -1,10 +1,12 @@
 #pragma once
 
 #include <memory>
+#include <utility>
 
 #include <rhi.h>
 
 #include "Render/Runtime/DescriptorServiceTypes.h"
+#include "Render/Runtime/NullViews.h"
 #include "Render/OwnedDescriptorBinding.h"
 #include "Render/Runtime/ResourceCleanupQueue.h"
 
@@ -52,6 +54,12 @@ public:
     virtual OwnedDescriptorBinding CreateOwnedShaderResourceView(std::shared_ptr<const void>,
         rhi::Resource, std::shared_ptr<const void>, const rhi::SrvDesc&) { return {}; }
     virtual OwnedDescriptorBinding CreateOwnedSampler(std::shared_ptr<const void>, const rhi::SamplerDesc&) { return {}; }
+    // A null descriptor of `kind` (NullSrvDesc): shaders that read it get zeros. Each call makes a new descriptor, so keep
+    // the binding. Empty when the service has no owned views, or when the device cannot make null descriptors (Vulkan
+    // without VK_EXT_robustness2's nullDescriptor).
+    virtual OwnedDescriptorBinding Null(std::shared_ptr<const void> deviceOwner, NullViewKind kind) {
+        return CreateOwnedShaderResourceView(std::move(deviceOwner), {}, {}, NullSrvDesc(kind));
+    }
     virtual std::shared_ptr<ResourceCleanupQueue> GetResourceCleanupQueue() const { return {}; }
 };
 

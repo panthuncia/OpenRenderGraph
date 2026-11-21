@@ -143,6 +143,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassBuilders.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FeatureDomainRegistry.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/Base/RenderPass.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/LatchedCopiesPass.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassExecutionContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphCompiler.cpp"
@@ -333,6 +334,12 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_features(OpenRenderGraphRecordingTagTests PRIVATE cxx_std_23)
     target_link_libraries(OpenRenderGraphRecordingTagTests PRIVATE OpenRenderGraph)
     add_test(NAME OpenRenderGraphRecordingTagTests COMMAND OpenRenderGraphRecordingTagTests)
+    # Latched copy joining, latch region bookkeeping and null view descriptions (no device).
+    add_executable(OpenRenderGraphLatchedCopiesTests tests/LatchedCopiesTests.cpp)
+    target_compile_features(OpenRenderGraphLatchedCopiesTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphLatchedCopiesTests PRIVATE NOMINMAX)
+    target_link_libraries(OpenRenderGraphLatchedCopiesTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphLatchedCopiesTests COMMAND OpenRenderGraphLatchedCopiesTests)
     add_executable(OpenRenderGraphAliasPackingTests tests/AliasPackingTests.cpp src/Render/RenderGraph/AliasPacking.cpp)
     target_compile_features(OpenRenderGraphAliasPackingTests PRIVATE cxx_std_23)
     add_test(NAME OpenRenderGraphAliasPackingTests COMMAND OpenRenderGraphAliasPackingTests)
