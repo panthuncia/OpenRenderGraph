@@ -1299,8 +1299,9 @@ int main(int argc, char** argv) {
 
     {
         auto api = device.Get();
+        // Two usable slots. A shader-visible heap never hands out slot 0.
         auto heap = std::make_shared<org::DescriptorHeap>(api,
-            rhi::DescriptorHeapType::CbvSrvUav, 2, true, "Queued descriptor ownership test");
+            rhi::DescriptorHeapType::CbvSrvUav, 3, true, "Queued descriptor ownership test");
         const auto first = heap->AllocateDescriptor();
         auto frame = heap->CaptureDescriptorLease(first);
         auto secondFrame = heap->CaptureDescriptorLease(first);

@@ -51,8 +51,10 @@ int TestMoveAll() {
 		org::RunSlots<int> gone;
 		gone.Store(staging, std::make_shared<const int>(1));
 	}
+	// The next MoveAll reaches only the live RunSlots. A moved slot keeps its run, so it is filled again first.
+	a.Store(staging, std::make_shared<const int>(12));
 	org::RunSlotsRegistry::MoveAll(staging, target);
-	CHECK(a.Find(target) && *a.Find(target) == 11);  // nothing at the staging run: the target keeps its value
+	CHECK(a.Find(target) && *a.Find(target) == 12);
 	return 0;
 }
 }

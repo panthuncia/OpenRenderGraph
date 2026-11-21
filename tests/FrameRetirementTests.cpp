@@ -59,6 +59,8 @@ int TestCompletionWake(rhi::Device device) {
 
 
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend) {
+    // A caller's runtime outlives this test, so its descriptor heaps are made again after the Cleanup checks below.
+    const bool borrowed = org::Runtime::Current() != nullptr;
     CHECK(TestCompletionWake(device) == 0);
     CHECK(TestBindingOwnership(device) == 0);
     {
@@ -184,5 +186,6 @@ int TestFrameRetirement(rhi::Device device, rhi::Backend backend) {
     CHECK(retirement.GetDeferredReleaseStats().releaseCount == 0);
     retirement.Cleanup(); // Shutdown is idempotent.
     CHECK(retirement.GetDeferredReleaseStats().releaseCount == 0);
+    if (borrowed) retirement.Initialize();
     return 0;
 }
