@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <concepts>
 #include <functional>
@@ -11,13 +12,14 @@
 #include <stdexcept>
 #include <utility>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 #include <string>
 #include <rhi.h>
 #include "RenderPasses/Base/PassReturn.h"
 #include "Render/ExternalBindings.h"
-#include "Render/PipelineDesc.h"
 #include "Render/PipelineState.h"
+#include "Render/QueueKind.h"
 #include "Render/BindlessResourceViews.h"
 #include "Render/ResourceUseDeclaration.h"
 #include "Render/PreparedInvocationArena.h"
@@ -547,7 +549,7 @@ public:
     // Keeps `owner` alive until this recording's GPU work retires.
     void Retain(std::shared_ptr<const void> owner);
 
-    // Binds the pipeline's current payload and its layout. The recording retains the payload. Then fills the pipeline's
+    // Binds the payload's pipeline and its layout. The recording retains the payload. Then fills the pipeline's
     // ResourceDescriptorIndex slots from the pass's declarations, by resource name. A slot whose name the pass did not
     // declare gets UINT32_MAX when:
     // - the slot is optional,
@@ -555,15 +557,12 @@ public:
     // - or its name starts with one of `absentPrefixes`.
     // Otherwise binding throws.
     using BindOptions = PipelineBindOptions;
-    void BindComputePipeline(const PipelineState& pipeline, BindOptions options = {});
-    void BindGraphicsPipeline(const PipelineState& pipeline, BindOptions options = {});
     void BindComputePipeline(std::shared_ptr<const PipelineStatePayload> payload, BindOptions options = {});
     void BindGraphicsPipeline(std::shared_ptr<const PipelineStatePayload> payload, BindOptions options = {});
     // A DXR state object and its global layout. PushConstants then reach the ray stages. A shader table only works with the
-    // state object it was built from, so a pass with a table binds the table's payload rather than the pipeline's current one.
-    void BindRayTracingPipeline(const PipelineState& pipeline, BindOptions options = {});
+    // state object it was built from, so a pass with a table binds the table's payload.
     void BindRayTracingPipeline(std::shared_ptr<const PipelineStatePayload> payload, BindOptions options = {});
-    // A pipeline made outside PipelineState: no descriptor slots.
+    // A bare pipeline: no descriptor slots.
     void BindComputePipeline(std::shared_ptr<const rhi::PipelinePtr> pipeline, rhi::PipelineLayoutHandle layout);
     void BindGraphicsPipeline(std::shared_ptr<const rhi::PipelinePtr> pipeline, rhi::PipelineLayoutHandle layout);
     // Root constants for the stages of the last bound pipeline.
@@ -580,12 +579,6 @@ public:
     // A full unordered-access barrier between dispatches of the bound kind: ray dispatches after BindRayTracingPipeline,
     // otherwise compute dispatches.
     void UavBarrier();
-    // The signature's creation on the pass's device, retained by the recording. Throws when it has none there.
-    std::shared_ptr<const rhi::CommandSignaturePtr> Resolve(const CommandSignatureState& signature);
-    // The signature's creation on the pass's device.
-    void ExecuteIndirect(const CommandSignatureState& signature,
-        ResourceBindingToken arguments, uint64_t argumentOffset = 0, uint32_t maxCommandCount = 1,
-        std::optional<ResourceBindingToken> count = std::nullopt, uint64_t countOffset = 0);
     // The same barrier between work of different kinds, such as a compute step whose output rays read.
     void UavBarrier(rhi::ResourceSyncState beforeSync, rhi::ResourceSyncState afterSync);
     // Launches rays from dispatch arguments in a declared buffer. Declare it with IndirectArguments. `tables` is

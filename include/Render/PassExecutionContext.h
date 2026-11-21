@@ -20,7 +20,6 @@ namespace org {
 class Resource;
 class SymbolicTracker;
 class GloballyIndexedResource;
-class PipelineState;
 class ResolverCaptureContext;
 
 struct IHostExecutionData {
@@ -114,7 +113,6 @@ struct PassExecutionContext {
 	rhi::DescriptorSlot ResolveRTV(const GloballyIndexedResource& resource, uint32_t mip = 0, uint32_t slice = 0) const;
 	rhi::DescriptorSlot ResolveDSV(const GloballyIndexedResource& resource, uint32_t mip = 0, uint32_t slice = 0) const;
 	rhi::DescriptorSlot ResolveNonShaderVisibleUAV(const GloballyIndexedResource& resource, uint32_t mip = 0, uint32_t slice = 0) const;
-	const rhi::Pipeline& ResolvePipeline(const PipelineState& pipeline) const;
 };
 
 

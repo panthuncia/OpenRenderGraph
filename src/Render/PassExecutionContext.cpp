@@ -2,7 +2,6 @@
 #include "Resources/Resource.h"
 #include "Resources/GloballyIndexedResource.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
-#include "Render/PipelineState.h"
 
 namespace org {
 
@@ -64,10 +63,6 @@ rhi::DescriptorSlot PassExecutionContext::ResolveNonShaderVisibleUAV(const Globa
 	return DescriptorHeapManager::GetInstance().ResolveDescriptorSlot(
 		backendInstance, rhi::DescriptorHeapType::CbvSrvUav, false,
 		resource.GetUAVNonShaderVisibleInfo(mip, slice).slot.index);
-}
-
-const rhi::Pipeline& PassExecutionContext::ResolvePipeline(const PipelineState& pipeline) const {
-	return pipeline.GetAPIPipelineState(backendInstance);
 }
 
 } // namespace org

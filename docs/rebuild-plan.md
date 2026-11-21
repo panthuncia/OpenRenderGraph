@@ -56,7 +56,6 @@ The branch (`backend_interop`, 86k lines) has also collected:
 **CS uses `PersistentGraphHost` only (Vulkan over DXVK):**
 - **Host features:**
   - async epochs and tickets;
-  - closed executions;
   - revision recordings;
   - external epochs and frame slots;
   - queue-scoped and copy-queue streaming uploads;
@@ -66,13 +65,13 @@ The branch (`backend_interop`, 86k lines) has also collected:
 - **Resources:** `Buffer`, `PixelBuffer`, `ExternalTextureResource`, `VersionedBuffer`, `LatchBlock`, `PreparedTablePublisher`.
 - **Services:** upload, descriptor and statistics.
 - **Debug:** `ScheduleInspector`, `ScheduleTrace`, `MemoryIntrospectionWidget`, `NvPerfCapture`, `DiagnosticSkip*`.
-- **Also needed for CS:** ORGModuleServices needs `Buffer`, `VersionedBuffer`, `IUploadService`, `StreamingUploadTypes`, `LatchBlock` and `ShaderCompilerService.h`.
+- **Also needed for CS:** ORGModuleServices needs `Buffer`, `VersionedBuffer`, `IUploadService`, `StreamingUploadTypes` and `LatchBlock`.
 
 **BR/SARP:**
 - **Driving:** BR drives `RenderGraph` directly: `CompileStructural`, `Setup`, `Update`, `Execute`.
 - **Passes:** about 139 typed passes, using lifecycle hooks and `Update` overrides. Recipes, `CaptureProgramBinding` and the 3 `PersistentTypedPass`es are gone: a pass's `Revision` drives kept-recording reuse only, and `Record` binds pipelines (`RecordingContext::BindComputePipeline`/`BindGraphicsPipeline`, retained by the recording) and resolves declared views and resources at record time.
 - **Graph inputs:** providers, resolvers, `IDynamicDeclaredResources`, `ResourceGroup`, and extensions with `ExternalInsertPoint`/`SetPassTechnique`.
-- **Readback:** the readback service and capture passes.
+- **Readback:** kept-recording readbacks (`org::RunReadback`).
 - **Uploads:** upload policy, `StreamingUploadPass`, `UploadInstance`, `FrameWorkQueue`.
 - **Aliasing:** `AutoAliasMode`/packing and the alias debug snapshot.
 - **Debug and diagnostics:** `RGInspector`, the memory frame-graph timeline, the VRAM dump.

@@ -1,36 +1,14 @@
 # Pipelines
 
-ORG builds no pipelines. The host builds them and hands them to passes, which bind them in `Record`:
+ORG builds no pipelines. The host builds them (OMS's `PipelineRegistry` and `BuildPipeline` in CS) and hands them to
+passes, which bind them in `Record`:
 
-- `RecordingContext::BindComputePipeline(const PipelineState&)` (and the graphics and ray tracing forms) binds a pipeline
-  with descriptor slots. A `PipelineState` holds one payload per device, and binding picks the pass's device's payload.
+- `RecordingContext::BindComputePipeline(std::shared_ptr<const PipelineStatePayload>)` (and the graphics and ray tracing
+  forms) binds a payload's pipeline and layout, and fills its descriptor slots from the pass's declarations.
 - `RecordingContext::BindComputePipeline(std::shared_ptr<const rhi::PipelinePtr>, rhi::PipelineLayoutHandle)` binds a
-  pipeline made outside `PipelineState`, with no descriptor slots.
-- `RecordingContext::ExecuteIndirect(const CommandSignatureState&, ...)` picks the pass's device's command signature.
+  bare pipeline, with no descriptor slots.
 
-A recording retains the payload it bound until the recording retires.
-
-## Descriptions
-
-`Render/PipelineDesc.h` describes pipelines by value, for hosts that build them from a description. They own all their
-data.
-
-- `ComputePipelineDesc`: a shader, a name, defines and a layout.
-- `GraphicsPipelineDesc`: vertex or mesh (with an optional amplification) and pixel shaders, and optional raster, blend,
-  depth, render-target, depth-format and sample states.
-  - An absent state is not given to the device, so the backend's default applies.
-  - Topology is the exception. Backends disagree about an omitted one, so vertex pipelines always get one, `TriangleList`
-    unless set.
-  - `inputLayout` gives a vertex pipeline vertex buffers (`PipelineInputLayout`: bindings, and attributes that own their
-    semantic names). Without one, the vertex shader pulls its own vertices.
-    - D3D12 matches attributes to shader inputs by semantic, and Vulkan by location. An unset location counts up in
-      declaration order, which is the order DXC gives the shader's inputs.
-    - The layout must allow the input assembler on D3D12. A custom layout needs `rhi::PF_AllowInputAssembler`.
-- `PipelineLayoutRef`:
-  - `StandardCompute` and `StandardGraphics` are the host's layouts.
-  - `Custom` holds a `PipelineLayoutSpec`.
-  - `RootConstants(count, stages, name)` is a custom layout of one block of root constants (b0, root parameter 0). The
-    shader reaches its resources through the descriptor heap, with indices from those constants.
+A recording retains what it bound until the recording retires.
 
 ## Waits across devices
 

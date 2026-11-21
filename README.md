@@ -66,12 +66,12 @@ resources and pipelines through the context, against the frame the packet was pr
 #include "RenderPasses/Base/TypedRenderGraphPass.h"
 #include "Render/PassBuilders.h"
 
-struct ClearBindings { org::DeclaredViewToken target; std::shared_ptr<const org::PipelineState> pipeline; };
+struct ClearBindings { org::DeclaredViewToken target; std::shared_ptr<const org::PipelineStatePayload> pipeline; };
 struct ClearFrame { uint32_t count = 0; };
 
 class ClearPass final : public org::TypedRenderGraphPass<ClearPass, ClearFrame, ClearBindings> {
 public:
-    ClearPass(std::shared_ptr<org::Buffer> target, std::shared_ptr<const org::PipelineState> pipeline)
+    ClearPass(std::shared_ptr<org::Buffer> target, std::shared_ptr<const org::PipelineStatePayload> pipeline)
         : m_target(std::move(target)), m_pipeline(std::move(pipeline)) {}
     ClearBindings Declare(org::PassBuilder& builder) {
         builder.PreferQueue(org::QueueKind::Compute).AutomaticQueueAssignment();
@@ -79,15 +79,15 @@ public:
     }
     ClearFrame Prepare(const ClearBindings&, const org::PassPrepareContext&) const { return {1024}; }
     static void Record(const ClearBindings& bindings, const ClearFrame& frame, org::PassRecordContext& recording) {
-        recording.BindComputePipeline(*bindings.pipeline);  // retained by the recording; descriptor slots filled by name
+        recording.BindComputePipeline(bindings.pipeline);  // retained by the recording; descriptor slots filled by name
         const uint32_t constants[] = {recording.Index(bindings.target), frame.count};
         recording.PushConstants(1, constants);
         recording.Commands().Dispatch((frame.count + 63) / 64, 1, 1);
     }
-    void Revision(std::vector<uint64_t>& out) const { out.push_back(m_pipeline->GetPayload()->generation); }
+    void Revision(std::vector<uint64_t>& out) const { out.push_back(m_pipeline->generation); }
 private:
     std::shared_ptr<org::Buffer> m_target;
-    std::shared_ptr<const org::PipelineState> m_pipeline;
+    std::shared_ptr<const org::PipelineStatePayload> m_pipeline;
 };
 ```
 
@@ -103,7 +103,7 @@ of, or matches `BindOptions::absentPrefixes`; otherwise binding throws. The BRSL
 
 #### Pipelines
 
-ORG builds no pipelines. The host builds them (an `org::PipelineState`, or a bare `rhi::PipelinePtr`) and hands them to
+ORG builds no pipelines. The host builds them (an `org::PipelineStatePayload`, or a bare `rhi::PipelinePtr`) and hands them to
 the pass, which binds them in `Record`. [docs/pipelines.md](docs/pipelines.md)
 
 #### Declarations that change
@@ -145,7 +145,7 @@ public:
     }
 private:
     std::shared_ptr<org::Buffer> m_target = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 4096, true);
-    std::shared_ptr<const org::PipelineState> m_pipeline;  // the clear shader, compiled by the host
+    std::shared_ptr<const org::PipelineStatePayload> m_pipeline;  // the clear shader, compiled by the host
 };
 
 host.AddExtension("my.extension", [] { return std::make_unique<MyExtension>(); });

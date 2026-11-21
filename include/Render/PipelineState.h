@@ -1,29 +1,23 @@
 #pragma once
 
 #include <rhi.h>
-#include <array>
-#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <stdint.h>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "Resources/ResourceIdentifier.h"
-#include "Render/QueueKind.h"
 
 
 namespace org {
-
-// Devices a pipeline can have a build on: DeviceRegistry ids below this. Hosts have a primary and a peer today.
-inline constexpr size_t kMaxPipelineDevices = 4;
 
 struct PipelineResources {
 	std::vector<ResourceIdentifier> mandatoryResourceDescriptorSlots;
 	std::vector<ResourceIdentifier> optionalResourceDescriptorSlots;
 };
 
+// A built pipeline, its layout and its descriptor slots. RecordingContext::Bind*Pipeline binds one and retains it.
 struct PipelineStatePayload {
 	PipelineStatePayload(
 		rhi::PipelinePtr pipeline,
@@ -52,139 +46,5 @@ struct PipelineStatePayload {
 	uint64_t bytecodeHash = 0;
 	std::string label;
 };
-
-class PipelineStateSlot {
-public:
-	PipelineStateSlot() = default;
-	explicit PipelineStateSlot(std::shared_ptr<PipelineStatePayload> payload) :
-		m_active(payload), m_peek(payload.get()) {}
-
-	std::shared_ptr<PipelineStatePayload> Load() const {
-		return m_active.load(std::memory_order_acquire);
-	}
-	// A non-owning identity of the active payload, for revision checks. Reading
-	// it needs no atomic shared_ptr load and no reference count traffic. Retired
-	// payloads stay alive through the packets that captured them, so the pointer
-	// is only compared.
-	PipelineStatePayload* Peek() const noexcept { return m_peek.load(std::memory_order_acquire); }
-
-	std::shared_ptr<PipelineStatePayload> Exchange(std::shared_ptr<PipelineStatePayload> payload) {
-		m_peek.store(payload.get(), std::memory_order_release);
-		return m_active.exchange(std::move(payload), std::memory_order_acq_rel);
-	}
-
-private:
-	std::atomic<std::shared_ptr<PipelineStatePayload>> m_active;
-	std::atomic<PipelineStatePayload*> m_peek{nullptr};
-};
-
-// A handle to a pipeline's builds, one slot per device. Copies share the slots. Every slot is atomic and the set is fixed, so
-// a build can land on one device while recordings read another, without a lock.
-class PipelineState {
-public:
-	PipelineState(rhi::PipelinePtr pso,
-		uint64_t resourceIDsHash,
-		PipelineResources resources,
-		std::shared_ptr<const void> layoutOwner = {},
-		rhi::PipelineLayoutHandle layout = {}) :
-		m_slots(std::make_shared<Slots>()) {
-		auto payload = std::make_shared<PipelineStatePayload>(std::move(pso), resourceIDsHash, std::move(resources));
-		payload->layoutOwner = std::move(layoutOwner);
-		payload->layout = layout;
-		(*m_slots)[0].Exchange(std::move(payload));
-	}
-	PipelineState() :
-		m_slots(std::make_shared<Slots>()) {
-		(*m_slots)[0].Exchange(std::make_shared<PipelineStatePayload>(rhi::PipelinePtr{}, 0, PipelineResources{}));
-	}
-
-	const rhi::Pipeline& GetAPIPipelineState() const {
-		return RequirePayload()->pso.Get();
-	}
-	const rhi::Pipeline& GetAPIPipelineState(BackendInstanceId backendInstance) const {
-		return RequirePayload(backendInstance)->pso.Get();
-	}
-	bool HasBackendPipeline(BackendInstanceId backendInstance) const {
-		const auto payload = GetPayload(backendInstance);
-		return payload && payload->pso;
-	}
-	void AttachBackendPipeline(BackendInstanceId backendInstance, rhi::PipelinePtr pipeline,
-		uint64_t resourceIDsHash, PipelineResources resources,
-		std::shared_ptr<const void> layoutOwner = {}, rhi::PipelineLayoutHandle layout = {}) const {
-		auto payload = std::make_shared<PipelineStatePayload>(
-			std::move(pipeline), resourceIDsHash, std::move(resources));
-		payload->layoutOwner = std::move(layoutOwner);
-		payload->layout = layout;
-		ReplacePayload(backendInstance, std::move(payload));
-	}
-	uint64_t GetResourceIDsHash() const {
-		return RequirePayload()->resourceIDsHash;
-	}
-	const PipelineResources& GetResourceDescriptorSlots() const {
-		return RequirePayload()->pipelineResources;
-	}
-	uint64_t GetGeneration() const {
-		const auto payload = GetPayload();
-		return payload ? payload->generation : 0;
-	}
-	uint64_t GetSourceHash() const {
-		const auto payload = GetPayload();
-		return payload ? payload->sourceHash : 0;
-	}
-	uint64_t GetBytecodeHash() const {
-		const auto payload = GetPayload();
-		return payload ? payload->bytecodeHash : 0;
-	}
-	std::string GetLabel() const {
-		const auto payload = GetPayload();
-		return payload ? payload->label : std::string{};
-	}
-	explicit operator bool() const {
-		const auto payload = GetPayload();
-		return payload && payload->pso;
-	}
-
-	std::shared_ptr<PipelineStatePayload> GetPayload() const {
-		return m_slots ? (*m_slots)[0].Load() : nullptr;
-	}
-	PipelineStatePayload* PeekPayload() const noexcept { return m_slots ? (*m_slots)[0].Peek() : nullptr; }
-	std::shared_ptr<PipelineStatePayload> GetPayload(BackendInstanceId backendInstance) const {
-		const size_t index = static_cast<uint8_t>(backendInstance);
-		return m_slots && index < kMaxPipelineDevices ? (*m_slots)[index].Load() : nullptr;
-	}
-	// The primary device's slot. Its address identifies the pipeline: copies of a handle share it.
-	std::shared_ptr<PipelineStateSlot> GetSlot() const {
-		return m_slots ? std::shared_ptr<PipelineStateSlot>(m_slots, &(*m_slots)[0]) : nullptr;
-	}
-	std::shared_ptr<PipelineStatePayload> ReplacePayload(std::shared_ptr<PipelineStatePayload> payload) const {
-		return m_slots ? (*m_slots)[0].Exchange(std::move(payload)) : nullptr;
-	}
-	std::shared_ptr<PipelineStatePayload> ReplacePayload(BackendInstanceId backendInstance, std::shared_ptr<PipelineStatePayload> payload) const {
-		const size_t index = static_cast<uint8_t>(backendInstance);
-		if (index >= kMaxPipelineDevices) throw std::out_of_range("PipelineState: device instance out of range");
-		return m_slots ? (*m_slots)[index].Exchange(std::move(payload)) : nullptr;
-	}
-
-private:
-	std::shared_ptr<PipelineStatePayload> RequirePayload() const {
-		auto payload = GetPayload();
-		if (!payload) {
-			throw std::runtime_error("PipelineState has no active payload");
-		}
-		return payload;
-	}
-	std::shared_ptr<PipelineStatePayload> RequirePayload(BackendInstanceId backendInstance) const {
-		auto payload = GetPayload(backendInstance);
-		if (!payload || !payload->pso) {
-			throw std::runtime_error("PipelineState has no payload for backend instance " +
-				std::to_string(static_cast<uint8_t>(backendInstance)));
-		}
-		return payload;
-	}
-
-	using Slots = std::array<PipelineStateSlot, kMaxPipelineDevices>;
-	std::shared_ptr<Slots> m_slots;
-};
-
 
 } // namespace org

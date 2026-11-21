@@ -10,7 +10,6 @@
 #include <spdlog/spdlog.h>
 
 #include "Render/FeatureDomainRegistry.h"
-#include "Render/PipelineDesc.h"
 #include "Render/ResourceRegistry.h"
 #include "RenderPasses/Base/RenderPass.h"
 #include "ResourceRequirements.h"
