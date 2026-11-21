@@ -447,14 +447,19 @@ std::vector<CommandListPair> CommandListPool::AcquireBatch(size_t count, uint64_
         if (m_available.size() >= count) break;
         if (m_stopBackgroundReset)
             throw std::runtime_error("Command-list pool stopped before satisfying batch demand");
+        // A queued reset may not start soon: its task service's threads can be busy, or blocked on what this caller holds (a
+        // submission holds the sequencer here). Wait a little for it, then make the shortfall on this thread.
+        bool inlineAfterWait = false;
         if (m_backgroundResetScheduled.load(std::memory_order_acquire)) {
             waited = true;
-            m_availableReady.wait(lock, [this, count] {
+            const bool ready = m_availableReady.wait_for(lock, std::chrono::milliseconds(20), [this, count] {
                 return m_available.size() >= count || m_stopBackgroundReset
                     || m_backgroundFailure
                     || !m_backgroundResetScheduled.load(std::memory_order_acquire);
             });
-            continue;
+            if (ready) continue;
+            inlineAfterWait = true;
+            ++m_diagnostics.resetWaitTimeouts;
         }
 
         const size_t shortage = count - m_available.size();
@@ -463,7 +468,7 @@ std::vector<CommandListPair> CommandListPool::AcquireBatch(size_t count, uint64_
         m_capacityTargetCount = (std::max)(m_capacityTargetCount, TotalOwnedLocked() + shortage);
         UpdateDiagnosticsCountsLocked();
         lock.unlock();
-        if (ScheduleBackgroundReset()) {
+        if (!inlineAfterWait && ScheduleBackgroundReset()) {
             waited = true;
             continue;
         }

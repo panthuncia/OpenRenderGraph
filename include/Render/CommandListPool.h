@@ -125,6 +125,7 @@ public:
         uint64_t acquisitionWaitCount = 0;
         uint64_t acquisitionWaitDurationNs = 0;
         uint64_t inlineCreateFallbackCount = 0;
+        uint64_t resetWaitTimeouts = 0;  // acquisitions that stopped waiting for a queued reset and made their lists themselves
         uint64_t startupStallCount = 0;
         uint64_t growthStallCount = 0;
         uint64_t backgroundCreatedCount = 0;
