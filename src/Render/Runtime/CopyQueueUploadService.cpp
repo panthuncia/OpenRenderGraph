@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <unordered_set>
 
 #include <rhi_helpers.h>
@@ -9,6 +10,7 @@
 #include <BasicTelemetry/Telemetry.h>
 #include <BasicTelemetry/Tracy.h>
 
+#include "OpenRenderGraph/Runtime.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/Resource.h"
 #include "Resources/ResourceStateTracker.h"
@@ -969,9 +971,12 @@ void CopyQueueUploadService::SubmitterMain(std::stop_token stopToken) {
 			}
 		}
 	} catch (const std::exception& error) {
+		// No call returns this: the thread is the uploader's own. Its copies stay queued and never complete.
 		spdlog::error("CopyQueueUploadService '{}': submitter stopped after exception: {}", m_config.debugName, error.what());
+		org::Runtime::ReportError("copy-queue uploader '" + m_config.debugName + "' stopped: " + error.what());
 	} catch (...) {
 		spdlog::error("CopyQueueUploadService '{}': submitter stopped after unknown exception", m_config.debugName);
+		org::Runtime::ReportError("copy-queue uploader '" + m_config.debugName + "' stopped after an unknown exception");
 	}
 }
 

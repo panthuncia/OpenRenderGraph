@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <tuple>
 #include <memory>
@@ -9,6 +10,7 @@
 #include <set>
 #include <source_location>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include <rhi.h>
@@ -48,6 +50,10 @@ public:
 		uint32_t slots = 3;
 		// Required: the host's job system, which runs graph builds, recording fan-out and background work.
 		std::shared_ptr<runtime::ITaskService> tasks;
+		// The host's handler of a failure deep in a runtime service that no call can return: a staging page that could not be
+		// mapped, the copy-queue uploader's thread stopping. Any thread. After it returns, the service acts as if the work
+		// failed (the copy is left out, the uploader stays stopped). Empty: the failure is only logged.
+		std::function<void(std::string_view)> onError;
 	};
 
 	// The most runs in flight a runtime serves: a bound on GraphHost's lease indices, and on Desc::slots. Indices are 32-bit
@@ -58,6 +64,9 @@ public:
 	static std::shared_ptr<Runtime> Create(Desc desc);
 	// The live runtime, for code with none in reach (resource teardown). Null when there is none.
 	static Runtime* Current() noexcept;
+	// Hands a failure no call can return to the live runtime's Desc::onError. Logged as critical without a runtime or a
+	// handler. Any thread.
+	static void ReportError(std::string_view error);
 
 	Runtime(const Runtime&) = delete;
 	Runtime& operator=(const Runtime&) = delete;
