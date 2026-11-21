@@ -13,7 +13,7 @@ ScheduleTraceNames ScheduleTraceNamesOf(const State& state, const persistent::Se
 		if (logical && prepared < logical->passSlots.size() && !logical->passSlots[prepared].debugName.empty())
 			return logical->passSlots[prepared].debugName;
 		for (const auto& main : state.mainPasses)
-			if (!main.retired && main.id.index == prepared) return main.name;
+			if (main.id.index == prepared) return main.name;
 		return {};
 	};
 	names.resource = [&state](uint32_t slot) -> std::string {
@@ -82,7 +82,7 @@ void RenderGraph::WritePersistentGraphDebugDump(const persistent::SelectedPublic
 		const auto& graph = *executable.graph;
 		const auto& structure = *graph.structure;
 		std::unordered_map<uint32_t, const std::string*> nameBySlot;
-		for (const auto& main : state.mainPasses) if (!main.retired) nameBySlot.emplace(main.id.index, &main.name);
+		for (const auto& main : state.mainPasses) nameBySlot.emplace(main.id.index, &main.name);
 		auto passName = [&](uint32_t pass) -> std::string {
 			const auto found = nameBySlot.find(structure.passes[pass].preparedPassIndex);
 			return found != nameBySlot.end() ? *found->second : "<pass " + std::to_string(pass) + ">";
@@ -108,8 +108,7 @@ void RenderGraph::WritePersistentGraphDebugDump(const persistent::SelectedPublic
 			<< " alias_plans=" << state.aliasPlans << "\n"
 			<< "passes=" << structure.passes.size() << " batches=" << graph.batches.size() << " resources=" << structure.resourceIDs.size()
 			<< " explicit_edges=" << structure.explicitEdges.size() << " placement_edges=" << structure.placementEdges.size()
-			<< " upload_passes=" << state.uploadMasterIndices.size()
-			<< " hosted_frame_interrupting=" << state.hostedMainPasses.size() << "\n\n[Batches]\n";
+			<< " upload_passes=" << state.uploadMasterIndices.size() << "\n\n[Batches]\n";
 		for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
 			const auto& batch = graph.batches[batchIndex];
 			dump << "batch " << batchIndex << " queue=" << batch.queue << "\n";

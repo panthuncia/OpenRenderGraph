@@ -32,26 +32,20 @@ namespace {
 
 } // namespace
 
-RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
-	const ExternalPassDesc& d,
-	bool callSetup,
-	bool materializeReferencedResources)
+RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(const ExternalPassDesc& d)
 {
 	const bool traceLifecycle = m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled();
-	const bool traceStructuralMaterialize = materializeReferencedResources && !callSetup;
-	const bool logStructuralMaterialize = traceStructuralMaterialize && traceLifecycle;
+	const bool logStructuralMaterialize = traceLifecycle;
 	AnyPassAndResources any;
 	any.type = d.type;
 	any.name = d.name;
 
 	if (logStructuralMaterialize) {
 		spdlog::info(
-			"RG structural materialize begin pass='{}' type={} preferredQueue={} pinnedQueue={} registerName={}",
+			"RG structural materialize begin pass='{}' type={} preferredQueue={}",
 			d.name,
 			PassTypeToString(d.type),
-			QueueKindToString(ResolveExternalPreferredQueueKind(d)),
-			d.pinnedQueueSlot.has_value() ? std::to_string(static_cast<unsigned int>(static_cast<uint8_t>(*d.pinnedQueueSlot))) : std::string("none"),
-			d.registerName);
+			QueueKindToString(ResolveExternalPreferredQueueKind(d)));
 	}
 
 	if (d.type == PassType::Render) {
@@ -96,18 +90,12 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resources.isGeometryPass = b.params.isGeometryPass;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
 			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
-			par.resources.pinnedQueueSlot = d.pinnedQueueSlot;
-			if (materializeReferencedResources) {
-				if (traceLifecycle) {
-					spdlog::info("RG materialize external render pass '{}' materialize referenced resources begin", d.name);
-				}
-				if (logStructuralMaterialize) {
-					spdlog::info("RG structural materialize render pass='{}' referenced resources begin", d.name);
-				}
-				MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions, d.name);
-				if (logStructuralMaterialize) {
-					spdlog::info("RG structural materialize render pass='{}' referenced resources complete", d.name);
-				}
+			if (logStructuralMaterialize) {
+				spdlog::info("RG structural materialize render pass='{}' referenced resources begin", d.name);
+			}
+			MaterializeReferencedResources(par.resources.staticResourceRequirements, par.resources.internalTransitions, d.name);
+			if (logStructuralMaterialize) {
+				spdlog::info("RG structural materialize render pass='{}' referenced resources complete", d.name);
 			}
 			par.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
 				par.resources.staticResourceRequirements,
@@ -116,29 +104,14 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 			par.resolverGroupPlan = lowering::PlanResolverGroups(par);
 		}
 
-		if (callSetup) {
-			par.pass->ConfigureRuntimeServices(m_uploadService, m_descriptorService);
-			par.pass->ConfigureResourceRegistryView(
-				MakePassResourceRegistryView(_registry, par.resources), par.resources);
-			if (traceLifecycle) {
-				spdlog::info("RG materialize external render pass '{}' setup begin", d.name);
-			}
-			par.pass->Setup();
-			if (traceLifecycle) {
-				spdlog::info("RG materialize external render pass '{}' setup complete", d.name);
-			}
-		}
-
 		any.pass = std::move(par);
 	}
 
 	if (logStructuralMaterialize) {
 		spdlog::info("RG structural materialize complete pass='{}' type={}", d.name, PassTypeToString(d.type));
 	}
-	if (traceStructuralMaterialize) {
-		if (m_structuralMaterializeCheckpointCallback) {
-			m_structuralMaterializeCheckpointCallback(d.name);
-		}
+	if (m_structuralMaterializeCheckpointCallback) {
+		m_structuralMaterializeCheckpointCallback(d.name);
 	}
 
 	return any;
@@ -146,10 +119,6 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(
 
 void RenderGraph::RegisterExternalPassName(const ExternalPassDesc& d, AnyPassAndResources& any)
 {
-	if (!d.registerName) {
-		return;
-	}
-
 	if (d.type == PassType::Render) {
 		auto& rp = std::get<RenderPassAndResources>(any.pass);
 		if (!d.name.empty()) {
@@ -200,7 +169,7 @@ void RenderGraph::CompileStructural() {
 	};
 
 	auto makeAny = [&](ExternalPassDesc const& d) -> AnyPassAndResources {
-		return MaterializeExternalPass(d, false, true);
+		return MaterializeExternalPass(d);
 	};
 
 	// Sentinels (must not collide with real pass names)
@@ -294,7 +263,7 @@ void RenderGraph::CompileStructural() {
 			if (m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled()) {
 				spdlog::info("RG gather structural extension {} materialize begin name='{}' type={} localOrder={}", ei, d.name, static_cast<int>(d.type), localOrder);
 			}
-			it.pr = MaterializeExternalPass(d, false, true);
+			it.pr = MaterializeExternalPass(d);
 			if (m_getRenderGraphBatchTraceEnabled && m_getRenderGraphBatchTraceEnabled()) {
 				spdlog::info("RG gather structural extension {} materialize complete name='{}'", ei, d.name);
 			}

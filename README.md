@@ -33,7 +33,6 @@ Each widget has its own header and CMake target:
 
 - `DebugUI/ScheduleInspector.h` (`OpenRenderGraph::ScheduleUI`, `OPENRENDERGRAPH_ENABLE_SCHEDULE_UI`)
 - `DebugUI/MemoryIntrospectionWidget.h` (`OpenRenderGraph::MemoryUI`, `OPENRENDERGRAPH_ENABLE_MEMORY_UI`)
-- `DebugUI/MemoryViewWidget.h` (`OpenRenderGraph::DebugUI`, `OPENRENDERGRAPH_ENABLE_DEBUG_UI`)
 
 ## Basic usage
 
@@ -153,7 +152,6 @@ host.AddExtension("my.extension", [] { return std::make_unique<MyExtension>(); }
 ```
 
 `ExternalPassDesc` places a pass (`At`: after or before other passes), names its queue, and tags it with an epoch.
-`GatherFramePasses` adds per-frame passes (readback captures); `InterruptsFrame` hosts one at its insert point.
 
 Resources are `Buffer`, `PixelBuffer` and the wrappers built on them (`VersionedBuffer`, `ExternalTextureResource`,
 ...). They are created unmaterialized and get memory when the graph first uses them; transient ones may share memory
@@ -184,7 +182,6 @@ epochs, anchors and exported resources; `samples/ContributorSample.cpp` is a min
 ORG exposes service interfaces through `RenderGraph`:
 
 - `GetUploadService()`
-- `GetReadbackService()`
 - `GetStatisticsService()`
 - `GetRenderGraphSettingsService()`
 

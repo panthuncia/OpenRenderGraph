@@ -3191,8 +3191,6 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 		DrainSubmissions("a submission on the calling thread");
 		SubmitTicket(async, index, std::move(ticket), beforeSubmit, std::move(resourceOwner), std::move(recording));
 	}
-	// Completed readback captures reach their callbacks here: a ticket's frame never runs Update, which polls them.
-	if (auto* readback = m_instances[instance].graph->GetReadbackService()) readback->ProcessReadbackRequests();
 }
 
 void GraphHost::RunSubmitThread() {

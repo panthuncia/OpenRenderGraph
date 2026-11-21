@@ -17,7 +17,6 @@
 namespace org::runtime {
 class ITaskService;
 class IUploadService;
-class IReadbackService;
 class IDescriptorService;
 class IStatisticsService;
 class IRenderGraphSettingsService;
@@ -33,7 +32,7 @@ class FrameArena;
 // The ORG runtime of a device: what every graph on it shares. One per process for now (the services behind it are still
 // process singletons); graphs and hosts take it and never initialize, reset or shut down shared state themselves.
 // - The device, and the queues whose progress bounds retirement (the device's three, plus RegisterQueue's).
-// - The services: tasks, uploads, readbacks, descriptors, statistics, settings.
+// - The services: tasks, uploads, descriptors, statistics, settings.
 // - Retirement by submission frontier (Retire): deferred deletions and descriptor releases are destroyed once every queue
 //   has completed what was submitted to it when they were released, whoever submitted it.
 // Thread safety: Frontier, Retire and RegisterQueue may be called from any thread. Synchronization across threads is a first
@@ -70,7 +69,6 @@ public:
 
 	const std::shared_ptr<runtime::ITaskService>& Tasks() const noexcept { return m_desc.tasks; }
 	const std::shared_ptr<runtime::IUploadService>& Uploads() const noexcept { return m_uploads; }
-	const std::shared_ptr<runtime::IReadbackService>& Readbacks() const noexcept { return m_readbacks; }
 	const std::shared_ptr<runtime::IDescriptorService>& Descriptors() const noexcept { return m_descriptors; }
 	const std::shared_ptr<runtime::IStatisticsService>& Statistics() const noexcept { return m_statistics; }
 	const std::shared_ptr<runtime::IRenderGraphSettingsService>& Settings() const noexcept { return m_settings; }
@@ -170,12 +168,10 @@ private:
 
 	Desc m_desc;
 	std::shared_ptr<runtime::IUploadService> m_uploads;
-	std::shared_ptr<runtime::IReadbackService> m_readbacks;
 	std::shared_ptr<runtime::IDescriptorService> m_descriptors;
 	std::shared_ptr<runtime::IStatisticsService> m_statistics;
 	std::shared_ptr<runtime::IRenderGraphSettingsService> m_settings;
 	std::shared_ptr<FrameArena> m_arena;
-	rhi::TimelinePtr m_readbackFence, m_copyReadbackFence;
 	std::shared_ptr<persistent::ResourceSequencer> m_sequencer;
 	std::shared_ptr<compiler::ScheduleCache> m_schedules;
 

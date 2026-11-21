@@ -29,7 +29,6 @@
 #include "Render/MemoryIntrospectionAPI.h"
 #include "Render/Runtime/IStatisticsService.h"
 #include "Render/Runtime/IUploadService.h"
-#include "Render/Runtime/IReadbackService.h"
 #include "Render/Runtime/IDescriptorService.h"
 #include "Render/Runtime/IRenderGraphSettingsService.h"
 #include "Render/Runtime/ITaskService.h"
@@ -608,10 +607,9 @@ public:
 	const org::memory::SnapshotProvider& GetMemorySnapshotProvider() const { return m_memorySnapshotProvider; }
 	void WriteVramUsageDebugDumpNow(uint32_t frameIndex) const { WriteVramUsageDebugDump(frameIndex); }
 	void SetStatisticsService(std::shared_ptr<org::runtime::IStatisticsService> service) { m_statisticsService = std::move(service); }
-	// Whether the graph drives the runtime's frame-indexed services: statistics query slots, persistent readback captures and
-	// readback completion polling. One graph on a runtime does (the per-frame one) until those services are per execution
-	// (docs/job-graphs.md, Phase 3); a graph executing alongside it (a job graph, on another thread) does not: it records no
-	// statistics, places no captures and leaves readback completions to that graph. Set before Setup.
+	// Whether the graph drives the runtime's frame-indexed services: statistics query slots. One graph on a runtime does
+	// (the per-frame one) until those services are per execution (docs/job-graphs.md, Phase 3); a graph executing alongside
+	// it (a job graph, on another thread) does not: it records no statistics. Set before Setup.
 	void SetDrivesFrameServices(bool drives) {
 		m_drivesFrameServices = drives;
 		if (!drives) m_statisticsService.reset();
@@ -623,10 +621,6 @@ public:
 	org::runtime::IUploadService* GetUploadService() { return m_uploadService.get(); }
 	const org::runtime::IUploadService* GetUploadService() const { return m_uploadService.get(); }
 	std::shared_ptr<org::runtime::IUploadService> RetainUploadService() const { return m_uploadService; }
-	void SetReadbackService(std::shared_ptr<org::runtime::IReadbackService> service) { m_readbackService = std::move(service); }
-	std::shared_ptr<org::runtime::IReadbackService> GetReadbackServiceOwner() const { return m_readbackService; }
-	org::runtime::IReadbackService* GetReadbackService() { return m_readbackService.get(); }
-	const org::runtime::IReadbackService* GetReadbackService() const { return m_readbackService.get(); }
 	void SetDescriptorService(std::shared_ptr<org::runtime::IDescriptorService> service) { m_descriptorService = std::move(service); }
 	org::runtime::IDescriptorService* GetDescriptorService() { return m_descriptorService.get(); }
 	const org::runtime::IDescriptorService* GetDescriptorService() const { return m_descriptorService.get(); }
@@ -650,9 +644,6 @@ public:
 	//void CreateResource(std::wstring name);
 	std::shared_ptr<Resource> GetResourceByName(const std::string& name);
 	std::shared_ptr<Resource> GetResourceByID(const uint64_t id);
-	// The resource a persistent executable schedules under this identity (ScheduleTrace::Resource::id), for a debug capture;
-	// null when none does.
-	std::shared_ptr<Resource> GetScheduledResource(uint64_t schedulingID) const;
 	std::shared_ptr<RenderPass> GetRenderPassByName(const std::string& name);
 
 	void RegisterProvider(IResourceProvider* prov);
@@ -864,7 +855,7 @@ private:
 		const PersistentExecutionOptions& options);
 	void BootstrapPersistentGraph();
 	// bootstrap: the first, whose passes were all just declared.
-	void BindPersistentFrame(bool ticket, bool bootstrap);
+	void BindPersistentFrame(bool bootstrap);
 	PersistentExecution PreparePersistentExecution(rhi::Device device, uint32_t frameIndex, const IHostExecutionData* hostData,
 		float deltaTime, const PersistentExecutionOptions& options);
 	// Execution of the prepared one: its uploads, then its main segment's admission, recording and submission.
@@ -923,10 +914,6 @@ private:
 	// Blocks until the pending structural build is installed (a relower that cannot be prepared against the live publication).
 	void DrainPersistentStructuralBuild(std::vector<uint32_t>& structural);
 	void RunPersistentStructuralBuildPhase(bool validated);
-	// Hosts this frame's frame-interrupting passes in the main executable and
-	// removes the previous frame's. Passes that name no main pass to insert
-	// against are dropped.
-	void UpdatePersistentFrameInterruptingPasses(std::vector<ExternalPassDesc> requested, rhi::Backend primaryBackend);
 	// Compile-dump mode for the persistent graph: written once per selected executable.
 	void WritePersistentGraphDebugDump(const persistent::SelectedPublication& selected) const;
 	// Schedule introspection, owner thread. Traces the selected executable and its epochs' when it is not the traced one.
@@ -1012,7 +999,6 @@ private:
 	org::memory::SnapshotProvider m_memorySnapshotProvider;
 	std::shared_ptr<org::runtime::IStatisticsService> m_statisticsService;
 	std::shared_ptr<org::runtime::IUploadService> m_uploadService;
-	std::shared_ptr<org::runtime::IReadbackService> m_readbackService;
 	std::shared_ptr<org::runtime::IDescriptorService> m_descriptorService;
 	std::shared_ptr<org::runtime::IRenderGraphSettingsService> m_renderGraphSettingsService;
 	std::shared_ptr<org::runtime::ITaskService> m_taskService;
@@ -1103,7 +1089,7 @@ private:
 	// lowers from this directly; the old compiler's RefreshRetainedDeclarationsForFrame also updates its declaration cache.
 	void RedeclarePass(PassAndResources& p, PassType type);
 	void WriteVramUsageDebugDump(uint32_t frameIndex) const;
-	AnyPassAndResources MaterializeExternalPass(const ExternalPassDesc& desc, bool callSetup, bool materializeReferencedResources);
+	AnyPassAndResources MaterializeExternalPass(const ExternalPassDesc& desc);
 	void RegisterExternalPassName(const ExternalPassDesc& desc, AnyPassAndResources& any);
 
 	struct PassView {

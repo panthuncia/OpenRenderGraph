@@ -27,9 +27,12 @@ class Buffer;
 // - A pinned region is kept until its owner frees it. Published copies and runs outside a lease use these
 //   (RunRef::Stable), because their recordings are submitted again. Pinned regions live in chunks of their own, so they
 //   never hold a run's chunk. A freed pinned region is reused only once the GPU reached the point it was freed at.
+// - An oversize region (AcquireOversize) has a chunk of its own, of kChunkBytes or more: a client's staging data, such as
+//   vertices or texture rows, which may be larger than a chunk. It starts at the chunk's first byte. It is freed as a
+//   pinned region is, when its last holder lets it go, and its chunk is then reused for the next one that fits.
 //
-// Every region is zeroed when it is allocated. Any thread.
-class FrameArena {
+// Every region but an oversize one is zeroed when it is allocated. Any thread.
+class FrameArena : public std::enable_shared_from_this<FrameArena> {
 public:
 	static constexpr uint32_t kAlignment = 256;
 	static constexpr uint32_t kChunkBytes = 256u * 1024u;
@@ -46,6 +49,7 @@ public:
 	struct Stats {
 		uint64_t chunks = 0, chunkBytes = 0;    // every chunk, for runs and pinned
 		uint64_t pinnedChunks = 0;
+		uint64_t oversizeChunks = 0;
 		uint64_t liveBytes = 0, peakLiveBytes = 0;  // bytes in live regions now, and the most since the last TakeStats
 		uint64_t pinnedBytes = 0;               // of liveBytes, in pinned regions
 		uint64_t liveRegions = 0;
@@ -71,6 +75,11 @@ public:
 	Region AllocatePinned(uint32_t bytes);
 	// The region is reused once the GPU reached what was submitted until now.
 	void FreePinned(const Region& region);
+	// An oversize region of at least `bytes`, in a chunk of its own: the smallest empty oversize chunk that holds it, else a
+	// new one of kChunkBytes or the next power of two. Its offset is 0, so the chunk's view reads it from its start. It is not
+	// zeroed. The last holder frees it, through FreePinned, so the holder must be what the GPU work that reads it retains
+	// (RecordingContext::Retain). Throws when it cannot be made. The arena must be owned by a shared_ptr.
+	std::shared_ptr<const Region> AcquireOversize(uint64_t bytes);
 	// The host retired the run's lease: its regions are free.
 	void ReleaseRun(uint32_t lease, uint32_t generation);
 
@@ -92,7 +101,8 @@ private:
 		bool open = false;  // freed while the frontier was not settled: frontier is not taken yet
 	};
 
-	Chunk* MakeChunkLocked(uint32_t bytes, bool pinned);
+	enum class Kind : uint8_t { Run, Pinned, Oversize };
+	Chunk* MakeChunkLocked(uint32_t bytes, Kind kind);
 	Region TakeLocked(bool pinned, uint32_t bytes, Chunk** taken = nullptr);
 	void FreeLocked(Chunk& chunk, uint32_t size);
 	void ReleaseRunLocked(RunRegions& run);

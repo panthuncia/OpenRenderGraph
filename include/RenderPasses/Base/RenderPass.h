@@ -59,7 +59,6 @@ struct PassParameters {
 	bool isGeometryPass = false;
 	QueueKind preferredQueueKind = QueueKind::Graphics;
 	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
 	BackendAffinity backendAffinity{};
 };
 using RenderPassParameters = PassParameters;

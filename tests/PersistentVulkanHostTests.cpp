@@ -1426,6 +1426,21 @@ static int Run(int argc, char** argv) {
 					runtime->Arena()->ReleaseRun(3, 2);
 					runtime->Arena()->ReleaseRun(4, 1);
 				}
+				// An oversize region has a chunk of its own at offset 0, and its chunk comes back once its last holder lets it go.
+				{
+					const auto& arena = runtime->Arena();
+					const auto before = arena->TakeStats().oversizeChunks;
+					auto large = arena->AcquireOversize(org::FrameArena::kChunkBytes + 1);
+					REQUIRE(large && large->offset == 0 && large->size >= org::FrameArena::kChunkBytes + 1, "an oversize region starts its own chunk");
+					auto small = arena->AcquireOversize(16);
+					REQUIRE(small && small->offset == 0 && small->buffer != large->buffer, "each oversize region has its own chunk");
+					const auto* largeBuffer = large->buffer;
+					large.reset();
+					arena->Trim();
+					auto again = arena->AcquireOversize(org::FrameArena::kChunkBytes + 1);
+					REQUIRE(again && again->buffer == largeBuffer, "a freed oversize chunk is reused by the next region that fits");
+					REQUIRE(arena->TakeStats().oversizeChunks == before + 2, "no chunk is made for a reused region");
+				}
 				auto program = CreateProgram(device.Get());
 				REQUIRE(program, "compute program");
 				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
@@ -2107,37 +2122,6 @@ static int Run(int argc, char** argv) {
 					outputRevision->fetch_add(1, std::memory_order_release);
 				});
 				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "a ticket made stale by its commit is prepared again");
-			}
-
-			// A readback capture after a mid-frame pass. It captures the write pass's target as the pass left it. The copy is
-			// recorded in the pass's own recording, so the executable is not built again.
-			if (!async && !revision) {
-				auto* graph = host.Graph();
-				graph->SetScheduleTraceEnabled(true);
-				value = 6600u;
-				host.ExecuteFrame(nullptr, upload);
-				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait before the capture");
-				const auto traced = graph->GetPersistentScheduleSnapshot();
-				REQUIRE(traced && !traced->executables.empty(), "a traced executable");
-				const auto revisionBefore = traced->executables.front()->structuralRevision;
-				std::vector<uint32_t> captured;
-				graph->GetReadbackService()->RequestReadbackCapture("test.write", scratch.get(), {},
-					[&](org::ReadbackCaptureResult&& result) {
-						captured.resize(result.data.size() / sizeof(uint32_t));
-						std::memcpy(captured.data(), result.data.data(), captured.size() * sizeof(uint32_t));
-					});
-				value = 6700u;
-				host.ExecuteFrame(nullptr, upload);
-				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for the captured frame");
-				graph->GetReadbackService()->ProcessReadbackRequests();
-				REQUIRE(captured.size() >= kCount, "the capture completes");
-				bool matches = true;
-				for (uint32_t i = 0; i < kCount; ++i) matches = matches && captured[i] == value + i;
-				REQUIRE(matches, "the capture holds what the pass wrote");
-				const auto after = graph->GetPersistentScheduleSnapshot();
-				REQUIRE(after && !after->executables.empty() && after->executables.front()->structuralRevision == revisionBefore,
-					"the capture did not build the executable again");
-				graph->SetScheduleTraceEnabled(false);
 			}
 
 			// A rebuild (e.g. on resize) retires the old graph and keeps rendering.
