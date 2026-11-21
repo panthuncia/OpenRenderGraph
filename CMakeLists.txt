@@ -91,11 +91,13 @@ add_library(OpenRenderGraph STATIC
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/BorrowedRecorder.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/ContributorHost.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Contributor/DeviceTable.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/EpochRecordings.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/GraphHost.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/JobGraph.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/GraphInstance.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Host/DeviceMemory.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Telemetry/NvPerfCapture.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/EpochRecordings.h"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/GraphHost.h"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/DeviceMemory.h"
 	"${CMAKE_CURRENT_SOURCE_DIR}/include/OpenRenderGraph/Runtime.h"
@@ -320,6 +322,12 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_features(OpenRenderGraphRunSlotsTests PRIVATE cxx_std_23)
     target_link_libraries(OpenRenderGraphRunSlotsTests PRIVATE OpenRenderGraph)
     add_test(NAME OpenRenderGraphRunSlotsTests COMMAND OpenRenderGraphRunSlotsTests)
+    # Epoch recording outcome rules and the recording cache (no device).
+    add_executable(OpenRenderGraphEpochRecordingsTests tests/EpochRecordingsTests.cpp)
+    target_compile_features(OpenRenderGraphEpochRecordingsTests PRIVATE cxx_std_23)
+    target_compile_definitions(OpenRenderGraphEpochRecordingsTests PRIVATE NOMINMAX)
+    target_link_libraries(OpenRenderGraphEpochRecordingsTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphEpochRecordingsTests COMMAND OpenRenderGraphEpochRecordingsTests)
     add_executable(OpenRenderGraphAliasPackingTests tests/AliasPackingTests.cpp src/Render/RenderGraph/AliasPacking.cpp)
     target_compile_features(OpenRenderGraphAliasPackingTests PRIVATE cxx_std_23)
     add_test(NAME OpenRenderGraphAliasPackingTests COMMAND OpenRenderGraphAliasPackingTests)
