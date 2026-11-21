@@ -498,13 +498,15 @@ std::shared_ptr<Resource> CreateContributorResource(const std::string& id, const
 		buffer->SetName(id);
 		return buffer;
 	}
-	if (desc.dimension != ORG_RG_RESOURCE_TEXTURE_2D || desc.sampleCount > 1)
+	if (desc.dimension != ORG_RG_RESOURCE_TEXTURE_2D)
 		throw std::invalid_argument("Contributor resource kind is not supported (2D textures and buffers): " + id);
 	TextureDescription texture;
 	texture.format = static_cast<rhi::Format>(desc.format);
 	texture.channels = 4;
 	texture.arraySize = (std::max)(1u, desc.depthOrArraySize);
 	texture.isArray = texture.arraySize > 1;
+	// The registry admits a multisampled texture only with one mip and no unordered access.
+	texture.sampleCount = static_cast<uint8_t>((std::max)(1u, desc.sampleCount));
 	texture.hasSRV = (desc.allowedUsages & ORG_RG_USAGE_SHADER_RESOURCE) != 0;
 	texture.hasUAV = unordered;
 	texture.hasNonShaderVisibleUAV = unordered;

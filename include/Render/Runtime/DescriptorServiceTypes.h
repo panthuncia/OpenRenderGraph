@@ -32,6 +32,8 @@ struct DescriptorViewRequirements {
 
         bool createCubemapAsArraySRV = false;
         uint32_t uavFirstMip = 0;
+        // Above 1: a multisampled 2D texture or array. Its views have the MS dimensions. It has one mip and no UAVs.
+        uint32_t sampleCount = 1;
     };
 
     struct BufferViews {

@@ -269,6 +269,9 @@ ORGStatus ContributorRegistry::DeclareResource(ORGBuildHandle buildHandle, const
 			return ORG_RG_E_INCOMPATIBLE_RESOURCE;
 		if (desc->dimension == ORG_RG_RESOURCE_TEXTURE_3D && desc->sampleCount != 1)
 			return ORG_RG_E_INCOMPATIBLE_RESOURCE;
+		// D3D12 and Vulkan sample counts are powers of two, at most 16 here.
+		if (desc->sampleCount > 16 || (desc->sampleCount & (desc->sampleCount - 1)) != 0)
+			return ORG_RG_E_UNSUPPORTED_CAPABILITY;
 		if (desc->sampleCount > 1 && (desc->mipLevels != 1 ||
 			(desc->allowedUsages & ORG_RG_USAGE_UNORDERED_ACCESS)))
 			return ORG_RG_E_INCOMPATIBLE_RESOURCE;

@@ -31,6 +31,12 @@ enum class SRVViewType : int {
 	TextureCubeArrayFull,
 	// The stencil plane of a 2D depth-stencil texture, read as uint (D3D12: its second channel; Vulkan: its first).
 	Texture2DStencil,
+	// A multisampled 2D texture's one view.
+	Texture2DMS,
+	// One slice of a multisampled 2D array, one view per slice.
+	Texture2DMSArray,
+	// Every slice of a multisampled 2D array.
+	Texture2DMSArrayFull,
 	NumSRVViewTypes
 };
 

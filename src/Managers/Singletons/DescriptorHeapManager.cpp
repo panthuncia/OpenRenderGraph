@@ -40,9 +40,34 @@ namespace {
 		}
 	}
 
+	bool IsMultisampled(const DescriptorHeapManager::ViewRequirements::TextureViews& tex) {
+		return tex.sampleCount > 1;
+	}
+
+	// A D3D12 Texture2DMS view has no plane slice, so a multisampled depth texture gets no stencil view.
 	bool WantsStencilSrv(const DescriptorHeapManager::ViewRequirements::TextureViews& tex) {
-		return tex.createSRV && !tex.isArray && !tex.isCubemap && !tex.is3D &&
+		return tex.createSRV && !tex.isArray && !tex.isCubemap && !tex.is3D && !IsMultisampled(tex) &&
 			(HasStencilPlane(tex.baseFormat) || HasStencilPlane(tex.dsvFormat));
+	}
+
+	// The default SRV variant of a texture: its per-mip, per-slice views.
+	SRVViewType DefaultTextureSrvType(const DescriptorHeapManager::ViewRequirements::TextureViews& tex) {
+		if (IsMultisampled(tex)) return tex.isArray ? SRVViewType::Texture2DMSArray : SRVViewType::Texture2DMS;
+		if (tex.isArray) return tex.isCubemap ? SRVViewType::TextureCubeArray : SRVViewType::Texture2DArray;
+		if (tex.isCubemap) return SRVViewType::TextureCube;
+		return SRVViewType::Texture2D;
+	}
+
+	// A multisampled texture is a 2D texture or array with one mip, and no unordered access (D3D12 and Vulkan have none
+	// without extra features). Anything else is a caller error.
+	void RequireValidMultisampledViews(const DescriptorHeapManager::ViewRequirements::TextureViews& tex) {
+		if (!IsMultisampled(tex)) return;
+		if (tex.is3D || tex.isCubemap)
+			throw std::invalid_argument("A multisampled texture must be a 2D texture or 2D array");
+		if (tex.mipLevels != 1)
+			throw std::invalid_argument("A multisampled texture must have one mip");
+		if (tex.createUAV || tex.createNonShaderVisibleUAV)
+			throw std::invalid_argument("A multisampled texture has no unordered-access views");
 	}
 
 	// A texture's UAV of one mip and slice: every depth slice of a 3D texture, one array slice of an array or cube, else the 2D mip.
@@ -517,6 +542,7 @@ void DescriptorHeapManager::ReserveDescriptorSlotsUnlocked(
     }
 
     if (const auto* tex = std::get_if<ViewRequirements::TextureViews>(&req.views)) {
+        RequireValidMultisampledViews(*tex);
         auto makeShaderVisibleGrid = [&](uint32_t slices, uint32_t mips, const std::shared_ptr<DescriptorHeap>& heap) {
             std::vector<std::vector<ShaderVisibleIndexInfo>> infos;
             infos.resize(slices);
@@ -550,22 +576,18 @@ void DescriptorHeapManager::ReserveDescriptorSlotsUnlocked(
         const uint32_t srvSlices = (tex->isArray || tex->isCubemap) ? tex->arraySize : 1u;
         const uint32_t uavSlices = (tex->isArray || tex->isCubemap) ? tex->totalArraySlices : 1u;
 
-        SRVViewType srvViewType = SRVViewType::Invalid;
-        if (tex->isArray) {
-            srvViewType = tex->isCubemap ? SRVViewType::TextureCubeArray : SRVViewType::Texture2DArray;
-        }
-        else if (tex->isCubemap) {
-            srvViewType = SRVViewType::TextureCube;
-        }
-        else {
-            srvViewType = SRVViewType::Texture2D;
-        }
+        const SRVViewType srvViewType = DefaultTextureSrvType(*tex);
 
         if (tex->createSRV) {
             target.SetDefaultSRVViewType(srvViewType);
             target.SetSRVView(srvViewType, m_cbvSrvUavHeap, makeShaderVisibleGrid(srvSlices, tex->mipLevels, m_cbvSrvUavHeap));
 
-            if (tex->isArray && !tex->isCubemap) {
+            if (IsMultisampled(*tex)) {
+                if (tex->isArray) {
+                    target.SetSRVView(SRVViewType::Texture2DMSArrayFull, m_cbvSrvUavHeap, makeShaderVisibleGrid(1u, 1u, m_cbvSrvUavHeap));
+                }
+            }
+            else if (tex->isArray && !tex->isCubemap) {
                 target.SetSRVView(SRVViewType::Texture2DArrayFull, m_cbvSrvUavHeap, makeShaderVisibleGrid(1u, tex->mipLevels, m_cbvSrvUavHeap));
             }
             else if (tex->isCubemap && tex->isArray) {
@@ -673,17 +695,10 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
     }
 
     if (const auto* tex = std::get_if<ViewRequirements::TextureViews>(&req.views)) {
+        RequireValidMultisampledViews(*tex);
+        const bool multisampled = IsMultisampled(*tex);
         if (tex->createSRV) {
-            SRVViewType srvViewType = SRVViewType::Invalid;
-            if (tex->isArray) {
-                srvViewType = tex->isCubemap ? SRVViewType::TextureCubeArray : SRVViewType::Texture2DArray;
-            }
-            else if (tex->isCubemap) {
-                srvViewType = SRVViewType::TextureCube;
-            }
-            else {
-                srvViewType = SRVViewType::Texture2D;
-            }
+            const SRVViewType srvViewType = DefaultTextureSrvType(*tex);
 
             const rhi::Format srvFormat = tex->srvFormat == rhi::Format::Unknown ? tex->baseFormat : tex->srvFormat;
             const uint32_t srvSlices = (tex->isArray || tex->isCubemap) ? tex->arraySize : 1u;
@@ -699,7 +714,17 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                     rhi::SrvDesc srvDesc{};
                     srvDesc.formatOverride = srvFormat;
 
-                    if (tex->is3D) {
+                    if (multisampled) {
+                        if (tex->isArray) {
+                            srvDesc.dimension = rhi::SrvDim::Texture2DMSArray;
+                            srvDesc.tex2DMSArray.firstArraySlice = slice;
+                            srvDesc.tex2DMSArray.arraySize = 1;
+                        }
+                        else {
+                            srvDesc.dimension = rhi::SrvDim::Texture2DMS;
+                        }
+                    }
+                    else if (tex->is3D) {
                         srvDesc.dimension = rhi::SrvDim::Texture3D;
                         srvDesc.tex3D.mostDetailedMip = mip;
                         srvDesc.tex3D.mipLevels = mipLevelsForView;
@@ -738,7 +763,18 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                 }
             }
 
-            if (tex->isArray && !tex->isCubemap) {
+            if (multisampled) {
+                if (tex->isArray) {
+                    rhi::SrvDesc srvDesc{};
+                    srvDesc.formatOverride = srvFormat;
+                    srvDesc.dimension = rhi::SrvDim::Texture2DMSArray;
+                    srvDesc.tex2DMSArray.firstArraySlice = 0u;
+                    srvDesc.tex2DMSArray.arraySize = tex->arraySize;
+                    const auto& slot = target.GetSRVInfo(SRVViewType::Texture2DMSArrayFull, 0u, 0u).slot;
+                    device.CreateShaderResourceView({ shaderHeap, slot.index }, apiResource.GetHandle(), srvDesc);
+                }
+            }
+            else if (tex->isArray && !tex->isCubemap) {
                 for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
                     const uint32_t mipLevelsForView =
 #if ORG_TEXTURE_SRV_INCLUDE_LOWER_MIPS
@@ -868,7 +904,9 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                 for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
                     rhi::RtvDesc rtvDesc{};
                     rtvDesc.formatOverride = rtvFormat;
-                    rtvDesc.dimension = (tex->isArray || tex->isCubemap) ? rhi::RtvDim::Texture2DArray : rhi::RtvDim::Texture2D;
+                    const bool arrayed = tex->isArray || tex->isCubemap;
+                    rtvDesc.dimension = multisampled ? (arrayed ? rhi::RtvDim::Texture2DMSArray : rhi::RtvDim::Texture2DMS)
+                        : (arrayed ? rhi::RtvDim::Texture2DArray : rhi::RtvDim::Texture2D);
                     rtvDesc.range = {
                         static_cast<uint32_t>(mip),
                         1u,
@@ -892,7 +930,9 @@ void DescriptorHeapManager::UpdateDescriptorContentsUnlocked(
                 for (uint32_t mip = 0; mip < tex->mipLevels; ++mip) {
                     rhi::DsvDesc dsvDesc{};
                     dsvDesc.formatOverride = dsvFormat;
-                    dsvDesc.dimension = (tex->isArray || tex->isCubemap) ? rhi::DsvDim::Texture2DArray : rhi::DsvDim::Texture2D;
+                    const bool arrayed = tex->isArray || tex->isCubemap;
+                    dsvDesc.dimension = multisampled ? (arrayed ? rhi::DsvDim::Texture2DMSArray : rhi::DsvDim::Texture2DMS)
+                        : (arrayed ? rhi::DsvDim::Texture2DArray : rhi::DsvDim::Texture2D);
                     dsvDesc.range = {
                         static_cast<uint32_t>(mip),
                         1u,

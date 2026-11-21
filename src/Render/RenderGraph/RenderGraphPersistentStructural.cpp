@@ -56,6 +56,8 @@ void RenderGraph::EnsurePersistentRepresentations(Resource& resource) {
 	if (!concrete->TryGetRHIResourceDesc(desc) || desc.heapType != rhi::HeapType::DeviceLocal
 		|| (desc.type != rhi::ResourceType::Buffer && desc.type != rhi::ResourceType::Texture2D))
 		throw std::runtime_error("Multi-device resource '" + concrete->GetName() + "' is not a device-local buffer or 2D texture");
+	if (desc.type == rhi::ResourceType::Texture2D && desc.texture.sampleCount > 1)
+		throw std::runtime_error("Multi-device multisampled texture '" + concrete->GetName() + "' is unsupported");
 	desc.heapFlags |= rhi::HeapFlags::Shared;
 	if (desc.type == rhi::ResourceType::Texture2D && !rhi::vulkan::query_d3d12_texture_support(vulkan->device, desc).supported)
 		throw std::runtime_error("Multi-device texture '" + concrete->GetName() + "' is unsupported for its format and usage");

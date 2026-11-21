@@ -4,6 +4,8 @@
 #include "Utilities/ORGUtilities.h"
 #include <rhi_interop_dx12.h>
 
+#include <algorithm>
+
 namespace org {
 
 bool ExternalTextureResource::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const
@@ -17,7 +19,7 @@ bool ExternalTextureResource::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) 
 	outDesc.texture.height = m_height;
 	outDesc.texture.depthOrLayers = m_arraySize;
 	outDesc.texture.mipLevels = m_mipLevels;
-	outDesc.texture.sampleCount = 1;
+	outDesc.texture.sampleCount = (std::max)(1u, static_cast<uint32_t>(m_description.sampleCount));
 	// The description asks for exactly the views the imported image supports. Persistent
 	// graphs validate each declared view against these flags.
 	auto flags = static_cast<uint32_t>(rhi::ResourceFlags::RF_None);
@@ -44,6 +46,7 @@ DescriptorHeapManager::ViewRequirements BuildExternalTextureViews(
 	views.depth = description.depth;
 	views.arraySize = description.arraySize;
 	views.totalArraySlices = arraySize;
+	views.sampleCount = (std::max)(1u, static_cast<uint32_t>(description.sampleCount));
 	views.baseFormat = description.format;
 	views.srvFormat = description.srvFormat;
 	views.uavFormat = description.uavFormat;
@@ -95,7 +98,7 @@ bool ExternalTextureResource::IsStructurallyCompatible(const TextureDescription&
 		m_description.rtvFormat != description.rtvFormat || m_description.hasDSV != description.hasDSV ||
 		m_description.dsvFormat != description.dsvFormat || m_description.hasUAV != description.hasUAV ||
 		m_description.uavFormat != description.uavFormat || m_description.hasSRV != description.hasSRV ||
-		m_description.srvFormat != description.srvFormat ||
+		m_description.srvFormat != description.srvFormat || m_description.sampleCount != description.sampleCount ||
 		m_description.hasNonShaderVisibleUAV != description.hasNonShaderVisibleUAV)
 		return false;
 	for (size_t i = 0; i < description.imageDimensions.size(); ++i) {

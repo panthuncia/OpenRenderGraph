@@ -31,6 +31,7 @@ DescriptorHeapManager::ViewRequirements::TextureViews BuildTextureViewRequiremen
     texViews.depth = desc.depth;
     texViews.arraySize = desc.arraySize;
     texViews.totalArraySlices = totalArraySlices;
+    texViews.sampleCount = (std::max)(1u, static_cast<uint32_t>(desc.sampleCount));
 
     texViews.baseFormat = desc.format;
     texViews.srvFormat = desc.srvFormat;
@@ -56,6 +57,19 @@ DescriptorHeapManager::ViewRequirements::TextureViews BuildTextureViewRequiremen
     texViews.uavFirstMip = 0;
     return texViews;
 }
+
+// A multisampled texture is a 2D texture or array with one mip and no unordered access. D3D12 and Vulkan allow no
+// other kind without extra features.
+void RequireValidMultisampling(const TextureDescription& desc, uint32_t mipLevels)
+{
+    if (desc.sampleCount <= 1) return;
+    if (desc.type != rhi::ResourceType::Texture2D || desc.isCubemap)
+        throw std::invalid_argument("A multisampled texture must be a 2D texture or 2D array");
+    if (mipLevels != 1 || desc.generateMipMaps)
+        throw std::invalid_argument("A multisampled texture must have one mip");
+    if (desc.hasUAV || desc.hasNonShaderVisibleUAV)
+        throw std::invalid_argument("A multisampled texture has no unordered-access views");
+}
 }
 
 PixelBuffer::PixelBuffer(const TextureDescription& desc, bool materialize)
@@ -66,6 +80,7 @@ PixelBuffer::PixelBuffer(const TextureDescription& desc, bool materialize)
     // construction on, range validation uses the logical texture description.
     m_mipLevels = ResolveTextureMipLevels(desc);
     m_arraySize = desc.isCubemap ? 6u * desc.arraySize : (desc.isArray ? desc.arraySize : 1u);
+    RequireValidMultisampling(desc, m_mipLevels);
     if (materialize) {
         Materialize();
     }
@@ -150,7 +165,7 @@ SymbolicTracker* PixelBuffer::GetStateTracker() {
 }
 
 bool PixelBuffer::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
-	if (m_desc.imageDimensions.empty() || m_desc.type != rhi::ResourceType::Texture2D || m_desc.sampleCount != 1 || m_desc.hasDSV) return false;
+	if (m_desc.imageDimensions.empty() || m_desc.type != rhi::ResourceType::Texture2D || m_desc.hasDSV) return false;
 	const uint32_t arraySize = m_desc.isCubemap ? 6u * m_desc.arraySize : (m_desc.isArray ? m_desc.arraySize : 1u);
 	uint32_t width = m_desc.imageDimensions[0].width;
 	uint32_t height = m_desc.imageDimensions[0].height;
@@ -167,7 +182,7 @@ bool PixelBuffer::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 	outDesc.texture.depthOrLayers = static_cast<uint16_t>(arraySize);
 	// Use the same mip count as the backing. ResolveTextureMipLevels prefers authored levels over generateMipMaps.
 	outDesc.texture.mipLevels = static_cast<uint16_t>(m_mipLevels);
-	outDesc.texture.sampleCount = 1;
+	outDesc.texture.sampleCount = (std::max)(1u, static_cast<uint32_t>(m_desc.sampleCount));
 	outDesc.texture.initialLayout = rhi::ResourceLayout::Undefined;
 	outDesc.queueSharing = m_desc.queueSharing; // As GpuTextureBacking creates it: representations share queues the same way.
 	if (m_desc.hasRTV) outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowRenderTarget;
