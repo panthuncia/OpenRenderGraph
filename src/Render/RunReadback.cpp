@@ -10,7 +10,6 @@
 #include <cstring>
 #include <format>
 #include <mutex>
-#include <stdexcept>
 #include <utility>
 
 #include <spdlog/spdlog.h>
@@ -25,9 +24,10 @@ constexpr uint32_t kAlign = 512;
 
 constexpr uint32_t AlignPart(uint32_t bytes) { return (bytes + kAlign - 1) / kAlign * kAlign; }
 
-[[noreturn]] void Fail(const std::string& why) {
-	spdlog::critical("[ORG] run readback: {}", why);
-	throw std::runtime_error("run readback: " + why);
+// Hands an error to the host. Without a handler it is only logged.
+void Report(const RunReadback::ErrorHandler& onError, const std::string& why) {
+	if (onError) onError("run readback: " + why);
+	else spdlog::critical("[ORG] run readback: {}", why);
 }
 
 enum class Scheme : uint8_t { Parts, List, Regions };
@@ -50,6 +50,7 @@ struct RunReadback::State {
 	};
 
 	std::string name;
+	ErrorHandler onError;
 	Scheme scheme = Scheme::Parts;
 	std::shared_ptr<Buffer> buffer;  // parts and regions
 	std::vector<uint32_t> sizes;     // by part
@@ -110,8 +111,13 @@ struct RunReadback::State {
 		std::erase(Registry(), this);
 	}
 
-	void CheckLease(uint32_t lease) const {
-		if (lease >= kLeases) Fail(std::format("{} got run lease {}, past its {} regions", name, lease, kLeases));
+	void Fail(const std::string& why) const { Report(onError, why); }
+
+	// False, after the error, when the lease is past the regions.
+	bool CheckLease(uint32_t lease) const {
+		if (lease < kLeases) return true;
+		Fail(std::format("{} got run lease {}, past its {} regions", name, lease, kLeases));
+		return false;
 	}
 
 	// Under the mutex. The lease's last run is done, so its region holds what that run copied.
@@ -122,7 +128,10 @@ struct RunReadback::State {
 		if (!run.committed || !run.submitted) return;
 		void* mapped = nullptr;
 		buffer->GetAPIResource().Map(&mapped);
-		if (!mapped) Fail(std::format("{} could not be mapped", name));
+		if (!mapped) {
+			Fail(std::format("{} could not be mapped", name));
+			return;
+		}
 		const auto* region = static_cast<const std::byte*>(mapped) + uint64_t(lease) * stride;
 		for (size_t part = 0; part < sizes.size(); ++part) {
 			uint32_t written = 0;
@@ -176,7 +185,7 @@ struct RunReadback::State {
 		if (from.lease == to.lease) return;
 		const std::scoped_lock lock(mutex);
 		if (from.lease >= runs.size() || !runs[from.lease].committed || !(runs[from.lease].ref == from)) return;
-		CheckLease(to.lease);
+		if (!CheckLease(to.lease)) return;
 		if (runs.size() <= to.lease) runs.resize(size_t{to.lease} + 1);
 		Harvest(to.lease);
 		auto moved = std::exchange(runs[from.lease], Run{});
@@ -236,8 +245,7 @@ public:
 		const auto& spec = *frame.spec;
 		const auto& state = *spec.state;
 		const auto& run = recording.Run();
-		if (run.lease >= kLeases)
-			throw std::runtime_error(std::format("the readback {} got run lease {}, past its {} regions", state.name, run.lease, kLeases));
+		if (!state.CheckLease(run.lease)) return;
 		auto& commands = recording.Commands();
 		const auto destination = state.buffer->GetAPIResource().GetHandle();
 		const uint64_t base = uint64_t(run.lease) * state.stride + state.bases[spec.part];
@@ -261,18 +269,23 @@ private:
 	std::shared_ptr<const PartSpec> m_spec;
 };
 
-std::shared_ptr<Buffer> MakeReadbackBuffer(const std::string& name, uint64_t bytes) {
+// Null, after the error, when it cannot be made.
+std::shared_ptr<Buffer> MakeReadbackBuffer(const RunReadback::State& state, uint64_t bytes) {
 	auto buffer = Buffer::CreateShared(rhi::HeapType::Readback, bytes);
-	if (!buffer) Fail(std::format("the buffer {} ({} bytes) could not be made", name, bytes));
-	buffer->SetName(name);
+	if (!buffer) {
+		state.Fail(std::format("the buffer {} ({} bytes) could not be made", state.name, bytes));
+		return nullptr;
+	}
+	buffer->SetName(state.name);
 	return buffer;
 }
 
 } // namespace
 
-std::shared_ptr<RunReadback> RunReadback::Create(std::string_view name, std::vector<uint32_t> parts) {
+std::shared_ptr<RunReadback> RunReadback::Create(std::string_view name, std::vector<uint32_t> parts, ErrorHandler onError) {
 	auto made = std::make_shared<State>();
 	made->name = std::string(name);
+	made->onError = std::move(onError);
 	for (const auto bytes : parts) {
 		made->bases.push_back(made->stride);
 		made->sizes.push_back(bytes);
@@ -280,7 +293,8 @@ std::shared_ptr<RunReadback> RunReadback::Create(std::string_view name, std::vec
 	}
 	made->latest.resize(parts.size());
 	made->latestStamps.resize(parts.size());
-	made->buffer = MakeReadbackBuffer(made->name, uint64_t(made->stride) * kLeases);
+	made->buffer = MakeReadbackBuffer(*made, uint64_t(made->stride) * kLeases);
+	if (!made->buffer) return nullptr;
 	made->Register();
 	return std::make_shared<RunReadback>(std::move(made));
 }
@@ -319,7 +333,7 @@ std::function<std::shared_ptr<RenderPass>()> RunReadback::TexturePass(uint32_t p
 uint32_t RunReadback::Commit(const RunRef& run) {
 	auto& state = *m_state;
 	const std::scoped_lock lock(state.mutex);
-	state.CheckLease(run.lease);
+	if (!state.CheckLease(run.lease)) return 0;
 	if (state.runs.size() <= run.lease) state.runs.resize(size_t{run.lease} + 1);
 	// A leased run's last run on this index retired before the lease reopened. A stage's staging run holds nothing.
 	state.Harvest(run.lease);
@@ -346,18 +360,22 @@ void RunReadback::MoveStagingRun(const RunRef& from, const RunRef& to) {
 	for (auto* state : State::Registry()) state->MoveRun(from, to);
 }
 
-std::shared_ptr<RunReadback> RunReadback::CreateList(std::string_view name, const List& list, uint32_t items) {
+std::shared_ptr<RunReadback> RunReadback::CreateList(std::string_view name, const List& list, uint32_t items, ErrorHandler onError) {
 	if (!list.itemBytes || list.headerBytes < 2 * sizeof(uint32_t) || list.headerBytes % sizeof(uint32_t) || list.stampOffset % sizeof(uint32_t)
-		|| list.stampOffset < sizeof(uint32_t) || list.stampOffset >= list.headerBytes || list.itemBytes % sizeof(uint32_t) || !list.regions)
-		Fail(std::format("the list readback {} has a malformed part", name));
+		|| list.stampOffset < sizeof(uint32_t) || list.stampOffset >= list.headerBytes || list.itemBytes % sizeof(uint32_t) || !list.regions) {
+		Report(onError, std::format("the list readback {} has a malformed part", name));
+		return nullptr;
+	}
 	auto made = std::make_shared<State>();
 	made->name = std::string(name);
+	made->onError = std::move(onError);
 	made->scheme = Scheme::List;
 	made->list = list;
 	made->regions = list.regions;
 	made->runs.resize(list.regions);
 	auto readback = std::make_shared<RunReadback>(std::move(made));
 	readback->Grow(items);
+	if (!readback->SetFor(items)) return nullptr;
 	return readback;
 }
 
@@ -367,7 +385,8 @@ void RunReadback::Grow(uint32_t items) {
 	auto set = std::make_unique<ListSet>();
 	set->items = items;
 	set->bytes = state.list.headerBytes + uint64_t(items) * state.list.itemBytes;
-	set->buffer = MakeReadbackBuffer(state.name, set->bytes * state.list.regions);
+	set->buffer = MakeReadbackBuffer(state, set->bytes * state.list.regions);
+	if (!set->buffer) return;
 	auto* added = set.release();
 	added->next = state.sets.load(std::memory_order_relaxed);
 	while (!state.sets.compare_exchange_weak(added->next, added, std::memory_order_release, std::memory_order_relaxed)) {}
@@ -424,15 +443,20 @@ RunReadback::ListStats RunReadback::Stats(bool take) {
 	return stats;
 }
 
-std::shared_ptr<RunReadback> RunReadback::CreateRegions(std::string_view name, uint32_t bytes, uint32_t regions) {
-	if (!bytes || !regions) Fail(std::format("the region readback {} needs a size and a region count", name));
+std::shared_ptr<RunReadback> RunReadback::CreateRegions(std::string_view name, uint32_t bytes, uint32_t regions, ErrorHandler onError) {
+	if (!bytes || !regions) {
+		Report(onError, std::format("the region readback {} needs a size and a region count", name));
+		return nullptr;
+	}
 	auto made = std::make_shared<State>();
 	made->name = std::string(name);
+	made->onError = std::move(onError);
 	made->scheme = Scheme::Regions;
 	made->regions = regions;
 	// Buffer copies need 4-byte offsets.
 	made->stride = (bytes + 3u) & ~3u;
-	made->buffer = MakeReadbackBuffer(made->name, uint64_t(made->stride) * regions);
+	made->buffer = MakeReadbackBuffer(*made, uint64_t(made->stride) * regions);
+	if (!made->buffer) return nullptr;
 	return std::make_shared<RunReadback>(std::move(made));
 }
 
@@ -444,18 +468,26 @@ uint32_t RunReadback::RegionOf(const RunRef& run) const {
 void RunReadback::RecordCopy(rhi::CommandList& commands, uint32_t region, uint64_t offset, rhi::ResourceHandle source, uint64_t sourceOffset,
 	uint64_t bytes) const {
 	const auto& state = *m_state;
-	if (state.scheme != Scheme::Regions || region >= state.regions || offset + bytes > state.stride)
-		Fail(std::format("{}: a copy of {} bytes at {} is outside region {}", state.name, bytes, offset, region));
+	if (state.scheme != Scheme::Regions || region >= state.regions || offset + bytes > state.stride) {
+		state.Fail(std::format("{}: a copy of {} bytes at {} is outside region {}", state.name, bytes, offset, region));
+		return;
+	}
 	commands.CopyBufferRegion(state.buffer->GetAPIResource().GetHandle(), uint64_t(region) * state.stride + offset, source, sourceOffset, bytes);
 }
 
 void RunReadback::ReadRegion(uint32_t region, const std::function<void(const std::byte*)>& read) const {
 	const auto& state = *m_state;
-	if (state.scheme != Scheme::Regions || region >= state.regions) Fail(std::format("{}: no region {} to read", state.name, region));
+	if (state.scheme != Scheme::Regions || region >= state.regions) {
+		state.Fail(std::format("{}: no region {} to read", state.name, region));
+		return;
+	}
 	auto resource = state.buffer->GetAPIResource();
 	void* mapped = nullptr;
 	resource.Map(&mapped);
-	if (!mapped) Fail(std::format("{} could not be mapped", state.name));
+	if (!mapped) {
+		state.Fail(std::format("{} could not be mapped", state.name));
+		return;
+	}
 	read(static_cast<const std::byte*>(mapped) + uint64_t(region) * state.stride);
 	resource.Unmap(0, 0);
 }
