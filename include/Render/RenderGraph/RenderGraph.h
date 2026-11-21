@@ -307,9 +307,13 @@ private:
 	public:
 		std::shared_ptr<const std::vector<const void*>> Keys() const noexcept { return m_keys.load(std::memory_order_acquire); }
 		bool Declares(const void* key) const noexcept;
+		// Whether a slot of `key` was lowered for another slice count than `slices` (array-size versions, VersionedResource).
+		bool DeclaresOtherSlices(const void* key, uint32_t slices) const noexcept;
 	private:
 		friend class RenderGraph;
 		std::atomic<std::shared_ptr<const std::vector<const void*>>> m_keys;
+		// Each versioned slot's key and slice count, sorted. A key has more than one entry when slots of two counts are declared.
+		std::atomic<std::shared_ptr<const std::vector<std::pair<const void*, uint32_t>>>> m_slices;
 	};
 	// Any thread. The same object for the graph's life.
 	std::shared_ptr<const DeclaredVersions> PersistentDeclaredVersions() const noexcept { return m_declaredVersions; }
@@ -793,6 +797,10 @@ private:
 	// and those resource objects are shared with the graph the epoch still runs (and with any other build of it in flight), whose
 	// next preparation would then find its bindings moved under it.
 	void PrepareFirstPersistentBuild();
+	// Before CompileStructural, on a graph built detached: the context its passes' resolvers are captured with and its first
+	// publication binds versions with. Each preparation replaces it with its own (UpdateExecutionContext::resolverCaptureContext).
+	// GraphHost::BuildEpochGraph gives one that names each texture's reshaped version (array-size versions, VersionedResource).
+	void SetBuildCaptureContext(std::shared_ptr<const ResolverCaptureContext> context) noexcept { m_resolverCaptureContext = std::move(context); }
 	// How the next execution runs (RenderGraphPersistentState.h, PersistentExecution::Options). Plain executions use the
 	// defaults; a ticket's set its ticket.
 	struct PersistentExecutionOptions {

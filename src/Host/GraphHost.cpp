@@ -28,6 +28,8 @@
 #include "Render/Runtime/RuntimeDevice.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
 #include "Resources/VersionedResource.h"
+#include "Resources/VersionedTexture.h"
+#include "Interfaces/IResourceResolver.h"
 #include "HostUploadExtension.h"
 #include "Resources/PixelBuffer.h"
 #include "../Render/RenderGraph/AliasPacking.h"
@@ -1055,9 +1057,35 @@ GraphHost::BuildInputs GraphHost::SnapshotBuildInputs(size_t index) {
 	return inputs;
 }
 
+namespace {
+// What a detached build lowers against: each texture's reshaped version (VersionedResource, "Array-size versions"), else the
+// current one. Buffers have no slice count, so they take the current one.
+struct ReshapedVersions final : IResourceVersions, IHostExecutionData {
+	std::shared_ptr<const BufferVersion> Find(const VersionedBuffer&) const noexcept override { return nullptr; }
+	std::shared_ptr<const TextureVersion> FindTexture(const VersionedTexture& texture) const noexcept override {
+		try {
+			return std::static_pointer_cast<const TextureVersion>(texture.Reshaped());
+		} catch (...) {
+			return nullptr;
+		}
+	}
+	const void* TryGet(std::type_index type) const noexcept override {
+		return type == std::type_index(typeid(IResourceVersions)) ? static_cast<const IResourceVersions*>(this) : nullptr;
+	}
+};
+
+std::shared_ptr<const ResolverCaptureContext> ReshapedCaptureContext() {
+	static const auto context = std::make_shared<const ResolverCaptureContext>(
+		std::shared_ptr<const IHostExecutionData>(std::make_shared<const ReshapedVersions>()));
+	return context;
+}
+} // namespace
+
 std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, bool detached, detail::HostUploadExtension** uploads) {
 	auto graph = std::make_unique<RenderGraph>(m_desc.runtime);
 	try {
+		// A detached build may be staged ahead of a new slice count, so it lowers for the pending version.
+		if (detached) graph->SetBuildCaptureContext(ReshapedCaptureContext());
 		graph->SetSharedQueueTimelines(inputs.timelines);
 		graph->SetPassEpochFilter(inputs.epoch);
 		// Before the extensions gather their passes: one may record a pass at execution when the epoch is external
@@ -1478,6 +1506,21 @@ std::vector<uint32_t> GraphHost::EpochsDeclaring(std::span<const IVersionedResou
 	};
 	for (size_t index = 0; index < declared.size() && index < m_instances.size(); ++index)
 		if (declares(declared[index].attached) || declares(declared[index].staged)) epochs.push_back(m_instances[index].epoch);
+	return epochs;
+}
+
+std::vector<uint32_t> GraphHost::EpochsAwaitingSlices(const IVersionedResource& slot, uint32_t slices) const {
+	const void* key = slot.Key();
+	std::vector<DeclaredGraphs> declared;
+	{
+		std::scoped_lock lock(m_declaredMutex);
+		declared = m_declared;
+	}
+	std::vector<uint32_t> epochs;
+	for (size_t index = 0; index < declared.size() && index < m_instances.size(); ++index) {
+		const auto& next = declared[index].staged ? declared[index].staged : declared[index].attached;
+		if (next && next->DeclaresOtherSlices(key, slices)) epochs.push_back(m_instances[index].epoch);
+	}
 	return epochs;
 }
 

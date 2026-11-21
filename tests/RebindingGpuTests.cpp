@@ -10,7 +10,8 @@
 // The same swaps with SharingChangePolicy::Deferred: the frame of the swap still reads the old backing, and a worker build
 // brings the new one in later. A frame never reads a stale value (last frame's), which a missing dependency would give.
 // Also: a pass whose new declarations add resources builds inline, unless it says PreparesOnlyDeclaredWork, when a
-// worker builds them and frames keep preparing against the old declaration meanwhile.
+// worker builds them and frames keep preparing against the old declaration meanwhile. And array-size versions: a versioned
+// texture's slice count changes, and a graph built for it switches in with the version (RunArraySizeScenario).
 
 #include "OpenRenderGraph/GraphDesc.h"
 #include "OpenRenderGraph/GraphHost.h"
@@ -804,6 +805,110 @@ int RunVersionedScenario(rhi::Device device, const std::shared_ptr<org::Runtime>
     return 0;
 }
 
+struct ArrayFrame { uint32_t slices = 0; };
+// Copies a buffer into every slice of a versioned array texture (fill), or its last slice into a buffer (read back). The slice
+// count is the bound version's, so the copies follow a version of another slice count.
+class ArrayCopyPass final : public org::TypedRenderGraphPass<ArrayCopyPass, ArrayFrame, TextureCopyBindings> {
+public:
+    ArrayCopyPass(std::shared_ptr<const org::VersionedTexture> texture, std::shared_ptr<org::Resource> buffer, bool fill)
+        : m_texture(std::move(texture)), m_buffer(std::move(buffer)), m_fill(fill) {}
+    TextureCopyBindings Declare(org::PassBuilder& builder) {
+        builder.PreferQueue(org::QueueKind::Graphics);
+        if (m_fill) return {builder.CopySource(m_buffer), builder.CopyDestination(*m_texture).Resource(), true};
+        return {builder.CopyDestination(m_buffer), builder.CopySource(*m_texture), false};
+    }
+    // The bound version is the current one here: the scenario adopts a new one only with the graph built for it.
+    ArrayFrame Prepare(const TextureCopyBindings&, const org::PassPrepareContext&) const {
+        const auto current = m_texture->CurrentResource();
+        return {current ? static_cast<uint32_t>(current->GetArraySize()) : 0u};
+    }
+    static void Record(const TextureCopyBindings& bindings, const ArrayFrame& frame, org::PassRecordContext& recording) {
+        if (!frame.slices) return;
+        auto copy = RowCopy(recording.Resolve(bindings.texture).GetHandle(), recording.Resolve(bindings.buffer).GetHandle());
+        if (!bindings.fill) {
+            copy.arraySlice = frame.slices - 1;
+            recording.Commands().CopyTextureToBuffer(copy);
+            return;
+        }
+        for (uint32_t slice = 0; slice < frame.slices; ++slice) {
+            copy.arraySlice = slice;
+            recording.Commands().CopyBufferToTexture(copy);
+        }
+    }
+private:
+    std::shared_ptr<const org::VersionedTexture> m_texture;
+    std::shared_ptr<org::Resource> m_buffer;
+    bool m_fill = false;
+};
+
+// Array-size versions (VersionedResource): a versioned texture whose slice count changes between versions. The new version is
+// pending while the running graph keeps binding the old count. A graph built then is lowered for the new count and switches in
+// with the version at one boundary. From then the copies cover the new slices and the read sees the last of them.
+int RunArraySizeScenario(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime) {
+    org::TextureDescription description{};
+    description.imageDimensions = {{kCount, 1, 0, 0}};
+    description.format = rhi::Format::R32_UInt;
+    description.channels = 1;
+    description.isArray = true;
+    description.arraySize = 2;
+    {
+        auto texture = org::VersionedTexture::Create(org::PixelBuffer::CreateShared(description));
+        auto upload = org::Buffer::CreateShared(rhi::HeapType::Upload, kBytes);
+        auto readback = org::Buffer::CreateShared(rhi::HeapType::Readback, kBytes);
+        upload->SetName("array.upload"); readback->SetName("array.readback");
+        org::GraphHost host({.runtime = runtime});
+        host.AddExtension("test.array-size", [&] {
+            return std::make_unique<VersionedExtension>(std::vector<std::pair<const char*, std::shared_ptr<org::RenderPass>>>{
+                {"array.fill", std::make_shared<ArrayCopyPass>(texture, upload, true)},
+                {"array.read", std::make_shared<ArrayCopyPass>(texture, readback, false)}});
+        });
+        const auto frame = [&](uint32_t value) {
+            ENSURE(Write(*upload, value));
+            host.ExecuteFrame(nullptr, [](org::RenderGraph& graph) { graph.SetScheduleTraceEnabled(true); });
+            ENSURE(device.WaitIdle() == rhi::Result::Ok);
+            return Read(*readback);
+        };
+        for (uint32_t i = 0; i < 3; ++i) CHECK(frame(0xA100u + i) == 0xA100u + i);
+        // A version of three slices is no error: it is pending, the texture's reshaped version.
+        description.arraySize = 3;
+        const auto three = texture->Make(org::PixelBuffer::CreateShared(description));
+        CHECK(three && texture->Reshaped() == three);
+        // The running graph was lowered for two slices, binds the current version, and is what the epoch would run.
+        CHECK(!host.EpochsAwaitingSlices(*texture, 3).empty());
+        CHECK(frame(0xA200u) == 0xA200u);
+        // A graph built now is lowered for three slices.
+        auto built = host.BuildEpochGraph(org::persistent::AllEpochs, "three slices");
+        CHECK(built && built->Built());
+        const auto declared = built->Graph()->PersistentDeclaredVersions();
+        CHECK(declared && declared->Declares(texture->Key()));
+        CHECK(declared->DeclaresOtherSlices(texture->Key(), 2));
+        CHECK(!declared->DeclaresOtherSlices(texture->Key(), 3));
+        // It switches in with the version at one boundary. Nothing awaits three slices then.
+        CHECK(host.AttachEpochGraph(built).attached);
+        texture->Adopt(three);
+        CHECK(!texture->Reshaped());
+        CHECK(host.EpochsAwaitingSlices(*texture, 3).empty());
+        CHECK(texture->CurrentResource()->GetArraySize() == 3);
+        // The fill covers the third slice, and the read follows it there.
+        for (uint32_t i = 0; i < 3; ++i) CHECK(frame(0xA300u + i) == 0xA300u + i);
+        // A pending new count is taken back by a version of the current count.
+        description.arraySize = 4;
+        const auto four = texture->Make(org::PixelBuffer::CreateShared(description));
+        CHECK(texture->Reshaped() == four);
+        description.arraySize = 3;
+        (void)texture->Make(org::PixelBuffer::CreateShared(description));
+        CHECK(!texture->Reshaped());
+        // Another format is still a new resource, not a version.
+        auto other = description;
+        other.format = rhi::Format::R32_Float;
+        bool rejected = false;
+        try { texture->Make(org::PixelBuffer::CreateShared(other)); } catch (const std::invalid_argument&) { rejected = true; }
+        CHECK(rejected);
+    }
+    CHECK(device.WaitIdle() == rhi::Result::Ok);
+    return 0;
+}
+
 // Both opt-ins at once is refused: rebinding applies new backings at once, while declared-work passes keep old work.
 int TestRebindOptInsExclusive(const std::shared_ptr<org::Runtime>& runtime) {
     auto value = org::Buffer::CreateShared(rhi::HeapType::Upload, kBytes);
@@ -1023,6 +1128,7 @@ int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& ru
     if (const int line = TestRebindOptInsExclusive(runtime)) return line;
     if (const int line = RunRemapScenario(device, runtime)) return line;
     if (const int line = RunVersionedScenario(device, runtime)) return line;
+    if (const int line = RunArraySizeScenario(device, runtime)) return line;
     if (const int line = RunExecutionHandleScenario(device, runtime)) return line;
     if (const int line = RunGraphDescScenario(device, runtime)) return line;
     if (const int line = RunGraphInstanceScenario(device, runtime)) return line;

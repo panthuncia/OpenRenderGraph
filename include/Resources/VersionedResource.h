@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rhi.h>
@@ -48,6 +49,9 @@ public:
     // True when a recording made with one version may only run while that version is selected, such as a swapchain's
     // acquired image. The graph never keeps such recordings for reuse.
     virtual bool PerFrame() const noexcept { return false; }
+    // A pending version with another slice count than the current one (VersionedResource::Reshaped), or null. A graph built
+    // while it is pending is lowered for it and binds it until it is current.
+    virtual std::shared_ptr<const ResourceVersion> Reshaped() const { return nullptr; }
 };
 
 // What a revision names as its immutable inputs: the version of each versioned resource its passes use. A preparation
@@ -70,9 +74,18 @@ struct IResourceVersions {
 // publication binds. Each preparation binds the slot to the version it selects, as an overlay of that preparation's
 // bindings. Admission, barriers and recording all see that version's backing.
 //
-// Every version must have the shape class of the first one. For a texture that is its format, mip count and slice count.
-// Buffers have no constraint, since a buffer's size is not part of its graph slot. A resource of another shape class is a
-// new resource, and its passes are declared again.
+// Every version must have the shape class of the first one. For a texture that is its format and mip count. Buffers have no
+// constraint, since a buffer's size is not part of its graph slot. A resource of another shape class is a new resource, and
+// its passes are declared again.
+//
+// Array-size versions. A texture version may have another slice count, like another extent. The slice count is part of a
+// graph's slot, though: a graph lowered for one slice count binds only versions of that count. So a new slice count needs
+// new graphs, and they switch in with it:
+// - The new version is made pending (Make). It is then the resource's reshaped version (Reshaped).
+// - A graph built while it is pending (GraphHost::BuildEpochGraph) is lowered for it, and binds it in every preparation
+//   until it is current. Graphs that were running keep binding the current version.
+// - The owner adopts the version at the frame boundary where it attaches those graphs (GraphHost::EpochsAwaitingSlices
+//   says which epochs still lack one). A graph that binds a version of another slice count than its slot's is an error.
 //
 // Thread contract:
 // - Making a version may run on any thread.
@@ -97,19 +110,25 @@ public:
     std::vector<std::shared_ptr<Resource>> Resolve() const override;
     std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState() const override;
     std::shared_ptr<const ResolverDeclarationState> CaptureDeclarationState(const ResolverCaptureContext& context) const override;
+    // Any thread: the newest pending version whose slice count differs from the current version's, while it lives and is not
+    // adopted. Null when there is none, or when a newer version has the current slice count again.
+    std::shared_ptr<const ResourceVersion> Reshaped() const final;
     // Always unknown. A revision may name a version other than the current one, so every preparation captures. The
     // declaration belongs to the version and is never rebuilt.
     uint64_t DeclarationVersionHint() const noexcept override { return 0; }
 
 protected:
-    // What every version of one resource must share. A buffer's is empty: its size is not part of its graph slot.
+    // What every version of one resource must share. A buffer's is empty: its size is not part of its graph slot. A texture's
+    // slice count is not in it: a version may change it (see "Array-size versions" above).
     struct ShapeClass {
         bool texture = false;
         rhi::Format format = rhi::Format::Unknown;
-        uint32_t mips = 0, slices = 0;
+        uint32_t mips = 0;
         bool operator==(const ShapeClass&) const = default;
     };
     static ShapeClass ShapeClassOf(const Resource& resource);
+    // A texture's slice count, 0 for a resource without a layout (a buffer).
+    static uint32_t SlicesOf(const Resource& resource) noexcept;
     struct State {
         std::atomic<std::shared_ptr<const ResourceVersion>> current;
         std::atomic<uint64_t> published{0};  // number of the last version made, on any thread
@@ -121,6 +140,10 @@ protected:
         // The shape class every version must have. The first adopted version sets it, before anything else sees the resource.
         ShapeClass shape;
         bool shaped = false;
+        // The newest made version, while it is pending and has another slice count than the current one (Reshaped). Weak, so
+        // a dropped version is not kept.
+        mutable std::mutex reshapeMutex;
+        std::weak_ptr<const ResourceVersion> reshaped;
         // A late-bound resource only. These are set once at creation.
         std::shared_ptr<Resource> standIn;
         std::shared_ptr<const ResolverDeclarationState> lateDeclaration;
@@ -137,6 +160,9 @@ protected:
     // Any thread. Fills `version` as the next version, around `resource`, kept alive with `owner`. It is not current.
     // Throws when `resource` has another shape class than the first version.
     void MakeVersion(ResourceVersion& version, std::shared_ptr<Resource> resource, std::shared_ptr<const void> owner) const;
+    // Any thread, after MakeVersion: notes `version` as the newest made one. It becomes the reshaped version when its slice
+    // count differs from the current version's; otherwise the reshaped version is cleared.
+    void NoteMade(const std::shared_ptr<const ResourceVersion>& version) const;
     // Owner thread: `version` becomes the current one. It must be this resource's.
     void AdoptVersion(const std::shared_ptr<const ResourceVersion>& version);
     // At creation: makes this a late-bound resource whose declarations resolve to `standIn`.

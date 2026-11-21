@@ -256,6 +256,9 @@ public:
 	 * @brief Any thread: builds a new graph for the epoch and returns it detached. The host and its graphs are not touched: the old
 	 * graph keeps running, preparing and submitting meanwhile.
 	 *
+	 * A detached build lowers each versioned texture for its reshaped version when one is pending, else for the current one
+	 * (VersionedResource, "Array-size versions"). Its preparations bind that version until it is current.
+	 *
 	 * It does everything the host's own build does: the extensions made for the epoch, the shared queue timelines, the epoch
 	 * filter, external epochs, the alias arena, the settings, CompileStructural and Setup. It also does the work the first
 	 * preparation would do inline. It lowers every pass, waits for the passes' pipelines, and builds and installs the first schedule.
@@ -360,6 +363,15 @@ public:
 	 * Resources match by IVersionedResource::Key, so a clone matches its original. Null entries are skipped.
 	 */
 	std::vector<uint32_t> EpochsDeclaring(std::span<const IVersionedResource* const> slots) const;
+	/**
+	 * @brief Any thread: the epochs that would bind `slot` lowered for another slice count than `slices` after their next attach.
+	 * That is the staged graph when one is staged, else the attached one. In the host's epoch order, each once.
+	 *
+	 * A new slice count of a versioned texture is adopted with graphs built for it (VersionedResource, "Array-size versions").
+	 * Its owner builds the epochs that declare the slot (EpochsDeclaring) after making the version, and adopts it once this is
+	 * empty, attaching those staged graphs at the same frame boundary.
+	 */
+	std::vector<uint32_t> EpochsAwaitingSlices(const IVersionedResource& slot, uint32_t slices) const;
 	/** @brief Totals since the host was made: builds attached or staged, staged sets attached, and refusals by reason. */
 	struct AttachStats {
 		uint64_t attached = 0;    // AttachEpochGraph and AttachStagedEpochGraphs, per epoch
