@@ -14,7 +14,6 @@
 #include <thread>
 
 #include "Render/FrameArena.h"
-#include "Render/PipelineLibrary.h"
 #include "Render/QueueRegistry.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/Runtime/IDescriptorService.h"
@@ -242,8 +241,6 @@ void Runtime::Initialize() {
 	runtime::InitializeRuntimeDevice(m_desc.device);
 	if (!m_desc.tasks) m_desc.tasks = std::make_shared<runtime::ThreadPoolTaskService>();
 	runtime::SetDefaultTaskService(m_desc.tasks);
-	m_pipelines = std::make_shared<PipelineLibrary>(m_desc.tasks, m_desc.pipelineCompiler);
-	m_pipelines->RegisterDevice(DeviceInstanceId::Primary, m_desc.backend, m_desc.device);
 	{
 		std::scoped_lock lock(m_relaysMutex);
 		m_devices.emplace_back(m_desc.device, m_desc.backend);
@@ -286,7 +283,6 @@ void Runtime::Initialize() {
 
 Runtime::~Runtime() {
 	if (g_current.load() != this) return;  // Create failed before publishing it
-	m_pipelines.reset(); // Joins its builds, which use the device.
 	m_deleter.reset();   // Drops what it still holds while the device and the services are alive.
 	{
 		std::scoped_lock lock(m_relaysMutex);

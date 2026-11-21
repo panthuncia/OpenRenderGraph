@@ -28,8 +28,6 @@ namespace org::compiler { class ScheduleCache; }
 
 namespace org {
 
-class PipelineCompiler;
-class PipelineLibrary;
 class FrameArena;
 
 // The ORG runtime of a device: what every graph on it shares. One per process for now (the services behind it are still
@@ -50,9 +48,6 @@ public:
 		uint32_t slots = 3;
 		// Optional; a ThreadPoolTaskService is created when absent.
 		std::shared_ptr<runtime::ITaskService> tasks;
-		// Optional; passes can declare pipelines by description only with one (Render/PipelineDesc.h). Its first call comes
-		// when a graph lowers a pass, so it may rely on host state made after the runtime.
-		std::shared_ptr<PipelineCompiler> pipelineCompiler;
 	};
 
 	// The most runs in flight a runtime serves: a bound on GraphHost's lease indices, and on Desc::slots. Indices are 32-bit
@@ -79,8 +74,6 @@ public:
 	const std::shared_ptr<runtime::IDescriptorService>& Descriptors() const noexcept { return m_descriptors; }
 	const std::shared_ptr<runtime::IStatisticsService>& Statistics() const noexcept { return m_statistics; }
 	const std::shared_ptr<runtime::IRenderGraphSettingsService>& Settings() const noexcept { return m_settings; }
-	// The pipelines passes declared by description, built for the devices they run on.
-	const std::shared_ptr<PipelineLibrary>& Pipelines() const noexcept { return m_pipelines; }
 	// The memory of every LatchBlock (per-run constants), shared by the runtime's graphs and hosts.
 	const std::shared_ptr<FrameArena>& Arena() const noexcept { return m_arena; }
 
@@ -181,7 +174,6 @@ private:
 	std::shared_ptr<runtime::IDescriptorService> m_descriptors;
 	std::shared_ptr<runtime::IStatisticsService> m_statistics;
 	std::shared_ptr<runtime::IRenderGraphSettingsService> m_settings;
-	std::shared_ptr<PipelineLibrary> m_pipelines;
 	std::shared_ptr<FrameArena> m_arena;
 	rhi::TimelinePtr m_readbackFence, m_copyReadbackFence;
 	std::shared_ptr<persistent::ResourceSequencer> m_sequencer;

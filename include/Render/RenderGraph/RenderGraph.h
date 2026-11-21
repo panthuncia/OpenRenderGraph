@@ -863,11 +863,6 @@ private:
 	void PreparePersistentFrame(rhi::Device device, uint32_t frameIndex, const IHostExecutionData* hostData, float deltaTime,
 		const PersistentExecutionOptions& options);
 	void BootstrapPersistentGraph();
-	// The pass's declared pipelines for its device. Starts their builds; returns whether all are ready. Failed builds are
-	// reported in `failure`, when given, and throw otherwise.
-	bool RequestPassPipelines(const PassParameters& resources, DeviceInstanceId device, const std::string& passName, std::string* failure = nullptr);
-	// As above, and blocks until every build ended. A failed build throws.
-	void AwaitPassPipelines(const PassParameters& resources, DeviceInstanceId device, const std::string& passName);
 	// bootstrap: the first, whose passes were all just declared.
 	void BindPersistentFrame(bool ticket, bool bootstrap);
 	PersistentExecution PreparePersistentExecution(rhi::Device device, uint32_t frameIndex, const IHostExecutionData* hostData,

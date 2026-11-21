@@ -1,6 +1,5 @@
 #include <algorithm>
 
-#include "Render/PipelineLibrary.h"
 #include "RenderGraphInternal.h"
 #include "Render/Runtime/RuntimeDevice.h"
 #include "OpenRenderGraph/Runtime.h"
@@ -270,7 +269,6 @@ DeviceInstanceId RenderGraph::RegisterBackendDevice(rhi::Backend backend, rhi::D
 	}
 	const auto id = m_backendDevices.Register(backend, device);
 	DescriptorHeapManager::GetInstance().RegisterBackend(id, device);
-	m_runtime->Pipelines()->RegisterDevice(id, backend, device);
 	m_runtime->RegisterDevice(device, backend);
 	return id;
 }

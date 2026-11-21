@@ -104,10 +104,8 @@ of, or matches `BindOptions::absentPrefixes`; otherwise binding throws. The BRSL
 
 #### Pipelines
 
-A pass describes its pipelines in `Declare` (`builder.Pipeline(org::ComputePipelineDesc{...})`, and
-`builder.CommandSignature` for indirect arguments), and binds the returned handle in `Record`. ORG builds each one for
-the device the pass runs on before the pass is published, so the pass runs on any device without backend code. The
-host supplies the shader compiler (`Runtime::Desc::pipelineCompiler`). [docs/pipelines.md](docs/pipelines.md)
+ORG builds no pipelines. The host builds them (an `org::PipelineState`, or a bare `rhi::PipelinePtr`) and hands them to
+the pass, which binds them in `Record`. [docs/pipelines.md](docs/pipelines.md)
 
 #### Declarations that change
 

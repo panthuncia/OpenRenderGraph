@@ -3,7 +3,6 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -15,8 +14,7 @@
 #include "Render/PipelineState.h"
 #include "Render/QueueKind.h"
 
-// Pipelines described by value, so one description can be built on any device (docs/pipelines.md). A pass passes one to
-// RenderPassBuilder::Pipeline in Declare; PipelineLibrary builds it for the device the pass lands on.
+// Pipelines described by value, so one description can be built on any device (docs/pipelines.md). The host builds them.
 namespace org {
 
 struct PipelineShaderDefine {
@@ -31,13 +29,9 @@ struct PipelineShaderSource {
 	std::wstring target;
 };
 
-/// @brief The built-in passes' shaders are in ORG's `shaders` folder, which CMake names OPENRENDERGRAPH_SHADER_DIR. Their
-/// default paths start with this prefix. The host's PipelineCompiler maps the prefix to that folder.
-inline constexpr const wchar_t* kBuiltinShaderPrefix = L"OpenRenderGraph/";
-
 enum class PipelineLayoutKind : uint8_t { StandardCompute, StandardGraphics, Custom };
 
-// A layout the library creates on each device a pipeline needs it, shared by every pipeline with the same content.
+// A layout the host creates on each device a pipeline needs it, shared by every pipeline with the same content.
 struct PipelineLayoutSpec {
 	std::vector<rhi::LayoutBindingRange> ranges;
 	std::vector<rhi::PushConstantRangeDesc> pushConstants;
@@ -115,16 +109,6 @@ struct GraphicsPipelineDesc {
 
 using PipelineDesc = std::variant<ComputePipelineDesc, GraphicsPipelineDesc>;
 
-// A command signature by description: it belongs to a device and names a layout of that device.
-struct CommandSignatureDesc {
-	std::vector<rhi::IndirectArg> args;
-	uint32_t byteStride = 0;
-	PipelineLayoutRef layout = PipelineLayoutRef::StandardCompute();
-	bool unorderedSequences = false;
-	bool explicitPreprocess = false;
-	std::string name;
-};
-
 // A handle to a command signature's creations, one slot per device, as PipelineState is to a pipeline's builds.
 class CommandSignatureState {
 public:
@@ -146,53 +130,6 @@ public:
 private:
 	using Slots = std::array<std::atomic<std::shared_ptr<const rhi::CommandSignaturePtr>>, kMaxPipelineDevices>;
 	std::shared_ptr<Slots> m_slots;
-};
-
-// What the library asks the host to compile: the shaders of one pipeline for one device. Defines apply to every stage.
-struct PipelineCompileRequest {
-	struct Stage {
-		rhi::ShaderStage stage{};
-		PipelineShaderSource source;
-	};
-	std::vector<Stage> stages;
-	std::vector<PipelineShaderDefine> defines;
-	/// The input layout the pipeline is created with, for a compiler whose output depends on it. For example, a Vulkan
-	/// compiler can give the vertex shader's inputs the locations that the layout names.
-	std::optional<PipelineInputLayout> inputLayout;
-	std::string name;
-	DeviceInstanceId device = DeviceInstanceId::Primary;
-	rhi::Backend backend = rhi::Backend::Null;
-	// A reload: the caller knows the source changed, so a cached artifact must not answer it.
-	bool bypassCache = false;
-};
-
-// The compiled stages, parallel to the request's. A non-empty error means the compile failed; the rest is then unused.
-struct CompiledPipeline {
-	std::vector<rhi::ShaderBinary> stages;
-	std::shared_ptr<const void> codeOwner; // Keeps the stages' code alive until the pipeline is created.
-	PipelineResources resources;
-	uint64_t resourceIDsHash = 0;
-	uint64_t sourceHash = 0;
-	uint64_t bytecodeHash = 0;
-	std::string error;
-};
-
-struct PipelineLayoutBinding {
-	rhi::PipelineLayoutHandle layout{};
-	std::shared_ptr<const void> owner; // Must outlive every pipeline created with the layout.
-};
-
-// The host's side of pipeline construction: ORG has no shader compiler, and a pipeline's descriptor slots come from the
-// host's shader conventions. Called on task service threads.
-class PipelineCompiler {
-public:
-	using Completion = std::function<void(CompiledPipeline)>;
-	virtual ~PipelineCompiler() = default;
-	// Compiles for request.backend. Completion runs exactly once, on any thread; it may run before Compile returns. An
-	// exception thrown before it runs counts as a failed compile.
-	virtual void Compile(const PipelineCompileRequest& request, Completion completion) = 0;
-	// The host's layout of that kind on a device. Throws when there is none.
-	virtual PipelineLayoutBinding StandardLayout(PipelineLayoutKind kind, DeviceInstanceId device) = 0;
 };
 
 } // namespace org

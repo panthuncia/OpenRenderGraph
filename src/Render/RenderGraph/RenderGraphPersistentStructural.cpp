@@ -1,7 +1,6 @@
 // Persistent execution, structural builds: representations, inline and worker-side builds, frame-interrupting passes and
 // alias placement.
 #include "RenderGraphPersistentState.h"
-#include "Render/PipelineLibrary.h"
 #include <rhi_interop_dx12.h>
 #include <unordered_set>
 
@@ -341,7 +340,6 @@ void RenderGraph::SubmitPersistentStructuralBuild(const std::vector<uint32_t>& s
 			using T = std::decay_t<decltype(value)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
 				auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
-				AwaitPassPipelines(value.resources, lowered.device, main.name);
 				const auto* dynamic = dynamic_cast<const IDynamicDeclaredResources*>(value.pass.get());
 				UseRebindSlots(main, lowered, dynamic);
 				if (!(dynamic && dynamic->PreparesOnlyDeclaredWork()) && LoweringAddsDeclarations(main, lowered)) {
@@ -595,7 +593,6 @@ void RenderGraph::UpdatePersistentFrameInterruptingPasses(
 			using T = std::decay_t<decltype(value)>;
 			if constexpr (!std::is_same_v<T, std::monostate>) {
 				auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
-				AwaitPassPipelines(value.resources, lowered.device, main.name);
 				std::vector<Resource*> resources;
 				for (const auto& use : lowered.entries) resources.push_back(use.resource);
 				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource.get());

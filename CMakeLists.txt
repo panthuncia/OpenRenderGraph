@@ -149,8 +149,6 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassBuilders.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FeatureDomainRegistry.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/Base/RenderPass.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/GenerateMipsPass.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/RenderPasses/ResolveMultisamplePass.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PassExecutionContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraph.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphCompiler.cpp"
@@ -174,8 +172,6 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/PersistentGraph.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExecutionState.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/InteropAllocator.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PipelineLibrary.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PipelinePermutations.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/FrameRecording.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalEpochExecution.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ExternalClient.cpp"
@@ -206,9 +202,6 @@ set_target_properties(OpenRenderGraph PROPERTIES
     CXX_STANDARD 23
     CXX_STANDARD_REQUIRED ON
 )
-
-# The folder of the built-in passes' shaders, for hosts that build ORG as a subdirectory.
-set(OPENRENDERGRAPH_SHADER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders" CACHE INTERNAL "OpenRenderGraph built-in shaders")
 
 target_include_directories(OpenRenderGraph
     PUBLIC
@@ -406,7 +399,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_definitions(OpenRenderGraphAsyncCompileTests PRIVATE NOMINMAX)
     add_test(NAME OpenRenderGraphAsyncCompileTests COMMAND OpenRenderGraphAsyncCompileTests)
     if(_org_d3d12_tests)
-    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/RuntimeTests.cpp tests/ExternalClientTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/PipelineLibraryTests.cpp tests/ReadbackCaptureTests.cpp tests/RebindingGpuTests.cpp)
+    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/RuntimeTests.cpp tests/ExternalClientTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/ReadbackCaptureTests.cpp tests/RebindingGpuTests.cpp)
     target_include_directories(OpenRenderGraphExternalResourceTests PRIVATE src/include)
     target_compile_definitions(OpenRenderGraphExternalResourceTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     if(WIN32 AND BASICRHI_ENABLE_STREAMLINE)
@@ -509,37 +502,12 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             basicrhi_compile_spirv(OUTPUT "${_org_persistent_write_spv}"
                 SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PersistentHostWrite.hlsl"
                 ENTRY main PROFILE cs_6_6)
-            # Input layouts, keyed pipelines and the built-in utility passes (the "pipelines" mode).
-            set(_org_pipeline_spv_dir "${CMAKE_CURRENT_BINARY_DIR}/test_shaders/pipelines")
-            set(_org_pipeline_spvs)
-            foreach(_shader IN ITEMS
-                    "GenerateMips2D|${CMAKE_CURRENT_SOURCE_DIR}/shaders/GenerateMips.hlsl|main|cs_6_6|"
-                    "GenerateMipsArray|${CMAKE_CURRENT_SOURCE_DIR}/shaders/GenerateMips.hlsl|main|cs_6_6|ORG_GENERATE_MIPS_ARRAY=1"
-                    "ResolveMultisample|${CMAKE_CURRENT_SOURCE_DIR}/shaders/ResolveMultisample.hlsl|main|cs_6_6|"
-                    "InputLayoutVS|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/InputLayout.hlsl|VSMain|vs_6_6|"
-                    "InputLayoutPS|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/InputLayout.hlsl|PSMain|ps_6_6|"
-                    "PermutationWrite0|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PermutationWrite.hlsl|main|cs_6_6|WRITE_BIAS=0"
-                    "PermutationWrite100|${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PermutationWrite.hlsl|main|cs_6_6|WRITE_BIAS=100")
-                string(REPLACE "|" ";" _parts "${_shader}")
-                list(GET _parts 0 _name)
-                list(GET _parts 1 _source)
-                list(GET _parts 2 _entry)
-                list(GET _parts 3 _profile)
-                list(GET _parts 4 _defines)
-                basicrhi_compile_spirv(OUTPUT "${_org_pipeline_spv_dir}/${_name}.spv" SOURCE "${_source}"
-                    ENTRY ${_entry} PROFILE ${_profile} DEFINES ${_defines}
-                    INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
-                    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ColorSpace.hlsli")
-                list(APPEND _org_pipeline_spvs "${_org_pipeline_spv_dir}/${_name}.spv")
-            endforeach()
             add_executable(OpenRenderGraphPersistentVulkanHostTests tests/PersistentVulkanHostTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp
-                tests/ContributorHostTests.cpp tests/RebindingGpuTests.cpp tests/PipelineVulkanTests.cpp "${_org_persistent_write_spv}"
-                ${_org_pipeline_spvs})
+                tests/ContributorHostTests.cpp tests/RebindingGpuTests.cpp "${_org_persistent_write_spv}")
             target_compile_features(OpenRenderGraphPersistentVulkanHostTests PRIVATE cxx_std_23)
             target_include_directories(OpenRenderGraphPersistentVulkanHostTests PRIVATE src/include)
             target_compile_definitions(OpenRenderGraphPersistentVulkanHostTests PRIVATE NOMINMAX
-                ORG_TEST_PERSISTENT_WRITE_SPV="${_org_persistent_write_spv}"
-                ORG_TEST_PIPELINE_SPV_DIR="${_org_pipeline_spv_dir}")
+                ORG_TEST_PERSISTENT_WRITE_SPV="${_org_persistent_write_spv}")
             if(MSVC)
                 target_compile_options(OpenRenderGraphPersistentVulkanHostTests PRIVATE /utf-8)
             endif()
@@ -636,12 +604,6 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
 )
 
-# The built-in passes' shaders (GenerateMipsPass, ResolveMultisamplePass). A host's PipelineCompiler maps
-# org::kBuiltinShaderPrefix to this folder.
-install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shaders/"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/OpenRenderGraph/shaders"
-)
-
 install(EXPORT OpenRenderGraphTargets
     FILE OpenRenderGraphTargets.cmake
     NAMESPACE OpenRenderGraph::
@@ -649,7 +611,6 @@ install(EXPORT OpenRenderGraphTargets
 )
 
 include(CMakePackageConfigHelpers)
-set(OPENRENDERGRAPH_INSTALL_SHADER_DIR "${CMAKE_INSTALL_DATADIR}/OpenRenderGraph/shaders")
 write_basic_package_version_file(
     "${CMAKE_CURRENT_BINARY_DIR}/OpenRenderGraphConfigVersion.cmake"
     VERSION ${PROJECT_VERSION}
@@ -659,7 +620,7 @@ write_basic_package_version_file(
 configure_package_config_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/OpenRenderGraphConfig.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/OpenRenderGraphConfig.cmake"
-    PATH_VARS CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_LIBDIR OPENRENDERGRAPH_INSTALL_SHADER_DIR
+    PATH_VARS CMAKE_INSTALL_INCLUDEDIR CMAKE_INSTALL_LIBDIR
     INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/OpenRenderGraph"
 )
 
