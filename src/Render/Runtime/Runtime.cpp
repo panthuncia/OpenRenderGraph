@@ -18,7 +18,6 @@
 #include "Render/QueueRegistry.h"
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/Runtime/IDescriptorService.h"
-#include "Render/Runtime/IReadbackService.h"
 #include "Render/Runtime/IRenderGraphSettingsService.h"
 #include "Render/Runtime/IStatisticsService.h"
 #include "Render/Runtime/IUploadService.h"
@@ -276,12 +275,6 @@ void Runtime::Initialize() {
 	m_statistics->RegisterQueue(rhi::QueueKind::Graphics);
 	m_statistics->RegisterQueue(rhi::QueueKind::Compute);
 	m_statistics->SetupQueryHeap();
-
-	if (rhi::Failed(m_desc.device.CreateTimeline(m_readbackFence, 0, "ORG.Readback.Graphics")) ||
-		rhi::Failed(m_desc.device.CreateTimeline(m_copyReadbackFence, 0, "ORG.Readback.Copy")))
-		throw std::runtime_error("Runtime failed to create its readback timelines");
-	m_readbacks = runtime::CreateDefaultReadbackService();
-	m_readbacks->Initialize(m_readbackFence.Get(), m_copyReadbackFence.Get());
 }
 
 Runtime::~Runtime() {
@@ -298,14 +291,11 @@ Runtime::~Runtime() {
 	if (m_arena) m_arena->SetFrontier({}, {});
 	m_arena.reset();
 	StatisticsManager::GetInstance().ClearAll();
-	m_readbacks.reset();
 	m_uploads.reset();
 	m_statistics.reset();
 	m_descriptors.reset();
 	m_settings.reset();
 	runtime::ShutdownRuntimeDevice();
-	m_readbackFence.Reset();
-	m_copyReadbackFence.Reset();
 	{
 		std::scoped_lock lock(m_queuesMutex);
 		m_queues.clear();

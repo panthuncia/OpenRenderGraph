@@ -300,7 +300,6 @@ void RenderGraph::ShutdownTaskWorkers() {
 void RenderGraph::UseRuntimeServices() {
 	if (!m_statisticsService && m_drivesFrameServices) m_statisticsService = m_runtime->Statistics();
 	if (!m_uploadService) m_uploadService = m_runtime->Uploads();
-	if (!m_readbackService) m_readbackService = m_runtime->Readbacks();
 	if (!m_descriptorService) m_descriptorService = m_runtime->Descriptors();
 	if (!m_renderGraphSettingsService) m_renderGraphSettingsService = m_runtime->Settings();
 	if (!m_taskService) m_taskService = m_runtime->Tasks();
@@ -397,7 +396,6 @@ void RenderGraph::ShutdownOwnedState() {
 	m_statisticsService.reset();
 	// Keep service generations alive across graph rebuilds; existing pass
 	// objects may still be initialized before the successor setup boundary.
-	m_readbackService.reset();
 	m_renderGraphSettingsService.reset();
 }
 
@@ -991,13 +989,6 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 		ResetForFrame();
 	}
 
-	// Poll readback completions early so that passes (e.g. CLod streaming)
-	// can react to GPU-produced data from the previous frame immediately,
-	// rather than waiting until post-Present.
-	if (m_readbackService && m_drivesFrameServices) {
-		BT_ZONE_SCOPE("RenderGraph::Update::ProcessReadbacks");
-		m_readbackService->ProcessReadbackRequests();
-	}
 
 	if (m_statisticsService) {
 		BT_ZONE_SCOPE("RenderGraph::Update::BeginStatisticsFrame");

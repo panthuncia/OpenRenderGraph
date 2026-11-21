@@ -1183,16 +1183,6 @@ public:
         return std::move(*this);
     }
 
-    RenderPassBuilder& PinToQueue(QueueSlotIndex slot) & {
-        m_pinnedQueueSlot = slot;
-        return *this;
-    }
-
-    RenderPassBuilder PinToQueue(QueueSlotIndex slot) && {
-        m_pinnedQueueSlot = slot;
-        return std::move(*this);
-    }
-
 	// A pipeline of this pass, by description. The graph builds it for the device the pass lands on, before publishing the
 	// pass; bind the returned handle in Record. Declaring it again returns the same pipeline, so call this from Declare.
 	PipelineState Pipeline(PipelineDesc desc);
@@ -1303,7 +1293,6 @@ private:
         params.isGeometryPass = m_isGeometryPass;
         params.preferredQueueKind = m_preferredQueueKind;
         params.queueAssignmentPolicy = m_queueAssignmentPolicy;
-        params.pinnedQueueSlot = m_pinnedQueueSlot;
 		params.backendAffinity = m_backendAffinity;
         params.identifierSet = _declaredIds;
         params.staticResourceRequirements = GatherResourceRequirements();
@@ -1343,7 +1332,6 @@ private:
         m_isGeometryPass = false;
 		m_preferredQueueKind = QueueKind::Graphics;
 		m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-        m_pinnedQueueSlot = std::nullopt;
 		m_backendAffinity = {};
 	}
 
@@ -1771,7 +1759,6 @@ private:
     bool m_isGeometryPass = false;
 	QueueKind m_preferredQueueKind = QueueKind::Graphics;
     QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-    std::optional<QueueSlotIndex> m_pinnedQueueSlot;
 	BackendAffinity m_backendAffinity{};
     std::unordered_set<ResourceIdentifier, ResourceIdentifier::Hasher> _declaredIds;
     std::vector<ResolverSnapshot> resolverSnapshots_;

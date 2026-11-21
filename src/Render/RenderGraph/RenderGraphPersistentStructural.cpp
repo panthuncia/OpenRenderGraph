@@ -1,5 +1,4 @@
-// Persistent execution, structural builds: representations, inline and worker-side builds, frame-interrupting passes and
-// alias placement.
+// Persistent execution, structural builds: representations, inline and worker-side builds, and alias placement.
 #include "RenderGraphPersistentState.h"
 #include "Render/PipelineLibrary.h"
 #include <rhi_interop_dx12.h>
@@ -500,127 +499,6 @@ void RenderGraph::DrainPersistentStructuralBuild(std::vector<uint32_t>& structur
 }
 
 
-// Frame-interrupting per-frame passes (ExternalPassDesc::interruptsFrame, e.g.
-// mid-frame debug readbacks) must observe resources at their insert point, so
-// they run inside the main executable. Each frame that has them, or had them the
-// frame before, pays one inline structural build: the previous set is removed
-// and the new set is added at authored orders just after (or before) their
-// anchors. Hazards follow the authored order, so a capture after a pass reads
-// the state that pass left, and alias placement treats it as a user.
-void RenderGraph::UpdatePersistentFrameInterruptingPasses(
-	std::vector<ExternalPassDesc> requested, rhi::Backend primaryBackend) {
-	auto& state = *m_compilerState->persistent;
-	if (!state.deferredInterrupting.empty()) {
-		requested.insert(requested.begin(), std::make_move_iterator(state.deferredInterrupting.begin()),
-			std::make_move_iterator(state.deferredInterrupting.end()));
-		state.deferredInterrupting.clear();
-	}
-	if (requested.empty() && state.hostedMainPasses.empty()) return;
-	if (state.pending) {
-		// The program cannot be edited inline under an in-flight structural
-		// build. Installed passes keep recording nothing; new ones wait.
-		state.deferredInterrupting = std::move(requested);
-		return;
-	}
-	BT_ZONE_SCOPE("ORG.Persistent.FrameInterruptingPasses");
-	const auto started = std::chrono::steady_clock::now();
-	auto edit = state.program.BeginEdit();
-	const size_t removed = state.hostedMainPasses.size();
-	for (const auto mainIndex : state.hostedMainPasses) {
-		auto& main = state.mainPasses[mainIndex];
-		edit.RemovePass(main.id);
-		for (const auto groupIndex : main.groups) {
-			auto& group = state.groups[groupIndex];
-			std::erase(group.subscribers, mainIndex);
-			for (const auto entryIndex : group.memberEntries) std::erase(state.entries[entryIndex].subscribers, mainIndex);
-		}
-		for (const auto entryIndex : main.directEntries) {
-			auto& entry = state.entries[entryIndex];
-			std::erase(entry.subscribers, mainIndex);
-			if (!entry.direct || !entry.subscribers.empty()) continue;
-			// Declared only by the removed pass: release the slot, and with it the
-			// raw resource pointer (published versions retire independently).
-			edit.RemoveResource(entry.slot);
-			if (auto found = state.entriesByResourceID.find(entry.resourceID); found != state.entriesByResourceID.end()) {
-				std::erase(found->second, entryIndex);
-				if (found->second.empty()) state.entriesByResourceID.erase(found);
-			}
-			persistent_impl::NoteRetiredDirectResource(state, entry);
-			if (entry.versioned) state.declaredVersionsChanged = true;
-			entry = {};
-			entry.retired = true;
-		}
-		main = {};
-		main.retired = true;
-	}
-	state.hostedMainPasses.clear();
-
-	std::unordered_map<std::string, uint32_t> byName;
-	for (uint32_t i = 0; i < state.mainPasses.size(); ++i)
-		if (!state.mainPasses[i].retired && !state.mainPasses[i].hosted) byName.emplace(state.mainPasses[i].name, i);
-	std::unordered_map<uint32_t, uint32_t> insertedAt; // anchor main index -> passes inserted there
-	constexpr uint32_t stride = persistent::GraphEditTransaction::kAuthoredOrderStride;
-	for (auto& desc : requested) {
-		if (desc.type == PassType::Unknown || !desc.pass || desc.name.empty()) continue;
-		std::vector<uint32_t> after, before;
-		if (desc.where) {
-			for (const auto& name : desc.where->after) if (const auto found = byName.find(name); found != byName.end()) after.push_back(found->second);
-			for (const auto& name : desc.where->before) if (const auto found = byName.find(name); found != byName.end()) before.push_back(found->second);
-		}
-		if (after.empty() && before.empty()) {
-			static std::atomic<uint32_t> reported{0};
-			if (reported.fetch_add(1) < 8)
-				spdlog::warn("Frame-interrupting pass '{}' names no main pass to insert against; dropped", desc.name);
-			continue;
-		}
-		// Latest 'after' anchor, else earliest 'before' anchor; consecutive
-		// insertions at one anchor keep their request order.
-		uint32_t anchor = after.empty() ? before.front() : after.front();
-		for (const auto a : after) if (edit.AuthoredOrder(state.mainPasses[a].id) > edit.AuthoredOrder(state.mainPasses[anchor].id)) anchor = a;
-		if (after.empty()) for (const auto b : before) if (edit.AuthoredOrder(state.mainPasses[b].id) < edit.AuthoredOrder(state.mainPasses[anchor].id)) anchor = b;
-		const auto k = ++insertedAt[anchor];
-		if (k >= stride / 2) throw std::runtime_error("Too many frame-interrupting passes at '" + state.mainPasses[anchor].name + "'");
-		const auto anchorOrder = edit.AuthoredOrder(state.mainPasses[anchor].id);
-		const uint32_t order = after.empty() ? anchorOrder - stride / 2 + k : anchorOrder + k;
-
-		uint32_t mainIndex = 0;
-		while (mainIndex < state.mainPasses.size() && !state.mainPasses[mainIndex].retired) ++mainIndex;
-		if (mainIndex == state.mainPasses.size()) state.mainPasses.emplace_back();
-		auto& main = state.mainPasses[mainIndex];
-		main = {};
-		main.hosted = std::make_unique<AnyPassAndResources>(MaterializeExternalPass(desc, true, false));
-		main.name = main.hosted->name;
-		auto& any = *main.hosted;
-		std::visit([&](auto& value) {
-			using T = std::decay_t<decltype(value)>;
-			if constexpr (!std::is_same_v<T, std::monostate>) {
-				auto lowered = lowering::LowerPass(*this, _registry, m_queueRegistry, primaryBackend, value, any.type);
-				AwaitPassPipelines(value.resources, lowered.device, main.name);
-				std::vector<Resource*> resources;
-				for (const auto& use : lowered.entries) resources.push_back(use.resource);
-				for (const auto& group : lowered.groups) for (const auto& [id, resource] : group.members) resources.push_back(resource.get());
-				MaterializePersistentStandalone(resources, true);
-				InstallMainPass(*this, state, edit, main, std::move(lowered), mainIndex, false, order);
-			}
-		}, any.pass);
-		for (const auto a : after) edit.AddOrdering(state.mainPasses[a].id, main.id);
-		for (const auto b : before) edit.AddOrdering(main.id, state.mainPasses[b].id);
-		state.hostedMainPasses.push_back(mainIndex);
-	}
-	auto ready = BuildPersistentStructural(edit);
-	if (!ready || !state.program.Install(edit, ready)) throw std::runtime_error("Persistent frame-interrupting pass edit failed to install");
-	++state.structuralBuilds;
-	basic_telemetry::AddCounter("ORG.Persistent.StructuralBuilds");
-	basic_telemetry::AddCounter("ORG.Persistent.FrameInterruptingBuilds");
-	std::string names;
-	for (const auto mainIndex : state.hostedMainPasses) {
-		if (names.size() > 512) { names += " ..."; break; }
-		names += (names.empty() ? "" : ", ") + state.mainPasses[mainIndex].name;
-	}
-	spdlog::info("Persistent frame-interrupting passes: added={} removed={} build_ms={:.2f} [{}]", state.hostedMainPasses.size(), removed,
-		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), names);
-}
-
 // Alias placement over the scheduled executable. Lifetimes are ranks in batch
 // order (a linear extension of the scheduling edges), packed per pool with the
 // same greedy sweep-line as the per-frame planner. Overlapping placements get
@@ -1075,7 +953,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		changed = true;
 		edit.ClearPlacementOrderings();
 		std::unordered_map<uint32_t, persistent::PassId> idBySlot;
-		for (const auto& main : state.mainPasses) if (!main.retired) idBySlot.emplace(main.id.index, main.id);
+		for (const auto& main : state.mainPasses) idBySlot.emplace(main.id.index, main.id);
 		for (const auto& [from, to] : edges) {
 			const auto a = idBySlot.find(from), b = idBySlot.find(to);
 			if (a == idBySlot.end() || b == idBySlot.end()) throw std::logic_error("Persistent alias planning: ordering references an unknown pass slot");
@@ -1234,7 +1112,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	}
 	if (logging) {
 		std::unordered_map<uint32_t, const std::string*> nameBySlot;
-		for (const auto& main : state.mainPasses) if (!main.retired) nameBySlot.emplace(main.id.index, &main.name);
+		for (const auto& main : state.mainPasses) nameBySlot.emplace(main.id.index, &main.name);
 		std::vector<std::string> nameByRank(nextRank);
 		for (uint32_t p = 0; p < structure.passes.size(); ++p) {
 			if (rank[p] == UINT32_MAX) continue;

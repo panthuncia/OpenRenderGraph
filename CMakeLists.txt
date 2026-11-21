@@ -6,7 +6,6 @@ include(GNUInstallDirs)
 
 option(OPENRENDERGRAPH_ENABLE_SUBMODULE_FALLBACK "Allow fallback to in-tree BasicRHI when package is unavailable" ON)
 option(OPENRENDERGRAPH_FORWARD_BASICRHI_DEP_OPTIONS "Forward BasicRHI PIX/Streamline options when adding BasicRHI subdirectory" ON)
-option(OPENRENDERGRAPH_ENABLE_DEBUG_UI "Build the optional ImGui/ImPlot/Slang inspector" OFF)
 option(OPENRENDERGRAPH_ENABLE_SCHEDULE_UI "Build the persistent schedule inspector (DebugUI/ScheduleInspector.h), Dear ImGui only" OFF)
 option(OPENRENDERGRAPH_ENABLE_MEMORY_UI "Build the memory introspection widget (DebugUI/MemoryIntrospectionWidget.h), Dear ImGui and ImPlot only" OFF)
 option(OPENRENDERGRAPH_BUILD_TESTS "Build OpenRenderGraph tests" OFF)
@@ -80,11 +79,6 @@ if(NOT WIN32)
     find_package(directxmath CONFIG REQUIRED)
 endif()
 find_package(Boost REQUIRED COMPONENTS container_hash)
-if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
-    find_package(imgui CONFIG REQUIRED)
-    find_package(implot CONFIG REQUIRED)
-    find_package(slang CONFIG REQUIRED)
-endif()
 if((OPENRENDERGRAPH_ENABLE_SCHEDULE_UI OR OPENRENDERGRAPH_ENABLE_MEMORY_UI) AND NOT TARGET imgui::imgui)
     find_package(imgui CONFIG REQUIRED)
 endif()
@@ -117,6 +111,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RecordingContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/LatchBlock.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FrameArena.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RunReadback.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Buffers/LateBackings.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/VersionedResource.cpp"
@@ -137,8 +132,6 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/CopyQueueUploadService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultUploadPolicyService.cpp"
     
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultReadbackService.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/ReadbackCapturePlan.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultDescriptorService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/ThreadPoolTaskService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ThreadPoolTaskService.h"
@@ -158,7 +151,6 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphDiagnostics.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphStructural.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistent.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentCaptures.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentExecute.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentStructural.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/RenderGraphPersistentTickets.cpp"
@@ -185,7 +177,6 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/DescriptorHeapManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/UploadManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/UploadInstance.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/ReadbackManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Managers/Singletons/StatisticsManager.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBackingResource.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ExternalBufferResource.cpp"
@@ -251,9 +242,8 @@ endif()
 target_compile_definitions(OpenRenderGraph PRIVATE ORG_ENABLE_NVPERF=$<BOOL:${_org_nvperf}>)
 
 # The memory introspection widget alone: Dear ImGui and ImPlot (the host's contexts), no Slang. The host feeds it a
-# ui::MemorySnapshot built from the graph's memory snapshot provider (Render/MemoryIntrospectionAPI.h). The debug UI links it
-# rather than compiling the widget a second time.
-if(OPENRENDERGRAPH_ENABLE_MEMORY_UI OR OPENRENDERGRAPH_ENABLE_DEBUG_UI)
+# ui::MemorySnapshot built from the graph's memory snapshot provider (Render/MemoryIntrospectionAPI.h).
+if(OPENRENDERGRAPH_ENABLE_MEMORY_UI)
     add_library(OpenRenderGraphMemoryUI STATIC
         "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryIntrospectionWidget.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/include/DebugUI/MemoryIntrospectionWidget.h")
@@ -266,23 +256,6 @@ if(OPENRENDERGRAPH_ENABLE_MEMORY_UI OR OPENRENDERGRAPH_ENABLE_DEBUG_UI)
         target_compile_options(OpenRenderGraphMemoryUI PRIVATE /utf-8)
     endif()
     target_link_libraries(OpenRenderGraphMemoryUI PUBLIC OpenRenderGraph::OpenRenderGraph imgui::imgui implot::implot)
-endif()
-
-if(OPENRENDERGRAPH_ENABLE_DEBUG_UI)
-    add_library(OpenRenderGraphDebugUI STATIC
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/DebugUI/MemoryViewWidget.cpp")
-    add_library(OpenRenderGraph::DebugUI ALIAS OpenRenderGraphDebugUI)
-    target_compile_features(OpenRenderGraphDebugUI PUBLIC cxx_std_23)
-    target_include_directories(OpenRenderGraphDebugUI PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    if(MSVC)
-        target_compile_options(OpenRenderGraphDebugUI PRIVATE /utf-8)
-    endif()
-    target_link_libraries(OpenRenderGraphDebugUI PUBLIC OpenRenderGraph::OpenRenderGraph OpenRenderGraph::MemoryUI
-        imgui::imgui implot::implot slang::slang)
 endif()
 
 # The persistent schedule inspector: plain Dear ImGui (the host's imgui::imgui and its context), no ImPlot or Slang.
@@ -406,7 +379,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_definitions(OpenRenderGraphAsyncCompileTests PRIVATE NOMINMAX)
     add_test(NAME OpenRenderGraphAsyncCompileTests COMMAND OpenRenderGraphAsyncCompileTests)
     if(_org_d3d12_tests)
-    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/RuntimeTests.cpp tests/ExternalClientTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/PipelineLibraryTests.cpp tests/ReadbackCaptureTests.cpp tests/RebindingGpuTests.cpp)
+    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/RuntimeTests.cpp tests/ExternalClientTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/PipelineLibraryTests.cpp tests/RebindingGpuTests.cpp)
     target_include_directories(OpenRenderGraphExternalResourceTests PRIVATE src/include)
     target_compile_definitions(OpenRenderGraphExternalResourceTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     if(WIN32 AND BASICRHI_ENABLE_STREAMLINE)

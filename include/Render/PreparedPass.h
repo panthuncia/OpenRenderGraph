@@ -769,29 +769,6 @@ public:
         result.m_storage = std::move(storage);
         return result;
     }
-    // Combines the packet with extra commands and extra lifecycle effects into one packet. An example is a readback
-    // capture: a copy of a resource the pass wrote, recorded right after the pass in the same executable, with no new
-    // pass to schedule. The trailer records into the pass's list after the pass. Its effects commit after the pass's
-    // own. The result is never replayable.
-    static PreparedPass WithTrailer(PreparedPass inner, std::function<void(RecordingContext&)> trailer,
-        std::vector<std::shared_ptr<const PreparedLifecycleEffect>> effects, std::shared_ptr<const void> keepAlive = {}) {
-        if (!inner.m_storage || inner.IsConsumed()) throw std::invalid_argument("A trailer needs an unconsumed packet");
-        if (!trailer) throw std::invalid_argument("Missing trailer recording");
-        auto storage = std::make_shared<TrailerStorage>();
-        storage->inner = inner.m_storage;
-        storage->trailer = std::move(trailer);
-        storage->effects = std::move(effects);
-        storage->keepAlive = std::move(keepAlive);
-        storage->dependencies = std::move(inner.m_storage->dependencies);
-        storage->externalSignals = inner.m_storage->externalSignals;
-        for (const auto& effect : storage->effects)
-            for (const auto& signal : effect->SignalsAfterCompletion()) storage->externalSignals.push_back(signal);
-        storage->debugName = inner.m_storage->debugName;
-        storage->workerSafe = inner.m_storage->workerSafe;
-        PreparedPass result;
-        result.m_storage = std::move(storage);
-        return result;
-    }
     explicit operator bool() const { return static_cast<bool>(m_storage); }
     bool IsConsumed() const { return m_storage && m_storage->state.load(std::memory_order_acquire) != LifecycleState::Prepared; }
     bool IsWorkerSafe() const noexcept { return m_storage && m_storage->workerSafe; }
@@ -960,33 +937,6 @@ private:
             else return false;
         }
 		mutable std::optional<Data> data;
-    };
-    // The inner packet's storage is driven directly: the outer packet owns the lifecycle state and the dependencies.
-    struct TrailerStorage final : StorageBase {
-        void Record(RecordingContext& context) const override {
-            inner->Record(context);
-            trailer(context);
-        }
-        void CommitSubmitted(SubmissionContext context) const override {
-            inner->CommitSubmitted(context);
-            for (const auto& effect : effects) effect->Submitted(context);
-        }
-        void CommitCompleted(CompletionContext context) const override {
-            inner->CommitCompleted(context);
-            for (const auto& effect : effects) effect->Completed(context);
-            Release();
-        }
-        void Abandon(AbandonReason reason) const override {
-            inner->Abandon(reason);
-            for (const auto& effect : effects) effect->Abandoned(reason);
-            Release();
-        }
-        bool HasCallbacks() const noexcept override { return true; }
-        void Release() const { effects.clear(); keepAlive.reset(); }
-        std::shared_ptr<const StorageBase> inner;
-        std::function<void(RecordingContext&)> trailer;
-        mutable std::vector<std::shared_ptr<const PreparedLifecycleEffect>> effects;
-        mutable std::shared_ptr<const void> keepAlive;
     };
     std::shared_ptr<const StorageBase> m_storage;
 };

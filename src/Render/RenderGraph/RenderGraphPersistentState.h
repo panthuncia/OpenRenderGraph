@@ -414,12 +414,6 @@ struct RenderGraph::PersistentInstanceState {
 		// RebindsConcreteResources: the wrappers its pointer declarations go through, one per distinct resource in
 		// declaration order (UseRebindSlots). Each is the pass's own slot; its backing is the resource declared there last.
 		std::vector<std::shared_ptr<DynamicResource>> rebindSlots;
-		// Frame-interrupting per-frame pass hosted in the main executable (not in
-		// the master list). It is prepared once and records nothing afterwards
-		// until its removal is installed.
-		std::unique_ptr<AnyPassAndResources> hosted;
-		bool hostedPrepared = false;
-		bool retired = false; // Hosted pass removed; the main index may be reused.
 		uint32_t epoch = persistent::AllEpochs; // Host epoch (ExternalPassDesc::Epoch).
 	};
 
@@ -443,8 +437,6 @@ struct RenderGraph::PersistentInstanceState {
 	std::vector<size_t> uploadMasterIndices;                        // Passes with immediate-mode commands.
 	std::vector<uint32_t> mainPassByMaster;                        // UINT32_MAX when not main.
 	std::vector<uint8_t> masterHostedInMain;
-	std::vector<uint32_t> hostedMainPasses;             // Main indices of installed frame-interrupting passes.
-	std::vector<ExternalPassDesc> deferredInterrupting; // Requested while a structural build was pending.
 	// Alias planning (structural builds only), into the pools of the graph's arena (RenderGraph::SetPersistentAliasArena; one of
 	// its own without one). This state is the arena's owner key for its requirements.
 	std::shared_ptr<PersistentAliasArena> aliasArena;
@@ -526,16 +518,6 @@ struct RenderGraph::PersistentInstanceState {
 	// Deferred), by slot index. The next structural build applies them. A newer edit of the slot drops its entry.
 	std::unordered_map<uint32_t, persistent::BindingVersion> deferredSharing;
 	uint64_t deferredSharingBuilds = 0;
-	// Readback captures anchored after a main pass (RenderGraphPersistentCaptures.cpp), by pass name: appended to the
-	// pass's own packet when it is next prepared, so a capture never changes the executable.
-	struct PendingCapture { runtime::ReadbackCaptureInfo info; uint64_t requestedFrame = 0; };
-	std::unordered_map<std::string, std::vector<PendingCapture>> pendingCaptures;
-	// Captures the anchor pass could not take (it does not bind the resource, or not over the whole range): inserted
-	// next frame as frame-interrupting capture passes.
-	std::vector<runtime::ReadbackCaptureInfo> capturesToInsert;
-	// Captures requested after the graph (runtime::kReadbackAfterGraph). Submitted through the graph's external client
-	// after the execution.
-	std::vector<runtime::ReadbackCaptureInfo> afterGraphCaptures;
 };
 
 // The layout: tables built from the selected publication.
@@ -804,16 +786,6 @@ void DeferSharingChanges(State& state, persistent::GraphEditTransaction& edit);
 // Applies state.deferredSharing to `edit` (a structural build's transaction) and clears it.
 void ApplyDeferredSharing(State& state, persistent::GraphEditTransaction& edit);
 
-// RenderGraphPersistentCaptures.cpp
-// Takes the readback service's new capture requests. Captures after the graph are queued for SubmitAfterGraphCaptures.
-// Captures after a pass wait for that pass's next preparation. The ones a pass could not take last frame become
-// frame-interrupting passes.
-void PlacePersistentCaptures(RenderGraph& graph, State& state, bool ticket, std::vector<ExternalPassDesc>& interrupting);
-// The pass's packet with the captures waiting for it recorded after its own commands.
-// Submits the captures requested after the graph, through the graph's external client. Call it after the execution.
-void SubmitAfterGraphCaptures(RenderGraph& graph, State& state);
-PreparedPass AppendPersistentCaptures(RenderGraph& graph, State& state, const State::MainPass& pass, const std::string& name,
-	PreparedPass packet, const FramePreparationContext& preparation, const persistent::SelectedPublication& publication);
 
 // RenderGraphPersistentTrace.cpp
 void FillScheduleSubmissionWaits(ScheduleSubmissionWaits& out, const compiler::Schedule& graph,

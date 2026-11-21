@@ -62,7 +62,6 @@ struct PassParameters {
 	bool isGeometryPass = false;
 	QueueKind preferredQueueKind = QueueKind::Graphics;
 	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
-	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot instead of using preferredQueueKind
 	BackendAffinity backendAffinity{};
 	// The pipelines the pass declared by description, built for its device before it is published.
 	std::vector<std::shared_ptr<PipelineLibraryEntry>> declaredPipelines;

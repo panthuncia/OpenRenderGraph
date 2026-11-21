@@ -722,7 +722,7 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint32_t frameIndex
 	RetireIdlePersistentAliasPools(state);
 	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
 	PlaceDeferredPersistentAliases();
-	BindPersistentFrame(options.ticket != nullptr, bootstrap);
+	BindPersistentFrame(bootstrap);
 	PublishDeclaredVersions();
 	state.prepared = PreparePersistentExecution(device, frameIndex, hostData, deltaTime, options);
 }
@@ -984,15 +984,12 @@ void RenderGraph::BootstrapPersistentGraph() {
 	}
 }
 
-// Steps 0-2 of a preparation: captures, the passes' declarations, group memberships and backings, and the edits they make.
-void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
+// Steps 1-2 of a preparation: the passes' declarations, group memberships and backings, and the edits they make.
+void RenderGraph::BindPersistentFrame(bool bootstrap) {
 	auto& compiler = *m_compilerState;
 	auto& state = *compiler.persistent;
 	const auto primaryBackend = m_backendDevices.empty() ? rhi::Backend::Null : m_backendDevices.front().backend;
 
-	// 0. Readback captures. Captures after a pass become passes inserted into the main graph (step 1).
-	std::vector<ExternalPassDesc> interrupting;
-	if (m_drivesFrameServices) PlacePersistentCaptures(*this, state, ticket, interrupting);
 	// 1. Structural and membership changes reported by legacy passes. One
 	// transaction carries both so the slot directory never diverges from the
 	// installed program: a directory change is only made against an edit that
@@ -1008,7 +1005,6 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 		std::vector<RemapCandidate> remapCandidates;
 		std::optional<persistent::GraphEditTransaction> edit;
 		AdvancePersistentStructuralBuild(structural);
-		UpdatePersistentFrameInterruptingPasses(std::move(interrupting), primaryBackend);
 		// Alias re-placement when the packing strategy changed since the latest plan (plans run only on structural builds).
 		const bool packingChanged = m_getAutoAliasPackingStrategy && m_getAutoAliasPackingStrategy() != state.aliasPackingStrategy;
 		if (packingChanged && !state.pending) {
@@ -1037,7 +1033,6 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 		{ BT_ZONE_SCOPE("ORG.Persistent.PollDynamicDeclared");
 		for (uint32_t mainIndex = 0; mainIndex < state.mainPasses.size(); ++mainIndex) {
 			auto& main = state.mainPasses[mainIndex];
-			if (main.hosted || main.retired) continue; // One-shot; never relowered.
 			auto& any = m_masterPassList[main.masterIndex];
 			std::visit([&](auto& value) {
 				using T = std::decay_t<decltype(value)>;
@@ -1312,7 +1307,6 @@ void RenderGraph::BindPersistentFrame(bool ticket, bool bootstrap) {
 		// is relowered inline above, so by here every pass must match; never silently.
 		{ BT_ZONE_SCOPE("ORG.Persistent.CheckDirectResolvers");
 		for (const auto& main : state.mainPasses) {
-			if (main.hosted || main.retired) continue;
 			for (const auto& [resolver, identity] : main.directResolvers) {
 				const auto captured = CaptureResolverDeclarationState(*resolver);
 				if (captured && !(captured->resourceSetIdentity == identity))
@@ -1464,8 +1458,8 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 		// Every pass's name, not only this epoch's: the table is rebuilt once per executable.
 		if (namesDirty)
 			for (const auto& pass : state.mainPasses)
-				if (!pass.retired && pass.id.index < mainNames->size())
-					(*mainNames)[pass.id.index] = (pass.hosted ? *pass.hosted : m_masterPassList[pass.masterIndex]).name;
+				if (pass.id.index < mainNames->size())
+					(*mainNames)[pass.id.index] = m_masterPassList[pass.masterIndex].name;
 		// A resolver use's resource tokens name the member it had when the pass declared it. They resolve as its views do: to
 		// the resource bound now at that member's position (a versioned buffer's current version: VersionedBuffer), so a
 		// membership change stays a binding edit.
@@ -1483,7 +1477,6 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 		};
 		for (uint32_t mainIndex = 0; mainIndex < state.mainPasses.size() && executing; ++mainIndex) {
 			auto& pass = state.mainPasses[mainIndex];
-			if (pass.retired) continue;
 			// Another epoch's pass: neither prepared nor recorded now. Its slot patches wait.
 			if (!RunsInPersistentEpoch(pass.epoch)) continue;
 			if (pass.slotsDirty || pass.slotsExecutable != selected->executable.get()) {
@@ -1500,7 +1493,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 				for (const auto index : pass.directEntries) expose(index);
 				for (const auto groupIndex : pass.groups) for (const auto index : state.groups[groupIndex].memberEntries) expose(index);
 				// Registry handle identities may differ from scheduling identities.
-				const auto view = GetPassView(pass.hosted ? *pass.hosted : m_masterPassList[pass.masterIndex]);
+				const auto view = GetPassView(m_masterPassList[pass.masterIndex]);
 				for (const auto& requirement : view.reqs) {
 					auto* resource = requirement.resourceHandleAndRange.resource.IsEphemeral()
 						? requirement.resourceHandleAndRange.resource.GetEphemeralPtr() : _registry.Resolve(requirement.resourceHandleAndRange.resource);
@@ -1542,14 +1535,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 				pass.slotAdds.clear(); pass.slotRemoves.clear();
 			}
 			if (pass.id.index >= main.invocations.size()) continue; // added by a pending structural build
-			auto& any = pass.hosted ? *pass.hosted : m_masterPassList[pass.masterIndex];
-			if (pass.hosted && pass.hostedPrepared) {
-				// Already ran; stays in the executable until its removal installs.
-				main.invocations[pass.id.index] = PreparedPass::NoOp();
-				if (namesDirty) (*mainNames)[pass.id.index] = any.name;
-				continue;
-			}
-			pass.hostedPrepared = static_cast<bool>(pass.hosted);
+			auto& any = m_masterPassList[pass.masterIndex];
 			passPreparation.resourceSlots = pass.slots;
 			passPreparation.preparedResourceUses = pass.preparedResourceUses;
 			passPreparation.preparedBindings = pass.preparedBindings;
@@ -1619,13 +1605,6 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 				cost.first += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prepareStarted).count());
 				++cost.second;
 			}
-			// A capture anchored after this pass records in its packet: the packet is this frame's only.
-			bool captured = false;
-			if (!state.pendingCaptures.empty() && state.pendingCaptures.contains(any.name)) {
-				packet = AppendPersistentCaptures(*this, state, pass, any.name, std::move(packet), passPreparation,
-					executing ? *executing : *selected);
-				captured = true;
-			}
 			packet.SetDebugName(any.name);
 			// A pass the host turned off for this execution by its host data (RenderGraphPass::SetSkipWhen) records only its barriers.
 			if (const RenderGraphPass* object = std::visit([](auto& value) -> const RenderGraphPass* {
@@ -1643,12 +1622,12 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 					else return value.pass.get();
 				}, any.pass);
 				uint64_t hash = 0;
-				if (object && !pass.hosted && !captured && object->RevisionHash(hash)) {
+				if (object && object->RevisionHash(hash)) {
 					ticket->revisions.emplace_back(object, hash);
 					ticket->revisionNames.push_back(any.name);
 				}
 				else {
-					if (!ticket->uncheckable) ticket->uncheckableBy = any.name + (!object ? " (no pass object)" : pass.hosted ? " (hosted)" : captured ? " (captured)" : " (no revision hash)");
+					if (!ticket->uncheckable) ticket->uncheckableBy = any.name + (!object ? " (no pass object)" : " (no revision hash)");
 					ticket->uncheckable = true;
 				}
 			}

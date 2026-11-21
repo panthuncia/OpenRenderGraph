@@ -91,7 +91,6 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 	if (!ticket && record->milestone.load(std::memory_order_acquire) == ExecutionMilestone::Admitted) record->Finish(false);
 	compiler.lastExecutedPreparationSlot = execution.frameIndex;
 	if (!ticket) {
-		SubmitAfterGraphCaptures(*this, state);
 		BT_ZONE_SCOPE("ORG.Persistent.AfterExecute");
 		for (auto& extension : m_extensions)
 			if (extension) extension->AfterExecute(*this);

@@ -60,10 +60,7 @@ struct ExternalPassDesc {
 	std::shared_ptr<RenderPass> pass;
 	std::optional<QueueKind> preferredQueueKind;
 	std::optional<QueueAssignmentPolicy> queueAssignmentPolicy;
-	std::optional<QueueSlotIndex> pinnedQueueSlot; // Target a specific queue slot, bypassing queue preference
 
-	// Optional: if true, the pass will be registered in Get*PassByName().
-	bool registerName = true;
 	bool isGeometryPass = false; // Optional: opts pass into statistics tracking for rasterization
 	bool collectStatistics = true;
 	// Persistent execution: the host epoch the pass runs in. persistent::AllEpochs
@@ -80,12 +77,6 @@ struct ExternalPassDesc {
 	// it knows then to be empty (TypedRenderGraphPass's SkipsAtExecution). An extension should ask
 	// RenderGraph::PassEpochRecordsAtExecution before it sets this: otherwise the graph refuses the pass.
 	bool recordAtExecution = false;
-	// Per-frame passes only. A frame-interrupting pass must run at its insert
-	// point even under the persistent graph, which hosts it in the main
-	// executable at the cost of a structural rebuild when it appears and when
-	// it goes away. Meant for rare debugging work (mid-frame readbacks); other
-	// per-frame passes run after the persistent main executable.
-	bool interruptsFrame = false;
 
 	static ExternalPassDesc Render(std::string name, std::shared_ptr<RenderPass> renderPass) {
 		ExternalPassDesc desc{};
@@ -150,25 +141,6 @@ struct ExternalPassDesc {
 		return std::move(*this);
 	}
 
-	ExternalPassDesc& PinToQueue(QueueSlotIndex queueSlot) & {
-		pinnedQueueSlot = queueSlot;
-		return *this;
-	}
-
-	ExternalPassDesc PinToQueue(QueueSlotIndex queueSlot) && {
-		pinnedQueueSlot = queueSlot;
-		return std::move(*this);
-	}
-
-	ExternalPassDesc& RegisterByName(bool enabled = true) & {
-		registerName = enabled;
-		return *this;
-	}
-
-	ExternalPassDesc RegisterByName(bool enabled = true) && {
-		registerName = enabled;
-		return std::move(*this);
-	}
 
 	ExternalPassDesc& GeometryPass(bool enabled = true) & {
 		isGeometryPass = enabled;
@@ -207,16 +179,6 @@ struct ExternalPassDesc {
 
 	ExternalPassDesc Epoch(uint32_t value) && {
 		epoch = value;
-		return std::move(*this);
-	}
-
-	ExternalPassDesc& InterruptsFrame(bool enabled = true) & {
-		interruptsFrame = enabled;
-		return *this;
-	}
-
-	ExternalPassDesc InterruptsFrame(bool enabled = true) && {
-		interruptsFrame = enabled;
 		return std::move(*this);
 	}
 };

@@ -246,29 +246,9 @@ Target size: about 40–45k lines.
 
 ### Phase 8: per-pass resource readback capture
 
-> **Status (2026-10-30): implemented.** A capture anchored after a main pass is appended to that pass's packet
-> (`PreparedPass::WithTrailer`: barrier to copy source from the pass's final compiled state, copy, barrier back), so the
-> executable is not rebuilt (`RenderGraphPersistentCaptures.cpp`); a pass that does not bind the resource, or not over the
-> whole range, falls back to an interrupting capture pass next frame, and after-graph captures run at the end. The graph
-> consumes the readback service's requests itself (BasicRenderer's `ReadbackCaptureExtension` is gone). The schedule
-> inspector takes a capture callback (`ScheduleCaptureFn`); requests by scheduling ID
-> (`IReadbackService::RequestScheduledReadbackCapture`) resolve on the render thread. Viewer: BR opens `MemoryViewWidget`;
-> CS has a byte/u32/f32 view. Test: `PersistentVulkanHostTests` sync mode captures after `test.write` with the structural
-> revision unchanged.
-
-Phase 5 deleted the old `RGInspector` (`DebugUI/RenderGraphInspector`), which read the old compiler's `PassBatch` list. With it went per-pass resource readback capture: pick a pass in the inspector, pick a resource it touches, and see that resource's contents as they were right after the pass. Bring this forward onto the persistent schedule.
-
-What still exists:
-- `IReadbackService::RequestReadbackCapture(passName, resource, range, callback)`, `ReadbackCapturePass` and `ReadbackCaptureTests`.
-- Persistent hosting of frame-interrupting passes (`UpdatePersistentFrameInterruptingPasses`): an inserted pass observes resources at its insert point.
-- `ScheduleInspector` and its `PersistentScheduleSnapshot`, used by both CS and BR.
-
-Work:
-1. **Capture on the persistent route.** A capture requested for a pass inserts a `ReadbackCapturePass` right after that pass for one frame, through the frame-interrupting path. The insert must not force a structural rebuild of the main executable, and the capture must see the pass's output state. Cover textures (any mip or slice) and buffers, and resources a resolver group provides as well as direct ones.
-2. **Inspector UI.** `ScheduleInspector` lists, for the selected pass, the resources it declares, with access, state and range from the snapshot. It offers a capture action through an optional host callback, so the inspector itself stays free of service dependencies.
-3. **Viewer.** Port the old inspector's preview: textures shown through the host's ImGui descriptor allocator (the callbacks `RGInspectorOptions` took), with mip and slice selection and basic channel and range controls. Buffers shown as a hex and typed-value dump.
-4. **Consumers.** BR wires the callback to its readback service in the RG Inspector window. CS wires it in its schedule window, if CS's readback path supports it; otherwise it states in the UI that capture is unavailable.
-5. **Tests.** Extend `ReadbackCaptureTests` with a persistent graph: capture after a mid-frame pass that writes a known pattern, and check the bytes and that the main executable was not rebuilt.
+> **Status (2026-11-20): removed.** The capture path (the readback service, its capture passes, the persistent route's
+> capture hooks and frame-interrupting passes, `MemoryViewWidget` and the inspector's capture button) is deleted. Captures
+> outside the graph's recordings could not be replayed. Readbacks are now kept recordings (`org::RunReadback`).
 
 ## Verification (every phase)
 

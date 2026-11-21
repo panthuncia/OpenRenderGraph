@@ -212,41 +212,38 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 	auto& declaration = result.declaration;
 	const auto& resources = pass.resources;
 	std::vector<uint32_t> compatible;
-	if (resources.pinnedQueueSlot) compatible.push_back(static_cast<uint32_t>(static_cast<uint8_t>(*resources.pinnedQueueSlot)));
-	else {
-		auto kindCompatible = [&](QueueKind kind) {
-			switch (type) {
-			case RenderGraph::PassType::Render: return kind == QueueKind::Graphics;
-			default: return true;
-			}
-		};
-		for (size_t slot = 0; slot < queues.SlotCount(); ++slot) {
-			const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
-			if (!queues.IsAutoAssignable(index)) continue;
-			const auto kind = queues.GetKind(index);
-			const bool automatic = resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic && kindCompatible(kind);
-			if (automatic || kind == resources.preferredQueueKind) compatible.push_back(static_cast<uint32_t>(slot));
+	auto kindCompatible = [&](QueueKind kind) {
+		switch (type) {
+		case RenderGraph::PassType::Render: return kind == QueueKind::Graphics;
+		default: return true;
 		}
-		// Pick the pass's device. It is the primary device unless the pass's backend affinity names another one. A preferred
-		// device falls back to the primary when it is not available.
-		const auto& affinity = resources.backendAffinity;
-		auto onDevice = [&](auto&& accept) {
-			std::vector<uint32_t> kept;
-			for (const auto slot : compatible) if (accept(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)))) kept.push_back(slot);
-			return kept;
-		};
-		auto primary = [&](QueueSlotIndex slot) { return queues.GetBackendInstance(slot) == BackendInstanceId::Primary; };
-		if (affinity.strength == BackendAffinityStrength::Primary) compatible = onDevice(primary);
-		else {
-			auto kept = onDevice([&](QueueSlotIndex slot) {
-				return affinity.device ? queues.GetBackendInstance(slot) == *affinity.device : queues.GetBackend(slot) == affinity.backend;
-			});
-			if (kept.empty() && affinity.strength == BackendAffinityStrength::Required)
-				throw std::runtime_error("Persistent lowering: pass '" + pass.name + "' requires an unavailable backend");
-			compatible = kept.empty() ? onDevice(primary) : std::move(kept);
-		}
-		if (compatible.empty()) compatible.push_back(static_cast<uint32_t>(resources.preferredQueueKind));
+	};
+	for (size_t slot = 0; slot < queues.SlotCount(); ++slot) {
+		const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+		if (!queues.IsAutoAssignable(index)) continue;
+		const auto kind = queues.GetKind(index);
+		const bool automatic = resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic && kindCompatible(kind);
+		if (automatic || kind == resources.preferredQueueKind) compatible.push_back(static_cast<uint32_t>(slot));
 	}
+	// Pick the pass's device. It is the primary device unless the pass's backend affinity names another one. A preferred
+	// device falls back to the primary when it is not available.
+	const auto& affinity = resources.backendAffinity;
+	auto onDevice = [&](auto&& accept) {
+		std::vector<uint32_t> kept;
+		for (const auto slot : compatible) if (accept(static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot)))) kept.push_back(slot);
+		return kept;
+	};
+	auto primary = [&](QueueSlotIndex slot) { return queues.GetBackendInstance(slot) == BackendInstanceId::Primary; };
+	if (affinity.strength == BackendAffinityStrength::Primary) compatible = onDevice(primary);
+	else {
+		auto kept = onDevice([&](QueueSlotIndex slot) {
+			return affinity.device ? queues.GetBackendInstance(slot) == *affinity.device : queues.GetBackend(slot) == affinity.backend;
+		});
+		if (kept.empty() && affinity.strength == BackendAffinityStrength::Required)
+			throw std::runtime_error("Persistent lowering: pass '" + pass.name + "' requires an unavailable backend");
+		compatible = kept.empty() ? onDevice(primary) : std::move(kept);
+	}
+	if (compatible.empty()) compatible.push_back(static_cast<uint32_t>(resources.preferredQueueKind));
 	const auto device = queues.SlotCount() != 0
 		? queues.GetBackendInstance(static_cast<QueueSlotIndex>(static_cast<uint8_t>(compatible.front()))) : BackendInstanceId::Primary;
 	result.device = device;

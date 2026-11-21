@@ -31,7 +31,6 @@ int TestStatisticsPoolRetirement(rhi::Device device);
 int TestExternalClient(rhi::Device device);
 int TestProgramVersions(rhi::Device device);
 int TestPipelineLibrary(rhi::Device device);
-int TestReadbackCaptures(rhi::Device device);
 int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime);
 
 namespace {
@@ -1406,7 +1405,6 @@ int main(int argc, char** argv) {
     if (const auto failure = TestSignalReservations(device.Get())) return failure;
     if (const auto failure = TestProgramVersions(device.Get())) return failure;
     if (const auto failure = TestPipelineLibrary(device.Get())) return failure;
-    if (const auto failure = TestReadbackCaptures(device.Get())) return failure;
     if (const auto failure = TestFrameRetirement(device.Get(), rhi::Backend::D3D12)) return failure;
     if (const auto failure = TestRuntimeRetirement(device.Get())) return failure;
     if (const auto failure = TestAssignedTimelineRetirement(device.Get())) return failure;
