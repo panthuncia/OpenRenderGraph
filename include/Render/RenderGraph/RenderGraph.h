@@ -24,6 +24,7 @@
 #include "Resources/ResourceStateTracker.h"
 #include "Interfaces/IResourceProvider.h"
 #include "Render/ResourceRegistry.h"
+#include "Render/RecordingTags.h"
 #include "Render/CommandListPool.h"
 #include "Interfaces/IPassBuilder.h"
 #include "Render/MemoryIntrospectionAPI.h"
@@ -738,10 +739,17 @@ public:
 	// persistent::AllEpochs (the default) takes every pass.
 	void SetPassEpochFilter(uint32_t epoch) noexcept { m_passEpochFilter = epoch; }
 	uint32_t PassEpochFilter() const noexcept { return m_passEpochFilter; }
-	// The owner's value that every recording of this graph carries (RecordingContext::Tag), such as the pipeline versions its
-	// passes bind. Set while the graph is built (an extension's PrepareForBuild), before it first executes. One owner sets it.
-	void SetRecordingTag(std::shared_ptr<const void> tag) noexcept { m_recordingTag = std::move(tag); }
-	const std::shared_ptr<const void>& RecordingTag() const noexcept { return m_recordingTag; }
+	// A value that every recording of this graph carries under key (RecordingContext::Tag), such as the pipeline versions its
+	// passes bind. Each extension tags under its own key, so several can tag one graph. Set while the graph is built (an
+	// extension's PrepareForBuild), before it first executes. A null tag removes the key.
+	void SetRecordingTag(const RecordingTagKey& key, std::shared_ptr<const void> tag) {
+		const org::RecordingTags& now = m_recordingTags ? *m_recordingTags : org::RecordingTags{};
+		m_recordingTags = std::make_shared<const org::RecordingTags>(now.With(key, std::move(tag)));
+	}
+	// The tag under key, null without one.
+	const void* RecordingTag(const RecordingTagKey& key) const noexcept { return m_recordingTags ? m_recordingTags->Find(key) : nullptr; }
+	// Every tag, as the graph's recordings carry them. Null before the first SetRecordingTag.
+	const std::shared_ptr<const org::RecordingTags>& RecordingTagSet() const noexcept { return m_recordingTags; }
 	// Whether the graph's epoch (PassEpochFilter) is an external one, whose graphics work the host runs in its own stream. Its
 	// extensions may then declare passes recorded at execution (ExternalPassDesc::RecordAtExecution). GraphHost sets this before
 	// it builds the graph, so an extension can read it while it gathers its passes.
@@ -920,7 +928,7 @@ private:
 	// lists, made at their first ticket).
 	std::vector<uint32_t> m_externalPersistentEpochs;
 	bool m_inlineAtExecution = false;  // SetInlineAtExecution
-	std::shared_ptr<const void> m_recordingTag;  // SetRecordingTag
+	std::shared_ptr<const org::RecordingTags> m_recordingTags;  // SetRecordingTag
 	std::mutex m_externalSecondaryPoolsMutex;
 	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;
 	bool m_persistentRecordingReuse = false;
