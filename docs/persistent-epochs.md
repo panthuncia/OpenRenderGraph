@@ -329,7 +329,7 @@ effect). Pipelines and other objects a recording binds are retained by the recor
 -   **Kept live recordings** (with `Desc::reuseRecordings`). A live epoch's runs take kept copies instead of new leases.
     -   A kept copy is a lease whose LatchBlock regions are pinned to its index, like a published copy's. The epoch makes
         copies as its runs need them, up to `Desc::liveCopiesMost`. A run that finds none free takes a lease of its own and
-        records as before (`AsyncStats::liveSpilled`).
+        records (`AsyncStats::liveSpilled`).
     -   Each copy keeps the last replayable recording made for it. The next ticket of the copy binds that recording when it
         is still current: the same build of the graph, no version published since (`NoteNewVersions`), and every pass's
         revision unchanged. Nothing is prepared or recorded for it. The submission checks the revisions again after the

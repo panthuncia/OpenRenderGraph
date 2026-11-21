@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <mutex>
+#include <span>
 #include <unordered_set>
 #include <vector>
 

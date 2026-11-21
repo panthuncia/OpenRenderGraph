@@ -21,7 +21,7 @@ using namespace org::runtime;
 
 struct TestTaskServiceImpl;
 
-// A plain thread pool for the tests. Hosts bring their own task service (Runtime::Desc::tasks); CS's runs on its executor.
+// A plain thread pool for the tests. Hosts bring their own task service (Runtime::Desc::tasks).
 // Submit runs work on a fixed pool, highest priority first; ScheduleAfter once the delay has passed. ParallelFor fans out
 // across the pool and the caller takes part. A scope's Cancel drops its queued work, and Wait blocks until the rest finished.
 class TestTaskService final : public ITaskService {

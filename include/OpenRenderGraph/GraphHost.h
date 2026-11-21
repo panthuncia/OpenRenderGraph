@@ -93,12 +93,12 @@ public:
 		// copies: a lease whose LatchBlock regions stay at its index, like a published copy's. A copy keeps the last replayable
 		// recording made for it. While that recording is current, the next ticket of the copy binds it: nothing is prepared or
 		// recorded. Current means every pass's revision is unchanged, no new version was published since (NoteNewVersions), and
-		// the epoch's graph was not built again. Otherwise the ticket is prepared and recorded as before, and its recording is
+		// the epoch's graph was not built again. Otherwise the ticket is prepared and recorded, and its recording is
 		// kept if it is replayable. Each reuse clears the copy's latch regions first (LatchBlock::ZeroStableRun), so a block the
 		// run's commit does not write reads zeros, as in a new lease. Passes recorded at execution are still recorded at every
 		// submission.
 		// The most kept copies a live epoch makes. When every copy holds a run that is neither done nor sealed, the run takes a
-		// lease of its own and records as before (AsyncStats::liveSpilled).
+		// lease of its own and records (AsyncStats::liveSpilled).
 		uint32_t liveCopiesMost = 64;
 		// Async epochs: a ticket's staged uploads whose destination it first uses on another queue than graphics (async compute)
 		// are recorded on that queue, just ahead of the ticket's first batch there, instead of on the graphics queue; and a batch
@@ -766,7 +766,7 @@ public:
 	}
 	/**
 	 * @brief Submitting thread: a client that records work reading its LatchBlocks outside the host's executions (into another
-	 * submitter's command buffer: Community Shaders' DCLF CPU pipeline, DXVK's own list) opens a run of its own. CurrentRun() returns
+	 * submitter's command buffer, such as a CPU pipeline's or a translation layer's own list) opens a run of its own. CurrentRun() returns
 	 * it from now until EndExternalRun, except inside a ticket's beforeSubmit. The run's lease retires once `timeline` reaches
 	 * `value`, which the client signals after its last work that reads the run (its frame's end, maybe later than this call). Its
 	 * upload pages are taken now (what was staged since the last submission), and every descriptor slot, resource or backing

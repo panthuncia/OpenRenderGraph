@@ -473,7 +473,8 @@ private:
 	// An external epoch's ticket (out.external) submits its batches off the graphics queue here and gives the rest to its host
 	// (ExternalEpochExecution). streamUploads: its graphics-queue uploads were recorded for the host's stream, ahead of its first
 	// segment. A batch off the graphics queue that uses them waits for a segment of their own (the first).
-	// carry: several tickets submitted back to back, holding the sequencer across them, share queue submissions. This ticket's first group of batches joins the group the carry holds when both are on one queue and the new group
+	// carry: several tickets submitted back to back, holding the sequencer across them, share queue submissions. This
+	// ticket's first group of batches joins the group the carry holds when both are on one queue and the new group
 	// waits for nothing the held one does not. Any other submission of this ticket submits the held group first. carryOut: this
 	// ticket's last group is held in the carry instead of submitted, for the next ticket to join. FlushSubmitCarry submits it.
 	struct SubmitCarry;

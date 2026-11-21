@@ -3,7 +3,6 @@
 #include <atomic>
 #include <exception>
 #include <format>
-#include <stdexcept>
 #include <utility>
 
 namespace org::epoch_recordings {

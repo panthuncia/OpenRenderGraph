@@ -719,7 +719,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	// orders that: a run whose transient overlaps another epoch's committed use enters it from Undefined, after that use (a wait
 	// on another timeline, sync All on its own queue).
 	// A transient holds nothing from one run to the next, and with shared pools its memory holds another epoch's data in between.
-	// A pass that reads texels no pass wrote in that run shows the other epoch's data. CS's Screen Space GI did (its radiance
+	// A pass that reads texels no pass wrote in that run shows the other epoch's data. A screen-space GI pass did (its radiance
 	// prefilter read past the frame), which gave the green streaks once blamed on sharing.
 	size_t excludedCount = 0;
 	for (auto& c : candidates) {
@@ -926,7 +926,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			if (!(earlier.lastUse < later.firstUse))
 				throw std::logic_error("Persistent alias plan produced overlapping lifetimes for '" + a.concrete->GetName() + "' and '" + b.concrete->GetName() + "'");
 			++overlapPairs;
-			// Which transients share memory, for checking a plan by hand (CS: CS_ORG_ALIAS_LOG=1).
+			// Which transients share memory, for checking a plan by hand (with alias logging on).
 			if (logging)
 				spdlog::info("Persistent alias overlap: '{}' [{}, {}) ranks {}-{} then '{}' [{}, {}) ranks {}-{}", earlier.concrete->GetName(),
 					earlier.offset, earlier.offset + earlier.sizeBytes, earlier.firstUse, earlier.lastUse, later.concrete->GetName(), later.offset,
