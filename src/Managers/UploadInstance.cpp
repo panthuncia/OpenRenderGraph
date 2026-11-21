@@ -9,19 +9,14 @@
 #include <format>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
-#if defined(_MSC_VER)
-#include <intrin.h>
-#define ORG_DEBUG_BREAK() __debugbreak()
-#else
-#include <csignal>
-#define ORG_DEBUG_BREAK() std::raise(SIGTRAP)
-#endif
 
 #include <rhi_helpers.h>
 #include <spdlog/spdlog.h>
 #include <BasicTelemetry/Tracy.h>
 
+#include "OpenRenderGraph/Runtime.h"
 #include "Resources/Buffers/Buffer.h"
 #include "Resources/Resource.h"
 #include "Render/MemoryIntrospectionAPI.h"
@@ -511,7 +506,10 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	MapUpload(uploadBuffer, &mapped);
 	if (mapped) std::memcpy(mapped + uploadOffset, data, size);
 	UnmapUpload(uploadBuffer, uploadOffset, size);
-	if (!mapped) ORG_DEBUG_BREAK();
+	// The update is left out below (inactive).
+	if (!mapped)
+		Runtime::ReportError("upload: a staging page could not be mapped (" + std::to_string(size) + " bytes, " + (file ? file : "?") + ":" +
+			std::to_string(line) + ")");
 
 	{
 		const auto rfound = std::ranges::find(m_resourceUpdates.rbegin(), m_resourceUpdates.rend(),
@@ -610,7 +608,10 @@ void UploadInstance::UploadDataBatch(UploadTarget target, std::span<const Upload
 		}
 	}
 	UnmapUpload(uploadBuffer, uploadOffset, totalBytes);
-	if (!mapped) ORG_DEBUG_BREAK();
+	// The batch's updates are left out below (inactive).
+	if (!mapped)
+		Runtime::ReportError("upload: a staging page could not be mapped (" + std::to_string(totalBytes) + " bytes, " + (file ? file : "?") + ":" +
+			std::to_string(line) + ")");
 
 	{
 		// The batch's entries are the newest staging entries with sequences in

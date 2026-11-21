@@ -226,6 +226,15 @@ Runtime* Runtime::Current() noexcept {
 	return g_current.load(std::memory_order_acquire);
 }
 
+void Runtime::ReportError(std::string_view error) {
+	const auto* runtime = Current();
+	if (runtime && runtime->m_desc.onError) {
+		runtime->m_desc.onError(error);
+		return;
+	}
+	spdlog::critical("[ORG] {}", error);
+}
+
 Runtime::Runtime(Desc desc)
 	: m_desc(std::move(desc)), m_sequencer(std::make_shared<persistent::ResourceSequencer>()),
 	  m_schedules(std::make_shared<compiler::ScheduleCache>()) {}
