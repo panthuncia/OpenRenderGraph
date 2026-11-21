@@ -1,25 +1,59 @@
-#include "Render/Runtime/ThreadPoolTaskService.h"
+#pragma once
 
-#include <BasicTelemetry/Tracy.h>
+// The tests' task service: the thread pool ORG shipped as ThreadPoolTaskService before hosts had to bring their own.
+
+#include "Render/Runtime/ITaskService.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 
-namespace org::runtime {
+namespace org::test {
 
-namespace {
+using namespace org::runtime;
+
+struct TestTaskServiceImpl;
+
+// A plain thread pool for the tests. Hosts bring their own task service (Runtime::Desc::tasks); CS's runs on its executor.
+// Submit runs work on a fixed pool, highest priority first; ScheduleAfter once the delay has passed. ParallelFor fans out
+// across the pool and the caller takes part. A scope's Cancel drops its queued work, and Wait blocks until the rest finished.
+class TestTaskService final : public ITaskService {
+public:
+    // workerCount == 0 picks hardware_concurrency - 1 (at least one).
+    explicit TestTaskService(size_t workerCount = 0);
+    ~TestTaskService() override;
+    TestTaskService(const TestTaskService&) = delete;
+    TestTaskService& operator=(const TestTaskService&) = delete;
+
+    void ParallelFor(std::string_view taskName, size_t itemCount, std::function<void(size_t)> func) override;
+    void ParallelForLimited(std::string_view taskName, size_t itemCount, size_t maximumConcurrency,
+        std::function<void(size_t)> func) override;
+    std::shared_ptr<ITaskScope> CreateScope(std::string_view name) override;
+    bool Submit(const std::shared_ptr<ITaskScope>& scope, TaskPriority priority, std::string_view taskName,
+        std::function<void()>&& func) override;
+    bool ScheduleAfter(const std::shared_ptr<ITaskScope>& scope, std::chrono::steady_clock::duration delay,
+        TaskPriority priority, std::string_view taskName, std::function<void()>&& func) override;
+
+    size_t WorkerCount() const noexcept;
+
+private:
+    std::shared_ptr<TestTaskServiceImpl> m_impl;
+};
+
+
+namespace detail {
 
 class PoolScope final : public ITaskScope {
 public:
     void Cancel() noexcept override { m_cancelled.store(true, std::memory_order_release); }
     void Wait() override {
-        BT_ZONE_SCOPE("ORG.TaskScope.Wait");
         std::unique_lock lock(m_mutex);
         m_idle.wait(lock, [&] { return m_outstanding == 0; });
     }
@@ -40,20 +74,20 @@ private:
 };
 
 struct Task {
-    std::shared_ptr<PoolScope> scope;
+    std::shared_ptr<detail::PoolScope> scope;
     std::function<void()> work;
 };
 
-} // namespace
+} // namespace detail
 
-struct ThreadPoolTaskService::Impl {
+struct TestTaskServiceImpl {
     std::mutex mutex;
     std::condition_variable ready;
-    std::array<std::deque<Task>, 3> queues; // indexed by TaskPriority
+    std::array<std::deque<detail::Task>, 3> queues; // indexed by TaskPriority
     struct Delayed {
         std::chrono::steady_clock::time_point due;
         TaskPriority priority;
-        Task task;
+        detail::Task task;
     };
     std::vector<Delayed> delayed;
     std::vector<std::thread> threads;
@@ -75,7 +109,7 @@ struct ThreadPoolTaskService::Impl {
         std::unique_lock lock(mutex);
         while (true) {
             PromoteDue(std::chrono::steady_clock::now());
-            Task task;
+            detail::Task task;
             bool found = false;
             for (auto& queue : queues) {
                 if (!queue.empty()) {
@@ -110,8 +144,8 @@ struct ThreadPoolTaskService::Impl {
     }
 
     // Removes the scope's queued (not yet started) tasks. Started ones keep running.
-    void Retract(const std::shared_ptr<PoolScope>& scope) {
-        std::vector<Task> removed;  // destroyed outside the lock (see Run)
+    void Retract(const std::shared_ptr<detail::PoolScope>& scope) {
+        std::vector<detail::Task> removed;  // destroyed outside the lock (see Run)
         {
             std::lock_guard lock(mutex);
             for (auto& queue : queues) {
@@ -128,7 +162,7 @@ struct ThreadPoolTaskService::Impl {
 
     bool Enqueue(const std::shared_ptr<ITaskScope>& scope, TaskPriority priority,
         std::chrono::steady_clock::duration delay, std::function<void()>&& func) {
-        auto pool = std::dynamic_pointer_cast<PoolScope>(scope);
+        auto pool = std::dynamic_pointer_cast<detail::PoolScope>(scope);
         if (scope && !pool) return false; // a scope from another service
         if (pool && pool->Cancelled()) return false;
         if (pool) pool->Enter();
@@ -138,7 +172,7 @@ struct ThreadPoolTaskService::Impl {
                 if (pool) pool->Leave();
                 return false;
             }
-            Task task{std::move(pool), std::move(func)};
+            detail::Task task{std::move(pool), std::move(func)};
             if (delay <= std::chrono::steady_clock::duration::zero())
                 queues[static_cast<size_t>(priority)].push_back(std::move(task));
             else
@@ -149,7 +183,7 @@ struct ThreadPoolTaskService::Impl {
     }
 };
 
-ThreadPoolTaskService::ThreadPoolTaskService(size_t workerCount) : m_impl(std::make_shared<Impl>()) {
+inline TestTaskService::TestTaskService(size_t workerCount) : m_impl(std::make_shared<TestTaskServiceImpl>()) {
     if (workerCount == 0) {
         const unsigned hardware = std::thread::hardware_concurrency();
         workerCount = hardware > 1 ? hardware - 1 : 1;
@@ -159,8 +193,8 @@ ThreadPoolTaskService::ThreadPoolTaskService(size_t workerCount) : m_impl(std::m
         m_impl->threads.emplace_back([impl = m_impl] { impl->Run(); });
 }
 
-ThreadPoolTaskService::~ThreadPoolTaskService() {
-    std::vector<Impl::Delayed> dropped;  // destroyed outside the lock (see Run)
+inline TestTaskService::~TestTaskService() {
+    std::vector<TestTaskServiceImpl::Delayed> dropped;  // destroyed outside the lock (see Run)
     {
         std::lock_guard lock(m_impl->mutex);
         m_impl->stopping = true;
@@ -178,13 +212,13 @@ ThreadPoolTaskService::~ThreadPoolTaskService() {
         if (thread.joinable()) thread.join();
 }
 
-size_t ThreadPoolTaskService::WorkerCount() const noexcept { return m_impl->threads.size(); }
+inline size_t TestTaskService::WorkerCount() const noexcept { return m_impl->threads.size(); }
 
-void ThreadPoolTaskService::ParallelFor(std::string_view taskName, size_t itemCount, std::function<void(size_t)> func) {
+inline void TestTaskService::ParallelFor(std::string_view taskName, size_t itemCount, std::function<void(size_t)> func) {
     ParallelForLimited(taskName, itemCount, m_impl->threads.size() + 1, std::move(func));
 }
 
-void ThreadPoolTaskService::ParallelForLimited(std::string_view, size_t itemCount, size_t maximumConcurrency,
+inline void TestTaskService::ParallelForLimited(std::string_view, size_t itemCount, size_t maximumConcurrency,
     std::function<void(size_t)> func) {
     if (itemCount == 0) return;
     const size_t helpers = (std::min)({maximumConcurrency > 0 ? maximumConcurrency - 1 : 0, itemCount - 1, m_impl->threads.size()});
@@ -210,7 +244,7 @@ void ThreadPoolTaskService::ParallelForLimited(std::string_view, size_t itemCoun
         }
     };
     // Helpers run under a private scope so this call can join exactly them.
-    auto scope = std::make_shared<PoolScope>();
+    auto scope = std::make_shared<detail::PoolScope>();
     for (size_t i = 0; i < helpers; ++i)
         m_impl->Enqueue(scope, TaskPriority::FrameCritical, {}, body);
     body(); // the caller participates until every item is claimed
@@ -221,18 +255,18 @@ void ThreadPoolTaskService::ParallelForLimited(std::string_view, size_t itemCoun
     if (shared->failure) std::rethrow_exception(shared->failure);
 }
 
-std::shared_ptr<ITaskScope> ThreadPoolTaskService::CreateScope(std::string_view) {
-    return std::make_shared<PoolScope>();
+inline std::shared_ptr<ITaskScope> TestTaskService::CreateScope(std::string_view) {
+    return std::make_shared<detail::PoolScope>();
 }
 
-bool ThreadPoolTaskService::Submit(const std::shared_ptr<ITaskScope>& scope, TaskPriority priority, std::string_view,
+inline bool TestTaskService::Submit(const std::shared_ptr<ITaskScope>& scope, TaskPriority priority, std::string_view,
     std::function<void()>&& func) {
     return m_impl->Enqueue(scope, priority, {}, std::move(func));
 }
 
-bool ThreadPoolTaskService::ScheduleAfter(const std::shared_ptr<ITaskScope>& scope, std::chrono::steady_clock::duration delay,
+inline bool TestTaskService::ScheduleAfter(const std::shared_ptr<ITaskScope>& scope, std::chrono::steady_clock::duration delay,
     TaskPriority priority, std::string_view, std::function<void()>&& func) {
     return m_impl->Enqueue(scope, priority, delay, std::move(func));
 }
 
-} // namespace org::runtime
+} // namespace org::test

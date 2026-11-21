@@ -24,7 +24,7 @@
 #include "Render/Runtime/RuntimeDevice.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
 #include "Render/Runtime/DescriptorServiceAccess.h"
-#include "Render/Runtime/ThreadPoolTaskService.h"
+#include "TestTaskService.h"
 #include "OpenRenderGraph/GraphHost.h"
 #include "Render/LatchBlock.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
@@ -640,14 +640,14 @@ static int Run(int argc, char** argv) {
 		REQUIRE(TestFrameRetirement(device.Get(), rhi::Backend::Vulkan) == 0, "descriptor and frame retirement");
 		if (rebinding) {
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
-				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+				.tasks = std::make_shared<org::test::TestTaskService>(2)});
 			const int line = TestRebindingGpu(device.Get(), runtime);
 			runtime.reset();
 			if (line) std::printf("FAIL: rebinding (line %d)\n", line);
 			REQUIRE(line == 0, "rebinding");
 		} else if (split) {
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
-				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+				.tasks = std::make_shared<org::test::TestTaskService>(2)});
 			{
 				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1}});
 				auto program = CreateProgram(device.Get());
@@ -710,7 +710,7 @@ static int Run(int argc, char** argv) {
 		} else if (built) {
 			// "built": application-driven builds (GraphHost::BuildEpochGraph, AttachEpochGraph) on a host of two async epochs.
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
-				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+				.tasks = std::make_shared<org::test::TestTaskService>(2)});
 			{
 				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1},
 					.reportStaleAliasPlacements = true});
@@ -1002,7 +1002,7 @@ static int Run(int argc, char** argv) {
 			runtime.reset();
 		} else if (arena) {
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
-				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+				.tasks = std::make_shared<org::test::TestTaskService>(2)});
 			const auto writeQueue = spareQueue ? org::QueueKind::Compute : org::QueueKind::Graphics;
 			for (const bool shared : {true, false}) {
 				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1},
@@ -1084,7 +1084,7 @@ static int Run(int argc, char** argv) {
 			runtime.reset();
 		} else if (stream) {
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
-				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+				.tasks = std::make_shared<org::test::TestTaskService>(2)});
 			// Without queue-scoped uploads the write waits for the uploads, which run in the host's stream: a segment of their own,
 			// and the copy's segment split from it. With them the upload goes to the compute queue, ahead of the write.
 			for (const bool scopedUploads : {false, true}) {
@@ -1176,7 +1176,7 @@ static int Run(int argc, char** argv) {
 			runtime.reset();
 		} else if (segmentExternal) {
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
-				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+				.tasks = std::make_shared<org::test::TestTaskService>(2)});
 			{
 				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0},
 					.externalHomeStates = true, .reuseRecordings = true});
@@ -1395,7 +1395,7 @@ static int Run(int argc, char** argv) {
 		} else if (leases) {
 			// Two frames in flight. The runtime starts with 4 statistics ranges and grows them with the leases in flight.
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
-				.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+				.tasks = std::make_shared<org::test::TestTaskService>(2)});
 			{
 				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0},
 					.reuseRecordings = wide});
@@ -1554,7 +1554,7 @@ static int Run(int argc, char** argv) {
 		// The host registers the runtime device, owns the task service and upload
 		// pass, and drives persistent execution with the external queue boundary.
 		auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
-			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+			.tasks = std::make_shared<org::test::TestTaskService>(2)});
 		org::GraphHost host({.runtime = runtime,
 			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .reuseRecordings = reuse || revision});
 		if (inlineLate) host.SetInlineAtExecution(true);

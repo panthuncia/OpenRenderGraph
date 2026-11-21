@@ -12,6 +12,7 @@
 #include <future>
 #include <chrono>
 #include "Render/BindingTable.h"
+#include "TestTaskService.h"
 
 
 namespace {
@@ -63,7 +64,7 @@ int TestFrameRetirement(rhi::Device device, rhi::Backend backend) {
     {
         // The caller's runtime, or one of its own for this check.
         const auto runtime = org::Runtime::Current() ? org::Runtime::Current()->shared_from_this()
-            : org::Runtime::Create({.device = device, .backend = backend});
+            : org::Runtime::Create({.device = device, .backend = backend, .tasks = std::make_shared<org::test::TestTaskService>(2)});
         auto instance = org::GraphInstance::Adopt(runtime, std::make_unique<org::RenderGraph>(runtime));
         auto& graph = *instance->Graph();
         graph.StopFrameProduction();

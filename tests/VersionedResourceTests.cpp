@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include "TestTaskService.h"
 
 namespace {
 constexpr uint32_t kCount = 64;
@@ -78,7 +79,7 @@ int main() {
     create.framesInFlight = 2;
     rhi::DevicePtr device;
     CHECK(!rhi::Failed(rhi::CreateD3D12Device(create, device)) && device);
-    auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::D3D12});
+    auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::D3D12, .tasks = std::make_shared<org::test::TestTaskService>(2)});
     if (const int line = TestAdoptionObserver()) return line;
     std::puts("PASS: VersionedResourceTests");
     return 0;

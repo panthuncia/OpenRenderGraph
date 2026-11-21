@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <cstring>
 #include <type_traits>
+#include "TestTaskService.h"
 
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 int TestRuntimeRetirement(rhi::Device device);
@@ -1294,7 +1295,7 @@ int main(int argc, char** argv) {
     if (const auto failure = TestAliasHeapOwnership(create)) return failure;
 	rhi::DevicePtr device; CHECK(!rhi::Failed(rhi::CreateD3D12Device(create, device)) && device);
 	auto* nativeDevice = rhi::dx12::get_device(device.Get()); CHECK(nativeDevice);
-	auto orgRuntime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::D3D12});
+	auto orgRuntime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::D3D12, .tasks = std::make_shared<org::test::TestTaskService>(2)});
 
     {
         auto api = device.Get();

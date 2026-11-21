@@ -9,7 +9,7 @@
 #include "TestSupport.h"
 #include <OpenRenderGraph/GraphHost.h>
 
-#include "Render/Runtime/ThreadPoolTaskService.h"
+#include "TestTaskService.h"
 #include "Resources/Resource.h"
 
 #include <atomic>
@@ -149,7 +149,7 @@ int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org
 	g_contributor = &contributor;
 	{
 		auto runtime = org::Runtime::Create({.device = device, .backend = rhi::Backend::Vulkan,
-			.tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(2)});
+			.tasks = std::make_shared<org::test::TestTaskService>(2)});
 		org::GraphHost host({.runtime = runtime,
 			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}});
 		// Import only after creating the host. Importing creates descriptors, and those need the graph's runtime.

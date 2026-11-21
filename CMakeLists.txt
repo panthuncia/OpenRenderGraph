@@ -140,8 +140,6 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultReadbackService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/ReadbackCapturePlan.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultDescriptorService.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/ThreadPoolTaskService.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/Runtime/ThreadPoolTaskService.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/DefaultRenderGraphSettingsService.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/RuntimeDevice.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/Runtime.cpp"

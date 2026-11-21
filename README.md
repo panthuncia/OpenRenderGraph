@@ -48,7 +48,7 @@ the host asks for them at each structural build; every frame then runs the compi
 org::GraphHost host({
     .device = device,                       // a BasicRHI device the host keeps alive
     .backend = rhi::Backend::D3D12,
-    .tasks = std::make_shared<org::runtime::ThreadPoolTaskService>(4),
+    .tasks = hostTasks,                     // the host's org::runtime::ITaskService; ORG has no thread pool
 });
 ```
 

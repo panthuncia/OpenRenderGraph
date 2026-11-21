@@ -24,7 +24,6 @@
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 #include "Render/Runtime/RuntimeDevice.h"
 #include "Render/Runtime/TaskServiceAccess.h"
-#include "Render/Runtime/ThreadPoolTaskService.h"
 
 #include "Managers/Singletons/DeletionManager.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
@@ -239,7 +238,8 @@ void Runtime::Initialize() {
 	runtime::SetOpenRenderGraphSettings(settings);
 
 	runtime::InitializeRuntimeDevice(m_desc.device);
-	if (!m_desc.tasks) m_desc.tasks = std::make_shared<runtime::ThreadPoolTaskService>();
+	// ORG has no thread pool of its own. The host brings its job system.
+	if (!m_desc.tasks) throw std::invalid_argument("org::Runtime needs a task service (Desc::tasks)");
 	runtime::SetDefaultTaskService(m_desc.tasks);
 	{
 		std::scoped_lock lock(m_relaysMutex);

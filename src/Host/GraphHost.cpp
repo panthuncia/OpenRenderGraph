@@ -27,7 +27,6 @@
 #include "Render/Runtime/OpenRenderGraphSettings.h"
 #include "Render/Runtime/RuntimeDevice.h"
 #include "Render/Runtime/ScopedActiveGraphServices.h"
-#include "Render/Runtime/ThreadPoolTaskService.h"
 #include "Resources/VersionedResource.h"
 #include "HostUploadExtension.h"
 #include "Resources/PixelBuffer.h"

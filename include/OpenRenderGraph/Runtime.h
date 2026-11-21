@@ -46,7 +46,7 @@ public:
 		// The first capacity of the services indexed by run (upload pages and statistics query ranges, by GraphHost's lease
 		// index), and a graph's admission depth. They grow when more runs are in flight. At most kMaxSlots.
 		uint32_t slots = 3;
-		// Optional; a ThreadPoolTaskService is created when absent.
+		// Required: the host's job system, which runs graph builds, recording fan-out and background work.
 		std::shared_ptr<runtime::ITaskService> tasks;
 	};
 
