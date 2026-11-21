@@ -1433,8 +1433,8 @@ static int Run(int argc, char** argv) {
 					const auto before = arena->TakeStats().oversizeChunks;
 					auto large = arena->AcquireOversize(org::FrameArena::kChunkBytes + 1);
 					REQUIRE(large && large->offset == 0 && large->size >= org::FrameArena::kChunkBytes + 1, "an oversize region starts its own chunk");
-					auto small = arena->AcquireOversize(16);
-					REQUIRE(small && small->offset == 0 && small->buffer != large->buffer, "each oversize region has its own chunk");
+					auto tiny = arena->AcquireOversize(16);
+					REQUIRE(tiny && tiny->offset == 0 && tiny->buffer != large->buffer, "each oversize region has its own chunk");
 					const auto* largeBuffer = large->buffer;
 					large.reset();
 					arena->Trim();
