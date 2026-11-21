@@ -546,8 +546,8 @@ int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org
 	rhi::PipelineLayoutHandle layout);
 
 static int Run(int argc, char** argv) {
-	// "reuse": async epochs that record replayable recordings (GraphHost::Desc::reuseRecordings). A live epoch's recording is
-	// still used once: every run records.
+	// "reuse": async epochs that record replayable recordings (GraphHost::Desc::reuseRecordings). A live epoch's runs take kept
+	// copies, and a copy's next run binds the recording it kept while that recording is current.
 	// "external-reuse": "external" with replayable recordings. The late pass is replayable.
 	const bool externalReuse = argc > 1 && std::strcmp(argv[1], "external-reuse") == 0;
 	const bool reuse = externalReuse || (argc > 1 && std::strcmp(argv[1], "reuse") == 0);
@@ -589,7 +589,8 @@ static int Run(int argc, char** argv) {
 	// executed only at the frame's end, before SealSubmitted. Each run takes a run lease of its own instead of waiting for a run of
 	// the same frame, and the leases retire once their runs complete. Also checks the frame arena's regions (LatchBlock).
 	const bool leases = argc > 1 && (std::strcmp(argv[1], "leases") == 0 || std::strcmp(argv[1], "leases-wide") == 0);
-	// "leases-wide": the same, with 260 runs a frame, so lease indices pass 255, and with replayable recordings.
+	// "leases-wide": the same, with 260 runs a frame, so lease indices pass 255, and with replayable recordings. Then a run takes
+	// one of the epoch's kept copies, and once every copy holds an unsealed run, a lease of its own.
 	const bool wide = argc > 1 && std::strcmp(argv[1], "leases-wide") == 0;
 	// "open" after the mode: the name the mode's output gives. Every execution is open, admitted at submission.
 	const bool open = argc > 2 && std::strcmp(argv[2], "open") == 0;
@@ -1501,7 +1502,8 @@ static int Run(int argc, char** argv) {
 					REQUIRE(Matches(first, expected), "the frame's last run wrote last");
 					// Every run of the frame had a lease of its own.
 					for (size_t a = 0; a < frameRuns.size(); ++a) {
-						REQUIRE(frameRuns[a].Leased() && !frameRuns[a].Published(), "a live run is leased");
+						// With replayable recordings a live run may hold a kept copy, which names its copy like a published one.
+						REQUIRE(frameRuns[a].Leased() && (wide || !frameRuns[a].Published()), "a live run is leased");
 						for (size_t b = 0; b < a; ++b) REQUIRE(!(frameRuns[a] == frameRuns[b]), "runs in flight have leases of their own");
 					}
 					frameRuns.clear();
@@ -1902,7 +1904,7 @@ static int Run(int argc, char** argv) {
 					std::printf("growth as graph work: %s uploader queue\n", uploads->HasDedicatedStreamingQueue() ? "a dedicated" : "the shared");
 					REQUIRE(!spareQueue || uploads->HasDedicatedStreamingQueue(), "the spare queue is the uploader's");
 				}
-				// A live epoch publishes nothing: it records every run. A recording request for it completes with an error, and a
+				// A live epoch publishes nothing. A recording request for it completes with an error, and a
 				// recording given to its submission is rejected without hanging the host.
 				host.SetAsyncEpochs({0});
 				{
@@ -1959,8 +1961,10 @@ static int Run(int argc, char** argv) {
 				}
 				if (externalReuse) {
 					const auto recorded = host.TakeAsyncStats();
-					std::printf("external-reuse: %llu recorded\n", static_cast<unsigned long long>(recorded.recorded));
-					REQUIRE(recorded.recorded >= 6, "a live epoch with a replayable late pass still records every run");
+					std::printf("external-reuse: %llu recorded, %llu bound a kept recording\n", static_cast<unsigned long long>(recorded.recorded),
+						static_cast<unsigned long long>(recorded.liveReused));
+					// The late pass is recorded at every execution (checked above); the rest of the run is recorded or bound from its copy.
+					REQUIRE(recorded.recorded + recorded.liveReused >= 6, "each run records or binds its copy's kept recording");
 				}
 				// An execution that is not executed. It is signalled without running its work. The output keeps its last value, and
 				// the next execution goes on.
@@ -2081,7 +2085,7 @@ static int Run(int argc, char** argv) {
 			}
 			REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 			if (reuse) {
-				// Steady frames. A live epoch records every run, replayable or not, and nothing keeps its recordings.
+				// Steady frames. A live epoch's runs take kept copies. Each copy records once, and its later runs bind that recording.
 				(void)host.TakeAsyncStats();
 				for (uint32_t frame = 0; frame < 12; ++frame) {
 					value = 20000u + 10u * frame;
@@ -2089,11 +2093,14 @@ static int Run(int argc, char** argv) {
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "a run's recording writes its frame's value");
 				}
 				const auto steady = host.TakeAsyncStats();
-				std::printf("reuse: steady %llu recorded, %llu prepared again\n", static_cast<unsigned long long>(steady.recorded),
-					static_cast<unsigned long long>(steady.stale));
+				std::printf("reuse: steady %llu recorded, %llu bound a kept recording, %llu kept, %llu prepared again\n",
+					static_cast<unsigned long long>(steady.recorded), static_cast<unsigned long long>(steady.liveReused),
+					static_cast<unsigned long long>(steady.liveKept), static_cast<unsigned long long>(steady.stale));
 				// The window's first ticket is recorded ahead, on the host's thread, after the last submission before the window: it may be
 				// counted before the window opens.
-				REQUIRE(steady.recorded >= 11 && steady.stale == 0, "steady frames record every run");
+				REQUIRE(steady.recorded + steady.liveReused >= 11 && steady.stale == 0, "each steady run records or binds a kept recording");
+				// A few copies cycle (the next ticket is prepared while the last run may still be on the GPU), so most runs bind.
+				REQUIRE(steady.liveReused >= 6, "steady frames bind their copies' kept recordings");
 				// A pass's revision alternates inside the commit (beforeSubmit), as a view's state does. Each ticket was prepared for the
 				// other variant, so it is stale at submission and prepared again, for the same run.
 				const uint64_t base = outputRevision->load() + 100;

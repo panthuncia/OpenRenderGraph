@@ -34,9 +34,13 @@ class Resource;
 // - Regions (CreateRegions): one fixed region per stable run, which the client's passes copy into and the client reads
 //   when it knows the region's last copy is done. The client's own stamp, copied with the data, says which run it is.
 //
-// Errors are fatal: they throw std::runtime_error.
+// Errors go to the host's error handler, given at creation. When it returns, the call that failed does nothing more: a
+// Create returns null, Commit returns 0 (never a stamp), and a copy or read is left out.
 class RunReadback {
 public:
+	// Called with what went wrong. It may be called with the readback's lock held, so it must not call the readback.
+	using ErrorHandler = std::function<void(std::string_view)>;
+
 	// The latch bytes a run's stamp takes. The client writes it where Bind said, with the value Commit returns.
 	struct Stamp {
 		uint32_t value = 0;
@@ -46,7 +50,7 @@ public:
 	static constexpr uint32_t kNoRegion = UINT32_MAX;
 
 	// One part per copy, parts[i] bytes each.
-	static std::shared_ptr<RunReadback> Create(std::string_view name, std::vector<uint32_t> parts);
+	static std::shared_ptr<RunReadback> Create(std::string_view name, std::vector<uint32_t> parts, ErrorHandler onError);
 
 	// At every build, before the passes: the client's latch, and the offset of the Stamp the client writes there.
 	void Bind(std::shared_ptr<const LatchBlock> latch, uint32_t stampOffset);
@@ -60,7 +64,7 @@ public:
 		uint32_t height, std::string& why) const;
 
 	// In the client's commit, before Take. Reads the lease's last run and stamps this run. Returns this run's stamp, which the
-	// client writes into run's latch as a Stamp. Stamps grow by one each commit.
+	// client writes into run's latch as a Stamp. Stamps grow by one each commit. 0 when the run's lease is past the regions.
 	uint32_t Commit(const RunRef& run);
 
 	// In the client's executed callback: the run last committed was submitted.
@@ -99,7 +103,7 @@ public:
 	struct ListSet;
 
 	// A list readback with a buffer set for items.
-	static std::shared_ptr<RunReadback> CreateList(std::string_view name, const List& list, uint32_t items);
+	static std::shared_ptr<RunReadback> CreateList(std::string_view name, const List& list, uint32_t items, ErrorHandler onError);
 	// Adds a buffer set for a list of items, if none has it. Any thread, one at a time.
 	void Grow(uint32_t items);
 	// The set for a list of items, or null. A pass binds the list only with a set, so its copy misses nothing. Any thread.
@@ -117,11 +121,11 @@ public:
 	ListStats Stats(bool take);
 
 	// A region readback: regions regions of bytes bytes each, one per stable run.
-	static std::shared_ptr<RunReadback> CreateRegions(std::string_view name, uint32_t bytes, uint32_t regions);
+	static std::shared_ptr<RunReadback> CreateRegions(std::string_view name, uint32_t bytes, uint32_t regions, ErrorHandler onError);
 	// run's region, given on first use. kNoRegion for a leased run, whose lease changes every run, or when every region is
 	// taken. Any thread.
 	uint32_t RegionOf(const RunRef& run) const;
-	// In a pass's recording: copies bytes bytes of source at sourceOffset to offset in region. Fatal past the region.
+	// In a pass's recording: copies bytes bytes of source at sourceOffset to offset in region. An error past the region.
 	void RecordCopy(rhi::CommandList& commands, uint32_t region, uint64_t offset, rhi::ResourceHandle source, uint64_t sourceOffset,
 		uint64_t bytes) const;
 	// Maps region for read. The caller knows the region's last copy is done and no later copy runs meanwhile.

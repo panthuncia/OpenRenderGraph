@@ -355,7 +355,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 	// else of the ticket, as the caller did before.
 	bool uploadsPending = uploads && !uploads->lists.empty();
 	if (uploadsPending) {
-		bool ride = m_uploadsWithBatches && m_coalesceSubmissions && !ticket.external && ticket.segments.size() == 1;
+		bool ride = !ticket.external && ticket.segments.size() == 1;
 		if (ride) {
 			const auto& segment = ticket.segments.front();
 			const auto& graph = *segment.admission.publication->executable->graph;
@@ -517,7 +517,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			// new submission.
 			std::vector<uint32_t> targets(batchCount);
 			for (uint32_t batch = 0; batch < batchCount; ++batch) targets[batch] = batch;
-			if (m_mergeHandoffs && m_coalesceSubmissions && !ticket.external) {
+			if (!ticket.external) {
 				const auto& packets = segment.recording->packets;
 				uint32_t first = UINT32_MAX, firstQueue = UINT32_MAX;
 				for (uint32_t batch = 0; batch < batchCount && batch < packets.size(); ++batch) {
@@ -856,179 +856,173 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			}
 			continue;
 		}
-		if (m_coalesceSubmissions) {
-			BT_ZONE_SCOPE("ORG.Frame.SubmitPacketsCoalesced");
-			// Consecutive batches on one queue share one queue submission (SetCoalescedSubmissions). A batch with queue-scoped
-			// uploads ahead of it, or a packet of another kind, is submitted on its own.
-			compiler::PreparedRhiExecutionBatch::GatheredSubmission gathered;
-			std::vector<uint32_t> group;
-			uint32_t groupQueue = UINT32_MAX;
-			rhi::Queue groupRhiQueue{};
-			// The ticket's last group may be held for the next ticket (carryOut): only when nothing of this ticket is submitted after it
-			// (no home acquires; the last segment).
-			const bool holdLast = carry && carryOut && &segment == &ticket.segments.back() && admission.Barriers().homeAcquires.textures.empty();
-			const auto flush = [&](bool last) -> bool {
-				if (group.empty()) return true;
-				// The ticket's uploads ahead of its first group's lists. Their signal is below the group's own values on the same
-				// timeline, so the group's highest signal covers it.
-				if (uploadsPending) {
-					uploadsPending = false;
-					uploads->withBatches = true;
-					gathered.lists.insert(gathered.lists.begin(), uploads->lists.begin(), uploads->lists.end());
-					gathered.signals.push_back(uploads->signal);
+		BT_ZONE_SCOPE("ORG.Frame.SubmitPacketsCoalesced");
+		// Consecutive batches on one queue share one queue submission. A batch with queue-scoped
+		// uploads ahead of it, or a packet of another kind, is submitted on its own.
+		compiler::PreparedRhiExecutionBatch::GatheredSubmission gathered;
+		std::vector<uint32_t> group;
+		uint32_t groupQueue = UINT32_MAX;
+		rhi::Queue groupRhiQueue{};
+		// The ticket's last group may be held for the next ticket (carryOut): only when nothing of this ticket is submitted after it
+		// (no home acquires; the last segment).
+		const bool holdLast = carry && carryOut && &segment == &ticket.segments.back() && admission.Barriers().homeAcquires.textures.empty();
+		const auto flush = [&](bool last) -> bool {
+			if (group.empty()) return true;
+			// The ticket's uploads ahead of its first group's lists. Their signal is below the group's own values on the same
+			// timeline, so the group's highest signal covers it.
+			if (uploadsPending) {
+				uploadsPending = false;
+				uploads->withBatches = true;
+				gathered.lists.insert(gathered.lists.begin(), uploads->lists.begin(), uploads->lists.end());
+				gathered.signals.push_back(uploads->signal);
+			}
+			// The batches' own queue timeline: a wait on a value one of them signals is covered by queue order. Every
+			// signal on one timeline collapses to its highest value, which covers the lower ones.
+			const auto own = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(groupQueue))).GetHandle();
+			uint64_t firstSignal = batches[group.front()].signal.value;
+			// The group an earlier ticket left held: this group joins it when both are on one queue and timeline, and this group
+			// waits for nothing the held one did not. A wait on a value the held group signals is then covered by queue order, as
+			// within a ticket. Otherwise the held group is submitted on its own first.
+			bool joined = false;
+			if (carry && carry->Active()) {
+				// One queue: each queue signals its own timeline (the host's, shared by every graph), so the same timeline means
+				// the same queue.
+				const bool sameTimeline = carry->own.index == own.index && carry->own.generation == own.generation;
+				bool covered = sameTimeline;
+				bool waitsOnHeld = false;
+				for (const auto& wait : gathered.waits) {
+					if (!covered) break;
+					if (wait.t.index == own.index && wait.t.generation == own.generation && wait.value >= carry->firstSignal) {
+						waitsOnHeld = true;
+						continue;
+					}
+					covered = std::ranges::any_of(carry->gathered.waits, [&](const rhi::TimelinePoint& held) {
+						return held.t.index == wait.t.index && held.t.generation == wait.t.generation && held.value >= wait.value;
+					});
 				}
-				// The batches' own queue timeline: a wait on a value one of them signals is covered by queue order. Every
-				// signal on one timeline collapses to its highest value, which covers the lower ones.
-				const auto own = m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint8_t>(groupQueue))).GetHandle();
-				uint64_t firstSignal = batches[group.front()].signal.value;
-				// The group an earlier ticket left held: this group joins it when both are on one queue and timeline, and this group
-				// waits for nothing the held one did not. A wait on a value the held group signals is then covered by queue order, as
-				// within a ticket. Otherwise the held group is submitted on its own first.
-				bool joined = false;
-				if (carry && carry->Active()) {
-					// One queue: each queue signals its own timeline (the host's, shared by every graph), so the same timeline means
-					// the same queue.
-					const bool sameTimeline = carry->own.index == own.index && carry->own.generation == own.generation;
-					bool covered = sameTimeline;
-					bool waitsOnHeld = false;
-					for (const auto& wait : gathered.waits) {
-						if (!covered) break;
-						if (wait.t.index == own.index && wait.t.generation == own.generation && wait.value >= carry->firstSignal) {
-							waitsOnHeld = true;
-							continue;
-						}
-						covered = std::ranges::any_of(carry->gathered.waits, [&](const rhi::TimelinePoint& held) {
-							return held.t.index == wait.t.index && held.t.generation == wait.t.generation && held.value >= wait.value;
-						});
+				if (covered) {
+					joined = true;
+					firstSignal = carry->firstSignal;
+					// Between the held lists and this group's, when this group waited for a value the held group signals: a full
+					// memory barrier. Apart, that wait ordered this group's work after the held group's and made its writes
+					// visible. In one submission the wait goes, and the barrier takes its place.
+					if (waitsOnHeld) {
+						auto allocation = std::make_shared<compiler::FrameCommandAllocation>();
+						allocation->pool = m_queueRegistry.GetSharedPool(static_cast<QueueSlotIndex>(static_cast<uint8_t>(groupQueue)));
+						allocation->pair = allocation->pool->Request();
+						auto barrierList = allocation->pair.list.Get();
+						if (rhi::census::Enabled()) rhi::census::SetLabel("joined barrier");
+						const auto full = rhi::FullMemoryBarrier();
+						rhi::BarrierBatch barriers{};
+						barriers.globals = {&full, 1u};
+						barrierList.Barriers(barriers);
+						if (barrierList.EndChecked() != rhi::Result::Ok) throw std::runtime_error("A joined submission's barrier list could not close");
+						allocation->Close();
+						out.leases.push_back(std::move(allocation));
+						gathered.lists.insert(gathered.lists.begin(), barrierList);
 					}
-					if (covered) {
-						joined = true;
-						firstSignal = carry->firstSignal;
-						// Between the held lists and this group's, when this group waited for a value the held group signals: a full
-						// memory barrier. Apart, that wait ordered this group's work after the held group's and made its writes
-						// visible. In one submission the wait goes, and the barrier takes its place.
-						if (waitsOnHeld) {
-							auto allocation = std::make_shared<compiler::FrameCommandAllocation>();
-							allocation->pool = m_queueRegistry.GetSharedPool(static_cast<QueueSlotIndex>(static_cast<uint8_t>(groupQueue)));
-							allocation->pair = allocation->pool->Request();
-							auto barrierList = allocation->pair.list.Get();
-							if (rhi::census::Enabled()) rhi::census::SetLabel("joined barrier");
-							const auto full = rhi::FullMemoryBarrier();
-							rhi::BarrierBatch barriers{};
-							barriers.globals = {&full, 1u};
-							barrierList.Barriers(barriers);
-							if (barrierList.EndChecked() != rhi::Result::Ok) throw std::runtime_error("A joined submission's barrier list could not close");
-							allocation->Close();
-							out.leases.push_back(std::move(allocation));
-							gathered.lists.insert(gathered.lists.begin(), barrierList);
-						}
-						gathered.waits.insert(gathered.waits.begin(), carry->gathered.waits.begin(), carry->gathered.waits.end());
-						gathered.lists.insert(gathered.lists.begin(), carry->gathered.lists.begin(), carry->gathered.lists.end());
-						gathered.signals.insert(gathered.signals.begin(), carry->gathered.signals.begin(), carry->gathered.signals.end());
-						++carry->joins;
-						basic_telemetry::AddCounter("ORG.Persistent.CarriedSubmissionsJoined");
-					} else if (!FlushSubmitCarry(*carry)) {
-						return false;
-					}
+					gathered.waits.insert(gathered.waits.begin(), carry->gathered.waits.begin(), carry->gathered.waits.end());
+					gathered.lists.insert(gathered.lists.begin(), carry->gathered.lists.begin(), carry->gathered.lists.end());
+					gathered.signals.insert(gathered.signals.begin(), carry->gathered.signals.begin(), carry->gathered.signals.end());
+					++carry->joins;
+					basic_telemetry::AddCounter("ORG.Persistent.CarriedSubmissionsJoined");
+				} else if (!FlushSubmitCarry(*carry)) {
+					return false;
 				}
-				const auto merge = [](std::vector<rhi::TimelinePoint>& points) {
-					std::vector<rhi::TimelinePoint> merged;
-					for (const auto& point : points) {
-						auto found = std::ranges::find_if(merged, [&](const rhi::TimelinePoint& other) {
-							return other.t.index == point.t.index && other.t.generation == point.t.generation;
-						});
-						if (found == merged.end()) merged.push_back(point);
-						else found->value = (std::max)(found->value, point.value);
-					}
-					points = std::move(merged);
-				};
-				std::erase_if(gathered.waits, [&](const rhi::TimelinePoint& wait) {
-					return wait.t.index == own.index && wait.t.generation == own.generation && wait.value >= firstSignal;
-				});
-				merge(gathered.waits);
-				merge(gathered.signals);
-				// Held for the next ticket instead of submitted: the joined group's batches and this one's, with their recordings.
-				if (last && holdLast) {
-					if (!joined) {
-						carry->Clear();
-						carry->queue = groupRhiQueue;
-						carry->own = own;
-						carry->queueSlot = groupQueue;
-					}
-					carry->firstSignal = firstSignal;
-					carry->gathered = std::move(gathered);
-					carry->keep.push_back(segment.recording);
-					carry->tickets = joined ? carry->tickets + 1 : 1;
-					// Committed as submitted now, not when the held submission reaches the queue: the next ticket's preparation and
-					// recording read what these passes publish at their submission (a new version, for one), and the queue takes the
-					// held submission before any other submitter's, under the same hold of the sequencer.
-					bool committed = true;
-					for (const auto batch : group) {
-						const auto* packet = static_cast<const compiler::PreparedRhiExecutionBatch*>(packets[batch].get());
-						committed = static_cast<bool>(packet->CommitGathered(batches[batch])) && committed;
-					}
-					group.clear();
-					gathered.Clear();
-					return committed;
+			}
+			const auto merge = [](std::vector<rhi::TimelinePoint>& points) {
+				std::vector<rhi::TimelinePoint> merged;
+				for (const auto& point : points) {
+					auto found = std::ranges::find_if(merged, [&](const rhi::TimelinePoint& other) {
+						return other.t.index == point.t.index && other.t.generation == point.t.generation;
+					});
+					if (found == merged.end()) merged.push_back(point);
+					else found->value = (std::max)(found->value, point.value);
 				}
-				const auto submitted = groupRhiQueue.Submit({gathered.lists.data(), static_cast<uint32_t>(gathered.lists.size())},
-					{{gathered.waits.data(), static_cast<uint32_t>(gathered.waits.size())},
-					 {gathered.signals.data(), static_cast<uint32_t>(gathered.signals.size())}});
-				basic_telemetry::AddCounter("ORG.Persistent.CoalescedSubmissions");
-				basic_telemetry::AddCounter("ORG.Persistent.CoalescedBatches", group.size());
-				const bool ok = submitted == rhi::Result::Ok;
-				// Each batch the queue accepted commits its passes, even when another one's commit failed.
-				bool committed = true;
-				if (joined) {
-					// The held batches were committed when they were held.
-					if (ok) basic_telemetry::AddCounter("ORG.Persistent.CarriedTicketsSubmitted", carry->tickets);
+				points = std::move(merged);
+			};
+			std::erase_if(gathered.waits, [&](const rhi::TimelinePoint& wait) {
+				return wait.t.index == own.index && wait.t.generation == own.generation && wait.value >= firstSignal;
+			});
+			merge(gathered.waits);
+			merge(gathered.signals);
+			// Held for the next ticket instead of submitted: the joined group's batches and this one's, with their recordings.
+			if (last && holdLast) {
+				if (!joined) {
 					carry->Clear();
+					carry->queue = groupRhiQueue;
+					carry->own = own;
+					carry->queueSlot = groupQueue;
 				}
+				carry->firstSignal = firstSignal;
+				carry->gathered = std::move(gathered);
+				carry->keep.push_back(segment.recording);
+				carry->tickets = joined ? carry->tickets + 1 : 1;
+				// Committed as submitted now, not when the held submission reaches the queue: the next ticket's preparation and
+				// recording read what these passes publish at their submission (a new version, for one), and the queue takes the
+				// held submission before any other submitter's, under the same hold of the sequencer.
+				bool committed = true;
 				for (const auto batch : group) {
-					if (!ok) break;
 					const auto* packet = static_cast<const compiler::PreparedRhiExecutionBatch*>(packets[batch].get());
 					committed = static_cast<bool>(packet->CommitGathered(batches[batch])) && committed;
 				}
 				group.clear();
 				gathered.Clear();
-				return ok && committed;
-			};
-			for (uint32_t i = 0; i < batchCount; ++i) {
-				const auto* packet = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[i].get());
-				const bool leadingUploads = std::ranges::any_of(planned.leading, [&](const auto& leading) { return leading.batch == i && leading.copies; });
-				if (!packet || leadingUploads) {
-					if (!flush(false) || !submitPacket(i)) return false;
-					continue;
-				}
-				const auto queue = graph.batches[i].queue;
-				if (queue != groupQueue && !flush(false)) return false;
-				groupQueue = queue;
-				groupRhiQueue = packet->SubmitQueue();
-				for (const auto wait : batches[i].waits) {
-					if (packet->BindsTimeline(wait.timeline)) continue;
-					const auto handle = m_runtime->TimelineHandleOf(wait.timeline);
-					if (handle.valid()) extra[i].push_back({wait.timeline, handle});
-				}
-				batches[i].extraTimelines = extra[i];
-				batches[i].skips = skips[i];
-				batches[i].untouched = untouched.Empty() ? nullptr : &untouched;
-				if (handoff[i]) batches[i].leading = {&handoff[i], 1};
-				// An inline late batch is recorded here, and a pass recorded at execution may submit work of its own on the queue (an
-				// external client's, after a drain). The held group goes first, so nothing comes ahead of it on the queue.
-				if (packet->Inline() && carry && !FlushSubmitCarry(*carry)) return false;
-				if (!packet->Gather(batches[i], gathered)) {
-					// Its effects are abandoned. The batches gathered before it still go to the queue.
-					(void)flush(false);
-					return false;
-				}
-				group.push_back(i);
+				return committed;
 			}
-			if (!flush(true)) return false;
-		} else {
-			BT_ZONE_SCOPE("ORG.Frame.SubmitPackets");
-			for (uint32_t i = 0; i < batchCount; ++i)
-				if (!submitPacket(i)) return false;
+			const auto submitted = groupRhiQueue.Submit({gathered.lists.data(), static_cast<uint32_t>(gathered.lists.size())},
+				{{gathered.waits.data(), static_cast<uint32_t>(gathered.waits.size())},
+				 {gathered.signals.data(), static_cast<uint32_t>(gathered.signals.size())}});
+			basic_telemetry::AddCounter("ORG.Persistent.CoalescedSubmissions");
+			basic_telemetry::AddCounter("ORG.Persistent.CoalescedBatches", group.size());
+			const bool ok = submitted == rhi::Result::Ok;
+			// Each batch the queue accepted commits its passes, even when another one's commit failed.
+			bool committed = true;
+			if (joined) {
+				// The held batches were committed when they were held.
+				if (ok) basic_telemetry::AddCounter("ORG.Persistent.CarriedTicketsSubmitted", carry->tickets);
+				carry->Clear();
+			}
+			for (const auto batch : group) {
+				if (!ok) break;
+				const auto* packet = static_cast<const compiler::PreparedRhiExecutionBatch*>(packets[batch].get());
+				committed = static_cast<bool>(packet->CommitGathered(batches[batch])) && committed;
+			}
+			group.clear();
+			gathered.Clear();
+			return ok && committed;
+		};
+		for (uint32_t i = 0; i < batchCount; ++i) {
+			const auto* packet = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[i].get());
+			const bool leadingUploads = std::ranges::any_of(planned.leading, [&](const auto& leading) { return leading.batch == i && leading.copies; });
+			if (!packet || leadingUploads) {
+				if (!flush(false) || !submitPacket(i)) return false;
+				continue;
+			}
+			const auto queue = graph.batches[i].queue;
+			if (queue != groupQueue && !flush(false)) return false;
+			groupQueue = queue;
+			groupRhiQueue = packet->SubmitQueue();
+			for (const auto wait : batches[i].waits) {
+				if (packet->BindsTimeline(wait.timeline)) continue;
+				const auto handle = m_runtime->TimelineHandleOf(wait.timeline);
+				if (handle.valid()) extra[i].push_back({wait.timeline, handle});
+			}
+			batches[i].extraTimelines = extra[i];
+			batches[i].skips = skips[i];
+			batches[i].untouched = untouched.Empty() ? nullptr : &untouched;
+			if (handoff[i]) batches[i].leading = {&handoff[i], 1};
+			// An inline late batch is recorded here, and a pass recorded at execution may submit work of its own on the queue (an
+			// external client's, after a drain). The held group goes first, so nothing comes ahead of it on the queue.
+			if (packet->Inline() && carry && !FlushSubmitCarry(*carry)) return false;
+			if (!packet->Gather(batches[i], gathered)) {
+				// Its effects are abandoned. The batches gathered before it still go to the queue.
+				(void)flush(false);
+				return false;
+			}
+			group.push_back(i);
 		}
+		if (!flush(true)) return false;
 		CommitTicketSegment(*state.admission, segment, batches);
 		// Host-owned textures last used off the graphics queue, acquired back on it after their producers (external home states).
 		const auto& home = admission.Barriers().homeAcquires;

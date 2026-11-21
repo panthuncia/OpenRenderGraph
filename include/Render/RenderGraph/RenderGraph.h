@@ -340,36 +340,12 @@ private:
 	 * after the run's commit), into a primary list of its queue's shared pool, with the admission's barriers before and after it,
 	 * and that list is submitted in the batch's place, with the batch's waits and signals. No secondary list, no extra submission,
 	 * any queue. For a host that owns its queues (no DXVK stream to run external epochs in). A kept recording's late batch is
-	 * recorded again at each submission (PreparedPass::RecordAgain), into the same list. Off (the default): such a pass must be an
-	 * external epoch's. GraphHost::SetInlineAtExecution sets it on every graph it builds.
+	 * recorded again at each submission (PreparedPass::RecordAgain), into the same list. A replayable late batch whose passes are
+	 * all keyed by their skip answers (PreparedPass::KeyedBySkip: gated copies and clears) submits its list again while those
+	 * answers are unchanged, instead of recording it. Off (the default): such a pass must be an external epoch's.
+	 * GraphHost::SetInlineAtExecution sets it on every graph it builds.
 	 */
 	void SetInlineAtExecution(bool enabled) noexcept;
-	/**
-	 * @brief A ticket's consecutive batches on one queue go to that queue in one submission. The submission waits for all
-	 * their waits and signals the last batch's value. Their order in the queue and the barriers between them are unchanged.
-	 * GraphHost::Desc::coalesceSubmissions sets it on every graph it builds.
-	 */
-	void SetCoalescedSubmissions(bool enabled) noexcept { m_coalesceSubmissions = enabled; }
-	/**
-	 * @brief With coalesced submissions: the entry barriers of a queue submission's batches go into one handoff list, ahead of the
-	 * submission's first batch, instead of one list ahead of each batch. A batch's entry barriers touch only resources the batches
-	 * before it in the ticket do not use, and every wait of the submission comes before all of its lists, so moving them ahead is
-	 * safe. Barriers for a queue-family transfer, and those that discard or start from Undefined, stay ahead of their own batch.
-	 * GraphHost::Desc::mergeHandoffs sets it on every graph it builds.
-	 */
-	void SetMergedHandoffs(bool enabled) noexcept { m_mergeHandoffs = enabled; }
-	/**
-	 * @brief With coalesced submissions: a ticket's upload lists (SubmitPersistentTicket's TicketUploads) go in the ticket's first
-	 * queue submission when every batch of the ticket is on the uploads' queue, instead of in a submission of their own.
-	 * GraphHost::Desc::uploadsWithBatches sets it on every graph it builds.
-	 */
-	void SetUploadsWithBatches(bool enabled) noexcept { m_uploadsWithBatches = enabled; }
-	/**
-	 * @brief Under SetInlineAtExecution: a kept recording's late batch whose passes are all keyed by their skip answers
-	 * (PreparedPass::KeyedBySkip: gated copies and clears) submits its list again while those answers are unchanged, instead of
-	 * recording it at each submission. GraphHost::Desc::keepGatedInline sets it on every graph it builds.
-	 */
-	void SetKeptGatedInline(bool enabled) noexcept { m_keepGatedInline = enabled; }
 	bool InlineAtExecution() const noexcept { return m_inlineAtExecution; }
 	// A queue slot the host's stream runs: the graphics queue's, or one on the same native queue (a kind the device aliases to it).
 	// An external epoch's batches on it are the host's to execute, in its stream's order.
@@ -484,6 +460,10 @@ private:
 	static std::string PersistentTicketStaleReason(const PersistentTicket& ticket);
 	// Submits the packets with values from nextQueueValues (the last value assigned per queue slot, advanced
 	// here). Returns false when a packet failed.
+	// Consecutive batches on one queue go to that queue in one submission, which waits for all their waits and signals the last
+	// batch's value. Their order and the barriers between them are unchanged. A ticket that is not external puts the entry
+	// barriers of a submission's batches in one handoff list ahead of its first batch. Barriers for a queue-family transfer, and
+	// those that discard or start from Undefined, stay ahead of their own batch.
 	// uploadsDone: the queue slot and value that signal the uploads recorded ahead of the ticket (RecordTakenUploads), when
 	// there are any. They precede the ticket on their own queue only, so a batch on another queue waits for them: every such
 	// batch, unless RecordTakenUploads planned the ticket's uploads by queue (queueLists), and then only a batch that uses
@@ -492,14 +472,13 @@ private:
 	// An external epoch's ticket (out.external) submits its batches off the graphics queue here and gives the rest to its host
 	// (ExternalEpochExecution). streamUploads: its graphics-queue uploads were recorded for the host's stream, ahead of its first
 	// segment. A batch off the graphics queue that uses them waits for a segment of their own (the first).
-	// carry (coalesced submissions only): several tickets submitted back to back, holding the sequencer across them, share queue
-	// submissions. This ticket's first group of batches joins the group the carry holds when both are on one queue and the new group
+	// carry: several tickets submitted back to back, holding the sequencer across them, share queue submissions. This ticket's first group of batches joins the group the carry holds when both are on one queue and the new group
 	// waits for nothing the held one does not. Any other submission of this ticket submits the held group first. carryOut: this
 	// ticket's last group is held in the carry instead of submitted, for the next ticket to join. FlushSubmitCarry submits it.
 	struct SubmitCarry;
 	// The ticket's upload lists, recorded by the caller, for SubmitPersistentTicket to submit before its batches. They signal `signal`
-	// on their queue's timeline. With SetUploadsWithBatches they go in the ticket's first queue submission when they can; otherwise
-	// in a submission of their own, before anything else of the ticket.
+	// on their queue's timeline. They go in the ticket's first queue submission when they can; otherwise in a submission of their
+	// own, before anything else of the ticket.
 	struct TicketUploads {
 		std::span<const rhi::CommandList> lists;
 		rhi::Queue queue{};
@@ -941,10 +920,6 @@ private:
 	// lists, made at their first ticket).
 	std::vector<uint32_t> m_externalPersistentEpochs;
 	bool m_inlineAtExecution = false;  // SetInlineAtExecution
-	bool m_coalesceSubmissions = false;  // SetCoalescedSubmissions
-	bool m_mergeHandoffs = false;        // SetMergedHandoffs
-	bool m_uploadsWithBatches = false;   // SetUploadsWithBatches
-	bool m_keepGatedInline = false;      // SetKeptGatedInline
 	std::shared_ptr<const void> m_recordingTag;  // SetRecordingTag
 	std::mutex m_externalSecondaryPoolsMutex;
 	std::vector<std::shared_ptr<CommandListPool>> m_externalSecondaryPools;

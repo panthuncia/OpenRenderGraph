@@ -89,30 +89,17 @@ public:
 		// epochs need: their published copies are submitted again and again. A live ticket's recording is used once and
 		// nothing keeps it. Replayable recordings carry no profiler GPU zones.
 		bool reuseRecordings = false;
-		// Async live epochs keep their recordings (needs reuseRecordings). Each run of a live epoch takes one of the epoch's
-		// kept copies: a lease whose LatchBlock regions stay at its index, like a published copy's. A copy keeps the last
-		// replayable recording made for it. While that recording is current, the next ticket of the copy binds it: nothing is
-		// prepared or recorded. Current means every pass's revision is unchanged, no new version was published since
-		// (NoteNewVersions), and the epoch's graph was not built again. Otherwise the ticket is prepared and recorded as
-		// before, and its recording is kept if it is replayable. Each reuse clears the copy's latch regions first
-		// (LatchBlock::ZeroStableRun), so a block the run's commit does not write reads zeros, as in a new lease.
-		// Passes recorded at execution are still recorded at every submission.
-		bool reuseLiveRecordings = false;
-		// The most kept copies a live epoch makes (reuseLiveRecordings). When every copy holds a run that is neither done nor
-		// sealed, the run takes a lease of its own and records as before (AsyncStats::liveSpilled).
+		// With reuseRecordings, async live epochs keep their recordings. Each run of a live epoch takes one of the epoch's kept
+		// copies: a lease whose LatchBlock regions stay at its index, like a published copy's. A copy keeps the last replayable
+		// recording made for it. While that recording is current, the next ticket of the copy binds it: nothing is prepared or
+		// recorded. Current means every pass's revision is unchanged, no new version was published since (NoteNewVersions), and
+		// the epoch's graph was not built again. Otherwise the ticket is prepared and recorded as before, and its recording is
+		// kept if it is replayable. Each reuse clears the copy's latch regions first (LatchBlock::ZeroStableRun), so a block the
+		// run's commit does not write reads zeros, as in a new lease. Passes recorded at execution are still recorded at every
+		// submission.
+		// The most kept copies a live epoch makes. When every copy holds a run that is neither done nor sealed, the run takes a
+		// lease of its own and records as before (AsyncStats::liveSpilled).
 		uint32_t liveCopiesMost = 64;
-		// A ticket's consecutive batches on one queue are submitted together, in one queue submission
-		// (RenderGraph::SetCoalescedSubmissions). Off: one submission per batch.
-		bool coalesceSubmissions = false;
-		// With coalesced submissions: one handoff list of entry barriers per queue submission, ahead of its first batch, instead of
-		// one per batch (RenderGraph::SetMergedHandoffs).
-		bool mergeHandoffs = false;
-		// With coalesced submissions: a ticket's uploads on the graphics queue go in its first queue submission when all its batches
-		// are on that queue, instead of in a submission of their own (RenderGraph::SetUploadsWithBatches).
-		bool uploadsWithBatches = false;
-		// With inline recording at execution: a kept recording's late batch made only of passes keyed by their skip answers
-		// (gated copies and clears) keeps its list while the answers are unchanged (RenderGraph::SetKeptGatedInline).
-		bool keepGatedInline = false;
 		// Async epochs: a ticket's staged uploads whose destination it first uses on another queue than graphics (async compute)
 		// are recorded on that queue, just ahead of the ticket's first batch there, instead of on the graphics queue; and a batch
 		// on another queue waits for the graphics queue's uploads only when it uses what they write (RenderGraph::
@@ -131,7 +118,7 @@ public:
 		// recorded at execution and the queue submissions. External epochs still submit on the calling thread. A queue user that
 		// must come after the epochs submitted so far drains the thread first (DrainSubmissions).
 		bool submissionThread = false;
-		// With a submission thread and coalesced submissions: the tickets queued together are finished as one group, and a
+		// With a submission thread: the tickets queued together are finished as one group, and a
 		// ticket's first queue submission joins the one the ticket before it left held, when both are on one queue and it waits
 		// for nothing new (RenderGraph::SubmitCarry). Only what is already queued is grouped: the thread never waits for more.
 		bool mergeTicketSubmissions = false;
@@ -727,7 +714,7 @@ public:
 		uint64_t copyRepins = 0;
 		// Tickets prepared ahead (SetEpochTicketsAhead) dropped before their submission, because one before them was stale.
 		uint64_t staleAhead = 0;
-		// Desc::reuseLiveRecordings: live tickets that bound a kept recording (nothing prepared or recorded), live recordings
+		// Live epochs with reuseRecordings: live tickets that bound a kept recording (nothing prepared or recorded), live recordings
 		// kept for a copy, live recordings made for a copy that were not replayable, and live runs that found no copy free.
 		uint64_t liveReused = 0, liveKept = 0, liveUnkeepable = 0, liveSpilled = 0;
 	};
@@ -1078,7 +1065,7 @@ private:
 	std::vector<std::pair<uint32_t, std::vector<RunLease*>>> m_copyLeases;
 	// Each revision-driven epoch's staging leases, one per published copy (EpochStagingRun), made with the copies and never run.
 	std::vector<std::pair<uint32_t, std::vector<RunLease*>>> m_stagingLeases;
-	// Each live epoch's kept copies' leases (Desc::reuseLiveRecordings), made as its runs need them and kept for the host's life.
+	// Each live epoch's kept copies' leases (with Desc::reuseRecordings), made as its runs need them and kept for the host's life.
 	std::vector<std::pair<uint32_t, std::vector<RunLease*>>> m_liveCopyLeases;
 	// The sync path's frame pacing: its runs of the last framesInFlight frames, by position.
 	std::vector<RunLease*> m_syncLeases;
@@ -1188,7 +1175,7 @@ private:
 	// one whose last run is done or sealed (waited for here: never a run that may still be in the host's stream). Null when every
 	// copy holds an unsealed run that is not done: the copies are busy until the next seal or one of their runs completes.
 	RunLease* TakeCopyLease(Async& state, uint32_t epochIndex);
-	// Host thread: the kept copy a live epoch's next run takes (Desc::reuseLiveRecordings). An idle copy whose kept recording is
+	// Host thread: the kept copy a live epoch's next run takes (with Desc::reuseRecordings). An idle copy whose kept recording is
 	// still of the epoch's graph comes first, then any idle copy, then a new copy (up to Desc::liveCopiesMost), then the least
 	// recently submitted copy whose last run is sealed (waited for here). Null when none of these exists.
 	RunLease* TakeLiveCopy(Async& state, uint32_t epochIndex);
