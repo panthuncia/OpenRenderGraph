@@ -161,6 +161,8 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ScheduleTrace.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ScheduleTraceBuild.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/ScheduleTrace.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/ReadOrderCheck.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/ReadOrderCheck.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RenderGraph/GraphReplay.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/GraphReplay.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Render/RenderGraph/PersistentGraph.h"
@@ -340,6 +342,11 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_definitions(OpenRenderGraphLatchedCopiesTests PRIVATE NOMINMAX)
     target_link_libraries(OpenRenderGraphLatchedCopiesTests PRIVATE OpenRenderGraph)
     add_test(NAME OpenRenderGraphLatchedCopiesTests COMMAND OpenRenderGraphLatchedCopiesTests)
+    # The read-order check across epoch graphs (no device).
+    add_executable(OpenRenderGraphReadOrderCheckTests tests/ReadOrderCheckTests.cpp src/Render/RenderGraph/ReadOrderCheck.cpp)
+    target_compile_features(OpenRenderGraphReadOrderCheckTests PRIVATE cxx_std_23)
+    target_include_directories(OpenRenderGraphReadOrderCheckTests PRIVATE include)
+    add_test(NAME OpenRenderGraphReadOrderCheckTests COMMAND OpenRenderGraphReadOrderCheckTests)
     add_executable(OpenRenderGraphAliasPackingTests tests/AliasPackingTests.cpp src/Render/RenderGraph/AliasPacking.cpp)
     target_compile_features(OpenRenderGraphAliasPackingTests PRIVATE cxx_std_23)
     add_test(NAME OpenRenderGraphAliasPackingTests COMMAND OpenRenderGraphAliasPackingTests)
