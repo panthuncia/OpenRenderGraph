@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <deque>
 #include <exception>
 #include <map>
@@ -33,6 +34,15 @@
 #include "../Render/RenderGraph/AliasPacking.h"
 
 #include <unordered_map>
+
+// Owner-thread checks (GraphHost::CheckOwner). On by default in builds without NDEBUG. Define ORG_THREAD_CHECKS as 0 or 1 to choose.
+#ifndef ORG_THREAD_CHECKS
+#ifdef NDEBUG
+#define ORG_THREAD_CHECKS 0
+#else
+#define ORG_THREAD_CHECKS 1
+#endif
+#endif
 
 namespace org {
 
@@ -477,6 +487,7 @@ GraphHost::GraphHost(Desc desc)
 		m_instances.emplace_back().epoch = epoch;
 	}
 	m_declared.resize(m_instances.size());
+	m_builds = std::make_unique<BuildsCell[]>(m_instances.size());
 	// Made with the host, so the queue's pointer never changes while another thread drains it.
 	if (m_desc.submissionThread) {
 		if (m_desc.mergeTicketSubmissions) m_submitCarry = RenderGraph::MakeSubmitCarry();
@@ -740,13 +751,70 @@ RenderGraph* GraphHost::Graph(uint32_t epoch) noexcept {
 }
 
 uint64_t GraphHost::BuildGeneration(uint32_t epoch) const noexcept {
+	CheckOwner("BuildGeneration");
 	const auto index = InstanceOf(epoch);
 	return index == kNoInstance ? 0 : m_instances[index].buildGeneration;
 }
 
 bool GraphHost::EpochRecordingCurrent(const EpochRecording& recording) const noexcept {
-	const auto index = InstanceOf(recording.epoch);
-	return index != kNoInstance && m_instances[index].graph && recording.buildGeneration == m_instances[index].buildGeneration;
+	// The attached build is 0 while the epoch has no graph, and a recording's build is never 0.
+	return recording.buildGeneration != 0 && BuildsOf(recording.epoch).attached == recording.buildGeneration;
+}
+
+GraphHost::Builds GraphHost::BuildsOf(uint32_t epoch) const noexcept {
+	const auto index = InstanceOf(epoch);
+	if (index == kNoInstance || !m_builds) return {};
+	const auto& cell = m_builds[index];
+	for (;;) {
+		const auto before = cell.sequence.load(std::memory_order_acquire);
+		Builds builds{cell.attached.load(std::memory_order_relaxed), cell.staged.load(std::memory_order_relaxed)};
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if ((before & 1) == 0 && cell.sequence.load(std::memory_order_relaxed) == before) return builds;
+		// The owner is inside a publish: a few stores, never a wait of its own.
+		std::this_thread::yield();
+	}
+}
+
+void GraphHost::PublishBuilds(size_t index) noexcept {
+	if (!m_builds || index >= m_instances.size()) return;
+	const auto& instance = m_instances[index];
+	const uint64_t attached = instance.graph ? instance.buildGeneration : 0;
+	const uint64_t staged = instance.staged && instance.staged->m_graph ? instance.stagedGeneration : 0;
+	auto& cell = m_builds[index];
+	if (cell.attached.load(std::memory_order_relaxed) == attached && cell.staged.load(std::memory_order_relaxed) == staged) return;
+	// One writer: the count goes odd, the pair is written, and the count goes even again.
+	const auto sequence = cell.sequence.load(std::memory_order_relaxed);
+	cell.sequence.store(sequence + 1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_release);
+	cell.attached.store(attached, std::memory_order_relaxed);
+	cell.staged.store(staged, std::memory_order_relaxed);
+	cell.sequence.store(sequence + 2, std::memory_order_release);
+}
+
+void GraphHost::SetOwnerThread() noexcept {
+	m_ownerThread.store(std::this_thread::get_id(), std::memory_order_release);
+}
+
+bool GraphHost::IsOwnerThread() const noexcept {
+	return m_ownerThread.load(std::memory_order_acquire) == std::this_thread::get_id();
+}
+
+void GraphHost::CheckOwner(const char* api) const noexcept {
+#if ORG_THREAD_CHECKS
+	const auto self = std::this_thread::get_id();
+	auto owner = m_ownerThread.load(std::memory_order_acquire);
+	if (owner == self) return;
+	// An unowned host is claimed by its first checked call.
+	if (owner == std::thread::id{} && m_ownerThread.compare_exchange_strong(owner, self, std::memory_order_acq_rel, std::memory_order_acquire)) return;
+	if (owner == self) return;
+	const auto id = [](std::thread::id a_thread) { return static_cast<unsigned long long>(std::hash<std::thread::id>{}(a_thread)); };
+	spdlog::critical("GraphHost: {} is an owner-thread call. It was made on thread {:#x}, and thread {:#x} owns the host (SetOwnerThread)", api,
+		id(self), id(owner));
+	if (auto logger = spdlog::default_logger()) logger->flush();
+	std::abort();
+#else
+	(void)api;
+#endif
 }
 
 void GraphHost::MarkRebuild(Instance& instance, std::string_view reason) noexcept {
@@ -811,16 +879,19 @@ bool GraphHost::RebuildRequested() const noexcept {
 }
 
 bool GraphHost::RebuildRequested(uint32_t epoch) const noexcept {
+	CheckOwner("RebuildRequested");
 	const auto index = InstanceOf(epoch);
 	return index != kNoInstance && m_instances[index].rebuildRequested;
 }
 
 uint64_t GraphHost::RebuildRequests(uint32_t epoch) const noexcept {
+	CheckOwner("RebuildRequests");
 	const auto index = InstanceOf(epoch);
 	return index == kNoInstance ? 0 : m_instances[index].requests->load(std::memory_order_acquire);
 }
 
 std::string GraphHost::RebuildReasons(uint32_t epoch) const {
+	CheckOwner("RebuildReasons");
 	const auto index = InstanceOf(epoch);
 	std::string why;
 	if (index == kNoInstance) return why;
@@ -839,6 +910,7 @@ bool GraphHost::InstanceFailed(size_t index) const noexcept {
 }
 
 bool GraphHost::EpochFailed(uint32_t epoch) const noexcept {
+	CheckOwner("EpochFailed");
 	const auto index = InstanceOf(epoch);
 	return index != kNoInstance && InstanceFailed(index);
 }
@@ -849,6 +921,7 @@ void GraphHost::ReportEpochFailure(EpochFailure failure) {
 }
 
 size_t GraphHost::PollEpochFailures() {
+	CheckOwner("PollEpochFailures");
 	std::vector<EpochFailure> failures;
 	{
 		std::scoped_lock lock(m_failureMutex);
@@ -908,6 +981,7 @@ runtime::IUploadService* GraphHost::Uploads() noexcept {
 }
 
 runtime::IDescriptorService* GraphHost::Descriptors() noexcept {
+	CheckOwner("Descriptors");
 	auto* graph = AnyGraph();
 	return graph ? graph->GetDescriptorService() : nullptr;
 }
@@ -1225,6 +1299,7 @@ std::unique_ptr<GraphHost::EpochGraph> GraphHost::BuildEpochGraph(uint32_t epoch
 
 GraphHost::AttachResult GraphHost::AttachEpochGraph(std::unique_ptr<EpochGraph>& built) {
 	BT_ZONE_SCOPE("ORG.Host.AttachEpochGraph");
+	CheckOwner("AttachEpochGraph");
 	if (!built) return Refuse(AttachRefusal::NoGraph, UINT32_MAX, "no graph");
 	if (built->m_index >= m_instances.size() || m_instances[built->m_index].epoch != built->m_epoch)
 		return Refuse(AttachRefusal::UnknownEpoch, built->m_epoch, "the graph is not one of this host's epochs");
@@ -1278,6 +1353,7 @@ GraphHost::AttachResult GraphHost::AttachEpochGraph(std::unique_ptr<EpochGraph>&
 }
 
 std::vector<uint32_t> GraphHost::StaleAliasPlacementEpochs() const {
+	CheckOwner("StaleAliasPlacementEpochs");
 	std::vector<uint32_t> stale;
 	// An epoch with a staged graph is not stale: the staged graph's placement grew the pool, and it replaces the attached one.
 	for (const auto& instance : m_instances)
@@ -1308,6 +1384,7 @@ void GraphHost::RetireStaged(size_t index) {
 
 GraphHost::StageResult GraphHost::StageEpochGraph(std::unique_ptr<EpochGraph>& built) {
 	BT_ZONE_SCOPE("ORG.Host.StageEpochGraph");
+	CheckOwner("StageEpochGraph");
 	StageResult result;
 	const auto refuse = [&](AttachRefusal refusal, std::string reason) {
 		auto refused = Refuse(refusal, built ? built->m_epoch : UINT32_MAX, std::move(reason));
@@ -1412,6 +1489,7 @@ bool GraphHost::SwapStagedIn(size_t index) {
 
 GraphHost::AttachResult GraphHost::AttachStagedEpochGraphs(std::span<const uint32_t> epochs) {
 	BT_ZONE_SCOPE("ORG.Host.AttachStagedEpochGraphs");
+	CheckOwner("AttachStagedEpochGraphs");
 	// Every epoch is checked before anything changes. A refusal leaves every staged graph staged.
 	// The set itself first: every epoch the host's, each once.
 	std::vector<size_t> indices;
@@ -1523,13 +1601,15 @@ void GraphHost::PublishDeclared(size_t index) {
 	DeclaredGraphs graphs;
 	if (instance.graph) graphs.attached = instance.graph->PersistentDeclaredVersions();
 	if (instance.staged && instance.staged->m_graph) graphs.staged = instance.staged->m_graph->PersistentDeclaredVersions();
-	std::scoped_lock lock(m_declaredMutex);
-	if (index < m_declared.size()) m_declared[index] = std::move(graphs);
+	{
+		std::scoped_lock lock(m_declaredMutex);
+		if (index < m_declared.size()) m_declared[index] = std::move(graphs);
+	}
+	PublishBuilds(index);
 }
 
 uint64_t GraphHost::StagedGeneration(uint32_t epoch) const noexcept {
-	const auto index = InstanceOf(epoch);
-	return index == kNoInstance || !m_instances[index].staged ? 0 : m_instances[index].stagedGeneration;
+	return BuildsOf(epoch).staged;
 }
 
 bool GraphHost::BuildDueInstances(bool all) {
@@ -1738,6 +1818,7 @@ std::string GraphHost::DescribeAsyncState(bool a_pollTimelines) const {
 }
 
 bool GraphHost::BuildIfRequested() {
+	CheckOwner("BuildIfRequested");
 	ReleaseRetiredGraphs(false);
 	return BuildDueInstances(true);
 }
@@ -1914,6 +1995,7 @@ void GraphHost::SetAsyncEpochs(std::vector<uint32_t> epochs, std::vector<uint32_
 }
 
 void GraphHost::SetPrivateAliasEpochs(std::vector<uint32_t> epochs) {
+	CheckOwner("SetPrivateAliasEpochs");
 	std::scoped_lock lock(m_configMutex);
 	m_privateAliasEpochs = std::move(epochs);
 }
@@ -1938,6 +2020,7 @@ std::string DescribeSpan(alias::FrameSpans::Span span) {
 }
 
 void GraphHost::SetFramePositions(std::vector<FramePosition> positions) {
+	CheckOwner("SetFramePositions");
 	std::scoped_lock lock(m_configMutex);
 	if (!m_frameAliasArena) m_frameAliasArena = FrameAliasArena::Create();
 	if (!m_frameTransients) {
@@ -2108,6 +2191,7 @@ RunRef GraphHost::EpochStagingRun(uint32_t epoch, uint32_t copy) const {
 }
 
 void GraphHost::SetEpochTicketsAhead(uint32_t epoch, uint32_t most) {
+	CheckOwner("SetEpochTicketsAhead");
 	std::erase_if(m_ticketsAhead, [&](const auto& entry) { return entry.first == epoch; });
 	if (most > 1) m_ticketsAhead.emplace_back(epoch, most);
 }

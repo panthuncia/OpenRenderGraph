@@ -572,8 +572,8 @@ static int Run(int argc, char** argv) {
 	// second (SplitEpochsScenario).
 	const bool split = argc > 1 && std::strcmp(argv[1], "split") == 0;
 	// "built": application-driven builds (GraphHost::BuildEpochGraph, AttachEpochGraph): a build on a worker thread while both
-	// epochs submit, attached between frames; a failed build; stale builds rejected; and stale alias placements reported
-	// (Desc::reportStaleAliasPlacements) instead of rebuilt.
+	// epochs submit, attached between frames; a failed build; stale builds rejected; staged sets; BuildsOf read on other threads
+	// while the owner stages and attaches; and stale alias placements reported (Desc::reportStaleAliasPlacements) instead of rebuilt.
 	const bool built = argc > 1 && std::strcmp(argv[1], "built") == 0;
 	// "stream": an external epoch with its write on the compute queue (the family's second queue): batches off the host's stream,
 	// and the stream's segments.
@@ -914,6 +914,92 @@ static int Run(int argc, char** argv) {
 					REQUIRE(refusals(org::GraphHost::AttachRefusal::EpochConfiguration) == 1 && refusals(org::GraphHost::AttachRefusal::Duplicate) == 1
 							&& refusals(org::GraphHost::AttachRefusal::NotStaged) == 1,
 						"refusals are counted by reason");
+				}
+
+				// 6. BuildsOf from other threads: each reader sees one pair the owner published, while the owner stages and attaches
+				// both epochs again and again, and frames run between.
+				{
+					// The owner-thread checks follow SetOwnerThread. IsOwnerThread is true only on the thread that owns the host.
+					host.SetOwnerThread();
+					bool otherOwns = true;
+					std::thread([&] { otherOwns = host.IsOwnerThread(); }).join();
+					REQUIRE(host.IsOwnerThread() && !otherOwns, "only the owner thread owns the host");
+					std::thread([&] { host.SetOwnerThread(); }).join();
+					REQUIRE(!host.IsOwnerThread(), "SetOwnerThread on another thread moves the host there");
+					host.SetOwnerThread();
+					REQUIRE(host.IsOwnerThread(), "and back");
+
+					std::atomic<bool> stop{false};
+					std::atomic<uint64_t> reads{0}, stagedSeen{0};
+					std::mutex failureMutex;
+					std::string failure;
+					// Every pair a reader can see in this test: an attached build, and no staged build or a newer one. A build seen
+					// staged stays staged until a read finds it attached (the test never drops one). A torn read breaks one of these:
+					// half of an attach reads as the old attached build with no staged one, or as the new build both staged and attached.
+					const auto reader = [&](uint32_t epoch) {
+						org::GraphHost::Builds last{};
+						uint64_t staged = 0;
+						while (!stop.load(std::memory_order_acquire)) {
+							const auto builds = host.BuildsOf(epoch);
+							const char* why = nullptr;
+							if (builds.attached == 0) why = "no attached build";
+							else if (builds.staged != 0 && builds.staged <= builds.attached) why = "a staged build not newer than the attached one";
+							else if (builds.attached < last.attached) why = "the attached build went back";
+							else if (staged != 0 && builds.attached < staged && builds.staged != staged) why = "a staged build was lost before its attach";
+							if (why) {
+								std::scoped_lock lock(failureMutex);
+								if (failure.empty())
+									failure = std::string(why) + " (epoch " + std::to_string(epoch) + ": attached " + std::to_string(builds.attached)
+										+ ", staged " + std::to_string(builds.staged) + "; before: attached " + std::to_string(last.attached) + ", staged "
+										+ std::to_string(staged) + ")";
+								return;
+							}
+							if (builds.staged != 0) {
+								if (builds.staged != staged) stagedSeen.fetch_add(1, std::memory_order_relaxed);
+								staged = builds.staged;
+							} else if (builds.attached >= staged) {
+								staged = 0;
+							}
+							last = builds;
+							reads.fetch_add(1, std::memory_order_relaxed);
+							std::this_thread::yield();
+						}
+					};
+					std::vector<std::thread> readers;
+					for (const uint32_t epoch : {0u, 0u, 1u, 1u}) readers.emplace_back(reader, epoch);
+					const auto cycles = [&]() -> int {
+						const uint32_t both[] = {0, 1};
+						for (int cycle = 0; cycle < 8; ++cycle) {
+							for (const uint32_t epoch : both) {
+								auto next = host.BuildEpochGraph(epoch, "test: BuildsOf readers");
+								REQUIRE(next && next->Built(), "a build for the readers");
+								const auto attachedBefore = host.BuildGeneration(epoch);
+								const auto staging = host.StageEpochGraph(next);
+								REQUIRE(staging.staged, "staged for the readers");
+								const org::GraphHost::Builds expected{attachedBefore, staging.generation};
+								REQUIRE(host.BuildsOf(epoch) == expected, "the owner reads its staging at once");
+							}
+							if (const int failed = run()) return failed;
+							REQUIRE(host.AttachStagedEpochGraphs(both).attached, "the staged set attaches");
+							for (const uint32_t epoch : both) {
+								const org::GraphHost::Builds expected{host.BuildGeneration(epoch), 0};
+								REQUIRE(host.BuildsOf(epoch) == expected && host.StagedGeneration(epoch) == 0, "the owner reads the attach at once");
+							}
+							if (const int failed = run()) return failed;
+						}
+						return 0;
+					};
+					const int failed = cycles();
+					// The readers see the last attach before they stop.
+					std::this_thread::sleep_for(std::chrono::milliseconds(20));
+					stop.store(true, std::memory_order_release);
+					for (auto& thread : readers) thread.join();
+					if (failed) return failed;
+					std::printf("built: BuildsOf: %llu reads on 4 threads, %llu staged builds seen\n", static_cast<unsigned long long>(reads.load()),
+						static_cast<unsigned long long>(stagedSeen.load()));
+					REQUIRE(failure.empty(), failure.c_str());
+					REQUIRE(reads.load() > 0, "the readers read");
+					REQUIRE(org::GraphHost::Builds{} == host.BuildsOf(7), "an epoch the host does not have reads {0, 0}");
 				}
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				host.SetAsyncEpochs({});

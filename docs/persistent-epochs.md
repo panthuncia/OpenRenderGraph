@@ -93,6 +93,11 @@ submission point is an **epoch**.
     -   Without async epochs, or for an epoch with no graph yet, staging attaches at once (`StageResult::attached`).
     -   Generations stay unique: every attach and every staging takes one above the highest given out (`Instance::lastGeneration`), so a
         recording of a dropped staged graph never matches a later build.
+    -   `BuildsOf(epoch)` reads the epoch's attached and staged generations as one pair, on any thread. The owner publishes the pair at
+        every change (build, attach, staging, staged set, retirement, `DestroyGraph`) behind a sequence count. A reader never sees half
+        of a change, and the owner never waits for a reader. `StagedGeneration` and `EpochRecordingCurrent` read it, so they are
+        any-thread calls too. A recording cache on a builder thread keeps both builds' recordings with
+        `epoch_recordings::Cache::Add(host, epoch, ...)`. Test: `PersistentVulkanHostTests built`, step 6.
     -   Test: `PersistentVulkanHostTests segment` stages a build, records for it while the attached graph's recording still submits, checks
         that the attached graph records nothing meanwhile, attaches it and submits its recording, and replaces one staged graph with a later
         one.
