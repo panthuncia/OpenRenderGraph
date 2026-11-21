@@ -5,6 +5,8 @@
 #include "Resources/Buffers/VersionedBuffer.h"
 #include "Resources/VersionedTexture.h"
 
+#include <algorithm>
+#include <mutex>
 #include <stdexcept>
 
 namespace org {
@@ -22,11 +24,30 @@ VersionedResource::ShapeClass VersionedResource::ShapeClassOf(const Resource& re
     if (!resource.HasLayout()) return shape;
     shape.texture = true;
     shape.mips = resource.GetMipLevels();
-    shape.slices = resource.GetArraySize();
     rhi::ResourceDesc description{};
     if (resource.TryGetRHIResourceDesc(description) && description.type != rhi::ResourceType::Buffer)
         shape.format = description.texture.format;
     return shape;
+}
+
+uint32_t VersionedResource::SlicesOf(const Resource& resource) noexcept {
+    return resource.HasLayout() ? (std::max)(1u, static_cast<uint32_t>(resource.GetArraySize())) : 0u;
+}
+
+std::shared_ptr<const ResourceVersion> VersionedResource::Reshaped() const {
+    std::scoped_lock lock(m_state->reshapeMutex);
+    return m_state->reshaped.lock();
+}
+
+void VersionedResource::NoteMade(const std::shared_ptr<const ResourceVersion>& version) const {
+    if (!version || !version->resource) return;
+    const auto current = CurrentVersion();
+    const bool reshapes = current && current->resource && SlicesOf(*version->resource) != SlicesOf(*current->resource);
+    std::scoped_lock lock(m_state->reshapeMutex);
+    // Only a newer version replaces the noted one. A version with the current slice count clears it.
+    if (const auto noted = m_state->reshaped.lock(); noted && noted->number > version->number) return;
+    if (reshapes) m_state->reshaped = version;
+    else m_state->reshaped.reset();
 }
 
 std::shared_ptr<const ResourceVersion> VersionedResource::SelectVersion(const ResolverCaptureContext* context) const {
@@ -60,8 +81,8 @@ void VersionedResource::MakeVersion(ResourceVersion& version, std::shared_ptr<Re
     if (!resource) throw std::invalid_argument("VersionedResource: a version needs a resource");
     // The first version sets the shape class. Versions made before it is set (none, in practice) are not checked.
     if (m_state->shaped && !(ShapeClassOf(*resource) == m_state->shape))
-        throw std::invalid_argument("VersionedResource: version '" + resource->GetName() + "' has another format, mip count or slice "
-            "count than the first version. A resource of another shape is a new resource: declare its passes again");
+        throw std::invalid_argument("VersionedResource: version '" + resource->GetName() + "' has another format or mip count than the "
+            "first version. A resource of another shape is a new resource: declare its passes again");
     version.number = m_state->published.fetch_add(1, std::memory_order_relaxed) + 1;
     auto declaration = std::make_shared<ResolverDeclarationState>();
     declaration->tracked = true;
@@ -81,6 +102,11 @@ void VersionedResource::AdoptVersion(const std::shared_ptr<const ResourceVersion
         m_state->shaped = true;
     }
     m_state->current.store(version, std::memory_order_release);
+    {
+        // The reshaped version is pending no more once it, or a newer version, is current.
+        std::scoped_lock lock(m_state->reshapeMutex);
+        if (const auto noted = m_state->reshaped.lock(); !noted || noted->number <= version->number) m_state->reshaped.reset();
+    }
     if (const auto observer = g_adoptionObserver.load(std::memory_order_relaxed)) observer(*this, *version);
 }
 
@@ -188,6 +214,7 @@ std::shared_ptr<const TextureVersion> VersionedTexture::Make(std::shared_ptr<Pix
     auto version = std::make_shared<TextureVersion>();
     version->texture = next;
     MakeVersion(*version, std::move(next), std::move(owner));
+    NoteMade(version);
     return version;
 }
 
@@ -208,6 +235,7 @@ std::shared_ptr<const TextureVersion> VersionedTexture::MakeImage(std::shared_pt
     auto version = std::make_shared<TextureVersion>();
     version->texture = std::dynamic_pointer_cast<PixelBuffer>(next);
     MakeVersion(*version, std::move(next), std::move(owner));
+    NoteMade(version);
     return version;
 }
 

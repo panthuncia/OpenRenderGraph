@@ -264,9 +264,11 @@ State::SlotEntry::FrameBinding BindVersion(State::SlotEntry& entry, std::shared_
 	if (!snapshot || !snapshot->resource.GetHandle().valid())
 		throw std::runtime_error("Persistent slot of '" + resource.GetName() + "' selected a version with no backing. A version "
 			"must be materialized before a preparation binds it");
-	if (ShapeOf(resource) != entry.shape)
-		throw std::logic_error("Persistent slot of '" + resource.GetName() + "' selected a version of another shape (mips or "
-			"slices) than the slot. Every version of a versioned resource must share its shape class");
+	if (const auto shape = ShapeOf(resource); shape != entry.shape)
+		throw std::logic_error("Persistent slot of '" + resource.GetName() + "' selected a version of " + std::to_string(shape.slices)
+			+ " slices and " + std::to_string(shape.mips) + " mips, but the graph was lowered for " + std::to_string(entry.shape.slices)
+			+ " and " + std::to_string(entry.shape.mips) + ". A new slice count needs graphs built for it, attached when its version "
+			"is adopted (VersionedResource, \"Array-size versions\")");
 	State::SlotEntry::FrameBinding made;
 	made.rebinding.slot = entry.slot;
 	made.rebinding.backing = BackingStateOf(*concrete, *snapshot, entry.slot.index, entry.shape);
@@ -730,16 +732,32 @@ bool RenderGraph::DeclaredVersions::Declares(const void* key) const noexcept {
 	return keys && std::binary_search(keys->begin(), keys->end(), key);
 }
 
+bool RenderGraph::DeclaredVersions::DeclaresOtherSlices(const void* key, uint32_t slices) const noexcept {
+	const auto declared = m_slices.load(std::memory_order_acquire);
+	if (!declared) return false;
+	const auto first = std::lower_bound(declared->begin(), declared->end(), std::pair<const void*, uint32_t>{key, 0u});
+	for (auto it = first; it != declared->end() && it->first == key; ++it)
+		if (it->second != slices) return true;
+	return false;
+}
+
 void RenderGraph::PublishDeclaredVersions() {
 	auto& state = *m_compilerState->persistent;
 	if (!state.declaredVersionsChanged) return;
 	state.declaredVersionsChanged = false;
 	auto keys = std::make_shared<std::vector<const void*>>();
+	auto slices = std::make_shared<std::vector<std::pair<const void*, uint32_t>>>();
 	for (const auto& entry : state.entries)
-		if (entry.versioned && !entry.retired) keys->push_back(entry.versioned->Key());
+		if (entry.versioned && !entry.retired) {
+			keys->push_back(entry.versioned->Key());
+			if (entry.shape.hasLayout) slices->emplace_back(entry.versioned->Key(), entry.shape.slices);
+		}
 	std::ranges::sort(*keys);
 	keys->erase(std::unique(keys->begin(), keys->end()), keys->end());
+	std::ranges::sort(*slices);
+	slices->erase(std::unique(slices->begin(), slices->end()), slices->end());
 	m_declaredVersions->m_keys.store(std::move(keys), std::memory_order_release);
+	m_declaredVersions->m_slices.store(std::move(slices), std::memory_order_release);
 }
 
 void RenderGraph::FreezeAliasedBindings() {
@@ -1337,6 +1355,10 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 			// Only the slots this execution compiled. A slot that a pending structural build added is not compiled yet.
 			if (index >= selected->bindings.Size() || index >= compiled.size() || compiled[index] == UINT32_MAX) continue;
 			auto version = entry.versioned->SelectVersion(m_resolverCaptureContext.get());
+			// A graph built for a pending slice count binds that version until it is current. It runs only once it is.
+			if (version && version->resource && ShapeOf(*version->resource) != entry.shape)
+				if (auto reshaped = entry.versioned->Reshaped(); reshaped && reshaped->resource && ShapeOf(*reshaped->resource) == entry.shape)
+					version = std::move(reshaped);
 			if (version) versionStamps.emplace_back(entry.versioned, version->number);
 			if (!version || !version->resource)
 				throw std::runtime_error("Persistent slot of '" + (entry.resource ? entry.resource->GetName() : std::string("?"))

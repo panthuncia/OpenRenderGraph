@@ -426,9 +426,16 @@ declared resource gets another backing". Passes declare the versioned resource i
     `GraphHost::NoteNewVersions` makes the tickets prepared before it stale.
 -   **Image versions.** `VersionedTexture::CreateImage`, `PublishImage` and `MakeImage` take any texture resource, such as an
     imported or exported image (`ExternalTextureResource`), under the same rules. Such a version's `texture` is null.
--   **Shape class.** Every version must have the first one's shape class. For a texture that is its format, mip count and
-    slice count. A buffer has none, since its size is not part of its graph slot. `Make` rejects a version of another shape
-    class. A resource of another shape is a new resource: its passes are declared again, which rebuilds.
+-   **Shape class.** Every version must have the first one's shape class. For a texture that is its format and mip count. A
+    buffer has none, since its size is not part of its graph slot. `Make` rejects a version of another shape class. A
+    resource of another shape is a new resource: its passes are declared again, which rebuilds.
+-   **Array-size versions.** A texture version may have another slice count, like another extent. The slice count is part of
+    a graph's slot, so a graph lowered for one count binds only versions of that count (`BindVersion` throws otherwise).
+    While a version of a new count is pending, it is the resource's reshaped version (`VersionedResource::Reshaped`). A graph
+    built then (`GraphHost::BuildEpochGraph`) is lowered for it and binds it until it is current; running graphs keep binding
+    the current version. The owner asks those builds after making the version, and adopts it at the boundary where they
+    attach, once `GraphHost::EpochsAwaitingSlices` is empty. A version of the current count again clears the pending one.
+    Test: `RebindingGpuTests` (`RunArraySizeScenario`).
 -   **Revisions.** A preparation for host data binds the version the data names (`IResourceVersions::Find` for a buffer,
     `FindTexture` for a texture), or else the current one.
 

@@ -13,8 +13,9 @@ struct TextureVersion : ResourceVersion {
     std::shared_ptr<PixelBuffer> texture;  // the same object as `resource`; null for an image version (MakeImage)
 };
 
-// A texture whose backing changes by versions (VersionedResource). Every version has the first one's format, mip count
-// and slice count. Its extent may differ. A texture of another format, mip count or slice count is a new resource.
+// A texture whose backing changes by versions (VersionedResource). Every version has the first one's format and mip count.
+// Its extent and its slice count may differ; a new slice count switches in with graphs built for it (VersionedResource,
+// "Array-size versions"). A texture of another format or mip count is a new resource.
 // Passes declare it, since it is a resolver. A preparation binds the version its revision names
 // (IResourceVersions::FindTexture), or else the current one.
 //
