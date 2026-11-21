@@ -85,6 +85,7 @@ std::unique_ptr<GraphInstance> GraphInstance::Create(std::shared_ptr<Runtime> ru
 	graph->GetMemorySnapshotProvider().SetProvider(memory::CreateECSMemorySnapshotProvider());
 	graph->CompileStructural();
 	graph->Setup();
+	graph->FinishExtensionsBuild();
 	instance->m_graph = std::move(graph);
 	return instance;
 }

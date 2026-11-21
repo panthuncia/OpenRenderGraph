@@ -578,6 +578,8 @@ public:
 	std::optional<uint32_t> GetLastExecutedPreparationSlot() const noexcept;
 	std::shared_ptr<const IHostExecutionData> GetLastSubmittedFrameData() const noexcept;
 	void PrepareExtensionsForBuild();
+	// Ends what PrepareExtensionsForBuild began (IRenderGraphExtension::FinishBuild), on the same thread.
+	void FinishExtensionsBuild();
 	void ShutdownExtensions();
 	// Serialized producer boundary. Joins CPU frame work without releasing
 	// submitted ownership; the caller can then wait for every device to idle.

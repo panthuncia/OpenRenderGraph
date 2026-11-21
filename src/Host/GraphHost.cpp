@@ -1109,9 +1109,11 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		graph->SetGpuPassRangeCallbacks(inputs.gpuPassRangeBegin, inputs.gpuPassRangeEnd);
 		// The lowering, pipelines and first schedule the first preparation would otherwise build inline on the host's thread.
 		if (detached) graph->PrepareFirstPersistentBuild();
+		graph->FinishExtensionsBuild();
 	} catch (...) {
 		// The half-built graph goes now: nothing was submitted with it.
 		try {
+			graph->FinishExtensionsBuild();
 			graph->ShutdownExtensions();
 			graph->ShutdownTaskWorkers();
 		} catch (...) {

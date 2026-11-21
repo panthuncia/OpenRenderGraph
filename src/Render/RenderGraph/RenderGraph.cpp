@@ -540,6 +540,14 @@ void RenderGraph::PrepareExtensionsForBuild() {
 	}
 }
 
+void RenderGraph::FinishExtensionsBuild() {
+	for (auto& ext : m_extensions) {
+		if (ext) {
+			ext->FinishBuild(*this);
+		}
+	}
+}
+
 void RenderGraph::ShutdownExtensions() {
 	for (auto& ext : m_extensions) {
 		if (ext) {

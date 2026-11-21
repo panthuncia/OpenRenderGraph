@@ -186,6 +186,9 @@ struct ExternalPassDesc {
 struct IRenderGraphExtension {
 	virtual ~IRenderGraphExtension() = default;
 	virtual void PrepareForBuild(RenderGraph& rg) { (void)rg; }
+	// Called on the building thread when the build that PrepareForBuild began has ended, built or failed. State an extension
+	// keeps for the build's thread (such as a snapshot its lookups read) ends here.
+	virtual void FinishBuild(RenderGraph& rg) { (void)rg; }
 
 	// Called once from RenderGraph::Setup() after queue registry is populated.
 	// Extensions can create queues, allocate upload instances, etc.
