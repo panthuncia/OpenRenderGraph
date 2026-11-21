@@ -63,11 +63,10 @@ public:
 	FrameArena& operator=(const FrameArena&) = delete;
 
 	// How a freed pinned region waits for the GPU: the frontier at the free, and how to test it. Without one, a freed
-	// region is reused at once (a runtime shutting down). settled says whether the frontier is complete now (as
-	// DescriptorHeapManager::SetFrontier's): a region freed while it is not takes the frontier at the first later retire
-	// that finds it settled.
+	// region is reused at once (a runtime shutting down). A region freed while an assignment scope is open takes its
+	// frontier at the first later retire after every scope open at the free has closed (runtime::AssignmentGate).
 	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached,
-		std::function<bool()> settled = {});
+		runtime::AssignmentGate gate = {});
 
 	// A zeroed region of `bytes` (rounded up to kAlignment) for the run. A leased run's is freed with its lease
 	// (ReleaseRun). A stable run's is pinned: the caller frees it with FreePinned.
@@ -98,7 +97,8 @@ private:
 		Chunk* chunk = nullptr;
 		uint32_t size = 0;
 		runtime::SubmissionFrontier frontier;
-		bool open = false;  // freed while the frontier was not settled: frontier is not taken yet
+		bool open = false;  // freed while an assignment scope was open: frontier is not taken yet
+		uint64_t mark = 0;  // the gate's mark at the free, for an open one
 	};
 
 	enum class Kind : uint8_t { Run, Pinned, Oversize };
@@ -116,7 +116,7 @@ private:
 	std::vector<PendingFree> m_pending;
 	std::function<runtime::SubmissionFrontier()> m_frontier;
 	runtime::PointReached m_reached;
-	std::function<bool()> m_settled;
+	runtime::AssignmentGate m_gate;
 	Stats m_stats{};
 };
 

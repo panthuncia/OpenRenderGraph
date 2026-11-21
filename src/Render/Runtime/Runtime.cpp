@@ -249,17 +249,14 @@ void Runtime::Initialize() {
 		RegisterQueue(m_desc.device.GetQueue(kind));
 	m_deleter = std::make_unique<Deleter>();
 	DeletionManager::GetInstance().Initialize();
-	DeletionManager::GetInstance().SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); },
-		[this] { return m_assigning.load(std::memory_order_acquire) == 0; });
-	// Descriptor releases and freed pinned regions wait for a settled frontier too: a submission still queued on a host's
-	// submission thread holds an AssignmentScope until its values are published (GraphHost::TicketCommit).
-	DescriptorHeapManager::GetInstance().SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); },
-		[this] { return m_assigning.load(std::memory_order_acquire) == 0; });
+	DeletionManager::GetInstance().SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); }, Gate());
+	// Descriptor releases and freed pinned regions wait for the scopes open at them too: a submission still queued on a
+	// host's submission thread holds an AssignmentScope until its values are published (GraphHost::TicketCommit).
+	DescriptorHeapManager::GetInstance().SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); }, Gate());
 
 	// Freed pinned regions wait for the GPU like deferred deletions do.
 	m_arena = std::make_shared<FrameArena>();
-	m_arena->SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); },
-		[this] { return m_assigning.load(std::memory_order_acquire) == 0; });
+	m_arena->SetFrontier([this] { return Frontier(); }, [this](const runtime::SubmittedPoint& point) { return Reached(point); }, Gate());
 
 	m_descriptors = runtime::CreateDefaultDescriptorService();
 	m_settings = runtime::CreateDefaultRenderGraphSettingsService();
@@ -443,6 +440,31 @@ void Runtime::RegisterDevice(rhi::Device device, rhi::Backend backend) {
 	}
 	for (auto kind : { rhi::QueueKind::Graphics, rhi::QueueKind::Compute, rhi::QueueKind::Copy })
 		RegisterQueue(device.GetQueue(kind));
+}
+
+uint64_t Runtime::OpenAssignment() {
+	std::scoped_lock lock(m_assignmentMutex);
+	const uint64_t id = m_nextAssignment++;
+	m_openAssignments.insert(id);
+	return id;
+}
+
+void Runtime::CloseAssignment(uint64_t a_id) {
+	std::scoped_lock lock(m_assignmentMutex);
+	m_openAssignments.erase(a_id);
+}
+
+runtime::AssignmentGate Runtime::Gate() {
+	return {
+		.mark = [this] {
+			std::scoped_lock lock(m_assignmentMutex);
+			return m_nextAssignment;
+		},
+		.closedBefore = [this](uint64_t a_mark) {
+			std::scoped_lock lock(m_assignmentMutex);
+			return m_openAssignments.empty() || *m_openAssignments.begin() >= a_mark;
+		},
+	};
 }
 
 runtime::SubmissionFrontier Runtime::Frontier() const {

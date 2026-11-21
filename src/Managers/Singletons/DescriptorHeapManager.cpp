@@ -263,18 +263,19 @@ void DescriptorHeapManager::RetireBufferBacking(std::unique_ptr<GpuBufferBacking
 }
 
 void DescriptorHeapManager::SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached,
-    std::function<bool()> settled) {
+    runtime::AssignmentGate gate) {
     std::scoped_lock lock(m_descriptorMutationMutex);
     m_frontier = std::move(frontier);
     m_reached = std::move(reached);
-    m_settled = std::move(settled);
+    m_gate = std::move(gate);
 }
 
 void DescriptorHeapManager::CaptureFencesUnlocked(DeferredRelease& release) const {
     // A submission still queued on a host's submission thread may use what is released here. Its values are not handed out
-    // yet, so the frontier now would miss it. The release waits for a frontier taken once nothing is queued.
-    if (m_settled && !m_settled()) {
+    // yet, so the frontier now would miss it. The release waits for a frontier taken once the scopes open now have closed.
+    if (const uint64_t mark = m_gate.Mark(); !m_gate.ClosedBefore(mark)) {
         release.open = true;
+        release.mark = mark;
         return;
     }
     release.requiredFences = ReleaseFencesUnlocked();
@@ -359,13 +360,12 @@ std::shared_ptr<void> DescriptorHeapManager::ProcessDeferredReleasesElsewhere() 
     {
         std::scoped_lock lock(m_descriptorMutationMutex);
 
-        // Open releases take their frontier now, when it is settled.
-        if (!m_settled || m_settled())
-            for (auto& release : m_deferredReleases)
-                if (release.open) {
-                    release.requiredFences = ReleaseFencesUnlocked();
-                    release.open = false;
-                }
+        // Open releases take their frontier once the scopes open when they were made have closed.
+        for (auto& release : m_deferredReleases)
+            if (release.open && m_gate.ClosedBefore(release.mark)) {
+                release.requiredFences = ReleaseFencesUnlocked();
+                release.open = false;
+            }
         auto releaseIsSafe = [this](DeferredRelease& release) {
             if (release.open) return false;
             for (auto& point : release.requiredFences) {

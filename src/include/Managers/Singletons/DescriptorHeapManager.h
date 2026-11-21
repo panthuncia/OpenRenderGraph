@@ -80,11 +80,11 @@ public:
 	};
 	// Installs the runtime's frontier, which every release waits for. PublishQueueFenceSnapshot adds more points for work
 	// submitted outside the runtime's queues. The frontier is called under the descriptor mutation lock.
-	// settled says whether the frontier is complete now: no values are handed out but not yet published, and no submission is
-	// still queued on a host's submission thread. A release made while it is not waits for the first processing that finds
-	// it settled, and takes the frontier then. Without it, the frontier always is complete.
+	// gate tells when a frontier is complete: a release made while an assignment scope is open (values handed out but not yet
+	// published, a submission still queued on a host's submission thread) takes the frontier at the first processing after
+	// every scope open at it has closed (runtime::AssignmentGate). Without a gate, the frontier always is complete.
 	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached,
-		std::function<bool()> settled = {});
+		runtime::AssignmentGate gate = {});
 	void PublishQueueFenceSnapshot(std::vector<QueueFenceSnapshotPoint> fenceSnapshot);
 	std::vector<QueueFenceSnapshotPoint> GetQueueFenceSnapshot() const;
 	void ProcessDeferredReleases(uint32_t frameIndex);
@@ -162,14 +162,15 @@ private:
 		std::vector<rhi::ResourcePtr> nativeResources;
         std::vector<std::shared_ptr<const void>> executionLeases;
 		std::vector<QueueFenceSnapshotPoint> requiredFences;
-		bool open = false;  // made while the frontier was not settled: requiredFences is not taken yet
+		bool open = false;  // made while an assignment scope was open: requiredFences is not taken yet
+		uint64_t mark = 0;  // the gate's mark when made, for an open one
 	};
 	std::vector<DeferredRelease> m_deferredReleases;
 	std::unordered_set<const Resource*> m_deferredResourcePointers;
 	std::vector<QueueFenceSnapshotPoint> m_latestQueueFenceSnapshot;
 	std::function<runtime::SubmissionFrontier()> m_frontier;
 	runtime::PointReached m_reached;
-	std::function<bool()> m_settled;
+	runtime::AssignmentGate m_gate;
 	std::vector<QueueFenceSnapshotPoint> ReleaseFencesUnlocked() const;
 	// Takes the release's frontier now, or leaves it open while the frontier is not settled. With the lock held.
 	void CaptureFencesUnlocked(DeferredRelease& release) const;

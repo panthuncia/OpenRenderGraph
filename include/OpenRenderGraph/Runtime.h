@@ -6,6 +6,7 @@
 #include <tuple>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <source_location>
 #include <span>
 #include <vector>
@@ -111,19 +112,22 @@ public:
 	void NoteExternalPoint(const rhi::Timeline& timeline, uint64_t value);
 
 	// Held by a submitter from taking values on the host's shared timelines until it publishes them (GraphHost::SubmitTicket).
-	// Meanwhile the work that signals them may already be queued, and Frontier would miss them: deferred deletions are not
-	// sealed until no scope is open. Any thread.
+	// Meanwhile the work that signals them may already be queued, and Frontier would miss them: a release waits for the
+	// scopes open at it to close before it takes its frontier (Gate). Any thread.
 	class AssignmentScope {
 	public:
-		explicit AssignmentScope(Runtime& runtime) noexcept : m_runtime(&runtime) {
-			m_runtime->m_assigning.fetch_add(1, std::memory_order_acq_rel);
-		}
-		~AssignmentScope() { m_runtime->m_assigning.fetch_sub(1, std::memory_order_acq_rel); }
+		explicit AssignmentScope(Runtime& runtime) : m_runtime(&runtime), m_id(runtime.OpenAssignment()) {}
+		~AssignmentScope() { m_runtime->CloseAssignment(m_id); }
 		AssignmentScope(const AssignmentScope&) = delete;
 		AssignmentScope& operator=(const AssignmentScope&) = delete;
 	private:
 		Runtime* m_runtime;
+		uint64_t m_id;
 	};
+
+	// The assignment gate the runtime's deferred releases use: a release notes Mark() and takes its frontier once every
+	// scope open then has closed. Any thread.
+	runtime::AssignmentGate Gate();
 
 	// Every registered queue's progress now.
 	runtime::SubmissionFrontier Frontier() const;
@@ -183,8 +187,12 @@ private:
 	std::vector<std::pair<std::shared_ptr<rhi::TimelinePtr>, std::shared_ptr<const std::atomic<uint64_t>>>> m_assignedTimelines;
 	// NoteExternalPoint's latest point per timeline. Guarded by m_queuesMutex.
 	std::vector<runtime::SubmittedPoint> m_externalPoints;
-	// Open AssignmentScopes.
-	std::atomic<uint32_t> m_assigning{0};
+	// Open AssignmentScopes by id, and the next id. Ids grow, so a release's mark is the first id it does not wait for.
+	uint64_t OpenAssignment();
+	void CloseAssignment(uint64_t a_id);
+	std::mutex m_assignmentMutex;
+	std::set<uint64_t> m_openAssignments;
+	uint64_t m_nextAssignment = 1;
 
 	// The thread DestroyDetached and RetireDetached hand objects to.
 	class Deleter;

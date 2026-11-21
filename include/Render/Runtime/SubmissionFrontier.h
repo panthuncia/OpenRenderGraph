@@ -26,6 +26,21 @@ using SubmissionFrontier = std::vector<SubmittedPoint>;
 // queues the runtime no longer has.
 using PointReached = std::function<bool(const SubmittedPoint&)>;
 
+// When a frontier taken now is complete. A submitter holds an assignment scope from taking values on a shared timeline
+// until it publishes them (Runtime::AssignmentScope); work still queued in such a scope may use what is released now, and
+// a frontier taken meanwhile misses its values. So a release notes mark() and takes its frontier once closedBefore(mark):
+// every scope open at the release has published. Scopes opened later cannot reach what was released. Without a gate, a
+// frontier taken now is complete.
+struct AssignmentGate {
+	std::function<uint64_t()> mark;
+	std::function<bool(uint64_t)> closedBefore;
+
+	explicit operator bool() const noexcept { return mark && closedBefore; }
+	// 0 without a gate: closed at once.
+	uint64_t Mark() const { return *this ? mark() : 0; }
+	bool ClosedBefore(uint64_t a_mark) const { return !*this || closedBefore(a_mark); }
+};
+
 inline bool TimelineReached(SubmittedPoint point) noexcept {
 	if (!point.timeline.IsValid()) return true;
 	const uint64_t completed = point.timeline.GetCompletedValue();

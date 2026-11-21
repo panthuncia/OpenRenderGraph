@@ -60,11 +60,11 @@ FrameArena::~FrameArena() {
 }
 
 void FrameArena::SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached,
-	std::function<bool()> settled) {
+	runtime::AssignmentGate gate) {
 	std::scoped_lock lock(m_mutex);
 	m_frontier = std::move(frontier);
 	m_reached = std::move(reached);
-	m_settled = std::move(settled);
+	m_gate = std::move(gate);
 	if (!m_frontier) RetirePendingLocked(true);
 }
 
@@ -176,9 +176,9 @@ void FrameArena::FreePinned(const Region& region) {
 		return;
 	}
 	// A submission still queued on a host's submission thread may read the region. Its values are not handed out yet, so the
-	// frontier now would miss it: the free waits for a frontier taken once nothing is queued.
-	if (m_settled && !m_settled()) {
-		m_pending.push_back({chunk, region.size, {}, true});
+	// frontier now would miss it: the free waits for a frontier taken once the scopes open now have closed.
+	if (const uint64_t mark = m_gate.Mark(); !m_gate.ClosedBefore(mark)) {
+		m_pending.push_back({chunk, region.size, {}, true, mark});
 		return;
 	}
 	m_pending.push_back({chunk, region.size, m_frontier()});
@@ -230,10 +230,9 @@ void FrameArena::ReleaseRun(uint32_t lease, uint32_t generation) {
 }
 
 void FrameArena::RetirePendingLocked(bool all) {
-	const bool settled = !m_settled || m_settled();
 	std::erase_if(m_pending, [&](PendingFree& pending) {
 		if (!all && pending.open) {
-			if (!settled || !m_frontier) return false;
+			if (!m_frontier || !m_gate.ClosedBefore(pending.mark)) return false;
 			pending.frontier = m_frontier();
 			pending.open = false;
 		}

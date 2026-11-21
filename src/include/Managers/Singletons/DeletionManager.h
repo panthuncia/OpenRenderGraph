@@ -123,14 +123,15 @@ public:
 	}
 
 	// Installs the runtime's frontier, which Retire seals batches with, and the check for when its points are reached.
-	// settled says whether the frontier is complete now (no values handed out but not yet published). Without it, it
-	// always is. All three are called under this manager's lock, so they must not mark anything.
+	// gate tells when a frontier is complete (runtime::AssignmentGate): what was marked while an assignment scope was open
+	// waits for every scope open then to close. Without a gate, it always is. All of them are called under this manager's
+	// lock, so they must not mark anything.
 	void SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached,
-		std::function<bool()> settled = {}) {
+		runtime::AssignmentGate gate = {}) {
 		std::scoped_lock lock(m_mutex);
 		m_frontier = std::move(frontier);
 		m_reached = std::move(reached);
-		m_settled = std::move(settled);
+		m_gate = std::move(gate);
 	}
 
 	// Each MarkForDelete takes an optional name (the allocation's own is used without one) and records its caller.
@@ -204,10 +205,16 @@ public:
 			Append(retired.trackedLabels, sealed.contents.trackedLabels);
 			m_sealed.pop_front();
 		}
-		// Not settled: the open batch waits for the next Retire, whose frontier covers that submission's values.
-		if (m_frontier && !m_open.Empty() && (!m_settled || m_settled())) {
-			m_sealed.push_back({ Batch{ m_frontier(), Origin::Of(where), std::chrono::steady_clock::now() }, std::move(m_open) });
+		// The open batch waits with the gate's mark now, which comes after everything in it was marked. A waiting batch is
+		// sealed with the frontier once every scope open at its mark has closed, so that frontier covers their values. Each
+		// batch has its own mark, so scopes that keep opening never hold an older batch back.
+		if (m_frontier && !m_open.Empty()) {
+			m_waiting.push_back({ m_gate.Mark(), std::move(m_open) });
 			m_open = {};
+		}
+		while (m_frontier && !m_waiting.empty() && m_gate.ClosedBefore(m_waiting.front().mark)) {
+			m_sealed.push_back({ Batch{ m_frontier(), Origin::Of(where), std::chrono::steady_clock::now() }, std::move(m_waiting.front().contents) });
+			m_waiting.pop_front();
 		}
 		return retired;
 	}
@@ -226,6 +233,7 @@ public:
 			stats.trackedAllocationCount += batch.trackedAllocations.size();
 		};
 		count(m_open);
+		for (const auto& batch : m_waiting) count(batch.contents);
 		for (const auto& batch : m_sealed) count(batch.contents);
 		return stats;
 	}
@@ -234,16 +242,18 @@ public:
 	void DrainAll() {
 		std::scoped_lock lock(m_mutex);
 		m_sealed.clear();
+		m_waiting.clear();
 		m_open = {};
 	}
 
 	void Cleanup() {
 		std::scoped_lock lock(m_mutex);
 		m_sealed.clear();
+		m_waiting.clear();
 		m_open = {};
 		m_frontier = {};
 		m_reached = {};
-		m_settled = {};
+		m_gate = {};
 		m_initialized = false;
 	}
 
@@ -266,8 +276,14 @@ private:
 	bool m_initialized = false;
 	std::function<runtime::SubmissionFrontier()> m_frontier;
 	runtime::PointReached m_reached;
-	std::function<bool()> m_settled;
+	runtime::AssignmentGate m_gate;
 	Retired m_open;
+	// Batches waiting for the scopes open at their mark to close, oldest first; marks only grow.
+	struct Waiting {
+		uint64_t mark = 0;
+		Retired contents;
+	};
+	std::deque<Waiting> m_waiting;
 	std::deque<Sealed> m_sealed;
 };
 
