@@ -315,8 +315,11 @@ private:
 		// Each versioned slot's key and slice count, sorted. A key has more than one entry when slots of two counts are declared.
 		std::atomic<std::shared_ptr<const std::vector<std::pair<const void*, uint32_t>>>> m_slices;
 	};
-	// Any thread. The same object for the graph's life.
+public:
+	// Any thread. The same object for the graph's life. Hosts and tests read what a built graph declares.
 	std::shared_ptr<const DeclaredVersions> PersistentDeclaredVersions() const noexcept { return m_declaredVersions; }
+
+private:
 	// Owner thread: whether RecordTakenUploads would record anything now (IUploadService::HasPendingUploads). A host that
 	// gets false skips its upload lists and RecordTakenUploads for the ticket.
 	bool HasPendingUploads() const;
