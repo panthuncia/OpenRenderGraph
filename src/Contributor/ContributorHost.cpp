@@ -246,10 +246,12 @@ public:
 			case ORG_RG_ACCESS_UNORDERED_ACCESS: take(builder.UnorderedAccess(target, UavView{UINT32_MAX, mip, slice})); break;
 			case ORG_RG_ACCESS_UNORDERED_ACCESS_CLEAR: take(builder.UnorderedAccessClear(target, UavView{UINT32_MAX, mip, slice})); break;
 			case ORG_RG_ACCESS_RENDER_TARGET: take(builder.RenderTarget(target, RtvView{UINT32_MAX, mip, slice})); break;
-			case ORG_RG_ACCESS_RENDER_TARGET_CLEAR: take(builder.RenderTargetClear(target, RtvView{UINT32_MAX, mip, slice})); break;
+			// The host clears render targets and depth with the pass's load op, so they are attachments, not ClearRTV or
+			// ClearDSV targets. On Vulkan those clears need a transfer layout, which the pass would not be in.
+			case ORG_RG_ACCESS_RENDER_TARGET_CLEAR: take(builder.RenderTarget(target, RtvView{UINT32_MAX, mip, slice})); break;
 			case ORG_RG_ACCESS_DEPTH_READ: take(builder.DepthRead(target, DsvView{UINT32_MAX, mip, slice})); break;
 			case ORG_RG_ACCESS_DEPTH_READ_WRITE: take(builder.DepthReadWrite(target, DsvView{UINT32_MAX, mip, slice})); break;
-			case ORG_RG_ACCESS_DEPTH_STENCIL_CLEAR: take(builder.DepthStencilClear(target, DsvView{UINT32_MAX, mip, slice})); break;
+			case ORG_RG_ACCESS_DEPTH_STENCIL_CLEAR: take(builder.DepthReadWrite(target, DsvView{UINT32_MAX, mip, slice})); break;
 			case ORG_RG_ACCESS_COPY_SOURCE: tokens.resource = builder.CopySource(target); break;
 			case ORG_RG_ACCESS_COPY_DESTINATION: tokens.resource = builder.CopyDestination(target); break;
 			case ORG_RG_ACCESS_INDIRECT_ARGUMENT: tokens.resource = builder.IndirectArguments(target); break;
