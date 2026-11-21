@@ -32,6 +32,7 @@ int TestStatisticsPoolRetirement(rhi::Device device);
 int TestExternalClient(rhi::Device device);
 int TestProgramVersions(rhi::Device device);
 int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime);
+int TestRunGates();
 
 namespace {
 struct RecordingStatisticsProbe final : org::runtime::IStatisticsService {
@@ -1410,6 +1411,7 @@ int main(int argc, char** argv) {
     if (const auto failure = TestStatisticsPoolRetirement(device.Get())) return failure;
     if (const auto failure = TestExternalClient(device.Get())) return failure;
     if (const auto failure = TestRebindingGpu(device.Get(), orgRuntime)) return failure;
+    if (const auto failure = TestRunGates()) return failure;
 	orgRuntime.reset();
 	return 0;
 }

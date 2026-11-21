@@ -110,6 +110,7 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/PreparedTablePublisher.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RecordingContext.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/LatchBlock.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RunGate.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/FrameArena.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/RunReadback.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Render/Runtime/StagedUploadBatch.cpp"
@@ -314,6 +315,11 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_features(OpenRenderGraphTokenTests PRIVATE cxx_std_23)
     target_link_libraries(OpenRenderGraphTokenTests PRIVATE OpenRenderGraph)
     add_test(NAME OpenRenderGraphTokenTests COMMAND OpenRenderGraphTokenTests)
+    # Per-run values and their staging move (no device).
+    add_executable(OpenRenderGraphRunSlotsTests tests/RunSlotsTests.cpp)
+    target_compile_features(OpenRenderGraphRunSlotsTests PRIVATE cxx_std_23)
+    target_link_libraries(OpenRenderGraphRunSlotsTests PRIVATE OpenRenderGraph)
+    add_test(NAME OpenRenderGraphRunSlotsTests COMMAND OpenRenderGraphRunSlotsTests)
     add_executable(OpenRenderGraphAliasPackingTests tests/AliasPackingTests.cpp src/Render/RenderGraph/AliasPacking.cpp)
     target_compile_features(OpenRenderGraphAliasPackingTests PRIVATE cxx_std_23)
     add_test(NAME OpenRenderGraphAliasPackingTests COMMAND OpenRenderGraphAliasPackingTests)
@@ -370,7 +376,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     target_compile_definitions(OpenRenderGraphAsyncCompileTests PRIVATE NOMINMAX)
     add_test(NAME OpenRenderGraphAsyncCompileTests COMMAND OpenRenderGraphAsyncCompileTests)
     if(_org_d3d12_tests)
-    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/RuntimeTests.cpp tests/ExternalClientTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/RebindingGpuTests.cpp)
+    add_executable(OpenRenderGraphExternalResourceTests tests/ExternalResourceTests.cpp tests/RuntimeTests.cpp tests/ExternalClientTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp tests/ProgramVersionTests.cpp tests/RebindingGpuTests.cpp tests/RunGateTests.cpp)
     target_include_directories(OpenRenderGraphExternalResourceTests PRIVATE src/include)
     target_compile_definitions(OpenRenderGraphExternalResourceTests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     if(WIN32 AND BASICRHI_ENABLE_STREAMLINE)
