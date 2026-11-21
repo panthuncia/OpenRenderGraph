@@ -491,7 +491,7 @@ bool BufferBase::TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const {
 	if (m_unorderedAccess || (m_descriptorRequirements && m_descriptorRequirements->createUAV)) {
 		outDesc.resourceFlags |= rhi::ResourceFlags::RF_AllowUnorderedAccess;
 	}
-	outDesc.resourceFlags |= m_extraResourceFlags;
+	outDesc.resourceFlags |= BackingResourceFlags();
 	return m_bufferSize != 0;
 }
 
@@ -565,7 +565,7 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
             options->aliasPlacement.value(),
             m_unorderedAccess,
             nullptr,
-            m_extraResourceFlags);
+            BackingResourceFlags());
     }
     else {
         m_dataBuffer = GpuBufferBacking::CreateUnique(
@@ -575,7 +575,7 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
             m_unorderedAccess,
             nullptr,
             false,
-            m_extraResourceFlags);
+            BackingResourceFlags());
         if (m_residencyPriority) DeviceManager::GetInstance().SetResidencyPriority(m_dataBuffer->m_bufferAllocation, *m_residencyPriority);
     }
 
@@ -782,8 +782,37 @@ void BufferBase::CreateAndSetBacking(rhi::HeapType accessType, uint64_t bufferSi
         accessType,
         bufferSize,
         GetGlobalResourceID(),
-        unorderedAccess);
+        unorderedAccess,
+        nullptr,
+        false,
+        BackingResourceFlags());
     SetBacking(std::move(newBacking), bufferSize);
+}
+
+namespace {
+    // D3D12 packs small buffers at 512-byte starts in a shared resource. A view counts its start in elements, so its element
+    // size must divide 512.
+    bool StartsOnPackedBuffer(rhi::BufferViewKind kind, uint32_t stride, rhi::Format format) {
+        uint32_t unit = 4;
+        if (kind == rhi::BufferViewKind::Structured) unit = stride;
+        else if (kind == rhi::BufferViewKind::Typed) unit = rhi::FormatByteSize(format);
+        return unit != 0 && 512u % unit == 0;
+    }
+}
+
+rhi::ResourceFlags BufferBase::BackingResourceFlags() const {
+    rhi::ResourceFlags flags = m_extraResourceFlags;
+    if (!m_descriptorRequirements) return flags;
+    const auto& r = *m_descriptorRequirements;
+    bool own = false;
+    if (r.createSRV && r.srvDesc.dimension == rhi::SrvDim::Buffer)
+        own = own || !StartsOnPackedBuffer(r.srvDesc.buffer.kind, r.srvDesc.buffer.structureByteStride, r.srvDesc.formatOverride);
+    if ((r.createUAV || r.createNonShaderVisibleUAV) && r.uavDesc.dimension == rhi::UavDim::Buffer) {
+        own = own || !StartsOnPackedBuffer(r.uavDesc.buffer.kind, r.uavDesc.buffer.structureByteStride, r.uavDesc.formatOverride);
+        own = own || r.uavCounterOffset != 0 || r.uavDesc.buffer.counterOffsetInBytes != 0;
+    }
+    if (own) flags |= rhi::RF_OwnResource;
+    return flags;
 }
 
 void BufferBase::SetBackingName(const std::string& baseName, const std::string& suffix) {

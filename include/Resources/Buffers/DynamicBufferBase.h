@@ -225,6 +225,10 @@ protected:
     // instead, which old work keeps using until it retires (docs/persistent-epochs.md, "Versioned resources").
     void SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t bufferSize);
     void CreateAndSetBacking(rhi::HeapType accessType, uint64_t bufferSize, bool unorderedAccess);
+    // The resource flags a backing is made with: the extra flags, and RF_OwnResource when a view this buffer declares cannot
+    // start inside a shared D3D12 resource (a structured stride that does not divide 512, a typed format likewise, or a UAV
+    // counter).
+    rhi::ResourceFlags BackingResourceFlags() const;
     void SetBackingName(const std::string& baseName, const std::string& suffix);
     void QueueResourceCopyFromOldBacking(uint64_t bytesToCopy);
 
