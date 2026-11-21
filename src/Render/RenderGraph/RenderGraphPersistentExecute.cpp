@@ -284,7 +284,6 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 		job.recording.external = inStream;
 		// Inline: the packet records the batch when it submits it, from the queue's shared pool (AcquireCommandLists skips it).
 		job.recording.inlineAtExecution = late && !external;
-		job.recording.keepBySkips = job.recording.inlineAtExecution && m_keepGatedInline;
 		if (job.recording.inlineAtExecution) job.recording.allocation->pool = job.pool;
 		job.recording.bindings = segment.bindings;
 		job.recording.run = run.execution.options.run.value_or(RunRef::Unleased(frameIndex));

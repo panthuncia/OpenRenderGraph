@@ -168,7 +168,7 @@ struct GraphHost::Async {
 		return requestGeneration && stagedGraph[index] && requestGeneration == stagedGeneration[index];
 	}
 	// Host thread, per live epoch index and kept copy (RunLease::copy): the last replayable recording made for the copy, and the
-	// build generation of the graph it was recorded on (Desc::reuseLiveRecordings).
+	// build generation of the graph it was recorded on (live epochs with Desc::reuseRecordings).
 	struct LiveCopy {
 		std::shared_ptr<const RenderGraph::PersistentRecording> recording;
 		uint64_t generation = 0;
@@ -479,7 +479,7 @@ GraphHost::GraphHost(Desc desc)
 	m_declared.resize(m_instances.size());
 	// Made with the host, so the queue's pointer never changes while another thread drains it.
 	if (m_desc.submissionThread) {
-		if (m_desc.mergeTicketSubmissions && m_desc.coalesceSubmissions) m_submitCarry = RenderGraph::MakeSubmitCarry();
+		if (m_desc.mergeTicketSubmissions) m_submitCarry = RenderGraph::MakeSubmitCarry();
 		m_submitQueue = std::make_unique<SubmitQueue>();
 		m_submitQueue->thread = std::thread([this] { RunSubmitThread(); });
 	}
@@ -1065,10 +1065,6 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		graph->SetExternalPersistentEpochs(inputs.externalEpochs);
 		// Likewise for a pass recorded at execution inline (RenderGraph::PassEpochRecordsAtExecution).
 		graph->SetInlineAtExecution(inputs.inlineAtExecution);
-		graph->SetCoalescedSubmissions(m_desc.coalesceSubmissions);
-		graph->SetMergedHandoffs(m_desc.mergeHandoffs);
-		graph->SetUploadsWithBatches(m_desc.uploadsWithBatches);
-		graph->SetKeptGatedInline(m_desc.keepGatedInline);
 		// A detached graph sets up nothing other graphs share until it is attached (RenderGraph::DeferSharedSetup): the upload
 		// service's registry, the shared upload pass and the statistics query heap.
 		auto hostUploads = std::make_unique<HostUploadExtension>(graph->GetUploadService(), detached);
@@ -2827,7 +2823,7 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 	// published copy's for a revision-driven epoch, or none: then nothing is prepared until a seal or a completion frees a copy
 	// (EpochCopiesBusyError meanwhile).
 	RunLease* lease = reprepare;
-	const bool keepsLive = !state.revisionDriven[epochIndex] && m_desc.reuseLiveRecordings && m_desc.reuseRecordings;
+	const bool keepsLive = !state.revisionDriven[epochIndex] && m_desc.reuseRecordings;
 	if (!lease && state.revisionDriven[epochIndex]) {
 		lease = TakeCopyLease(state, epochIndex);
 	} else if (!lease && keepsLive) {
@@ -2879,7 +2875,7 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 				if (const auto recording = weak.lock()) AddRevisionCandidate(state, epochIndex, *ticket, *recording);
 		} else {
 			const auto version = state.backingVersion.load(std::memory_order_acquire);
-			// A live epoch's kept copy (Desc::reuseLiveRecordings).
+			// A live epoch's kept copy.
 			const bool liveCopy = keepsLive && lease->copy != RunRef::kNoCopy;
 			if (liveCopy && !reprepare) {
 				// The copy's regions still hold its last run's values. A new lease's would be zeros, and a client whose commit does
@@ -3701,7 +3697,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		const rhi::TimelinePoint signal{async.graphicsFence, value};
 		uploadLists.push_back(commands);
 		// SubmitPersistentTicket submits it, after the group an earlier ticket left held (the submission thread's carry): in the
-		// ticket's first queue submission when it can (Desc::uploadsWithBatches), otherwise on their own first.
+		// ticket's first queue submission when it can, otherwise on their own first.
 		uploads.lists = {uploadLists.data(), uploadLists.size()};
 		uploads.queue = async.graphicsQueue;
 		uploads.queueSlot = async.graphicsSlot;

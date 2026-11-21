@@ -229,9 +229,10 @@ thread calls `SubmitEpoch(epoch, beforeSubmit)` at each point instead of `Execut
         A stale ticket is prepared again for the same run lease, whose latch regions `beforeSubmit` just wrote;
     4.  admits the ticket (`AdmitPersistentTicket`), records the pending uploads into the lease's upload list, and submits
         the uploads and the ticket with the handoff lists (`SubmitPersistentTicket`), then commits.
--   **Coalesced submissions** (`Desc::coalesceSubmissions`, `RenderGraph::SetCoalescedSubmissions`). Without it each batch is a
-    queue submission of its own. With it, a ticket's consecutive batches on one queue go to the queue in one submission:
-    -   the lists in batch order, each batch's handoff list ahead of its own lists;
+-   **Coalesced submissions.** A ticket's consecutive batches on one queue go to the queue in one submission:
+    -   the lists in batch order. A ticket that is not external has one handoff list per submission, ahead of its first
+        batch; barriers for a queue-family transfer, and those that discard or start from Undefined, stay ahead of their own
+        batch;
     -   the waits of all of them, without the waits on values the group itself signals (queue order covers those);
     -   the passes' external signals, and the queue timeline's highest value, which covers the lower ones.
 
@@ -240,8 +241,9 @@ thread calls `SubmitEpoch(epoch, beforeSubmit)` at each point instead of `Execut
     (`relativeWaits` are only between queues), so nothing that synchronized before is lost.
     -   Each batch's passes are committed as submitted once the queue accepted the group
         (`PreparedRhiExecutionBatch::Gather`, `CommitGathered`).
--   **Uploads.** The uploads go to the graphics queue, ahead of the ticket. A batch on another queue waits for them only
-    when it uses what they write.
+-   **Uploads.** The uploads go to the graphics queue, ahead of the ticket. They ride in the ticket's first queue submission
+    when the ticket is not external, has one segment and every batch is on the graphics queue. A batch on another queue waits
+    for them only when it uses what they write.
     -   **Queue-scoped uploads** (`Desc::queueScopedUploads`, default on). A staged upload whose destination the ticket first
         uses on another queue is recorded into that queue's list instead, just ahead of that queue's first batch. That list
         waits for what a write of the destination needs against earlier executions (`FrameAdmission::boundaryAccessWaits`).
@@ -322,9 +324,9 @@ Revision(std::vector<uint64_t>&) const`: what its recording depends on beyond it
 effect). Pipelines and other objects a recording binds are retained by the recording itself (`RecordingRetention`, on
 `OwnedRecordingList`).
 
--   **Live epochs record every run.** A live ticket's recording is used once and nothing keeps it. A ticket that
-    `beforeSubmit` made stale is prepared again, for the same run lease. A live epoch takes no revision recording.
--   **Kept live recordings** (`Desc::reuseLiveRecordings`). A live epoch's runs take kept copies instead of new leases.
+-   **Live epochs.** Without replayable recordings, a live ticket's recording is used once and nothing keeps it. A ticket
+    that `beforeSubmit` made stale is prepared again, for the same run lease. A live epoch takes no revision recording.
+-   **Kept live recordings** (with `Desc::reuseRecordings`). A live epoch's runs take kept copies instead of new leases.
     -   A kept copy is a lease whose LatchBlock regions are pinned to its index, like a published copy's. The epoch makes
         copies as its runs need them, up to `Desc::liveCopiesMost`. A run that finds none free takes a lease of its own and
         records as before (`AsyncStats::liveSpilled`).

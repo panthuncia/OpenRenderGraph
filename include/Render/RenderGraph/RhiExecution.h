@@ -648,7 +648,7 @@ private:
     bool m_replayable = false;
     std::shared_ptr<OwnedRecordingList> m_deferred;
     bool m_inline = false;  // m_deferred->inlineAtExecution
-    // An inline replayable batch whose passes are all keyed by their skip answers (OwnedRecordingList::keepBySkips). Its list
+    // An inline replayable batch whose passes are all keyed by their skip answers (PreparedPass::KeyedBySkip). Its list
     // is recorded again only when the answers differ from those it was recorded with (m_keptSkips). Submitting thread only.
     bool m_keyedBySkips = false;
     mutable bool m_keptList = false;
@@ -786,11 +786,9 @@ struct OwnedRecordingList {
     // A late batch of an epoch that is not external, under RenderGraph::SetInlineAtExecution. Its packet records it at
     // submission, on the submitting thread, into a primary list from allocation->pool, and submits that list in the
     // batch's place. It has no Tracy GPU zones: the submitting thread records it while the recording workers may record
-    // other lists for the same queue.
+    // other lists for the same queue. A replayable packet whose passes are all keyed by their skip answers
+    // (PreparedPass::KeyedBySkip) submits its list again, without recording, while the answers are unchanged.
     bool inlineAtExecution = false;
-    // With inlineAtExecution, under RenderGraph::SetKeptGatedInline: a replayable packet whose passes are all keyed by their
-    // skip answers (PreparedPass::KeyedBySkip) submits its list again, without recording, while the answers are unchanged.
-    bool keepBySkips = false;
     // Record for resubmission, when every pass of the packet is replayable (PreparedRhiExecutionBatch's replayable
     // packets). The list then has no profiler GPU zones or ranges, because a resubmission would write their queries
     // again. Nothing a list records may name a resource its recording does not own. Its statistics queries, if any, are
@@ -1341,7 +1339,7 @@ inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, 
     m_replayable = m_deferred->replayable
         && std::all_of(m_deferred->passes.begin(), m_deferred->passes.end(), [](const PreparedPass& pass) { return pass.IsReplayable(); });
     if (!m_replayable) m_submissionEffects = m_deferred->passes;
-    m_keyedBySkips = m_inline && m_replayable && m_deferred->keepBySkips
+    m_keyedBySkips = m_inline && m_replayable
         && std::all_of(m_deferred->passes.begin(), m_deferred->passes.end(), [](const PreparedPass& pass) { return pass.KeyedBySkip(); });
 }
 
