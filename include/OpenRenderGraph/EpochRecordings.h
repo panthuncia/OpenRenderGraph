@@ -62,13 +62,8 @@ namespace org::epoch_recordings {
 	Posting Request(GraphHost& a_host, std::uint32_t a_epoch, std::shared_ptr<const IHostExecutionData> a_hostData,
 		std::uint64_t a_buildGeneration, std::uint32_t a_copy, Done a_done);
 
-	/** @brief The builds of an epoch whose recordings a cache keeps. 0 means none. */
-	struct Builds {
-		std::uint64_t attached = 0;
-		std::uint64_t staged = 0;
-		/** @brief Whether a recording on build a_build is of one of them. */
-		bool Has(std::uint64_t a_build) const { return a_build != 0 && (a_build == attached || a_build == staged); }
-	};
+	/** @brief The builds of an epoch whose recordings a cache keeps. 0 means none. The host's snapshot (GraphHost::BuildsOf). */
+	using Builds = GraphHost::Builds;
 
 	/** @brief What a cache does with an entry that a graph build dropped. */
 	enum class AfterDrop : std::uint8_t {
@@ -90,8 +85,8 @@ namespace org::epoch_recordings {
 	 * - a request that fails goes to OnFailure when it settles. Its entry settles with the error;
 	 * - a kept entry that settled with no recording and no drop goes to OnFailure when it is looked up. The lookup misses;
 	 * - a dropped entry follows Rule;
-	 * - adding an entry first drops the settled entries recorded on a build the caller no longer keeps (Builds). They hold
-	 *   that build's graph and alias pools;
+	 * - adding an entry first drops the settled entries recorded on a build the caller no longer keeps (Builds, or the host's
+	 *   own pair with the Add that takes the host). They hold that build's graph and alias pools;
 	 * - when the cache holds Keep entries, the least recently used settled one goes.
 	 * Payload is the caller's own data per entry, such as what its recordings resolve.
 	 */
@@ -216,6 +211,14 @@ namespace org::epoch_recordings {
 			}
 			m_entries.push_back(entry);
 			return entry;
+		}
+
+		/**
+		 * @brief Owner thread of the cache, any thread of the host's. As the Add above, with the builds a_epoch has on a_host now
+		 * (GraphHost::BuildsOf): its attached and staged builds' recordings stay, every other build's settled ones go.
+		 */
+		EntryPtr Add(const GraphHost& a_host, std::uint32_t a_epoch, Key a_key, std::uint64_t a_use, std::size_t a_requests = 1) {
+			return Add(a_host.BuildsOf(a_epoch), std::move(a_key), a_use, a_requests);
 		}
 
 		/**

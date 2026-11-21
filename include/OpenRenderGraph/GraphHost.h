@@ -65,6 +65,10 @@ struct IHostExecutionData;
 // Not thread-safe: all calls come from the host's render thread. With async epochs (SetAsyncEpochs) the host
 // runs one thread of its own that owns the graphs from then on; the render thread submits, and builds a graph only
 // while the host's thread has let go of it.
+//
+// Owner thread. The calls marked "Owner thread" are checked when GraphHost.cpp is built with ORG_THREAD_CHECKS (on by
+// default without NDEBUG): a call from another thread logs the call and both threads, then aborts. The first checked call
+// claims the host for its thread. An application whose render thread changes moves it with SetOwnerThread.
 class GraphHost {
 public:
 	struct Desc {
@@ -146,6 +150,7 @@ public:
 	void RemoveExtension(const std::string& id);
 	/** @brief Whether an extension is registered under id (AddExtension). Owner thread. */
 	bool HasExtension(std::string_view id) const noexcept {
+		CheckOwner("HasExtension");
 		return std::ranges::any_of(m_extensions, [&](const Registered& entry) { return entry.id == id; });
 	}
 
@@ -334,7 +339,24 @@ public:
 		AttachRefusal refusal = AttachRefusal::None;
 	};
 	StageResult StageEpochGraph(std::unique_ptr<EpochGraph>& graph);
-	/** @brief Owner thread: the staged graph's build generation (0 with none). */
+	/** @brief An epoch's attached and staged build generations, read together (BuildsOf). 0 means none. */
+	struct Builds {
+		uint64_t attached = 0;  // the build its graph runs (0 with no graph)
+		uint64_t staged = 0;    // the build staged for it (0 with none)
+		/** @brief Whether build a_build is one of them. */
+		bool Has(uint64_t a_build) const noexcept { return a_build != 0 && (a_build == attached || a_build == staged); }
+		bool operator==(const Builds&) const = default;
+	};
+	/**
+	 * @brief Any thread: the epoch's attached and staged builds ({0, 0} for an epoch the host does not have).
+	 *
+	 * The owner thread publishes the pair whenever it changes: at a build, an attach, a staging, a staged set's attach, a staged
+	 * graph's retirement and DestroyGraph. A reader always gets one pair the owner published, never half of one. On the owner
+	 * thread it is the host's state now. Elsewhere it may be one change behind. It never blocks the owner. A reader retries only
+	 * while the owner is inside a publish (a few stores).
+	 */
+	Builds BuildsOf(uint32_t epoch) const noexcept;
+	/** @brief Any thread: the staged graph's build generation (0 with none). BuildsOf(epoch).staged. */
 	uint64_t StagedGeneration(uint32_t epoch) const noexcept;
 	/**
 	 * @brief Owner thread, at a frame boundary: swaps the staged graphs of several epochs in as one step (frame revisions, rule R3).
@@ -395,7 +417,10 @@ public:
 	/** @brief Called on the owner thread by PollEpochFailures, once per failure. It must not throw. */
 	using EpochFailedCallback = std::function<void(const EpochFailure&)>;
 	/** @brief The owner's handler of epoch failures (PollEpochFailures calls it). Owner thread. */
-	void SetEpochFailedCallback(EpochFailedCallback callback) { m_epochFailed = std::move(callback); }
+	void SetEpochFailedCallback(EpochFailedCallback callback) {
+		CheckOwner("SetEpochFailedCallback");
+		m_epochFailed = std::move(callback);
+	}
 	/**
 	 * @brief Owner thread: hands the failures reported since the last call to the callback, in the order they happened. A failure
 	 * of a build the epoch has since replaced is dropped. Call it where nothing of the failed epoch's is in progress, for example
@@ -665,13 +690,24 @@ public:
 	// SubmitEpoch throw.
 	void UseEpochRecording(std::shared_ptr<const EpochRecording> recording) noexcept { m_chosenRecording = std::move(recording); }
 	// Owner thread: moves with every graph build, of any epoch.
-	uint64_t BuildGeneration() const noexcept { return m_buildGeneration; }
+	uint64_t BuildGeneration() const noexcept {
+		CheckOwner("BuildGeneration");
+		return m_buildGeneration;
+	}
 	// Owner thread: moves with every build of the epoch's graph: a recording (RequestEpochRecording) is of the build it was made on,
-	// and no later one's tickets take it. 0 for an epoch the host does not have.
+	// and no later one's tickets take it. 0 for an epoch the host does not have. Another thread reads BuildsOf(epoch).attached.
 	uint64_t BuildGeneration(uint32_t epoch) const noexcept;
-	// Owner thread: whether a recording is of its epoch's graph as built now - with explicit builds, what decides before a frame's
-	// submissions whether they can take it (until the next BuildIfRequested).
+	// Any thread: whether a recording is of its epoch's graph as built now (BuildsOf(epoch).attached) - with explicit builds, what
+	// decides before a frame's submissions whether they can take it (until the next BuildIfRequested). Off the owner thread it may be
+	// one change behind.
 	bool EpochRecordingCurrent(const EpochRecording& recording) const noexcept;
+	/**
+	 * @brief The calling thread owns the host from now on: the "Owner thread" calls are checked against it (ORG_THREAD_CHECKS). For an
+	 * application whose render thread changes, called by the new one before its first owner call. Any thread.
+	 */
+	void SetOwnerThread() noexcept;
+	/** @brief Any thread: whether the calling thread owns the host (SetOwnerThread, or the first checked call's thread). */
+	bool IsOwnerThread() const noexcept;
 	// Any thread: whether copy `copy` of the recording was recorded with the versions its versioned slots have now (a recording
 	// for host data that names no versions binds the current ones). False for a copy it does not have. A host whose revision does
 	// not name versions checks this instead of counting NoteNewVersions: a version of a resource the epoch does not use leaves it
@@ -966,8 +1002,23 @@ private:
 	void RetireStaged(size_t index);
 	// Owner thread, the instance not in the host's thread's hands: swaps its staged graph in, with the recordings made on it.
 	bool SwapStagedIn(size_t index);
-	// Owner thread: publishes what the instance's attached and staged graphs declare, for EpochsDeclaring.
+	// Owner thread: publishes what the instance's attached and staged graphs declare, for EpochsDeclaring, and their build
+	// generations, for BuildsOf. Every change of either graph calls it.
 	void PublishDeclared(size_t index);
+	// Owner thread: publishes the instance's attached and staged generations (BuildsOf).
+	void PublishBuilds(size_t index) noexcept;
+	// BuildsOf's pair per instance (index as m_instances), behind a sequence count. The owner writes it alone: the count is odd
+	// while it writes. A reader takes the pair when the count is even and the same before and after.
+	struct BuildsCell {
+		std::atomic<uint64_t> sequence{0};
+		std::atomic<uint64_t> attached{0};
+		std::atomic<uint64_t> staged{0};
+	};
+	std::unique_ptr<BuildsCell[]> m_builds;  // made with the instances, never resized
+	// Owner-thread check (ORG_THREAD_CHECKS in GraphHost.cpp; otherwise it does nothing): a call from a thread that does not own the
+	// host is logged and aborts. The first call claims an unowned host.
+	void CheckOwner(const char* api) const noexcept;
+	mutable std::atomic<std::thread::id> m_ownerThread{};  // SetOwnerThread's, or the first checked call's; none before
 	// Counts a refusal and returns it as an AttachResult.
 	AttachResult Refuse(AttachRefusal refusal, uint32_t epoch, std::string reason) noexcept;
 	// EpochsDeclaring's view, per instance (index as m_instances). Written on the owner thread under the mutex.
