@@ -288,7 +288,7 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 		if (job.recording.inlineAtExecution) job.recording.allocation->pool = job.pool;
 		job.recording.bindings = segment.bindings;
 		job.recording.run = run.execution.options.run.value_or(RunRef::Unleased(frameIndex));
-		job.recording.tag = m_recordingTag;
+		job.recording.tags = m_recordingTags;
 		job.recording.externalEntryBarrier = m_externalQueueBoundary.entry && run.firstBatchOnSlot[slot] == batch;
 		job.recording.externalExitBarrier = m_externalQueueBoundary.exit && run.lastBatchOnSlot[slot] == batch;
 		job.recording.replayable = keepable;

@@ -773,8 +773,9 @@ struct OwnedRecordingList {
     std::shared_ptr<RecordingRetention> retention = std::make_shared<RecordingRetention>();
     // RecordingContext::Run for the passes of this list.
     RunRef run{};
-    // RecordingContext::Tag for the passes of this list: the graph's RecordingTag. Held as long as the list.
-    std::shared_ptr<const void> tag;
+    // RecordingContext::Tag for the passes of this list: the graph's tags (RenderGraph::RecordingTagSet). Held as long as
+    // the list.
+    std::shared_ptr<const RecordingTags> tags;
     // RenderGraph::ExternalQueueBoundary: full memory barrier before the first
     // pass / after the last pass of this command list.
     bool externalEntryBarrier = false;
@@ -1052,7 +1053,7 @@ inline RecordingContext MakeOwnedRecordingContext(rhi::CommandList list, const O
     if (recording.bindings && recording.publication)
         context = context.WithPersistentBindings(recording.publication);
     context.SetRun(recording.run);
-    context.SetTag(recording.tag);
+    context.SetTags(recording.tags);
     context.SetRetention(recording.retention);
     context.SetDescriptorHeaps(recording.resourceDescriptorHeap, recording.samplerDescriptorHeap);
     return context;
