@@ -5,6 +5,8 @@
 #include <rhi_allocator.h>
 
 #include "Resources/BackedResource.h"
+#include "Resources/Relocation.h"
+#include "Resources/Resource.h"
 
 namespace org::relocation {
 
@@ -144,6 +146,12 @@ void BackedResource::SetRelocationClass(relocation::Class value) {
     std::unique_lock<std::recursive_mutex> lock;
     if (auto* mutex = BackingMutex()) lock = std::unique_lock(*mutex);
     if (auto* record = relocation::RecordOf(RelocationAllocation())) record->SetClass(value);
+    if (lock) lock.unlock();
+    // A ReadOnly resource is a candidate for the stress switch. A resource not owned by a shared_ptr yet (still in its
+    // constructor) is not registered.
+    if (value == relocation::Class::ReadOnly)
+        if (auto* resource = dynamic_cast<Resource*>(this))
+            if (auto owned = resource->weak_from_this().lock()) relocation::Service::Get().NoteReadOnly(owned);
 }
 
 relocation::RelocationRecord* BackedResource::CurrentRelocationRecord() noexcept {

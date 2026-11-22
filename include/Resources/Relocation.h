@@ -161,8 +161,22 @@ public:
     // stale and records again (RenderGraph::PersistentRecordingBackingsCurrent).
     bool MovedFrom(uint64_t resourceID, uint64_t generation) const;
 
+    // The ORG_RELOCATION_STRESS debug switch: each commit makes this many ReadOnly graph backings again at a new
+    // allocation, copies them in the relocation batch and commits the moves, as DXVK's stress relocations do. The environment
+    // variable is read once; SetStress overrides it. 0 is off. Any thread.
+    void SetStress(uint32_t perCommit) noexcept;
+    uint32_t Stress() const noexcept { return m_stress.load(std::memory_order_acquire); }
+
+    // A resource was marked ReadOnly (BackedResource::SetRelocationClass). The stress switch picks from these. Any thread.
+    void NoteReadOnly(const std::shared_ptr<Resource>& resource);
+
+    ~Service();
+
 private:
     Service();
+    struct Candidates;
+    // Appends up to `count` relocations of resources marked ReadOnly, taken in turn (the stress switch).
+    void MakeStressRelocations(uint32_t count, std::vector<Relocation>& out);
     // Records and submits the relocation batch: one copy per relocation that has a copyTarget. Returns false when the
     // submission failed; the relocations are then ignored.
     bool SubmitCopies(const CommitContext& context, std::span<Relocation*> copies);
@@ -174,8 +188,18 @@ private:
     mutable std::shared_mutex m_movedMutex;
     // Per resource, the generations its backing moved away from (the last few).
     std::unordered_map<uint64_t, std::vector<uint64_t>> m_movedFrom;
+    std::atomic<uint32_t> m_stress{0};
+    std::unique_ptr<Candidates> m_candidates;
 };
 
 inline Service& GetService() { return Service::Get(); }
+
+// Makes a relocation of a graph resource that has a backing of its own (a PixelBuffer, or a BufferBase): a new backing of the
+// same description, and a copy of the current backing into it in the relocation batch. Null when the resource may not move
+// now (MayMove with gpuIdle) or cannot move this way: no backing of its own, placed in an alias heap, multisampled,
+// depth-stencil, externally immutable, or represented on other devices. why says which.
+// Owner thread. The caller hands the result to a commit (from a source's Poll).
+std::unique_ptr<Relocation> MakeGraphRelocation(const std::shared_ptr<Resource>& resource, Source source, bool gpuIdle = false,
+    IgnoreReason* why = nullptr);
 
 } // namespace org::relocation

@@ -1,7 +1,9 @@
 #include "Resources/Relocation.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
+#include <unordered_set>
 
 #include <spdlog/spdlog.h>
 #include <BasicTelemetry/Tracy.h>
@@ -164,9 +166,199 @@ bool Adopt(Relocation& relocation, bool inPlace, uint64_t& from, IgnoreReason& w
     return false;
 }
 
+// The resource a relocation batch copies into: a view of a new backing's native resource with the moving resource's shape.
+// It does not own the native resource. It keeps the new backing's allocation lease, so the native resource outlives every
+// use of this wrapper. Its state starts as a new resource's (Undefined for a texture, Common for a buffer), which is where
+// the ledgers seed a backing they do not know yet.
+class CopyTarget final : public Resource {
+public:
+    CopyTarget(rhi::Resource resource, Resource& like, std::shared_ptr<const void> lease)
+        : m_resource(resource), m_lease(std::move(lease)) {
+        m_hasLayout = like.HasLayout();
+        m_mipLevels = (std::max)(1u, like.GetMipLevels());
+        m_arraySize = (std::max)(1u, like.GetArraySize());
+        m_hasDescription = like.TryGetRHIResourceDesc(m_description);
+        // The description's pointers name the moving resource's storage. A copy needs neither.
+        m_description.castableFormats = {};
+        m_description.debugName = nullptr;
+        if (!like.TryGetBufferByteSize(m_bufferBytes)) m_bufferBytes = 0;
+        const ResourceState initial = m_hasLayout
+            ? ResourceState{rhi::ResourceAccessType::None, rhi::ResourceLayout::Undefined, rhi::ResourceSyncState::None}
+            : ResourceState{rhi::ResourceAccessType::Common, rhi::ResourceLayout::Common, rhi::ResourceSyncState::All};
+        m_tracker = SymbolicTracker(RangeSpec{}, initial);
+        name = like.GetName() + " (relocation target)";
+    }
+
+    rhi::Resource GetAPIResource() override { return m_resource; }
+    rhi::BarrierBatch GetEnhancedBarrierGroup(RangeSpec range, rhi::ResourceAccessType previousAccess, rhi::ResourceAccessType nextAccess,
+        rhi::ResourceLayout previousLayout, rhi::ResourceLayout nextLayout, rhi::ResourceSyncState previousSync,
+        rhi::ResourceSyncState nextSync) override {
+        rhi::BarrierBatch batch{};
+        if (!m_hasLayout) {
+            m_bufferBarrier = rhi::BufferBarrier{
+                .buffer = m_resource.GetHandle(),
+                .offset = 0,
+                .size = UINT64_MAX,
+                .beforeSync = previousSync,
+                .afterSync = nextSync,
+                .beforeAccess = previousAccess,
+                .afterAccess = nextAccess};
+            batch.buffers = {&m_bufferBarrier};
+            return batch;
+        }
+        const auto resolved = ResolveRangeSpec(range, m_mipLevels, m_arraySize);
+        m_textureBarrier = {};
+        m_textureBarrier.beforeAccess = previousAccess;
+        m_textureBarrier.afterAccess = nextAccess;
+        m_textureBarrier.beforeLayout = previousLayout;
+        m_textureBarrier.afterLayout = nextLayout;
+        m_textureBarrier.beforeSync = previousSync;
+        m_textureBarrier.afterSync = nextSync;
+        m_textureBarrier.range = {resolved.firstMip, resolved.mipCount, resolved.firstSlice, resolved.sliceCount};
+        m_textureBarrier.texture = m_resource.GetHandle();
+        batch.textures = {&m_textureBarrier};
+        return batch;
+    }
+    SymbolicTracker* GetStateTracker() override { return &m_tracker; }
+    bool TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const override {
+        if (!m_hasDescription) return false;
+        outDesc = m_description;
+        return true;
+    }
+    bool TryGetBufferByteSize(uint64_t& outByteSize) const override {
+        if (m_hasLayout) return false;
+        outByteSize = m_bufferBytes;
+        return true;
+    }
+
+private:
+    rhi::Resource m_resource;
+    std::shared_ptr<const void> m_lease;
+    SymbolicTracker m_tracker;
+    rhi::ResourceDesc m_description{};
+    bool m_hasDescription = false;
+    uint64_t m_bufferBytes = 0;
+    rhi::TextureBarrier m_textureBarrier{};
+    rhi::BufferBarrier m_bufferBarrier{};
+};
+
 } // namespace
 
-Service::Service() = default;
+std::unique_ptr<Relocation> MakeGraphRelocation(const std::shared_ptr<Resource>& resource, Source source, bool gpuIdle, IgnoreReason* why) {
+    const auto fail = [&](IgnoreReason reason) -> std::unique_ptr<Relocation> {
+        if (why) *why = reason;
+        return nullptr;
+    };
+    if (!resource) return fail(IgnoreReason::Expired);
+    auto* backed = dynamic_cast<BackedResource*>(resource.get());
+    if (!backed) return fail(IgnoreReason::Unsupported);
+    // An externally immutable resource gets no barriers from the ledgers, so the copy could not move it to CopySource.
+    if (resource->GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource
+        || resource->GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid())
+        return fail(IgnoreReason::Unsupported);
+    IgnoreReason reason = IgnoreReason::Failed;
+    // Placed backings have no record of their own, so they stop here as NoRecord.
+    if (!MayMove(backed->CurrentRelocationRecord(), gpuIdle, &reason)) return fail(reason);
+    auto relocation = std::make_unique<Relocation>();
+    relocation->resource = resource;
+    relocation->resourceID = resource->GetGlobalResourceID();
+    relocation->fromGeneration = backed->GetBackingGeneration();
+    relocation->source = source;
+    try {
+        if (auto* texture = dynamic_cast<PixelBuffer*>(resource.get())) {
+            const auto& description = texture->GetDescription();
+            // A copy cannot carry a multisampled texture. On D3D12 it copies one plane, so a depth-stencil texture would
+            // lose its stencil.
+            if (description.sampleCount > 1 || description.hasDSV) return fail(IgnoreReason::Unsupported);
+            auto next = texture->MakeRelocationBacking();
+            if (!next) return fail(IgnoreReason::NoRecord);
+            relocation->copyTarget = std::make_shared<CopyTarget>(next->GetAPIResource(), *resource, next->CaptureAllocationLease());
+            relocation->nextTexture = std::move(next);
+        } else if (auto* buffer = dynamic_cast<BufferBase*>(resource.get())) {
+            auto next = buffer->MakeRelocationBacking();
+            if (!next) return fail(IgnoreReason::NoRecord);
+            relocation->copyTarget = std::make_shared<CopyTarget>(next->GetAPIResource(), *resource, next->CaptureAllocationLease());
+            relocation->nextBuffer = std::move(next);
+        } else {
+            return fail(IgnoreReason::Unsupported);
+        }
+    } catch (const std::exception& error) {
+        spdlog::warn("ORG relocation: making a new backing for '{}' failed: {}", resource->GetName(), error.what());
+        return fail(IgnoreReason::Failed);
+    }
+    if (auto* record = backed->CurrentRelocationRecord()) relocation->sizeBytes = record->SizeBytes();
+    // The backing changed while the new one was made: the copy would read the wrong backing.
+    if (backed->GetBackingGeneration() != relocation->fromGeneration) return fail(IgnoreReason::Stale);
+    return relocation;
+}
+
+// Resources marked ReadOnly, for the stress switch. Taken in turn, so each one moves now and then.
+struct Service::Candidates {
+    std::mutex mutex;
+    std::vector<std::weak_ptr<Resource>> resources;
+    std::unordered_set<uint64_t> ids;
+    size_t next = 0;
+};
+
+Service::Service() : m_candidates(std::make_unique<Candidates>()) {
+    // A debug switch, read once from the environment like ORG's other ones. SetStress overrides it.
+    if (const auto* value = std::getenv("ORG_RELOCATION_STRESS")) {
+        const auto parsed = (std::min)(std::strtoul(value, nullptr, 10), 4096ul);
+        m_stress.store(static_cast<uint32_t>(parsed), std::memory_order_release);
+        if (parsed) spdlog::info("ORG relocation: ORG_RELOCATION_STRESS moves {} ReadOnly backings at each commit", parsed);
+    }
+}
+
+Service::~Service() = default;
+
+void Service::SetStress(uint32_t perCommit) noexcept {
+    m_stress.store(perCommit, std::memory_order_release);
+}
+
+void Service::NoteReadOnly(const std::shared_ptr<Resource>& resource) {
+    if (!resource) return;
+    std::scoped_lock lock(m_candidates->mutex);
+    if (!m_candidates->ids.insert(resource->GetGlobalResourceID()).second) return;
+    m_candidates->resources.push_back(resource);
+}
+
+void Service::MakeStressRelocations(uint32_t count, std::vector<Relocation>& out) {
+    BT_ZONE_SCOPE("ORG.Relocation.Stress");
+    std::vector<std::shared_ptr<Resource>> picked;
+    {
+        std::scoped_lock lock(m_candidates->mutex);
+        auto& candidates = *m_candidates;
+        // One pass over the list at most, from where the last commit stopped. Gone resources leave the list.
+        const size_t size = candidates.resources.size();
+        for (size_t seen = 0; seen < size && picked.size() < count && !candidates.resources.empty(); ++seen) {
+            if (candidates.next >= candidates.resources.size()) candidates.next = 0;
+            auto resource = candidates.resources[candidates.next].lock();
+            if (!resource) {
+                candidates.resources.erase(candidates.resources.begin() + static_cast<std::ptrdiff_t>(candidates.next));
+                continue;
+            }
+            ++candidates.next;
+            auto* backed = dynamic_cast<BackedResource*>(resource.get());
+            if (!backed || backed->GetRelocationClass() != Class::ReadOnly) continue;
+            picked.push_back(std::move(resource));
+        }
+        // The ID set only stops duplicates. It is rebuilt once gone resources have left the list.
+        if (candidates.ids.size() > candidates.resources.size()) {
+            candidates.ids.clear();
+            for (const auto& weak : candidates.resources)
+                if (const auto resource = weak.lock()) candidates.ids.insert(resource->GetGlobalResourceID());
+        }
+    }
+    for (const auto& resource : picked) {
+        IgnoreReason why = IgnoreReason::Failed;
+        auto relocation = MakeGraphRelocation(resource, Source::Stress, false, &why);
+        if (!relocation) {
+            detail::NoteIgnored(why);
+            continue;
+        }
+        out.push_back(std::move(*relocation));
+    }
+}
 
 Service& Service::Get() {
     // Never destroyed: retirements may run during static destruction.
@@ -280,6 +472,7 @@ size_t Service::Commit(const CommitContext& context) {
         }
         if (pending.size() > first) polled.push_back({source.get(), first, pending.size()});
     }
+    if (const auto stress = Stress()) MakeStressRelocations(stress, pending);
     if (pending.empty()) return 0;
 
     // Moves whose resource is gone, or whose backing changed since they were made, are skipped.
