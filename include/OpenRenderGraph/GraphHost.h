@@ -602,9 +602,16 @@ public:
 		std::vector<uint32_t> repeatedEpochs;
 		// Beam search instead of the greedy sweep line.
 		bool beamSearch = false;
-		// One log line per resource and per epoch slot with each new layout.
+		// One log line per resource and per epoch slot with each new layout. Also a memory breakdown every memoryLogSeconds: each
+		// frame placement heap (reserved against packed bytes, generation, what holds it), the frame arena and the shared pools.
 		bool logLifetimes = false;
 		uint32_t settleMilliseconds = 250;
+		// Frame placement heaps: a new heap is heapHeadroom times its need, and a heap more than heapShrinkFactor times its need
+		// with headroom is replaced by a smaller one.
+		double heapHeadroom = 1.25;
+		double heapShrinkFactor = 2.0;
+		// The memory breakdown's period while logLifetimes is set, in seconds. 0: never.
+		uint32_t memoryLogSeconds = 10;
 	};
 	/** @brief Owner thread. Kept across rebuilds. */
 	void SetFramePlacement(FramePlacementSettings settings);
@@ -1287,6 +1294,8 @@ private:
 	// Whether a graph placed from a frame placement other than the current one, where that matters: it placed something from
 	// its version, or the current version places something in its epoch. A graph that has not planned yet is never stale.
 	bool FramePlacementStale(const RenderGraph& graph, uint32_t epoch) const;
+	// Owner thread: the frame placement's memory breakdown (FramePlacement::LogMemory), with which version each graph placed from.
+	void LogFramePlacementMemory() const;
 	// The frame-wide placement: summaries, the worker and its versions. Made with the host. Graphs hold it weakly.
 	std::shared_ptr<FramePlacement> m_framePlacement;
 	std::vector<uint32_t> m_externalEpochs;  // SetExternalEpochs; set on every build's graph

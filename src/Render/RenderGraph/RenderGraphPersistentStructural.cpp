@@ -553,6 +553,9 @@ struct FramePlacedRecord {
 	// The graph state that gives the placement back at its end. A newer build of the same epoch that finds the resource at its
 	// frame placement claims it, so the build it replaces does not take the backing away from it when it ends.
 	const void* owner = nullptr;
+	// For the memory log (FramePlacedResidents): its bytes, and the epoch whose graph placed it.
+	uint64_t size = 0;
+	uint32_t epoch = UINT32_MAX;
 };
 std::mutex g_framePlacedMutex;
 std::unordered_map<const void*, FramePlacedRecord> g_framePlaced;
@@ -565,11 +568,12 @@ bool AtFramePlacement(Resource* concrete, const AliasHeapGeneration* heap, uint6
 	return record.resource.lock().get() == concrete && record.heap == heap && record.offset == offset && record.generation == generation;
 }
 
-void NoteFramePlaced(Resource* concrete, const AliasHeapGeneration* heap, uint64_t offset, uint64_t generation, const void* owner) {
+void NoteFramePlaced(Resource* concrete, const AliasHeapGeneration* heap, uint64_t offset, uint64_t generation, const void* owner,
+	uint64_t size, uint32_t epoch) {
 	std::lock_guard lock(g_framePlacedMutex);
 	// Records of resources that are gone are dropped now and then.
 	if (g_framePlaced.size() > 4096) std::erase_if(g_framePlaced, [](const auto& entry) { return entry.second.resource.expired(); });
-	g_framePlaced[concrete] = {concrete->weak_from_this(), heap, offset, generation, owner};
+	g_framePlaced[concrete] = {concrete->weak_from_this(), heap, offset, generation, owner, size, epoch};
 }
 
 // Makes owner the graph state that gives the frame placement of concrete back.
@@ -595,6 +599,19 @@ uint64_t PlacementKey(const std::string& name, uint64_t size, uint64_t alignment
 	boost::hash_combine(key, backendMask);
 	return key;
 }
+}
+
+std::vector<FramePlacedResident> FramePlacedResidents() {
+	std::vector<FramePlacedResident> out;
+	std::lock_guard lock(g_framePlacedMutex);
+	for (const auto& [key, record] : g_framePlaced) {
+		const auto resource = record.resource.lock();
+		auto* backed = resource ? dynamic_cast<BackedResource*>(resource.get()) : nullptr;
+		// Only resources still at the placement the record names. A resource placed again elsewhere left that heap.
+		if (!backed || !backed->IsMaterialized() || backed->GetBackingGeneration() != record.generation) continue;
+		out.push_back({record.heap, resource->GetName(), record.offset, record.size, record.epoch});
+	}
+	return out;
 }
 
 void persistent_impl::ReleaseOwnAliasPlacements(const std::unordered_map<Resource*, AliasPlacementOwner>& owners, const void* self) noexcept {
@@ -722,6 +739,13 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		// its own.
 		std::shared_ptr<const ResourceVersion> version;
 		uint32_t versionedEntry = UINT32_MAX;
+		// It keeps its contents across the runs of a repeated epoch (Resource::SetContentAcrossRuns). Only a frame placement
+		// places it, with one lifetime over every run.
+		bool acrossRuns = false;
+		// Placed from a frame placement, its contents carry over into this graph's executions from an earlier one in the frame:
+		// this is not the first epoch of the frame that uses it, or it keeps its contents across runs. It then enters without a
+		// discard (PreparedBackingState::aliasContinues).
+		bool continues = false;
 	};
 	std::vector<Candidate> candidates;
 	std::unordered_map<Resource*, uint32_t> candidateByConcrete;
@@ -780,6 +804,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		// A version's place comes from a frame placement alone, so a manual pool means nothing for it.
 		if (c.version) c.manualPool.reset();
 		c.shared = state.multiDeviceResources.contains(concrete);
+		c.acrossRuns = concrete->ContentAcrossRuns();
 		if (c.shared) c.resourceClass = c.texture ? 3u : 1u; // Render targets and depth do not qualify (IsSharedAliasEligible).
 		rhi::ResourceAllocationInfo info{};
 		if (c.shared) info = SharedAliasAllocationInfo(concrete);
@@ -859,6 +884,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		} else if (mode == AutoAliasMode::Off) c.exclusion = "auto aliasing off";
 		else if (!c.firstUseIsWrite) c.exclusion = "first use is read";
 		else if (!c.scoreOk) c.exclusion = "score below threshold";
+		// Contents kept across runs: another epoch's transients in the shared pools could use its bytes between two runs. Only a
+		// frame placement, which spans every run, may place it. It stays eligible for one.
+		else if (c.acrossRuns) c.exclusion = "keeps its contents across runs";
 		else { c.poolID = kAutoPoolGlobal; c.pooled = true; }
 		if (c.pooled && c.shared) {
 			// One pool per class for every resource the devices share, whichever device uses it.
@@ -903,8 +931,10 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			if (!entry) continue;
 			const auto* use = entry->UseIn(m_passEpochFilter);
 			const bool firstInFrame = use && entry->uses.front().epoch == m_passEpochFilter;
+			// A resource that keeps its contents across runs needs a version that gave it one lifetime over every run. A version
+			// computed before it was marked did not.
 			const bool covered = entry->placed && use && use->firstRank <= c.firstUse && c.lastUse <= use->lastRank
-				&& (!firstInFrame || (c.firstUseIsWrite && c.writeGuaranteed));
+				&& (!firstInFrame || (c.firstUseIsWrite && c.writeGuaranteed)) && (!c.acrossRuns || entry->acrossRuns);
 			if (covered) {
 				if (c.exclusion) --excludedCount;
 				c.exclusion = nullptr;
@@ -912,6 +942,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				c.framePlaced = true;
 				c.frameBlock = entry->block;
 				c.frameShared = entry->MultiEpoch();
+				// Its lifetime in the version covers everything between its earlier use and this one, so no other occupant of its
+				// bytes runs in this graph before it.
+				c.continues = !firstInFrame || entry->acrossRuns;
 				c.poolID = framePlacement->Blocks().at(entry->block).poolID;
 				c.offset = entry->offset;
 				framePlacedBytes += c.sizeBytes;
@@ -943,6 +976,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		c.pooled = false;
 		c.keepBacking = true;
 	}
+
+	// The resources whose bindings continue from an earlier execution of the frame. Bindings made from here on read it.
+	state.aliasContinues.clear();
+	for (const auto& c : candidates)
+		if (c.framePlaced && c.continues) state.aliasContinues.insert(c.concrete);
 
 	// Pack per pool, into the arena's pools (shared with the other graphs of a host): each graph from offset 0.
 	if (!state.aliasArena) state.aliasArena = PersistentAliasArena::Create();
@@ -1181,7 +1219,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			// A frame placement's block is allocated by the first graph that places into it.
 			const std::shared_ptr<const AliasHeapGeneration> frameHeap = c.framePlaced ? framePlacement->AcquireBlock(c.frameBlock) : nullptr;
 			const auto& heap = c.framePlaced ? frameHeap : heapOf(c.poolID);
-			const State::AliasPlacementRecord record{c.poolID, c.offset, c.sizeBytes, heap.get()};
+			const State::AliasPlacementRecord record{c.poolID, c.offset, c.sizeBytes, heap.get(), c.framePlaced && c.continues};
 			const auto previous = state.aliasPlaced.find(c.concrete);
 			if (c.shared) {
 				// Placed on both devices. A new placement replaces the representations, so nothing is dematerialized first.
@@ -1232,7 +1270,8 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			TrackTransientFrameResource(c.concrete);
 			state.aliasPlaced[c.concrete] = record;
 			NoteAliasPlaced(c.concrete, true);
-			if (c.framePlaced) NoteFramePlaced(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration(), &state);
+			if (c.framePlaced)
+				NoteFramePlaced(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration(), &state, c.sizeBytes, m_passEpochFilter);
 			// A resource several epochs use is not this graph's alone: the graph's end leaves its placement to the others. A version
 			// outlives the graph, so its end never gives one back.
 			if (c.frameShared || c.version) state.aliasPlacementOwners.erase(c.concrete);
@@ -1289,6 +1328,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			use.lastRank = c.lastUse;
 			use.firstUseWrites = c.firstUseIsWrite;
 			use.writeGuaranteed = c.writeGuaranteed;
+			use.loopCrossing = c.acrossRuns;
 			use.eligible = c.eligible;
 			if (c.ineligible) use.exclusion = c.ineligible;
 			else if (c.exclusion) use.exclusion = c.exclusion;

@@ -146,10 +146,13 @@ std::shared_ptr<FramePlacementVersion> FramePlacementVersion::Compute(const Fram
 		entry.frameFirst = firstSlot.base + first.firstRank;
 		entry.frameLast = lastSlot.base + last.lastRank;
 		// A resource several epochs use, at an end that is a repeated epoch, crosses that epoch's runs. It spans the whole
-		// slot there. So does a resource a graph marked as crossing runs.
+		// slot there. A resource whose contents cross runs spans the whole slots at both ends, whether or not the host lists
+		// the epoch as repeated: the mark says it repeats.
+		entry.acrossRuns = pending.loopCrossing;
 		const bool spansSlots = entry.MultiEpoch() || pending.loopCrossing;
-		if (spansSlots && firstSlot.repeated) entry.frameFirst = firstSlot.base;
-		if (spansSlots && lastSlot.repeated) entry.frameLast = lastSlot.base + (std::max)(lastSlot.rankCount, 1u) - 1;
+		if (spansSlots && (firstSlot.repeated || pending.loopCrossing)) entry.frameFirst = firstSlot.base;
+		if (spansSlots && (lastSlot.repeated || pending.loopCrossing))
+			entry.frameLast = lastSlot.base + (std::max)(lastSlot.rankCount, 1u) - 1;
 		if (!pending.ineligible.empty()) entry.reason = pending.ineligible;
 		else if (!first.firstUseWrites)
 			entry.reason = "previous-frame read: its first use in frame order (epoch " + std::to_string(first.epoch) + ") reads";
@@ -221,6 +224,7 @@ std::shared_ptr<FramePlacementVersion> FramePlacementVersion::Compute(const Fram
 	}
 	version->m_allocations.resize(version->m_blocks.size());
 	version->m_heaps.resize(version->m_blocks.size());
+	version->m_sharedHeaps.resize(version->m_blocks.size());
 
 	Hasher hasher;
 	for (const auto& slot : version->m_slots) {
@@ -237,7 +241,7 @@ std::shared_ptr<FramePlacementVersion> FramePlacementVersion::Compute(const Fram
 	}
 	for (const auto& entry : version->m_entries) {
 		hasher.Mix(entry.key);
-		hasher.Mix(entry.placed ? 1 : 0);
+		hasher.Mix((entry.placed ? 1 : 0) | (entry.acrossRuns ? 2 : 0));
 		hasher.Mix(entry.block);
 		hasher.Mix(entry.offset);
 		hasher.Mix(entry.frameFirst);
@@ -288,12 +292,16 @@ uint64_t FramePlacementVersion::BytesOfClass(uint8_t memoryClass) const noexcept
 std::shared_ptr<const AliasHeapGeneration> FramePlacementVersion::AcquireBlock(uint32_t blockIndex) const {
 	if (blockIndex >= m_blocks.size()) throw std::out_of_range("A frame placement has no such block");
 	std::lock_guard lock(m_memoryMutex);
-	if (m_heaps[blockIndex]) return m_heaps[blockIndex];
 	const auto& block = m_blocks[blockIndex];
 	if (m_memory) {
-		m_heaps[blockIndex] = m_memory->Acquire(block.memoryClass, block.backendMask, block.capacity, block.alignment, block.poolID, m_id);
-		return m_heaps[blockIndex];
+		// The heap the block took before, while a placement still holds it. So every graph that places from this version at the
+		// same time places in the same heap.
+		if (auto heap = m_sharedHeaps[blockIndex].lock()) return heap;
+		auto heap = m_memory->Acquire(block.memoryClass, block.backendMask, block.capacity, block.alignment, block.poolID, m_id);
+		m_sharedHeaps[blockIndex] = heap;
+		return heap;
 	}
+	if (m_heaps[blockIndex]) return m_heaps[blockIndex];
 	rhi::ma::AllocationDesc allocDesc{};
 	allocDesc.heapType = rhi::HeapType::DeviceLocal;
 	allocDesc.flags = rhi::ma::AllocationFlagCanAlias;
@@ -333,11 +341,17 @@ std::shared_ptr<const AliasHeapGeneration> FramePlacementMemory::Acquire(uint8_t
 	std::lock_guard lock(m_mutex);
 	auto& cached = m_heaps[{memoryClass, backendMask}];
 	// Room to grow a little, so small changes between versions reuse the heap.
-	constexpr double kHeadroom = 1.25;
+	const double headroom = (std::max)(m_sizing.headroom, 1.0);
+	const double shrinkFactor = (std::max)(m_sizing.shrinkFactor, 1.0);
 	const bool fits = cached.heap && cached.capacity >= capacity && cached.alignment >= alignment;
-	const bool tooBig = cached.heap && cached.capacity > 2 * static_cast<uint64_t>(static_cast<double>(capacity) * kHeadroom);
-	if (fits && !tooBig) return cached.heap;
-	const auto size = static_cast<uint64_t>(static_cast<double>(capacity) * kHeadroom + 65535.0) / 65536ull * 65536ull;
+	const bool tooBig = cached.heap
+		&& static_cast<double>(cached.capacity) > shrinkFactor * static_cast<double>(capacity) * headroom;
+	if (fits && !tooBig) {
+		cached.needed = capacity;
+		cached.neededBy = versionID;
+		return cached.heap;
+	}
+	const auto size = static_cast<uint64_t>(static_cast<double>(capacity) * headroom + 65535.0) / 65536ull * 65536ull;
 	rhi::ma::AllocationDesc allocDesc{};
 	allocDesc.heapType = rhi::HeapType::DeviceLocal;
 	allocDesc.flags = rhi::ma::AllocationFlagCanAlias;
@@ -355,12 +369,15 @@ std::shared_ptr<const AliasHeapGeneration> FramePlacementMemory::Acquire(uint8_t
 		throw std::runtime_error("Failed to allocate frame placement memory");
 	// Frame targets and per-frame working memory: over the OS budget, the costliest to leave in system memory.
 	DeviceManager::GetInstance().SetResidencyPriority(allocation, rhi::ResidencyPriorityHigh);
-	// The placements in the replaced heap keep it alive through their leases until they go.
+	// The placements in the replaced heap keep it alive through their leases until they go. Heaps lists it while it lives.
+	if (cached.heap) m_replaced.push_back({memoryClass, backendMask, cached.capacity, cached.generation, cached.heap});
 	if (cached.allocation.GetAllocation())
 		DeletionManager::GetInstance().MarkForDelete(std::move(cached.allocation), "RenderGraph frame placement block (replaced)");
 	cached.allocation = std::move(allocation);
 	cached.capacity = size;
 	cached.alignment = allocInfo.alignment;
+	cached.needed = capacity;
+	cached.neededBy = versionID;
 	++cached.generation;
 	cached.heap = AliasHeapGeneration::Capture(cached.allocation, cached.generation);
 	spdlog::info("Frame placement {}: heap for class {} {}: capacity={} (needed {}) generation={}", versionID, memoryClass,
@@ -375,9 +392,49 @@ uint64_t FramePlacementMemory::Bytes() const {
 	return bytes;
 }
 
+std::vector<FramePlacementMemory::HeapInfo> FramePlacementMemory::Heaps() const {
+	std::lock_guard lock(m_mutex);
+	std::vector<HeapInfo> out;
+	for (const auto& [key, heap] : m_heaps) {
+		if (!heap.heap) continue;
+		HeapInfo info;
+		info.memoryClass = key.first;
+		info.backendMask = key.second;
+		info.capacity = heap.capacity;
+		info.generation = heap.generation;
+		info.needed = heap.needed;
+		info.neededBy = heap.neededBy;
+		info.current = true;
+		info.references = heap.heap.use_count();
+		info.identity = heap.heap.get();
+		out.push_back(info);
+	}
+	std::erase_if(m_replaced, [](const Replaced& replaced) { return replaced.heap.expired(); });
+	for (const auto& replaced : m_replaced) {
+		const auto heap = replaced.heap.lock();
+		if (!heap) continue;
+		HeapInfo info;
+		info.memoryClass = replaced.memoryClass;
+		info.backendMask = replaced.backendMask;
+		info.capacity = replaced.capacity;
+		info.generation = replaced.generation;
+		// Less the reference taken here.
+		info.references = heap.use_count() - 1;
+		info.identity = heap.get();
+		out.push_back(info);
+	}
+	return out;
+}
+
+void FramePlacementMemory::SetSizing(Sizing sizing) {
+	std::lock_guard lock(m_mutex);
+	m_sizing = sizing;
+}
+
 bool FramePlacementVersion::Allocated() const {
 	std::lock_guard lock(m_memoryMutex);
-	return std::ranges::any_of(m_heaps, [](const auto& heap) { return static_cast<bool>(heap); });
+	return std::ranges::any_of(m_heaps, [](const auto& heap) { return static_cast<bool>(heap); })
+		|| std::ranges::any_of(m_sharedHeaps, [](const auto& heap) { return !heap.expired(); });
 }
 
 }  // namespace org

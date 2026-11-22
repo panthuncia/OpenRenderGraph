@@ -29,8 +29,9 @@ struct PlacementUse {
 	bool firstUseWrites = false;
 	// False when the pass of the first use may skip its writes (ExternalPassDesc::mayNotWrite).
 	bool writeGuaranteed = false;
-	// Used in more than one run of a repeated epoch. Graphs cannot see runs, so they leave it false. The host spans the
-	// whole slot of a repeated epoch for a resource several epochs use.
+	// Its contents cross the runs of a repeated epoch (Resource::SetContentAcrossRuns). The host spans the whole slot of each
+	// epoch that uses it, so it has one lifetime over every run. The host also spans the whole slot of a repeated epoch for a
+	// resource several epochs use.
 	bool loopCrossing = false;
 	// The graph's planner would place it in an automatic pool on one backend, if its first use wrote. False for manual pools,
 	// resources shared between devices, resources used on several backends, scores below the threshold and auto aliasing off.
@@ -42,6 +43,20 @@ struct PlacementUse {
 	uint8_t memoryClass = 0;
 	uint64_t backendMask = 0;
 };
+
+/** @brief A resource placed from a frame placement that is still at that placement (FramePlacedResidents). */
+struct FramePlacedResident {
+	const AliasHeapGeneration* heap = nullptr;  // the heap generation it lies in
+	std::string name;
+	uint64_t offset = 0, size = 0;
+	uint32_t epoch = UINT32_MAX;  // the epoch whose graph placed it
+};
+
+/**
+ * @brief Every resource that an epoch graph's alias plan placed from a frame placement and that is still there. Each one keeps
+ * its heap generation alive. Any thread.
+ */
+std::vector<FramePlacedResident> FramePlacedResidents();
 
 /** @brief Where an epoch graph's own transients go today. */
 enum class PlacementMemory : uint8_t {
@@ -104,13 +119,35 @@ struct FramePlacementInputs {
  * A version's block takes the heap an earlier version used for the same memory class and backend set when it is big enough.
  * So a new version with the same layout, or a similar one, allocates nothing. Graphs that still place from the earlier version
  * share the heap with the new one for a frame or two. The alias ledger orders their uses of the same bytes, as it does for
- * any placed resource. A heap too small, or more than twice too big, is replaced. The replaced memory stays alive through the
- * placements made in it.
+ * any placed resource. A heap too small, or too big (more than shrinkFactor times what it needs with headroom), is replaced.
+ * The replaced memory stays alive through the placements made in it. Heaps lists the replaced ones that are still alive.
  *
  * Any thread.
  */
 class FramePlacementMemory {
 public:
+	/** @brief How heaps are sized. */
+	struct Sizing {
+		// A new heap is this much larger than its first need, so small growth between versions reuses it.
+		double headroom = 1.25;
+		// A heap more than this many times its need with headroom is replaced by a smaller one.
+		double shrinkFactor = 2.0;
+	};
+	/** @brief One heap, current or replaced and still alive (Heaps). */
+	struct HeapInfo {
+		uint8_t memoryClass = 0;
+		uint64_t backendMask = 0;
+		uint64_t capacity = 0, generation = 0;
+		// The capacity the latest version asked for when it took the heap (its block's packed bytes). 0 for a replaced heap.
+		uint64_t needed = 0;
+		uint64_t neededBy = 0;  // that version's id
+		bool current = false;
+		// Owners of the heap generation now: the placements made in it, the bindings and recordings that hold them, and
+		// FramePlacementMemory's own reference to a current heap.
+		long references = 0;
+		const AliasHeapGeneration* identity = nullptr;
+	};
+
 	FramePlacementMemory() = default;
 	~FramePlacementMemory();
 	FramePlacementMemory(const FramePlacementMemory&) = delete;
@@ -118,17 +155,29 @@ public:
 	/** @brief A heap of at least capacity bytes. poolID and versionID are for memory statistics and the log. Throws on failure. */
 	std::shared_ptr<const AliasHeapGeneration> Acquire(uint8_t memoryClass, uint64_t backendMask, uint64_t capacity, uint64_t alignment,
 		uint64_t poolID, uint64_t versionID);
-	/** @brief The heaps' capacities now, in bytes. */
+	/** @brief The current heaps' capacities, in bytes. Replaced heaps still alive are not counted (Heaps lists them). */
 	uint64_t Bytes() const;
+	/** @brief The current heaps, then the replaced heaps that are still alive. Drops the records of replaced heaps that are gone. */
+	std::vector<HeapInfo> Heaps() const;
+	/** @brief Sets how later heaps are sized. Heaps already made stay until a version replaces them. */
+	void SetSizing(Sizing sizing);
 
 private:
 	struct Heap {
 		uint64_t capacity = 0, alignment = 1, generation = 0;
+		uint64_t needed = 0, neededBy = 0;
 		TrackedHandle allocation;
 		std::shared_ptr<const AliasHeapGeneration> heap;
 	};
+	struct Replaced {
+		uint8_t memoryClass = 0;
+		uint64_t backendMask = 0, capacity = 0, generation = 0;
+		std::weak_ptr<const AliasHeapGeneration> heap;
+	};
 	mutable std::mutex m_mutex;
+	Sizing m_sizing;
 	std::map<std::pair<uint8_t, uint64_t>, Heap> m_heaps;  // by memory class and backend mask
+	mutable std::vector<Replaced> m_replaced;
 };
 
 class FramePlacementVersion {
@@ -167,6 +216,8 @@ public:
 		bool placed = false;
 		uint32_t block = UINT32_MAX;
 		uint64_t offset = 0;
+		// Its contents cross runs (PlacementUse::loopCrossing): its lifetime spans the whole slot of every epoch that uses it.
+		bool acrossRuns = false;
 		// Why it is not placed. Empty when placed.
 		std::string reason;
 		bool MultiEpoch() const noexcept { return uses.size() > 1; }
@@ -200,7 +251,7 @@ public:
 	 * block the version does not have.
 	 */
 	std::shared_ptr<const AliasHeapGeneration> AcquireBlock(uint32_t block) const;
-	/** @brief Whether any block's memory was allocated. */
+	/** @brief Whether any block's memory is allocated now. */
 	bool Allocated() const;
 	/** @brief Takes block memory from memory (shared with the host's other versions) instead of allocating its own. Before any AcquireBlock. */
 	void SetMemory(std::shared_ptr<FramePlacementMemory> memory) { m_memory = std::move(memory); }
@@ -212,10 +263,13 @@ private:
 	std::vector<Block> m_blocks;
 	std::vector<Entry> m_entries;
 	std::unordered_map<uint64_t, uint32_t> m_entryByKey;
-	// Block memory, made by AcquireBlock.
+	// Block memory, made by AcquireBlock. Without shared memory (SetMemory) the version owns its blocks' memory. With it, the
+	// version only remembers the heaps its blocks took, weakly: the placements made in a heap keep it alive, and a version a
+	// graph still holds keeps no heap alive by itself. A block whose heap went takes one again at its next AcquireBlock.
 	mutable std::mutex m_memoryMutex;
 	mutable std::vector<TrackedHandle> m_allocations;
 	mutable std::vector<std::shared_ptr<const AliasHeapGeneration>> m_heaps;
+	mutable std::vector<std::weak_ptr<const AliasHeapGeneration>> m_sharedHeaps;
 	std::shared_ptr<FramePlacementMemory> m_memory;  // SetMemory
 };
 

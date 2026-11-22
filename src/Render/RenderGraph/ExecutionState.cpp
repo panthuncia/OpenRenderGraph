@@ -295,10 +295,17 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         // memory since its last: it enters every execution from Undefined, which its body barrier (before its first pass) encodes
         // without the ledger. Every other backing enters from the state the ledger hands off, in its batch's entry barriers: the
         // body's own barriers then depend on the compiled graph alone (docs/job-graphs.md, "Phase 2 investigation").
+        // An aliased backing that continues from an earlier execution of the frame (PreparedBackingState::aliasContinues) enters
+        // like a backing of its own. Its entry is then made at each submission, so a kept recording never bakes it. It is
+        // discarded only when another occupant took its bytes since its last use (it is in `invalidated`, the alias
+        // activations), or when the ledger has no state for it. That covers an earlier epoch that did not run this frame.
         const bool aliasedBacking = captured.aliasSize != 0;
-        const bool invalidatedState = boundaryStep && (aliasedBacking || wasInvalidated(handle)) && !authoritativeState;
-        auto& boundaryTextures = aliasedBacking ? beforePass.textures : output.textures;
-        auto& boundaryBuffers = aliasedBacking ? beforePass.buffers : output.buffers;
+        const bool continuesAlias = aliasedBacking && captured.aliasContinues;
+        const bool discardsAlias = aliasedBacking && !captured.aliasContinues;
+        const bool invalidatedState = boundaryStep
+            && (discardsAlias || wasInvalidated(handle) || (continuesAlias && !gridOf(step.resource))) && !authoritativeState;
+        auto& boundaryTextures = discardsAlias ? beforePass.textures : output.textures;
+        auto& boundaryBuffers = discardsAlias ? beforePass.buffers : output.buffers;
         if (boundaryStep
             && (!gridOf(step.resource) || invalidatedState || authoritativeState)
             && std::none_of(output.seeds.begin(), output.seeds.end(),

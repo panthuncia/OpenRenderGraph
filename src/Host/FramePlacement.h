@@ -15,6 +15,7 @@
 namespace org {
 
 class FrameAliasArena;
+class PersistentAliasArena;
 
 /**
  * @brief GraphHost's frame-wide placement of transients.
@@ -37,6 +38,10 @@ public:
 		bool beamSearch = false;
 		bool logLifetimes = false;
 		std::chrono::milliseconds settle{250};
+		// How the shared block memory sizes its heaps (FramePlacementMemory::Sizing).
+		FramePlacementMemory::Sizing sizing;
+		// The period of the memory breakdown (LogMemory) while logLifetimes is set. Zero: never.
+		std::chrono::seconds memoryLogPeriod{10};
 	};
 
 	explicit FramePlacement(std::vector<uint32_t> epochOrder);
@@ -62,6 +67,17 @@ public:
 	std::vector<std::shared_ptr<const PlacementSummary>> Summaries() const;
 	/** @brief Logs the latest layout against today's pools. detailed: one line per resource too. */
 	void Log(bool detailed) const;
+	/** @brief Whether the memory breakdown is due (Settings::memoryLogPeriod while logLifetimes is set). Starts the next period. */
+	bool MemoryLogDue();
+	/**
+	 * @brief Logs where alias memory goes now:
+	 * - each frame placement heap, current or replaced and still alive: its class, bytes reserved against the bytes its latest
+	 *   version packed, its generation, and what holds it (the resources still placed in it, by epoch, and its reference count),
+	 * - the frame alias arena's blocks against the bytes reserved in them,
+	 * - the shared arena's pools (pools may be null),
+	 * - graphs, the line the host gives (which version each graph placed from).
+	 */
+	void LogMemory(PersistentAliasArena* pools, const std::string& graphs) const;
 
 private:
 	void Run();
@@ -83,6 +99,7 @@ private:
 	const std::shared_ptr<FramePlacementMemory> m_memory = std::make_shared<FramePlacementMemory>();
 	std::atomic<uint64_t> m_currentId{0};  // m_current's id
 	std::atomic<bool> m_enabled{false};    // m_settings.enabled
+	std::chrono::steady_clock::time_point m_nextMemoryLog{};  // MemoryLogDue, under m_mutex
 	bool m_stopping = false;
 	std::thread m_thread;
 };

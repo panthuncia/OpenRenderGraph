@@ -1803,6 +1803,32 @@ void GraphHost::SealSubmitted() {
 	if (const auto& arena = m_desc.runtime->Arena()) arena->Trim();
 	// The frame boundary: relocations switch here, before the next frame prepares anything.
 	(void)CommitRelocationsNow(false);
+	// Now and then, where alias memory goes (FramePlacementSettings::memoryLogSeconds). The owner thread reads the instances.
+	if (m_framePlacement && IsOwnerThread() && m_framePlacement->MemoryLogDue()) LogFramePlacementMemory();
+}
+
+void GraphHost::LogFramePlacementMemory() const {
+	// Which frame placement version each graph's latest alias plan placed from, with the epochs. A graph that has not planned
+	// yet (built, never prepared) holds nothing.
+	std::map<uint64_t, std::pair<uint64_t, std::string>> byVersion;  // version: (resources placed, epochs)
+	size_t unplanned = 0;
+	for (const auto& instance : m_instances) {
+		if (!instance.graph) continue;
+		const auto use = instance.graph->FramePlacementInUse();
+		if (!use.planned) {
+			++unplanned;
+			continue;
+		}
+		auto& entry = byVersion[use.version];
+		entry.first += use.placed;
+		entry.second += (entry.second.empty() ? "" : ",") + std::to_string(instance.epoch);
+	}
+	std::string graphs;
+	for (const auto& [version, entry] : byVersion)
+		graphs += (graphs.empty() ? "" : "; ") + (version ? "version " + std::to_string(version) : std::string("no version")) + ": "
+			+ std::to_string(entry.first) + " resources placed, epochs " + entry.second;
+	if (unplanned) graphs += (graphs.empty() ? "" : "; ") + std::to_string(unplanned) + " graphs not planned yet";
+	m_framePlacement->LogMemory(m_aliasArena.get(), graphs);
 }
 
 size_t GraphHost::CommitRelocations(bool gpuIdle) {
@@ -2383,6 +2409,9 @@ void GraphHost::ApplyFramePlacementSettings() {
 		applied.beamSearch = m_framePlacementSettings.beamSearch;
 		applied.logLifetimes = m_framePlacementSettings.logLifetimes;
 		applied.settle = std::chrono::milliseconds(m_framePlacementSettings.settleMilliseconds);
+		applied.sizing.headroom = m_framePlacementSettings.heapHeadroom;
+		applied.sizing.shrinkFactor = m_framePlacementSettings.heapShrinkFactor;
+		applied.memoryLogPeriod = std::chrono::seconds(m_framePlacementSettings.memoryLogSeconds);
 	}
 	for (const auto& [epoch, most] : m_ticketsAhead)
 		if (std::ranges::find(applied.repeatedEpochs, epoch) == applied.repeatedEpochs.end()) applied.repeatedEpochs.push_back(epoch);
