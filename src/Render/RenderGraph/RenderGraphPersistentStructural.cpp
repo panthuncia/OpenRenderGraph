@@ -927,8 +927,16 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		for (auto& c : candidates) {
 			if (!c.eligible) continue;
 			const auto* entry = framePlacement->Find(keyOf(c));
-			// A resource the version does not know (new since it was computed) stays on the graph's own path.
-			if (!entry) continue;
+			// A resource the version does not know (new since it was computed) is not pooled here: the graph cannot tell whether
+			// other epochs use it, and a graph that pooled it would disagree with one that gave it memory of its own. It keeps
+			// memory of its own until a version covers it.
+			if (!entry) {
+				if (!c.exclusion) ++excludedCount;
+				c.pooled = false;
+				c.exclusion = "the frame placement does not know it yet";
+				++frameWithheld;
+				continue;
+			}
 			const auto* use = entry->UseIn(m_passEpochFilter);
 			const bool firstInFrame = use && entry->uses.front().epoch == m_passEpochFilter;
 			// A resource that keeps its contents across runs needs a version that gave it one lifetime over every run. A version
