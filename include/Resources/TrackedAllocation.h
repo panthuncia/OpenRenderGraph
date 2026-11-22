@@ -10,6 +10,7 @@
 #include <flecs.h>
 #include <rhi_allocator.h>
 
+#include "Resources/AllocationRelease.h"
 #include "Resources/RelocationRecord.h"
 #include "Resources/ResourceIdentifier.h"
 
@@ -343,6 +344,9 @@ public:
     // Called by DeletionManager when it's actually time to free.
     void Reset() noexcept {
         leaseOwner_.reset();
+        // An allocation is freed with its record through the release gate, which holds frees off during a defragmentation pass.
+        if (auto* allocation = std::get_if<rhi::ma::AllocationPtr>(&h_); allocation && *allocation)
+            relocation::ReleaseAllocation(std::move(*allocation), std::move(record_));
         std::visit([](auto& v) {
             using V = std::decay_t<decltype(v)>;
             if constexpr (!std::is_same_v<V, std::monostate>) v.Reset();

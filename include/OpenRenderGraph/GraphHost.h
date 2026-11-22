@@ -36,6 +36,11 @@ namespace org::detail {
 class HostUploadExtension;
 }
 
+namespace org::relocation {
+struct DefragmentBudget;
+struct DefragmentReport;
+}
+
 namespace org {
 
 struct IHostExecutionData;
@@ -956,6 +961,19 @@ public:
 	 * @return How many relocations were committed. 0 before the first graph is built.
 	 */
 	size_t CommitRelocations(bool gpuIdle = false);
+	/**
+	 * @brief Owner thread, at an idle point such as a loading screen, after the frame's SealSubmitted: compacts the device-local
+	 * memory (relocation::Defragmenter). Safe to call every loading frame. Each call checks whether a campaign should run, then
+	 * runs up to budget.maxPasses passes within budget.maxMilliseconds. Before each pass it waits for every queue the graphs use
+	 * to go idle, so the descriptors are rewritten in place and bindless indices keep their values.
+	 *
+	 * Each pass is a relocation commit with the GPU idle. Moved resources keep their identity and indices. Their backing generation
+	 * changes and the relocation journal gets an entry for each, so holders of raw handles can follow.
+	 * @return What the call did. Nothing before the first graph is built, or when the GPU did not go idle in time.
+	 */
+	relocation::DefragmentReport DefragmentAtIdle(const relocation::DefragmentBudget& budget);
+	/** @brief Owner thread: ends a running defragmentation campaign (the idle point is over). The next DefragmentAtIdle starts again. */
+	void EndDefragmentation();
 	// Any thread: the SealSubmitted calls so far, queued seals included.
 	uint64_t Seals() const noexcept { return m_sealsPushed.load(std::memory_order_acquire); }
 	// Any thread: the point SealSubmitted last captured (none before the first). It names only work already on the device, and

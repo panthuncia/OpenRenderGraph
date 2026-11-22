@@ -15,6 +15,8 @@ namespace org::memory {
 class AllocatedResource {
 public:
     explicit AllocatedResource(rhi::ma::AllocationPtr allocation) noexcept;
+    // Frees the memory through ORG's release gate, which holds frees off during a defragmentation pass.
+    ~AllocatedResource();
     AllocatedResource(const AllocatedResource&) = delete;
     AllocatedResource& operator=(const AllocatedResource&) = delete;
 

@@ -49,8 +49,9 @@ const char* SourceName(Source value) noexcept;
 // What each source fills in:
 // - DXVK: resource (an ExternalTextureResource or ExternalBufferResource), next (the new storage, imported), ready (DXVK's
 //   copy), retired (whose deleter gives DXVK its storage back).
-// - Defragmenter: resource, fromGeneration, copyTarget (a wrapper of the new resource at the destination), retired (the
-//   retained allocation). nextTexture and nextBuffer stay null: after EndPass the backing's Allocation names the new resource.
+// - Defragmenter: resource, fromGeneration, copyTarget (a wrapper of the new resource at the destination), and in BeforeAdopt
+//   retired (the retained allocation). nextTexture and nextBuffer stay null: after EndPass the backing's Allocation names the new
+//   resource.
 // - Graph resources made again (MakeGraphRelocation, the stress switch): resource, fromGeneration, nextTexture or nextBuffer,
 //   copyTarget.
 struct Relocation {
@@ -85,6 +86,9 @@ struct Relocation {
     // The size of the old backing, for the counters. Commit fills it from the owner record when 0.
     uint64_t sizeBytes = 0;
     Source source = Source::Owner;
+    // Set by Commit when it will not adopt the relocation (its resource is gone, its backing changed, its copy failed). A source
+    // reads it in BeforeAdopt, and may set it there itself to call the move off.
+    bool skipped = false;
 };
 
 // A producer of relocations. Registered with Service::AddSource.
@@ -98,6 +102,9 @@ public:
     // Owner thread, once per commit in which Poll returned any: after the relocation batch was submitted and before the
     // backings switch. A defragmenter ends its pass here (EndPass), so each Allocation names its new resource by then.
     virtual void BeforeAdopt(std::span<Relocation> polled) { (void)polled; }
+    // Owner thread, once per commit in which Poll returned any: after the backings switched. Each relocation's toGeneration is set
+    // when it was adopted, and skipped when it was not. A defragmenter lets go of the backing locks it held since Poll here.
+    virtual void AfterAdopt(std::span<Relocation> polled) { (void)polled; }
 };
 
 // Whether a backing with this record may move now. When it may not, why says why.
@@ -201,5 +208,12 @@ inline Service& GetService() { return Service::Get(); }
 // Owner thread. The caller hands the result to a commit (from a source's Poll).
 std::unique_ptr<Relocation> MakeGraphRelocation(const std::shared_ptr<Resource>& resource, Source source, bool gpuIdle = false,
     IgnoreReason* why = nullptr);
+
+namespace detail {
+// The resource a relocation batch copies into (Relocation::copyTarget): a view of a native resource with the shape of `like`. It
+// does not own the native resource. lease keeps whatever owns it alive while the wrapper lives. Its state starts as a new
+// resource's: Undefined for a texture, Common for a buffer.
+std::shared_ptr<Resource> MakeCopyTarget(rhi::Resource resource, Resource& like, std::shared_ptr<const void> lease);
+}
 
 } // namespace org::relocation

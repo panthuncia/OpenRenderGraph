@@ -621,6 +621,14 @@ bool BufferBase::AdoptRelocatedBacking(std::unique_ptr<GpuBufferBacking>& next, 
     return true;
 }
 
+rhi::Result BufferBase::MakeDefragmentationResource(const rhi::ma::Allocation& source, rhi::ma::Allocation& destination, rhi::ResourcePtr& out) {
+    std::scoped_lock lock(m_materializationMutex);
+    if (!m_dataBuffer || m_dataBuffer->GetAliasHeap() || m_dataBuffer->GetAllocation() != &source
+        || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid())
+        return rhi::Result::InvalidCall;
+    return m_dataBuffer->CreateResourceAt(destination, GetName().empty() ? nullptr : GetName().c_str(), out);
+}
+
 rhi::ma::Allocation* BufferBase::RelocationAllocation() noexcept {
     std::scoped_lock lock(m_materializationMutex);
     return m_dataBuffer ? m_dataBuffer->GetAllocation() : nullptr;

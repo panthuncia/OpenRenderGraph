@@ -167,6 +167,9 @@ public:
     // PixelBuffer::AdoptRelocatedBacking does for textures. On success `next` holds the old backing (or stays null when it
     // was null: the allocation already names the new resource). False when nothing changed.
     bool AdoptRelocatedBacking(std::unique_ptr<GpuBufferBacking>& next, uint64_t fromGeneration, bool rewriteInPlace);
+    // Defragmentation. Creates the current backing's buffer again at the start of destination, when the current backing's
+    // allocation is source. Fails when the backing changed, is placed, or for an attached representation. The caller owns the result.
+    rhi::Result MakeDefragmentationResource(const rhi::ma::Allocation& source, rhi::ma::Allocation& destination, rhi::ResourcePtr& out);
 
     void SetDescriptorRequirements(const DescriptorRequirements& requirements);
 

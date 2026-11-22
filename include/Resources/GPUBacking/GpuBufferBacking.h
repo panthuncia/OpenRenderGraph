@@ -57,6 +57,9 @@ public:
     }
 	// The backing's own allocation. Null for a buffer placed in an alias heap.
 	rhi::ma::Allocation* GetAllocation() noexcept { return m_bufferAllocation.GetAllocation(); }
+	// Defragmentation. Creates this buffer's resource again, with the same description, at the start of destination. Its GPU
+	// address differs from the old one's. The caller owns the result.
+	rhi::Result CreateResourceAt(rhi::ma::Allocation& destination, const char* name, rhi::ResourcePtr& out) const;
 	void SetName(const char* name);
 	// Debug helper: dumps any live buffers that haven't been destroyed yet.
 	static unsigned int DumpLiveBuffers();
@@ -71,6 +74,8 @@ public:
 
 private:
 	size_t m_size = 0;
+	// The description the buffer was created with. A buffer's description holds no pointers.
+	rhi::ResourceDesc m_resourceDesc{};
 	rhi::BufferBarrier m_barrier = {};
 
 	SymbolicTracker m_stateTracker;

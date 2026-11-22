@@ -75,6 +75,15 @@ public:
 		const rhi::ResourceDesc& resourceDesc,
 		rhi::ma::AllocationPtr& outAllocation) const noexcept;
 
+	// Creates a resource in an allocation's memory, at its start, with no tracking entity. The caller hands it to the allocation
+	// (Allocation::SetResource). The defragmenter makes the resource of a move's destination this way. Any thread.
+	rhi::Result CreateResourceAt(
+		rhi::ma::Allocation& allocation,
+		const rhi::ResourceDesc& resourceDesc,
+		UINT32 numCastableFormats,
+		const rhi::Format* pCastableFormats,
+		rhi::ResourcePtr& out) const noexcept;
+
 	rhi::Result AllocateMemoryTracked(
 		const rhi::ma::AllocationDesc& allocDesc,
 		const rhi::ResourceAllocationInfo& allocationInfo,

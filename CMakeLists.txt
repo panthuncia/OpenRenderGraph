@@ -193,6 +193,9 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Resources/RelocationRecord.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Relocation.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/Resources/Relocation.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Defragmenter.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Resources/Defragmenter.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Resources/AllocationRelease.h"
 )
 
 add_library(OpenRenderGraph::OpenRenderGraph ALIAS OpenRenderGraph)

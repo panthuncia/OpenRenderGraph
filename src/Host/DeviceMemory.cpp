@@ -4,12 +4,18 @@
 #include <utility>
 
 #include "Managers/Singletons/DeviceManager.h"
+#include "Resources/AllocationRelease.h"
 
 namespace org::memory {
 
 AllocatedResource::AllocatedResource(rhi::ma::AllocationPtr allocation) noexcept
     : m_allocation(std::move(allocation))
 {
+}
+
+AllocatedResource::~AllocatedResource()
+{
+    relocation::ReleaseAllocation(std::move(m_allocation));
 }
 
 rhi::Resource& AllocatedResource::Resource() noexcept

@@ -76,6 +76,9 @@ public:
     }
     // The owner record of the current backing's allocation. Null without a backing, or for a placed backing.
     relocation::RelocationRecord* CurrentRelocationRecord() noexcept;
+    // Points the current backing's record at this resource (RelocationRecord::Owner), so the defragmenter can find it. A factory
+    // calls it once the resource is owned by a shared_ptr, because a backing made in the constructor has no owner to point at.
+    void NoteRelocationOwner();
 protected:
     // The current backing's allocation. Null when there is none, or when the backing is placed in another allocation.
     // Called with BackingMutex held, when there is one.

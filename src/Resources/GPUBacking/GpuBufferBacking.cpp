@@ -106,9 +106,16 @@ GpuBufferBacking::GpuBufferBacking(
     }
 
     m_size = bufferSize;
+    m_resourceDesc = desc;
 
     RegisterLiveAlloc();
     UpdateLiveAllocName(name);
+}
+
+rhi::Result GpuBufferBacking::CreateResourceAt(rhi::ma::Allocation& destination, const char* name, rhi::ResourcePtr& out) const {
+    const auto result = DeviceManager::GetInstance().CreateResourceAt(destination, m_resourceDesc, 0, nullptr, out);
+    if (rhi::IsOk(result) && out && name) out->SetName(name);
+    return result;
 }
 
 GpuBufferBacking::~GpuBufferBacking() {

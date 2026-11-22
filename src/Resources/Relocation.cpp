@@ -244,6 +244,12 @@ private:
 
 } // namespace
 
+std::shared_ptr<Resource> detail::MakeCopyTarget(rhi::Resource resource, Resource& like, std::shared_ptr<const void> lease) {
+    // A short-lived wrapper. It needs no memory statistics entity.
+    Resource::ScopedECSRegistrationSuppression noEntity;
+    return std::make_shared<CopyTarget>(resource, like, std::move(lease));
+}
+
 std::unique_ptr<Relocation> MakeGraphRelocation(const std::shared_ptr<Resource>& resource, Source source, bool gpuIdle, IgnoreReason* why) {
     const auto fail = [&](IgnoreReason reason) -> std::unique_ptr<Relocation> {
         if (why) *why = reason;
@@ -481,6 +487,7 @@ size_t Service::Commit(const CommitContext& context) {
     std::vector<uint8_t> live(pending.size(), 1);
     const auto ignore = [&](size_t index, IgnoreReason reason) {
         live[index] = 0;
+        pending[index].skipped = true;
         detail::NoteIgnored(reason);
     };
     for (size_t i = 0; i < pending.size(); ++i) {
@@ -531,6 +538,7 @@ size_t Service::Commit(const CommitContext& context) {
     size_t committed = 0;
     for (size_t i = 0; i < pending.size(); ++i) {
         auto& relocation = pending[i];
+        if (live[i] && relocation.skipped) ignore(i, IgnoreReason::Failed);  // its source called it off in BeforeAdopt
         if (!live[i]) {
             // A new backing a failed batch may name: it goes behind the frontier too.
             Retire(relocation, false);
@@ -555,6 +563,9 @@ size_t Service::Commit(const CommitContext& context) {
         Retire(relocation, true);
         ++committed;
     }
+    // 5. Sources let go of what they held for the switch (a defragmenter's backing locks).
+    for (const auto& entry : polled)
+        entry.source->AfterAdopt(std::span<Relocation>(pending.data() + entry.first, entry.last - entry.first));
     detail::NoteJournalHead(m_journal.Head());
     basic_telemetry::AddCounter("ORG.Relocation.Moved", static_cast<int64_t>(committed));
     return committed;
