@@ -287,6 +287,18 @@ void DescriptorHeapManager::RetireBufferBacking(std::unique_ptr<GpuBufferBacking
     m_deferredReleases.push_back(std::move(release));
 }
 
+void DescriptorHeapManager::RetireRelocated(std::shared_ptr<const void> retired) {
+    if (!retired) {
+        return;
+    }
+
+    std::scoped_lock lock(m_descriptorMutationMutex);
+    DeferredRelease release{};
+    CaptureFencesUnlocked(release);
+    release.relocatedBackings.push_back(std::move(retired));
+    m_deferredReleases.push_back(std::move(release));
+}
+
 void DescriptorHeapManager::SetFrontier(std::function<runtime::SubmissionFrontier()> frontier, runtime::PointReached reached,
     runtime::AssignmentGate gate) {
     std::scoped_lock lock(m_descriptorMutationMutex);
@@ -446,6 +458,7 @@ DescriptorHeapManager::DeferredReleaseStats DescriptorHeapManager::GetDeferredRe
         stats.descriptorSlotCount += release.descriptorSlots.size();
         stats.bufferBackingCount += release.bufferBackings.size();
         stats.resourceCount += release.resources.size();
+        stats.relocatedBackingCount += release.relocatedBackings.size();
         for (const auto& resource : release.resources) {
             if (resource) {
                 stats.resourceIDs.push_back(resource->GetGlobalResourceID());

@@ -111,7 +111,7 @@ void ExternalClient::RetireLocked() {
 
 ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<const Access> accesses,
 	const std::function<void(rhi::CommandList&)>& record, std::span<const rhi::TimelinePoint> signals,
-	std::shared_ptr<const void> keepAlive, std::span<const rhi::TimelinePoint> extraWaits) {
+	std::shared_ptr<const void> keepAlive, std::span<const rhi::TimelinePoint> extraWaits, bool cachePublication) {
 	BT_ZONE_SCOPE("ORG.ExternalClient.Submit");
 	std::lock_guard lock(m_mutex);
 	auto& slot = Slot(slotIndex);
@@ -144,7 +144,8 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 	basic_telemetry::AddCounter("ORG.ExternalClient.Accesses", static_cast<int64_t>(accesses.size()));
 	auto& cache = *m_publications;
 	std::shared_ptr<const persistent::SelectedPublication> publication;
-	if (auto found = std::ranges::find(cache.entries, key, &PublicationCache::Entry::key); found != cache.entries.end()) {
+	auto found = cachePublication ? std::ranges::find(cache.entries, key, &PublicationCache::Entry::key) : cache.entries.end();
+	if (found != cache.entries.end()) {
 		found->lastUse = ++cache.clock;
 		publication = found->publication;
 		basic_telemetry::AddCounter("ORG.ExternalClient.PublicationReuses");
@@ -165,9 +166,11 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 		}
 		publication = persistent::BuildExternalPublication(*m_empty, queues, slotIndex, lowered, *m_workspace);
 		if (!publication) throw std::runtime_error("ExternalClient publication failed to build");
-		if (cache.entries.size() >= PublicationCache::kEntries)
-			cache.entries.erase(std::ranges::min_element(cache.entries, {}, &PublicationCache::Entry::lastUse));
-		cache.entries.push_back({std::move(key), publication, ++cache.clock});
+		if (cachePublication) {
+			if (cache.entries.size() >= PublicationCache::kEntries)
+				cache.entries.erase(std::ranges::min_element(cache.entries, {}, &PublicationCache::Entry::lastUse));
+			cache.entries.push_back({std::move(key), publication, ++cache.clock});
+		}
 	}
 
 	// Record the caller's commands first, outside the sequencer lock. They don't depend on the barriers computed below.

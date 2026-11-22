@@ -77,9 +77,12 @@ public:
 	// `signals` are extra timeline points the submission signals when it finishes.
 	// `keepAlive` is held until the submission finishes (for example the staging memory its commands read).
 	// `waits` are extra timeline points on this queue's device that the submission waits for before it runs.
+	// `cachePublication`: keep what was built from these accesses for a later submission with the same ones. The cache holds
+	// the backings it names. A one-off submission whose backings should go once its GPU work is done (a relocation copy)
+	// passes false.
 	Signal Submit(uint32_t slot, std::span<const Access> accesses, const std::function<void(rhi::CommandList&)>& record,
 		std::span<const rhi::TimelinePoint> signals = {}, std::shared_ptr<const void> keepAlive = {},
-		std::span<const rhi::TimelinePoint> waits = {});
+		std::span<const rhi::TimelinePoint> waits = {}, bool cachePublication = true);
 
 	// Frees what finished submissions held. Submit also does this.
 	void Retire();

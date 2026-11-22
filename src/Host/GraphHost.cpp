@@ -33,6 +33,7 @@
 #include "Interfaces/IResourceResolver.h"
 #include "HostUploadExtension.h"
 #include "Resources/PixelBuffer.h"
+#include "Resources/Relocation.h"
 #include "../Render/RenderGraph/AliasPacking.h"
 
 #include <unordered_map>
@@ -1758,6 +1759,32 @@ void GraphHost::SealSubmitted() {
 	}
 	// Once a frame: chunks the runs in flight have not needed for a while go.
 	if (const auto& arena = m_desc.runtime->Arena()) arena->Trim();
+	// The frame boundary: relocations switch here, before the next frame prepares anything.
+	(void)CommitRelocationsNow(false);
+}
+
+size_t GraphHost::CommitRelocations(bool gpuIdle) {
+	CheckOwner("CommitRelocations");
+	return CommitRelocationsNow(gpuIdle);
+}
+
+size_t GraphHost::CommitRelocationsNow(bool gpuIdle) {
+	// Before the first build there is no queue to copy on. Sources keep what they have until then.
+	auto* graph = AnyGraph();
+	if (!graph) return 0;
+	try {
+		relocation::CommitContext context;
+		context.gpuIdle = gpuIdle;
+		const auto& queues = graph->GetQueueRegistry();
+		context.client = &graph->GetExternalClient();
+		context.copySlot = static_cast<uint32_t>(ToUnderlying(queues.FindGraphicsSlot()));
+		for (size_t index = 0; index < queues.SlotCount(); ++index)
+			context.queues.push_back(queues.GetQueue(static_cast<QueueSlotIndex>(static_cast<uint8_t>(index))));
+		return relocation::Service::Get().Commit(context);
+	} catch (const std::exception& error) {
+		spdlog::error("GraphHost: committing relocations failed: {}", error.what());
+		return 0;
+	}
 }
 
 void GraphHost::PassSeal(const std::shared_ptr<GpuPoint::Pending>& a_marker) {

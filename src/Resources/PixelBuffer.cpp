@@ -225,13 +225,7 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
 
     EnsureVirtualDescriptorSlotsAllocatedLocked();
 
-    auto newDesc = m_desc;
-    if (m_desc.padInternalResolution) {
-        for (auto& dim : newDesc.imageDimensions) {
-            dim.width = (std::max)(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(dim.width)))));
-            dim.height = (std::max)(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(dim.height)))));
-        }
-    }
+    const auto newDesc = BackingDescription();
 
     if (options && options->aliasPlacement.has_value()) {
         m_backing = GpuTextureBacking::CreateUnique(newDesc, GetGlobalResourceID(), options->aliasPlacement.value(), name.empty() ? nullptr : name.c_str());
@@ -261,6 +255,46 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
 
     ApplyRelocationClass(GetGlobalResourceID());
     ++m_backingGeneration;
+}
+
+TextureDescription PixelBuffer::BackingDescription() const {
+    auto newDesc = m_desc;
+    if (m_desc.padInternalResolution) {
+        for (auto& dim : newDesc.imageDimensions) {
+            dim.width = (std::max)(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(dim.width)))));
+            dim.height = (std::max)(1u, static_cast<unsigned int>(std::pow(2, std::ceil(std::log2(dim.height)))));
+        }
+    }
+    return newDesc;
+}
+
+std::unique_ptr<GpuTextureBacking> PixelBuffer::MakeRelocationBacking() {
+    std::scoped_lock lock(m_materializationMutex);
+    if (!m_backing) return {};
+    return GpuTextureBacking::CreateUnique(BackingDescription(), GetGlobalResourceID(), name.empty() ? nullptr : name.c_str());
+}
+
+bool PixelBuffer::AdoptRelocatedBacking(std::unique_ptr<GpuTextureBacking>& next, uint64_t fromGeneration, bool rewriteInPlace) {
+    std::scoped_lock lock(m_materializationMutex);
+    if (!m_backing || m_backingGeneration != fromGeneration || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid())
+        return false;
+    if (!rewriteInPlace) RotateDescriptorSlotsForPublication();
+    if (next) std::swap(m_backing, next);
+    // Fresh slots after a rotation, or the same slots when they are rewritten in place.
+    EnsureVirtualDescriptorSlotsAllocatedLocked();
+    DescriptorHeapManager::ViewRequirements views;
+    views.views = BuildTextureViewRequirements(m_desc, m_mipLevels, m_arraySize);
+    auto resource = m_backing->GetAPIResource();
+    DescriptorHeapManager::GetInstance().UpdateDescriptorContents(*this, resource, views);
+    if (next) {
+        // A new backing object: it gets the resource's metadata and name, as Materialize gives them.
+        for (const auto& bundle : m_metadataBundles) m_backing->ApplyMetadataComponentBundle(bundle);
+        if (!name.empty()) m_backing->SetName(name.c_str());
+    }
+    ApplyRelocationClass(GetGlobalResourceID());
+    ++m_backingGeneration;
+    ForgetPublishedAllocation();
+    return true;
 }
 
 rhi::ma::Allocation* PixelBuffer::RelocationAllocation() noexcept {
