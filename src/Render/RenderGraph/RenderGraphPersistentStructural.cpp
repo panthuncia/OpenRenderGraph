@@ -1,6 +1,9 @@
 // Persistent execution, structural builds: representations, inline and worker-side builds, and alias placement.
 #include "RenderGraphPersistentState.h"
 #include <rhi_interop_dx12.h>
+#include <array>
+#include <bit>
+#include <functional>
 #include <unordered_set>
 
 namespace org {
@@ -540,6 +543,17 @@ bool NoteAliasPlaced(const void* resource, bool placed) {
 	if (placed) return g_aliasPlaced.insert(resource).second;
 	return g_aliasPlaced.erase(resource) != 0;
 }
+
+// A candidate's key in usage summaries (PlacementUse::key): its name and memory description. Resources are made again when a
+// graph is built again, so their ids change. Their names and descriptions do not.
+uint64_t PlacementKey(const std::string& name, uint64_t size, uint64_t alignment, uint8_t resourceClass, uint64_t backendMask) {
+	uint64_t key = std::hash<std::string>{}(name);
+	boost::hash_combine(key, size);
+	boost::hash_combine(key, alignment);
+	boost::hash_combine(key, resourceClass);
+	boost::hash_combine(key, backendMask);
+	return key;
+}
 }
 
 void persistent_impl::ReleaseOwnAliasPlacements(const std::unordered_map<Resource*, AliasPlacementOwner>& owners) noexcept {
@@ -642,6 +656,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		// Used by passes on more than one device: placed in a shared pool (PlaceSharedRepresentations).
 		bool shared = false;
 		const char* exclusion = nullptr;
+		// For the usage summary (PlacementSummary): whether the planner would pool it automatically on one backend if its first
+		// use wrote, and why not.
+		bool scoreOk = false;
+		bool eligible = false;
+		const char* ineligible = nullptr;
 	};
 	std::vector<Candidate> candidates;
 	std::unordered_map<Resource*, uint32_t> candidateByConcrete;
@@ -732,6 +751,23 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		c.users.erase(std::unique(c.users.begin(), c.users.end()), c.users.end());
 		// A first write by a pass that may skip it (MayNotWrite) leaves the memory's old content in the runs where it does.
 		c.writeGuaranteed = c.firstUseIsWrite && c.firstPass < structure.passes.size() && !structure.passes[c.firstPass].mayNotWrite;
+		if (c.firstUse != UINT32_MAX && c.direct && !c.manualPool && mode != AutoAliasMode::Off) {
+			const float benefitMB = static_cast<float>(c.sizeBytes) / (1024.0f * 1024.0f);
+			const float critNorm = static_cast<float>(c.criticality) / static_cast<float>(maxCriticality);
+			const float penalty = c.materialized ? 1.0f : 0.0f;
+			const float score = mode == AutoAliasMode::Conservative ? benefitMB - 2.0f * critNorm - 1.0f * penalty
+				: mode == AutoAliasMode::Balanced ? benefitMB - 1.25f * critNorm - 0.5f * penalty
+				: benefitMB - 0.5f * critNorm - 0.25f * penalty;
+			c.scoreOk = score >= threshold;
+		}
+		if (c.firstUse == UINT32_MAX) c.ineligible = "unused";
+		else if (!c.direct) c.ineligible = "group member";
+		else if (c.manualPool) c.ineligible = "manual pool";
+		else if (mode == AutoAliasMode::Off) c.ineligible = "auto aliasing off";
+		else if (!c.scoreOk) c.ineligible = "score below threshold";
+		else if (c.shared) c.ineligible = "used on several devices";
+		else if (std::popcount(c.backendMask) > 1) c.ineligible = "multi-backend placement unsupported";
+		c.eligible = !c.ineligible;
 		if (c.firstUse == UINT32_MAX) { c.exclusion = "unused"; }
 		else if (!c.direct) { c.exclusion = "group member"; }
 		else if (c.manualPool) {
@@ -741,16 +777,8 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		} else if (mode == AutoAliasMode::Off) c.exclusion = "auto aliasing off";
 		else if (!c.firstUseIsWrite) c.exclusion = "first use is read";
 		else if (!c.writeGuaranteed) c.exclusion = "first writer may not write";
-		else {
-			const float benefitMB = static_cast<float>(c.sizeBytes) / (1024.0f * 1024.0f);
-			const float critNorm = static_cast<float>(c.criticality) / static_cast<float>(maxCriticality);
-			const float penalty = c.materialized ? 1.0f : 0.0f;
-			const float score = mode == AutoAliasMode::Conservative ? benefitMB - 2.0f * critNorm - 1.0f * penalty
-				: mode == AutoAliasMode::Balanced ? benefitMB - 1.25f * critNorm - 0.5f * penalty
-				: benefitMB - 0.5f * critNorm - 0.25f * penalty;
-			if (score < threshold) c.exclusion = "score below threshold";
-			else { c.poolID = kAutoPoolGlobal; c.pooled = true; }
-		}
+		else if (!c.scoreOk) c.exclusion = "score below threshold";
+		else { c.poolID = kAutoPoolGlobal; c.pooled = true; }
 		if (c.pooled && c.shared) {
 			// One pool per class for every resource the devices share, whichever device uses it.
 			boost::hash_combine(c.poolID, 0x5A4EDu);
@@ -779,6 +807,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	for (uint32_t i = 0; i < candidates.size(); ++i) if (candidates[i].pooled) byPool[candidates[i].poolID].push_back(i);
 	std::vector<std::pair<uint32_t, uint32_t>> edges; // (logical slot, logical slot)
 	uint64_t independentBytes = 0, requiredBytes = 0, reservedBytes = 0;
+	std::array<uint64_t, 4> requiredByClass{};
 	size_t overlapPairs = 0;
 	for (auto& [poolID, members] : byPool) {
 		std::sort(members.begin(), members.end(), [&](uint32_t l, uint32_t r) {
@@ -822,6 +851,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		for (size_t i = 0; i < members.size(); ++i) candidates[members[i]].offset = packed.offsets[i];
 		const uint64_t heapEnd = packed.heapEnd, poolAlignment = packed.alignment;
 		requiredBytes += heapEnd;
+		requiredByClass[candidates[members.front()].resourceClass & 3u] += heapEnd;
 		if (heapEnd == 0) continue;
 		const bool sharedPool = candidates[members.front()].shared;
 		if (m_frameAliasArena && !sharedPool) {
@@ -1030,6 +1060,39 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	state.aliasRematerializations += rematerialized;
 	// The previous plan's ranges go. Its placements that this plan did not replace keep their memory through their leases.
 	state.frameRegions = std::move(newFrameRegions);
+	// The usage summary: every used candidate with its ranks, for the host's frame-wide placement.
+	if (m_placementSummaryObserver) {
+		PlacementSummary summary;
+		summary.epoch = m_passEpochFilter;
+		summary.rankCount = nextRank;
+		summary.pooledBytesByClass = requiredByClass;
+		summary.pooledBytes = requiredBytes;
+		summary.uses.reserve(candidates.size());
+		for (const auto& c : candidates) {
+			if (c.firstUse == UINT32_MAX || !c.direct) continue;
+			PlacementUse use;
+			use.name = c.concrete->GetName();
+			use.key = PlacementKey(use.name, c.sizeBytes, c.alignment, c.resourceClass, c.backendMask);
+			use.firstRank = c.firstUse;
+			use.lastRank = c.lastUse;
+			use.firstUseWrites = c.firstUseIsWrite;
+			use.writeGuaranteed = c.writeGuaranteed;
+			use.eligible = c.eligible;
+			if (c.ineligible) use.exclusion = c.ineligible;
+			else if (c.exclusion) use.exclusion = c.exclusion;
+			use.size = c.sizeBytes;
+			use.alignment = c.alignment;
+			use.memoryClass = c.resourceClass;
+			use.backendMask = c.backendMask;
+			summary.uses.push_back(std::move(use));
+		}
+		summary.Finish();
+		try {
+			m_placementSummaryObserver(std::move(summary));
+		} catch (const std::exception& error) {
+			spdlog::warn("Persistent alias plan: the usage summary of epoch {} was not published: {}", m_passEpochFilter, error.what());
+		}
+	}
 	BT_PLOT("ORG.Persistent.AliasPlacements", static_cast<int64_t>(placed));
 	BT_PLOT("ORG.Persistent.AliasRequiredBytes", static_cast<int64_t>(requiredBytes));
 	BT_PLOT("ORG.Persistent.AliasReservedBytes", static_cast<int64_t>(reservedBytes));

@@ -32,6 +32,7 @@
 #include "Resources/VersionedTexture.h"
 #include "Interfaces/IResourceResolver.h"
 #include "HostUploadExtension.h"
+#include "FramePlacement.h"
 #include "Resources/PixelBuffer.h"
 #include "../Render/RenderGraph/AliasPacking.h"
 
@@ -490,6 +491,7 @@ GraphHost::GraphHost(Desc desc)
 	}
 	m_declared.resize(m_instances.size());
 	m_builds = std::make_unique<BuildsCell[]>(m_instances.size());
+	m_framePlacement = std::make_shared<FramePlacement>(m_desc.epochOrder);
 	// Made with the host, so the queue's pointer never changes while another thread drains it.
 	if (m_desc.submissionThread) {
 		if (m_desc.mergeTicketSubmissions) m_submitCarry = RenderGraph::MakeSubmitCarry();
@@ -506,6 +508,8 @@ GraphHost::~GraphHost() {
 	StopSubmitThread();
 	StopAsync();
 	DestroyGraph();
+	// Its worker stops here. Graphs still alive hold it weakly and publish nothing more.
+	m_framePlacement.reset();
 	// The host's queue timelines go last: what was submitted on them completes first, and the runtime's ledgers stop waiting on them.
 	for (const auto& timeline : m_timelines) {
 		const auto next = timeline.nextValue->load(std::memory_order_acquire);
@@ -1190,6 +1194,16 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		if (inputs.frameTransients)
 			graph->SetFrameTransientObserver([this, epoch = inputs.epoch, position = inputs.framePosition, lane = inputs.frameArena ? inputs.epoch + 1 : 0u](
 												 std::span<Resource* const> resources) { NoteFrameTransientUses(epoch, position, lane, resources); });
+		// Each alias plan publishes the graph's usage summary to the frame placement, with where its own transients go today.
+		{
+			const auto memory = inputs.frameArena ? PlacementMemory::FrameArena
+				: inputs.aliasArena ? PlacementMemory::SharedArena : PlacementMemory::PrivatePools;
+			graph->SetPlacementSummaryObserver([placement = std::weak_ptr<FramePlacement>(m_framePlacement), memory](PlacementSummary summary) {
+				summary.memory = memory;
+				summary.Finish();
+				if (const auto locked = placement.lock()) locked->Publish(std::move(summary));
+			});
+		}
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
 		graph->SetPersistentRecordingTimestampMode(m_recordingTimestamps.load(std::memory_order_acquire));
 		graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
@@ -2077,6 +2091,7 @@ void GraphHost::SetFramePositions(std::vector<FramePosition> positions) {
 		m_frameTransients->spans.SetLastPosition(last);
 	}
 	m_framePositions = std::move(positions);
+	m_framePlacement->SetFrameArena(m_frameAliasArena);
 }
 
 std::shared_ptr<FrameAliasArena> GraphHost::FrameArena() const {
@@ -2237,6 +2252,48 @@ void GraphHost::SetEpochTicketsAhead(uint32_t epoch, uint32_t most) {
 	CheckOwner("SetEpochTicketsAhead");
 	std::erase_if(m_ticketsAhead, [&](const auto& entry) { return entry.first == epoch; });
 	if (most > 1) m_ticketsAhead.emplace_back(epoch, most);
+	// An epoch with several tickets ahead runs several times a frame: a repeated epoch for the frame placement.
+	ApplyFramePlacementSettings();
+}
+
+void GraphHost::SetFramePlacement(FramePlacementSettings settings) {
+	CheckOwner("SetFramePlacement");
+	{
+		std::scoped_lock lock(m_configMutex);
+		m_framePlacementSettings = std::move(settings);
+	}
+	ApplyFramePlacementSettings();
+}
+
+GraphHost::FramePlacementSettings GraphHost::GetFramePlacement() const {
+	std::scoped_lock lock(m_configMutex);
+	return m_framePlacementSettings;
+}
+
+void GraphHost::ApplyFramePlacementSettings() {
+	FramePlacement::Settings applied;
+	{
+		std::scoped_lock lock(m_configMutex);
+		applied.repeatedEpochs = m_framePlacementSettings.repeatedEpochs;
+		applied.beamSearch = m_framePlacementSettings.beamSearch;
+		applied.logLifetimes = m_framePlacementSettings.logLifetimes;
+		applied.settle = std::chrono::milliseconds(m_framePlacementSettings.settleMilliseconds);
+	}
+	for (const auto& [epoch, most] : m_ticketsAhead)
+		if (std::ranges::find(applied.repeatedEpochs, epoch) == applied.repeatedEpochs.end()) applied.repeatedEpochs.push_back(epoch);
+	m_framePlacement->SetSettings(std::move(applied));
+}
+
+void GraphHost::LogFramePlacement(bool detailed) const {
+	if (m_framePlacement) m_framePlacement->Log(detailed);
+}
+
+std::vector<std::shared_ptr<const PlacementSummary>> GraphHost::PlacementSummaries() const {
+	return m_framePlacement ? m_framePlacement->Summaries() : std::vector<std::shared_ptr<const PlacementSummary>>{};
+}
+
+std::shared_ptr<const FramePlacementVersion> GraphHost::LatestFramePlacement() const {
+	return m_framePlacement ? m_framePlacement->Latest() : nullptr;
 }
 
 void GraphHost::SetExternalEpochs(std::vector<uint32_t> epochs) {

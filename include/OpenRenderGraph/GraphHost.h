@@ -39,6 +39,7 @@ class HostUploadExtension;
 namespace org {
 
 struct IHostExecutionData;
+class FramePlacement;
 
 // Drives persistent (static) execution for an application that embeds ORG in its own renderer, for example a host that
 // adopted another API's device. It owns what every such embedding needs and nothing application-specific (the device,
@@ -578,6 +579,31 @@ public:
 		std::vector<std::string> members;
 	};
 	std::vector<FrameTransientGroup> FrameTransientGroups() const;
+	/**
+	 * @brief Frame placement: every epoch graph's alias plan publishes a usage summary (PlacementSummary). The host keeps the
+	 * latest of each epoch, and a worker thread of its own computes a placement of the whole frame from them
+	 * (FramePlacementVersion) once they have been quiet for settleMilliseconds. Each new layout is logged with what it would
+	 * need against today's pools and frame arena.
+	 */
+	struct FramePlacementSettings {
+		// Epochs that may run more than once a frame. A resource several epochs use spans the whole slot of a repeated epoch
+		// at either end of its lifetime. Epochs given several tickets ahead (SetEpochTicketsAhead) count as repeated too.
+		std::vector<uint32_t> repeatedEpochs;
+		// Beam search instead of the greedy sweep line.
+		bool beamSearch = false;
+		// One log line per resource and per epoch slot with each new layout.
+		bool logLifetimes = false;
+		uint32_t settleMilliseconds = 250;
+	};
+	/** @brief Owner thread. Kept across rebuilds. */
+	void SetFramePlacement(FramePlacementSettings settings);
+	FramePlacementSettings GetFramePlacement() const;
+	/** @brief Any thread: logs the latest frame placement against today's pools. detailed: one line per resource too. */
+	void LogFramePlacement(bool detailed = true) const;
+	/** @brief Any thread: the latest usage summary of each epoch, in ascending epoch order. */
+	std::vector<std::shared_ptr<const PlacementSummary>> PlacementSummaries() const;
+	/** @brief Any thread: the latest frame placement computed, or null. */
+	std::shared_ptr<const FramePlacementVersion> LatestFramePlacement() const;
 	/**
 	 * @brief Submitting thread, for a revision-driven async epoch: its runs take their published copies by the caller's index
 	 * from now on, starting with copy `copy` for the next SubmitEpoch.
@@ -1211,6 +1237,12 @@ private:
 	// A graph's plan reports what its passes use (RenderGraph::SetFrameTransientObserver). lane: the epoch's lane in the frame
 	// arena (its own transients' ranges), 0 for none.
 	void NoteFrameTransientUses(uint32_t epoch, uint32_t position, uint32_t lane, std::span<Resource* const> resources);
+	// SetFramePlacement's settings, under m_configMutex. The repeated epochs given to m_framePlacement add the epochs with
+	// several tickets ahead (ApplyFramePlacementSettings).
+	FramePlacementSettings m_framePlacementSettings;
+	void ApplyFramePlacementSettings();
+	// The frame-wide placement: summaries, the worker and its versions. Made with the host. Graphs hold it weakly.
+	std::shared_ptr<FramePlacement> m_framePlacement;
 	std::vector<uint32_t> m_externalEpochs;  // SetExternalEpochs; set on every build's graph
 	bool m_inlineAtExecution = false;        // SetInlineAtExecution; set on every build's graph
 	std::shared_ptr<ExternalEpochExecution> m_externalExecution;  // submitting thread: the last external SubmitEpoch's

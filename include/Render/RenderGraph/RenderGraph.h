@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Render/RenderGraph/FrameAliasArena.h"
+#include "Render/RenderGraph/FramePlacement.h"
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -293,6 +294,11 @@ private:
 	// it. It may throw: the plan fails then. Set before the first frame.
 	using FrameTransientObserver = std::function<void(std::span<Resource* const>)>;
 	void SetFrameTransientObserver(FrameTransientObserver observer) { m_frameTransientObserver = std::move(observer); }
+	// Usage summaries: called at the end of each alias plan with the plan's candidates (PlacementSummary), on the thread that
+	// plans. The host keeps the latest summary of each epoch and places transients across the frame from them. It must not
+	// throw. The graph fills in epoch, ranks, uses and pooled bytes; the host fills in memory. Set before the first frame.
+	using PlacementSummaryObserver = std::function<void(PlacementSummary)>;
+	void SetPlacementSummaryObserver(PlacementSummaryObserver observer) { m_placementSummaryObserver = std::move(observer); }
 	// False while some of its placements are in a pool generation another graph has replaced (the pool grew): placed again, by a
 	// rebuild, they share the pool's memory again.
 	bool PersistentAliasPlacementsCurrent() const;
@@ -936,6 +942,7 @@ private:
 	AliasSpan m_frameAliasSpan{};
 	uint32_t m_frameAliasLane = 0;
 	FrameTransientObserver m_frameTransientObserver;  // SetFrameTransientObserver
+	PlacementSummaryObserver m_placementSummaryObserver;  // SetPlacementSummaryObserver
 	// SetExternalPersistentEpochs; and the secondary lists their tickets record into, per queue slot in the host's stream (graphics
 	// lists, made at their first ticket).
 	std::vector<uint32_t> m_externalPersistentEpochs;
