@@ -23,6 +23,7 @@ class IUploadService;
 class IDescriptorService;
 class IStatisticsService;
 class IRenderGraphSettingsService;
+class StagedUploadBatch;
 }
 
 namespace org::persistent { class ResourceSequencer; }
@@ -172,6 +173,11 @@ public:
 	const void* TimelineDeviceOf(uint64_t identity) const;
 	// The resource ledgers every graph's admission on the runtime shares (docs/job-graphs.md, "Phase 2 investigation").
 	const std::shared_ptr<persistent::ResourceSequencer>& Sequencer() const noexcept { return m_sequencer; }
+	// Holding the sequencer, before the admission of the work that first follows the batches' copies: each texture the batches
+	// write gets its ledger state, Common last committed on queueSlot, as its copies leave it (StagedUploadBatch::RecordCopies).
+	// The copies must be submitted on that queue ahead of that work. A later use on another queue is then released on queueSlot
+	// behind the copies and waits for the release. Throws when the ledger holds one of the textures already (a queue used it).
+	void SeedFreshTextureUploads(std::span<const std::shared_ptr<runtime::StagedUploadBatch>> batches, uint32_t queueSlot);
 	// The schedule cache shared by every graph on this runtime (compiler::ScheduleCache).
 	const std::shared_ptr<compiler::ScheduleCache>& Schedules() const noexcept { return m_schedules; }
 

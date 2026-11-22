@@ -1145,6 +1145,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			rhi::ma::AllocationDesc allocDesc{};
 			allocDesc.heapType = rhi::HeapType::DeviceLocal;
 			allocDesc.flags = rhi::ma::AllocationFlagCanAlias;
+			allocDesc.extraHeapFlags = alias::AliasClassHeapFlags(candidates[members.front()].resourceClass);
 			rhi::ResourceAllocationInfo allocInfo{};
 			allocInfo.alignment = poolAlignment;
 			allocInfo.sizeInBytes = capacity;

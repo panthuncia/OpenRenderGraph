@@ -11,6 +11,7 @@
 #include "AliasPacking.h"
 #include "Managers/Singletons/DeletionManager.h"
 #include "Managers/Singletons/DeviceManager.h"
+#include "Render/RenderGraph/Aliasing/RenderGraphAliasingSubsystem.h"
 #include "Resources/MemoryStatisticsComponents.h"
 
 namespace org {
@@ -305,6 +306,7 @@ std::shared_ptr<const AliasHeapGeneration> FramePlacementVersion::AcquireBlock(u
 	rhi::ma::AllocationDesc allocDesc{};
 	allocDesc.heapType = rhi::HeapType::DeviceLocal;
 	allocDesc.flags = rhi::ma::AllocationFlagCanAlias;
+	allocDesc.extraHeapFlags = alias::AliasClassHeapFlags(block.memoryClass);
 	rhi::ResourceAllocationInfo allocInfo{};
 	allocInfo.alignment = block.alignment;
 	allocInfo.sizeInBytes = block.capacity;
@@ -355,6 +357,7 @@ std::shared_ptr<const AliasHeapGeneration> FramePlacementMemory::Acquire(uint8_t
 	rhi::ma::AllocationDesc allocDesc{};
 	allocDesc.heapType = rhi::HeapType::DeviceLocal;
 	allocDesc.flags = rhi::ma::AllocationFlagCanAlias;
+	allocDesc.extraHeapFlags = alias::AliasClassHeapFlags(memoryClass);
 	rhi::ResourceAllocationInfo allocInfo{};
 	allocInfo.alignment = (std::max)(alignment, cached.alignment);
 	allocInfo.sizeInBytes = size;

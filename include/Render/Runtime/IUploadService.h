@@ -104,6 +104,15 @@ public:
         (void)frameIndex; (void)out;
         return !HasPendingUploads();
     }
+    // Owner thread, direct mode: hands every staged batch waiting now (the producers' open one included) to a submission made
+    // outside the graphs, which records them (StagedUploadBatch::RecordCopies) ahead of its own work and keeps them alive until
+    // the GPU is done with it. Texture entries need Runtime::SeedFreshTextureUploads first. So work outside the graphs finds
+    // what was uploaded before it. False, with nothing taken, off the owner thread or when staged batches are not recorded
+    // directly.
+    virtual bool TakeStagedUploadsForSubmission(std::vector<std::shared_ptr<StagedUploadBatch>>& out) {
+        (void)out;
+        return false;
+    }
     // Owner thread: whether a host's upload list would record anything now (queued or posted uploads, copies, staged
     // batches). False lets a host skip the list. A post from another thread after the call goes with the next one.
     virtual bool HasPendingUploads() const { return true; }

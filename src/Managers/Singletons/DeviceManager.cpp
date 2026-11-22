@@ -174,6 +174,8 @@ rhi::ma::Pool* DeviceManager::MemoryGroupPool(MemoryGroup group, rhi::HeapType h
     rhi::ma::PoolDesc desc{};
     desc.heapType = heapType;
     desc.blockSize = kPerFrameBlockBytes;
+    // Buffers only, which D3D12 resource heap tier 1 needs and tier 2 allows.
+    desc.heapFlags = rhi::HeapFlags::DenyRtDsTextures | rhi::HeapFlags::DenyNonRtDsTextures;
     desc.debugName = name;
     rhi::ma::Pool* pool = nullptr;
     const auto result = m_allocator->CreatePool(&desc, &pool);

@@ -81,6 +81,7 @@ public:
 	void SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch);
 	void SetStagedUploadsRecordedDirectly(bool direct);
 	bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out);
+	bool TakeStagedUploadsForSubmission(std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out);
 	// IUploadService::HasPendingUploads: queued copies, or anything the instance holds.
 	bool HasPendingUploads() const;
 	void SetUploadResolveContext(UploadResolveContext ctx);

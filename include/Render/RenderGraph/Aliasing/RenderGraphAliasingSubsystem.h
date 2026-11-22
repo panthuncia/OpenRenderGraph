@@ -98,4 +98,8 @@ struct AutoAliasDebugSnapshot {
 rhi::ResourceDesc AliasTextureResourceDesc(const TextureDescription& desc);
 rhi::ResourceDesc AliasBufferResourceDesc(uint64_t sizeBytes, bool unorderedAccess, rhi::HeapType heapType);
 
+// The heap flags for an alias memory class (1 buffers, 2 render-target or depth textures, 3 other textures). D3D12 resource
+// heap tier 1 heaps hold one class only, so each class gets its own heaps. None for any other value.
+rhi::HeapFlags AliasClassHeapFlags(uint8_t memoryClass);
+
 } // namespace org::alias

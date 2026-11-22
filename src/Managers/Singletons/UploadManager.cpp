@@ -240,6 +240,11 @@ void UploadManager::SetStagedUploadsRecordedDirectly(bool direct)
 	}
 }
 
+bool UploadManager::TakeStagedUploadsForSubmission(std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out)
+{
+	return m_uploadInstance && m_uploadInstance->TakeStagedUploadsForSubmission(out);
+}
+
 bool UploadManager::TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out)
 {
 	return m_uploadInstance ? m_uploadInstance->TakeStagedUploads(frameIndex, out) : true;

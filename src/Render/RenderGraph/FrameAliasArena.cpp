@@ -112,6 +112,7 @@ std::shared_ptr<FrameAliasArena::Reservation> FrameAliasArena::ReserveRange(uint
 		rhi::ma::AllocationDesc allocDesc{};
 		allocDesc.heapType = rhi::HeapType::DeviceLocal;
 		allocDesc.flags = rhi::ma::AllocationFlagCanAlias;
+		allocDesc.extraHeapFlags = alias::AliasClassHeapFlags(resourceClass);
 		rhi::ResourceAllocationInfo allocInfo{};
 		allocInfo.alignment = block.alignment;
 		allocInfo.sizeInBytes = block.capacity;

@@ -1306,6 +1306,31 @@ bool RenderGraph::HasPendingUploads() const {
 	return m_uploadService && m_uploadService->HasPendingUploads();
 }
 
+void RenderGraph::SeedTakenTextureUploads(const TakenUploads& taken, uint32_t graphicsSlot) {
+	m_runtime->SeedFreshTextureUploads(taken.staged, graphicsSlot);
+}
+
+void Runtime::SeedFreshTextureUploads(std::span<const std::shared_ptr<runtime::StagedUploadBatch>> batches, uint32_t queueSlot) {
+	auto& states = m_sequencer->states;
+	std::unordered_set<const Resource*> seeded;  // a texture staged twice is seeded once
+	for (const auto& batch : batches) {
+		if (!batch) continue;
+		for (const auto& entry : batch->Textures()) {
+			auto& texture = *entry.target.pinned;
+			if (!seeded.insert(&texture).second) continue;
+			const auto handle = texture.GetAPIResource().GetHandle();
+			if (states.Holds(handle)) {
+				throw std::runtime_error("A texture upload into '" + texture.GetName() +
+					"' was staged after a queue used it: async epochs take uploads only into textures no queue has used");
+			}
+			states.SeedUniform(handle, lowering::ShapeOf(texture),
+				{static_cast<uint64_t>(rhi::ResourceAccessType::Common), static_cast<uint64_t>(rhi::ResourceLayout::Common),
+					static_cast<uint64_t>(rhi::ResourceSyncState::All), false},
+				queueSlot);
+		}
+	}
+}
+
 RenderGraph::TakenUploads RenderGraph::TakePendingUploads(rhi::Device device, uint32_t slot) {
 	BT_ZONE_SCOPE("ORG.Persistent.TakePendingUploads");
 	TakenUploads taken;

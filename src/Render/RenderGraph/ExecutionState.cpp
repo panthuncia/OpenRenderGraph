@@ -894,6 +894,22 @@ void BackingStateAdmissionLedger::SeedBatch(const PreparedBatchBarriers& batch) 
     }
 }
 
+bool BackingStateAdmissionLedger::Holds(rhi::ResourceHandle resource) const {
+    return m_states.Contains(Key(resource));
+}
+
+void BackingStateAdmissionLedger::SeedUniform(rhi::ResourceHandle resource, const CompileResourceShape& shape,
+    const CompileResourceState& state, uint32_t queue) {
+    const auto key = Key(resource);
+    if (m_states.Contains(key)) throw std::logic_error("A backing the ledger holds cannot be seeded again");
+    auto& grid = m_states.Emplace(key);
+    grid = StateGrid{};
+    grid.shape = shape;
+    grid.cells.assign(size_t{shape.mips} * shape.slices, state);
+    grid.queues.assign(grid.cells.size(), queue);
+    grid.fingerprint = Fingerprint(grid);
+}
+
 void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch) {
     if (batch.committedResources.size() != batch.committedStates.size()
         || batch.committedQueues.size() != batch.committedStates.size())

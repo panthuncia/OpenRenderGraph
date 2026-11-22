@@ -578,6 +578,10 @@ private:
 	TakenUploads TakePendingUploads(rhi::Device device, uint32_t slot);
 	bool RecordTakenUploads(TakenUploads& taken, rhi::CommandList& list, std::shared_ptr<void>& keepAlive, bool& recorded,
 		PersistentTicket* ticket = nullptr, std::span<rhi::CommandList> queueLists = {}, size_t* queueCopies = nullptr);
+	// Submitting thread, holding the sequencer, before AdmitPersistentTicket: each texture the staged uploads write gets its
+	// ledger state, Common on the graphics queue, as its copies leave it (StagedUploadBatch::RecordCopies). The ticket's own
+	// entry barriers then start from there. Throws when a queue has used one of the textures already.
+	void SeedTakenTextureUploads(const TakenUploads& taken, uint32_t graphicsSlot);
 	// The epoch the next Update/Execute runs; persistent::AllEpochs runs every pass.
 	void SetPersistentEpoch(uint32_t epoch) noexcept { m_persistentEpoch = epoch; }
 	uint32_t PersistentEpoch() const noexcept { return m_persistentEpoch; }

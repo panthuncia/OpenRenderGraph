@@ -3972,6 +3972,8 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	// Admitted now, against the ledgers as they are: the upload plan by queue and the submission's handoff read it. The sequencer
 	// stays held until the ticket is submitted and committed, so no other admission comes between.
 	auto sequencer = graph.HoldPersistentSequencer();
+	// Fresh textures the uploads write: their ledger states first, so the ticket's entry barriers start from what the copies leave.
+	if (hasUploads) graph.SeedTakenTextureUploads(commit.uploads, async.graphicsSlot);
 	graph.AdmitPersistentTicket(*ticket, async.queueValues);
 	struct AbandonUnsubmitted {
 		RenderGraph& graph;

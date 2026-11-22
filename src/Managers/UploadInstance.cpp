@@ -456,10 +456,17 @@ void UploadInstance::UploadData(const void* data, size_t size, UploadTarget targ
 	if (!data || size == 0) {
 		return;
 	}
+	// A pointer target's bytes are staged here on any thread, so the owner only records the copy, in order with every other
+	// staged upload.
+	if (target.kind == UploadTarget::Kind::PinnedShared && target.pinned) {
+		StageProducer([&](org::runtime::StagedUploadBatch& batch) { batch.Stage(std::move(target), dstOffset, data, size); });
+		basic_telemetry::AddCounter("ORG.Upload.FrameInstance.ProducerStagedBytes", static_cast<std::int64_t>(size));
+		return;
+	}
 	if (!IsOwnerThread()) {
-		// Producers never touch the owner's queue: the bytes are copied and the
-		// owner applies the upload before its next upload pass records.
+		// Producers never touch the owner's queue.
 		NoteProducerCall("UploadData");
+		// A registry handle resolves on the owner, so the bytes are copied and the owner stages them before its next upload pass.
 		PostedBufferUpload posted;
 		posted.target = std::move(target);
 		posted.bytes.assign(static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + size);
@@ -644,6 +651,15 @@ void UploadInstance::UploadTextureSubresources(
 	const auto plan = rhi::helpers::PlanTextureUploadSubresources(
 		fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize, srcSpan);
 	if (plan.totalSize == 0 || plan.footprints.empty()) return;
+	if (target.kind == UploadTarget::Kind::PinnedShared && target.pinned) {
+		// Staged now, so the call keeps no pointer to the caller's bytes. Ordered with every other staged upload.
+		StageProducer([&](org::runtime::StagedUploadBatch& batch) {
+			batch.StageTexture(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
+				std::span<const rhi::helpers::SubresourceData>(srcSubresources, srcCount));
+		});
+		basic_telemetry::AddCounter("ORG.Upload.FrameInstance.ProducerStagedBytes", static_cast<std::int64_t>(plan.totalSize));
+		return;
+	}
 	if (!ClaimOwnerThread()) {
 		// The raw entry cannot outlive the caller's source pointers, so an
 		// off-owner call has no safe way to post; PostTextureSubresources is the
@@ -731,6 +747,11 @@ void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fm
 	std::shared_ptr<const void> keepAlive, const char* file, int line)
 {
 	if (!subresources || subresources->empty()) return;
+	if (target.kind == UploadTarget::Kind::PinnedShared && target.pinned) {
+		UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
+			subresources->data(), static_cast<uint32_t>(subresources->size()), file, line);
+		return;
+	}
 	if (IsOwnerThread()) {
 		UploadTextureSubresources(std::move(target), fmt, baseWidth, baseHeight, depthOrLayers, mipLevels, arraySize,
 			subresources->data(), static_cast<uint32_t>(subresources->size()), file, line);
@@ -787,7 +808,7 @@ void UploadInstance::PostTextureSubresources(UploadTarget target, rhi::Format fm
 
 void UploadInstance::SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUploadBatch> batch) {
 	NoteOffOwnerCall("SubmitStagedUploads");
-	if (!batch || batch->Entries().empty()) return;
+	if (!batch || batch->Empty()) return;
 	if (m_stagedDirect) {
 		m_currentFrameUploadBytes += batch->Bytes();
 		m_directStaged.push_back(std::move(batch));
@@ -803,6 +824,20 @@ void UploadInstance::SubmitStagedUploads(std::shared_ptr<org::runtime::StagedUpl
 		update.dataBufferOffset = entry.dstOffset;
 		update.firstSequence = update.lastSequence = ++m_lastUploadSequence;
 		m_resourceUpdates.push_back(std::move(update));
+	}
+	// Recorded by the upload pass, whose requirements move each texture into its copy state.
+	for (const auto& entry : batch->Textures()) {
+		for (const auto& copy : entry.copies) {
+			TextureUpdate update;
+			update.texture = entry.target;
+			update.mip = copy.mip;
+			update.slice = copy.slice;
+			update.footprint = copy.footprint;
+			update.z = copy.z;
+			update.uploadBuffer = entry.page;
+			update.sequence = ++m_lastUploadSequence;
+			m_textureUpdates.push_back(std::move(update));
+		}
 	}
 	m_currentFrameUploadBytes += batch->Bytes();
 	m_pendingStaged.push_back(std::move(batch));
@@ -834,7 +869,65 @@ bool UploadInstance::TakeStagedUploads(uint32_t frameIndex, std::vector<std::sha
 	return true;
 }
 
+namespace {
+	// Producer batches' pages. A batch whose last payload passed kMaxReusedBatchBytes is dropped once free rather than kept
+	// with all its pages, and at most kIdleProducerBatches free batches stay pooled.
+	constexpr size_t kProducerPageBytes = size_t{ 4 } << 20;
+	constexpr size_t kMaxReusedBatchBytes = size_t{ 32 } << 20;
+	constexpr size_t kIdleProducerBatches = 2;
+}
+
+void UploadInstance::StageProducer(const std::function<void(org::runtime::StagedUploadBatch&)>& stage) {
+	{
+		std::lock_guard lock(m_producerMutex);
+		if (!m_producerBatch) {
+			// A free pooled batch, else a new one. Free batches past the idle limit, and large ones, leave the pool.
+			size_t idle = 0;
+			for (auto it = m_producerPool.begin(); it != m_producerPool.end();) {
+				const bool free = it->use_count() == 1;
+				if (free && !m_producerBatch && (*it)->Bytes() <= kMaxReusedBatchBytes) {
+					m_producerBatch = *it;
+					m_producerBatch->Reset();
+					++it;
+				} else if (free && (++idle > kIdleProducerBatches || (*it)->Bytes() > kMaxReusedBatchBytes)) {
+					it = m_producerPool.erase(it);
+				} else {
+					++it;
+				}
+			}
+			if (!m_producerBatch) {
+				m_producerBatch = org::runtime::StagedUploadBatch::Create(kProducerPageBytes);
+				m_producerPool.push_back(m_producerBatch);
+			}
+		}
+		stage(*m_producerBatch);
+		m_producerPending.store(true, std::memory_order_release);
+	}
+	MarkPendingWorkChangedLocked();
+}
+
+void UploadInstance::DrainProducerBatch() {
+	if (!m_producerPending.load(std::memory_order_acquire)) return;
+	std::shared_ptr<org::runtime::StagedUploadBatch> batch;
+	{
+		std::lock_guard lock(m_producerMutex);
+		batch = std::move(m_producerBatch);
+		m_producerPending.store(false, std::memory_order_release);
+	}
+	if (batch) SubmitStagedUploads(std::move(batch));
+}
+
+bool UploadInstance::TakeStagedUploadsForSubmission(std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out) {
+	if (!IsOwnerThread() || !m_stagedDirect) return false;
+	DrainProducerBatch();
+	if (m_directStaged.empty()) return true;
+	out.insert(out.end(), std::make_move_iterator(m_directStaged.begin()), std::make_move_iterator(m_directStaged.end()));
+	m_directStaged.clear();
+	return true;
+}
+
 void UploadInstance::DrainPostedUploads() {
+	DrainProducerBatch();
 	PostedBufferUpload buffer;
 	while (m_postedBufferUploads.Pop(buffer)) {
 		UploadData(buffer.bytes.data(), buffer.bytes.size(), buffer.target, buffer.dstOffset, buffer.file, buffer.line);
@@ -1274,7 +1367,8 @@ void UploadInstance::ProcessDeferredReleases(uint32_t frameIndex) {
 
 bool UploadInstance::HasPendingWork() const {
 	return !m_resourceUpdates.empty() || !m_textureUpdates.empty() ||
-		!m_postedTextureUploads.Empty() || !m_postedBufferUploads.Empty();
+		!m_postedTextureUploads.Empty() || !m_postedBufferUploads.Empty() ||
+		m_producerPending.load(std::memory_order_acquire);
 }
 
 bool UploadInstance::HasPendingUploads() const {
@@ -1361,6 +1455,10 @@ void UploadInstance::Cleanup() {
 		while (m_postedBufferUploads.Pop(buffer)) {}
 		PostedTextureUpload texture;
 		while (m_postedTextureUploads.Pop(texture)) {}
+		std::lock_guard lock(m_producerMutex);
+		m_producerBatch.reset();
+		m_producerPool.clear();
+		m_producerPending.store(false, std::memory_order_release);
 	}
 	m_freePages.clear();
 	m_readyPages.clear();

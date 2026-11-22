@@ -197,4 +197,13 @@ rhi::ResourceDesc org::alias::AliasBufferResourceDesc(uint64_t sizeBytes, bool u
 	return BuildAliasBufferResourceDesc(sizeBytes, unorderedAccess, heapType);
 }
 
+rhi::HeapFlags org::alias::AliasClassHeapFlags(uint8_t memoryClass) {
+	switch (memoryClass) {
+	case 1: return rhi::HeapFlags::DenyRtDsTextures | rhi::HeapFlags::DenyNonRtDsTextures;
+	case 2: return rhi::HeapFlags::DenyBuffers | rhi::HeapFlags::DenyNonRtDsTextures;
+	case 3: return rhi::HeapFlags::DenyBuffers | rhi::HeapFlags::DenyRtDsTextures;
+	default: return rhi::HeapFlags::None;
+	}
+}
+
 } // namespace org

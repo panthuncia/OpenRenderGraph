@@ -57,6 +57,14 @@ class Buffer;
 // An unowned instance also posts. This way a producer never writes the queue
 // of an instance whose owner has not run yet. Queue operations off the owner
 // thread are misuse. They are logged (ORG.Upload.FrameInstance.OffThreadCalls).
+//
+// A buffer upload to a pointer target, from any thread, is staged on the
+// calling thread into a batch the producers share (StagedUploadBatch). The
+// owner takes the batch when it drains and copies nothing. Other posted buffer
+// uploads are copied into the mailbox and staged by the owner.
+// A texture upload to a pointer target, from any thread, is staged into the
+// same batch. A host that records staged batches directly (the persistent
+// ticket host) takes texture uploads only into textures no queue has used yet.
 class UploadInstance {
 public:
 	using UploadTarget        = org::runtime::UploadTarget;
@@ -171,6 +179,8 @@ public:
 	void SetStagedUploadsRecordedDirectly(bool direct);
 	// IUploadService::TakeStagedUploads (direct mode).
 	bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out);
+	// IUploadService::TakeStagedUploadsForSubmission.
+	bool TakeStagedUploadsForSubmission(std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>>& out);
 
 	// Configuration
 
@@ -352,6 +362,16 @@ private:
 		int line = 0;
 	};
 	org::runtime::EventQueue<PostedTextureUpload, 1024> m_postedTextureUploads;
+	// Producer staging for buffer uploads to pointer targets. The open batch takes every producer's uploads until the owner
+	// drains it. The pool keeps the batches for reuse; one is free again once the service released it (use_count() == 1).
+	std::mutex m_producerMutex;
+	std::shared_ptr<org::runtime::StagedUploadBatch> m_producerBatch;
+	std::vector<std::shared_ptr<org::runtime::StagedUploadBatch>> m_producerPool;
+	std::atomic<bool> m_producerPending{ false };
+	// Any thread: runs `stage` on the open batch, under the producer lock.
+	void StageProducer(const std::function<void(org::runtime::StagedUploadBatch&)>& stage);
+	// Owner thread: submits the open batch, if it holds anything.
+	void DrainProducerBatch();
 	org::runtime::EventQueue<PostedBufferUpload, 1024> m_postedBufferUploads;
 	org::runtime::EventQueue<UploadPagePtr, 256> m_readyPageInbox;
 

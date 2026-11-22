@@ -276,6 +276,11 @@ public:
         std::span<const uint32_t> unmoved = {});
     // A batch's seeds: the grids of backings the ledger does not hold yet, and of those whose state the batch makes again.
     void SeedBatch(const PreparedBatchBarriers& batch);
+    // Whether the ledger holds a state for the backing.
+    bool Holds(rhi::ResourceHandle resource) const;
+    // Seeds a backing the ledger does not hold yet: every cell in `state`, last committed on `queue`. For a texture's first
+    // contents, written outside the graphs before its first execution.
+    void SeedUniform(rhi::ResourceHandle resource, const CompileResourceShape& shape, const CompileResourceState& state, uint32_t queue);
     // The prediction's entries taken anew: what the ledger holds now of each resource the graph's entry steps name.
     void Capture(StatePrediction& prediction, const Schedule& graph, std::span<const PreparedBackingState> initial,
         uint64_t backingSet = 0) const;

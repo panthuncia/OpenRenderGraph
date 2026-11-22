@@ -81,6 +81,9 @@ public:
         Manager().SetStagedUploadsRecordedDirectly(direct);
     }
 
+    bool TakeStagedUploadsForSubmission(std::vector<std::shared_ptr<StagedUploadBatch>>& out) override {
+        return Manager().TakeStagedUploadsForSubmission(out);
+    }
     bool TakeStagedUploads(uint32_t frameIndex, std::vector<std::shared_ptr<StagedUploadBatch>>& out) override {
         return Manager().TakeStagedUploads(frameIndex, out);
     }
