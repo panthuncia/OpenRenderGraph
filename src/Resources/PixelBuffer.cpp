@@ -259,7 +259,13 @@ void PixelBuffer::Materialize(const MaterializeOptions* options) {
         m_backing->ApplyMetadataComponentBundle(bundle);
     }
 
+    ApplyRelocationClass(GetGlobalResourceID());
     ++m_backingGeneration;
+}
+
+rhi::ma::Allocation* PixelBuffer::RelocationAllocation() noexcept {
+    std::scoped_lock lock(m_materializationMutex);
+    return m_backing ? m_backing->GetAllocation() : nullptr;
 }
 
 BackingAllocationSnapshot PixelBuffer::CaptureBackingAllocation(bool retain) {

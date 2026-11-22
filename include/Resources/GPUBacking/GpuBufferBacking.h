@@ -55,6 +55,8 @@ public:
     std::shared_ptr<const TrackedHandle> CaptureAllocationLease() {
         return m_bufferAllocation.CaptureAllocationLease();
     }
+	// The backing's own allocation. Null for a buffer placed in an alias heap.
+	rhi::ma::Allocation* GetAllocation() noexcept { return m_bufferAllocation.GetAllocation(); }
 	void SetName(const char* name);
 	// Debug helper: dumps any live buffers that haven't been destroyed yet.
 	static unsigned int DumpLiveBuffers();

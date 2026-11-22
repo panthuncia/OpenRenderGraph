@@ -1,9 +1,13 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <rhi.h>
+
+#include "Resources/RelocationRecord.h"
 
 
 // Graph-facing contract for resources whose API handle is backed by a concrete GPU allocation.
@@ -61,7 +65,24 @@ public:
         m_publishedGeneration = generation;
         return m_publishedAllocation;
     }
+    // The relocation class of this resource's backings (relocation::Class), from now on and for every later backing.
+    // An owner marks a resource ReadOnly once nothing writes it any more (a sealed resource or version). Unset, each
+    // backing keeps the class DeviceManager gave it. Owner thread of the resource.
+    void SetRelocationClass(relocation::Class value);
+    std::optional<relocation::Class> GetRelocationClass() const noexcept {
+        const auto value = m_relocationClass.load(std::memory_order_acquire);
+        if (value == kNoRelocationClass) return std::nullopt;
+        return static_cast<relocation::Class>(value);
+    }
+    // The owner record of the current backing's allocation. Null without a backing, or for a placed backing.
+    relocation::RelocationRecord* CurrentRelocationRecord() noexcept;
 protected:
+    // The current backing's allocation. Null when there is none, or when the backing is placed in another allocation.
+    // Called with BackingMutex held, when there is one.
+    virtual rhi::ma::Allocation* RelocationAllocation() noexcept { return nullptr; }
+    // Gives the current backing's record the class set with SetRelocationClass, if one was set, and the resource's ID.
+    // Each owner calls it after it makes or adopts a backing, with BackingMutex held.
+    void ApplyRelocationClass(uint64_t resourceID) noexcept;
     // A dematerialized resource lets go of its cached publication snapshot. The snapshot holds a lease on the old allocation, so
     // keeping it would keep the memory of a backing given back until the next publication, which a resource no graph uses never
     // gets. Publications already captured keep their own reference.
@@ -71,6 +92,8 @@ protected:
         m_publishedGeneration = UINT64_MAX;
     }
 private:
+    static constexpr uint8_t kNoRelocationClass = 0xFF;
+    std::atomic<uint8_t> m_relocationClass{kNoRelocationClass};
     std::mutex m_publicationMutex;
     uint64_t m_publishedGeneration = UINT64_MAX;
     std::shared_ptr<const BackingAllocationSnapshot> m_publishedAllocation;

@@ -60,6 +60,8 @@ public:
     std::shared_ptr<const TrackedHandle> CaptureAllocationLease() {
         return m_textureHandle.CaptureAllocationLease();
     }
+	// The backing's own allocation. Null for a texture placed in an alias heap.
+	rhi::ma::Allocation* GetAllocation() noexcept { return m_textureHandle.GetAllocation(); }
 
 	//rhi::HeapHandle GetPlacedResourceHeap() const {
 	//	return m_placedResourceHeap;

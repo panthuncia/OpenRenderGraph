@@ -583,8 +583,14 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
 
     RefreshDescriptorContents();
     ProbeVirtualShadowBufferStep(GetName(), "after descriptor refresh");
+    ApplyRelocationClass(GetGlobalResourceID());
     ++m_backingGeneration;
     OnBackingMaterialized();
+}
+
+rhi::ma::Allocation* BufferBase::RelocationAllocation() noexcept {
+    std::scoped_lock lock(m_materializationMutex);
+    return m_dataBuffer ? m_dataBuffer->GetAllocation() : nullptr;
 }
 
 BackingAllocationSnapshot BufferBase::CaptureBackingAllocation(bool retain) {
@@ -771,6 +777,7 @@ void BufferBase::SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t 
     m_dataBuffer = std::move(backing);
     m_bufferSize = bufferSize;
     RefreshDescriptorContents();
+    ApplyRelocationClass(GetGlobalResourceID());
     ++m_backingGeneration;
     if (m_dataBuffer) {
         OnBackingMaterialized();

@@ -17,6 +17,28 @@
 
 namespace org {
 
+namespace {
+
+// The class a resource allocation starts with, when the caller names none (org-relocation.md, "Movability"):
+// - memory the CPU maps (upload, readback, ReBAR) never moves,
+// - shared resources never move: another API or process holds them,
+// - any other device-local resource is Written until its owner says it is sealed (BackedResource::SetRelocationClass).
+relocation::Class DefaultResourceClass(const rhi::ma::AllocationDesc& allocDesc, const rhi::ResourceDesc& resourceDesc) noexcept {
+    if (allocDesc.heapType != rhi::HeapType::DeviceLocal) return relocation::Class::Pinned;
+    const auto shared = static_cast<uint32_t>(rhi::HeapFlags::Shared) | static_cast<uint32_t>(rhi::HeapFlags::SharedCrossAdapter);
+    if ((static_cast<uint32_t>(allocDesc.extraHeapFlags) & shared) != 0u) return relocation::Class::Pinned;
+    if ((static_cast<uint32_t>(resourceDesc.heapFlags) & shared) != 0u) return relocation::Class::Pinned;
+    return relocation::Class::Written;
+}
+
+void AttachRecord(TrackedHandle& handle, relocation::Class cls, uint64_t resourceID) {
+    auto* allocation = handle.GetAllocation();
+    if (!allocation) return;
+    handle.AttachRelocationRecord(std::make_unique<relocation::RelocationRecord>(cls, resourceID, allocation->GetSize()));
+}
+
+} // namespace
+
 rhi::Result DeviceManager::CreateResourceTracked(
     const rhi::ma::AllocationDesc& allocDesc,
     const rhi::ResourceDesc& resourceDesc,
@@ -58,6 +80,11 @@ rhi::Result DeviceManager::CreateResourceTracked(
     tok.ApplyAttachBundle(track.attach);
 
     outAllocation = TrackedHandle::FromAllocation(std::move(alloc), std::move(tok));
+    if (rhi::IsOk(result)) {
+        // A resource ID of -1 (no owner) is stored as 0.
+        const uint64_t owner = track.globalResourceID == static_cast<uint64_t>(-1) ? 0 : track.globalResourceID;
+        AttachRecord(outAllocation, track.relocationClass.value_or(DefaultResourceClass(allocDesc, resourceDesc)), owner);
+    }
     return result;
 }
 
@@ -163,6 +190,11 @@ rhi::Result DeviceManager::AllocateMemoryTracked(
 
     tok.ApplyAttachBundle(track.attach);
     outAllocation = TrackedHandle::FromAllocation(std::move(alloc), std::move(tok));
+    // Raw memory is an alias heap or a frame arena chunk. Placed resources live in it, so it never moves.
+    if (rhi::IsOk(result)) {
+        const uint64_t owner = track.globalResourceID == static_cast<uint64_t>(-1) ? 0 : track.globalResourceID;
+        AttachRecord(outAllocation, track.relocationClass.value_or(relocation::Class::Pinned), owner);
+    }
     return result;
 }
 

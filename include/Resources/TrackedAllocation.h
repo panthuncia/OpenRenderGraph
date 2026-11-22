@@ -1,13 +1,16 @@
 #pragma once
 
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <variant>
 #include <stdexcept>
 
 #include <flecs.h>
 #include <rhi_allocator.h>
 
+#include "Resources/RelocationRecord.h"
 #include "Resources/ResourceIdentifier.h"
 
 
@@ -283,6 +286,7 @@ public:
             Reset(); // Release native objects before their lifetime dependencies.
             leaseOwner_ = std::move(other.leaseOwner_);
             h_ = std::move(other.h_);
+            record_ = std::move(other.record_);
             tok_ = std::move(other.tok_);
             lifetimeOwner_ = std::move(other.lifetimeOwner_);
         }
@@ -344,8 +348,26 @@ public:
             if constexpr (!std::is_same_v<V, std::monostate>) v.Reset();
             }, h_);
         h_ = std::monostate{};
+        // The record goes after the allocation, so the allocation never points at a freed record.
+        record_.reset();
         tok_.Reset(); // enqueues entity deletion (main thread flush later)
         lifetimeOwner_.reset();
+    }
+
+    // Gives the allocation its owner record (relocation::RecordOf). The holder keeps the record as long as the
+    // allocation. Set once, at creation, before the handle is published. Does nothing for a handle without an allocation.
+    void AttachRelocationRecord(std::unique_ptr<relocation::RelocationRecord> record) noexcept {
+        if (leaseOwner_) { leaseOwner_->AttachRelocationRecord(std::move(record)); return; }
+        auto* allocation = GetAllocation();
+        if (!allocation || !record) return;
+        allocation->SetPrivateData(record.get());
+        record_ = std::move(record);
+    }
+
+    // The allocation's owner record, or null.
+    relocation::RelocationRecord* GetRelocationRecord() noexcept {
+        if (leaseOwner_) return leaseOwner_->GetRelocationRecord();
+        return record_.get();
     }
 
     // If you want to hand out the underlying pointer and keep the entity alive:
@@ -356,7 +378,12 @@ public:
             return leaseOwner_->ReleaseAllocationDisarm();
         }
         tok_.Disarm();
-        if (auto* p = std::get_if<rhi::ma::AllocationPtr>(&h_)) return std::move(*p);
+        if (auto* p = std::get_if<rhi::ma::AllocationPtr>(&h_)) {
+            // The record stays with this handle. The allocation must not point at it once it leaves.
+            if (p->Get()) p->Get()->SetPrivateData(nullptr);
+            record_.reset();
+            return std::move(*p);
+        }
         return {};
     }
 
@@ -393,6 +420,7 @@ private:
     std::shared_ptr<const void> lifetimeOwner_;
     std::shared_ptr<TrackedHandle> leaseOwner_;
     std::variant<std::monostate, rhi::ma::AllocationPtr, rhi::ResourcePtr> h_;
+    std::unique_ptr<relocation::RelocationRecord> record_;
     TrackedEntityToken tok_;
 };
 
@@ -411,6 +439,10 @@ struct AllocationTrackDesc {
 
 	// Arbitrary attachments
     EntityComponentBundle attach;
+
+    // The owner record's class (relocation::Class). Unset: DeviceManager picks the default for the allocation (see
+    // DeviceManager::CreateResourceTracked).
+    std::optional<relocation::Class> relocationClass;
 };
 
 

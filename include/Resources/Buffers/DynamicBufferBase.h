@@ -241,6 +241,8 @@ protected:
 
     virtual void OnBackingMaterialized() {}
 
+    rhi::ma::Allocation* RelocationAllocation() noexcept override;
+
 	// Engine representation of a GPU buffer- owns a handle to the actual GPU resource.
     std::unique_ptr<GpuBufferBacking> m_dataBuffer;
     rhi::HeapType m_accessType = rhi::HeapType::DeviceLocal;

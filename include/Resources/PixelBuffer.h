@@ -139,6 +139,9 @@ public:
 
     ~PixelBuffer() override;
 
+protected:
+    rhi::ma::Allocation* RelocationAllocation() noexcept override;
+
 private:
     PixelBuffer(const TextureDescription& desc, bool materialize);
 
