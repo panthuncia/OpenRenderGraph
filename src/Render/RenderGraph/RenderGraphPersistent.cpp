@@ -958,7 +958,7 @@ void RenderGraph::BootstrapPersistentGraph() {
 // that version's resource list, its requirements name the version, and its keep-alives and the graph's transient pin hold
 // it. Preparations bind the version they select, so a new version needs no new declaration. Without this, the graph would
 // hold the old version until its next build.
-// So once a newer version is current, each such declaration moves to it here, as a redeclaration would. Its uses lower to
+// So once a preparation binds a newer version, each such declaration moves to it here, as a redeclaration would. Its uses lower to
 // the same slot, so the installed executable stays. The pass's use layout names resources by ID only, so it stays too.
 // Frames in flight keep what they run: their bindings own the versions they bind (BindVersion).
 void RenderGraph::ReleaseReplacedVersionDeclarations() {
@@ -967,7 +967,9 @@ void RenderGraph::ReleaseReplacedVersionDeclarations() {
 	bool changed = std::exchange(state.versionSweepRetry, false);
 	for (auto& entry : state.entries) {
 		if (!entry.versioned || entry.retired || entry.versioned->PerFrame() || entry.versioned->LateBound()) continue;
-		const auto current = entry.versioned->SelectVersion(nullptr);
+		// The version this preparation binds: a revision's pending one while its recordings are made, else the current one.
+		// A revision's recordings are replayed after its adoption without another preparation, so the move happens here.
+		const auto current = entry.versioned->SelectVersion(m_resolverCaptureContext.get());
 		if (!current || current->number == entry.sweptVersion) continue;
 		entry.sweptVersion = current->number;
 		changed = true;
@@ -993,7 +995,7 @@ void RenderGraph::ReleaseReplacedVersionDeclarations() {
 						++leftSet;
 						continue;
 					}
-					const auto current = versioned->SelectVersion(nullptr);
+					const auto current = versioned->SelectVersion(m_resolverCaptureContext.get());
 					if (!current || current->declaration == snapshot.state) continue;
 					// Only an older version moves. A newer one, such as a revision's or a pending reshape's, stays.
 					if (snapshot.state->resourceSetIdentity.high >= current->number) continue;
