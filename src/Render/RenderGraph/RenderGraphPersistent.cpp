@@ -964,7 +964,7 @@ void RenderGraph::BootstrapPersistentGraph() {
 void RenderGraph::ReleaseReplacedVersionDeclarations() {
 	auto& state = *m_compilerState->persistent;
 	// A cheap test first: has any versioned slot's current version changed since the last sweep?
-	bool changed = false;
+	bool changed = std::exchange(state.versionSweepRetry, false);
 	for (auto& entry : state.entries) {
 		if (!entry.versioned || entry.retired || entry.versioned->PerFrame() || entry.versioned->LateBound()) continue;
 		const auto current = entry.versioned->SelectVersion(nullptr);
@@ -977,6 +977,9 @@ void RenderGraph::ReleaseReplacedVersionDeclarations() {
 	// The replaced versions' resource IDs. Resource IDs are never reused.
 	std::unordered_set<uint64_t> replaced;
 	size_t passes = 0;
+	// Snapshots left on an older version, by why: not one resource, no declaration yet, another shape.
+	size_t leftSet = 0, leftWaiting = 0, leftShape = 0;
+	std::string movedNames;  // the first passes moved, so the log says which graph it is
 	for (auto& any : m_masterPassList) {
 		std::visit([&](auto& value) {
 			using T = std::decay_t<decltype(value)>;
@@ -985,15 +988,28 @@ void RenderGraph::ReleaseReplacedVersionDeclarations() {
 				std::unordered_map<uint64_t, Resource*> moves;
 				for (auto& snapshot : value.resolverSnapshots) {
 					const auto* versioned = lowering::PreparedVersions(snapshot.resolver.get());
-					if (!versioned || !snapshot.state || !snapshot.state->resources || snapshot.state->resources->size() != 1) continue;
+					if (!versioned || !snapshot.state || !snapshot.state->resources) continue;
+					if (snapshot.state->resources->size() != 1) {
+						++leftSet;
+						continue;
+					}
 					const auto current = versioned->SelectVersion(nullptr);
-					if (!current || !current->declaration || !current->resource || current->declaration == snapshot.state) continue;
+					if (!current || current->declaration == snapshot.state) continue;
 					// Only an older version moves. A newer one, such as a revision's or a pending reshape's, stays.
 					if (snapshot.state->resourceSetIdentity.high >= current->number) continue;
+					// The current version has no declaration or resource yet. The pass moves at a later preparation.
+					if (!current->declaration || !current->resource) {
+						state.versionSweepRetry = true;
+						++leftWaiting;
+						continue;
+					}
 					const auto* declared = snapshot.state->resources->front().get();
 					// A version of another slice count: the graph was lowered for the old shape, and graphs built for the new
 					// one replace it.
-					if (!declared || lowering::ShapeOf(*declared) != lowering::ShapeOf(*current->resource)) continue;
+					if (!declared || lowering::ShapeOf(*declared) != lowering::ShapeOf(*current->resource)) {
+						++leftShape;
+						continue;
+					}
 					const auto oldID = declared->GetGlobalResourceID();
 					moves.emplace(oldID, current->resource.get());
 					replaced.insert(oldID);
@@ -1002,6 +1018,7 @@ void RenderGraph::ReleaseReplacedVersionDeclarations() {
 				}
 				if (moves.empty()) return;
 				++passes;
+				if (passes <= 3) movedNames += (movedNames.empty() ? "" : ", ") + any.name;
 				auto& resources = value.resources;
 				const auto move = [&](ResourceHandleAndRange& use) {
 					if (use.resource.IsEphemeral()) return;
@@ -1017,6 +1034,9 @@ void RenderGraph::ReleaseReplacedVersionDeclarations() {
 			}
 		}, any.pass);
 	}
+	if (leftSet || leftWaiting || leftShape)
+		spdlog::info("Persistent declarations left on replaced versions: {} of a resource set, {} waiting for the current declaration, {} of another shape",
+			leftSet, leftWaiting, leftShape);
 	if (replaced.empty()) return;
 	// The graph's transient pin of a replaced version goes, unless a pass still names it, for example by pointer.
 	std::unordered_set<uint64_t> named;
@@ -1048,8 +1068,8 @@ void RenderGraph::ReleaseReplacedVersionDeclarations() {
 		m_transientFrameResourcesByID.erase(found);
 		++released;
 	}
-	spdlog::info("Persistent declarations moved off {} replaced versions in {} passes; {} transient pins released",
-		replaced.size(), passes, released);
+	spdlog::info("Persistent declarations moved off {} replaced versions in {} passes ({}); {} transient pins released",
+		replaced.size(), passes, movedNames, released);
 }
 
 // Steps 1-2 of a preparation: the passes' declarations, group memberships and backings, and the edits they make.

@@ -421,6 +421,8 @@ struct RenderGraph::PersistentInstanceState {
 
 	persistent::GraphProgram program;
 	std::vector<SlotEntry> entries;                                // Index == slot index.
+	// A sweep left a pass on a replaced version it could not move yet, so the next preparation sweeps again.
+	bool versionSweepRetry = false;
 	std::unordered_map<uint64_t, std::vector<uint32_t>> entriesByResourceID;
 	// Resources whose last direct slot retired. A declared resource is pinned in the graph's transient maps
 	// (TrackTransientFrameResource), which keep it alive for the executions that bind it, raw slot pointers and publication
