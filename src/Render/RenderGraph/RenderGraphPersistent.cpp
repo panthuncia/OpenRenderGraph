@@ -954,6 +954,104 @@ void RenderGraph::BootstrapPersistentGraph() {
 	}
 }
 
+// A pass that declares a versioned resource captured the version current at its declaration. Its resolver snapshot owns
+// that version's resource list, its requirements name the version, and its keep-alives and the graph's transient pin hold
+// it. Preparations bind the version they select, so a new version needs no new declaration. Without this, the graph would
+// hold the old version until its next build.
+// So once a newer version is current, each such declaration moves to it here, as a redeclaration would. Its uses lower to
+// the same slot, so the installed executable stays. The pass's use layout names resources by ID only, so it stays too.
+// Frames in flight keep what they run: their bindings own the versions they bind (BindVersion).
+void RenderGraph::ReleaseReplacedVersionDeclarations() {
+	auto& state = *m_compilerState->persistent;
+	// A cheap test first: has any versioned slot's current version changed since the last sweep?
+	bool changed = false;
+	for (auto& entry : state.entries) {
+		if (!entry.versioned || entry.retired || entry.versioned->PerFrame() || entry.versioned->LateBound()) continue;
+		const auto current = entry.versioned->SelectVersion(nullptr);
+		if (!current || current->number == entry.sweptVersion) continue;
+		entry.sweptVersion = current->number;
+		changed = true;
+	}
+	if (!changed) return;
+	BT_ZONE_SCOPE("ORG.Persistent.ReleaseReplacedVersionDeclarations");
+	// The replaced versions' resource IDs. Resource IDs are never reused.
+	std::unordered_set<uint64_t> replaced;
+	size_t passes = 0;
+	for (auto& any : m_masterPassList) {
+		std::visit([&](auto& value) {
+			using T = std::decay_t<decltype(value)>;
+			if constexpr (!std::is_same_v<T, std::monostate>) {
+				// Old resource ID to the current version's resource, for this pass.
+				std::unordered_map<uint64_t, Resource*> moves;
+				for (auto& snapshot : value.resolverSnapshots) {
+					const auto* versioned = lowering::PreparedVersions(snapshot.resolver.get());
+					if (!versioned || !snapshot.state || !snapshot.state->resources || snapshot.state->resources->size() != 1) continue;
+					const auto current = versioned->SelectVersion(nullptr);
+					if (!current || !current->declaration || !current->resource || current->declaration == snapshot.state) continue;
+					// Only an older version moves. A newer one, such as a revision's or a pending reshape's, stays.
+					if (snapshot.state->resourceSetIdentity.high >= current->number) continue;
+					const auto* declared = snapshot.state->resources->front().get();
+					// A version of another slice count: the graph was lowered for the old shape, and graphs built for the new
+					// one replace it.
+					if (!declared || lowering::ShapeOf(*declared) != lowering::ShapeOf(*current->resource)) continue;
+					const auto oldID = declared->GetGlobalResourceID();
+					moves.emplace(oldID, current->resource.get());
+					replaced.insert(oldID);
+					// This may release the old version's resource list. Only IDs are used from here on.
+					snapshot.state = current->declaration;
+				}
+				if (moves.empty()) return;
+				++passes;
+				auto& resources = value.resources;
+				const auto move = [&](ResourceHandleAndRange& use) {
+					if (use.resource.IsEphemeral()) return;
+					if (const auto found = moves.find(use.resource.GetGlobalResourceID()); found != moves.end())
+						use.resource = RequestResourceHandle(found->second);
+				};
+				for (auto& requirement : resources.staticResourceRequirements) move(requirement.resourceHandleAndRange);
+				for (auto& requirement : resources.frameResourceRequirements) move(requirement.resourceHandleAndRange);
+				for (auto& transition : resources.internalTransitions) move(transition.first);
+				resources.mergedFrameRequirementsDirty = true;
+				value.retainedAnonymousKeepAlive = CaptureRetainedAnonymousKeepAlive(
+					resources.staticResourceRequirements, resources.internalTransitions);
+			}
+		}, any.pass);
+	}
+	if (replaced.empty()) return;
+	// The graph's transient pin of a replaced version goes, unless a pass still names it, for example by pointer.
+	std::unordered_set<uint64_t> named;
+	for (const auto& any : m_masterPassList) {
+		std::visit([&](const auto& value) {
+			using T = std::decay_t<decltype(value)>;
+			if constexpr (!std::is_same_v<T, std::monostate>) {
+				const auto note = [&](const ResourceHandleAndRange& use) {
+					const auto id = use.resource.GetGlobalResourceID();
+					if (replaced.contains(id)) named.insert(id);
+				};
+				const auto& resources = value.resources;
+				for (const auto& requirement : resources.staticResourceRequirements) note(requirement.resourceHandleAndRange);
+				for (const auto& requirement : resources.frameResourceRequirements) note(requirement.resourceHandleAndRange);
+				for (const auto& transition : resources.internalTransitions) note(transition.first);
+			}
+		}, any.pass);
+	}
+	size_t released = 0;
+	for (const auto id : replaced) {
+		if (named.contains(id) || resourcesByID.contains(id)) continue;
+		const auto found = m_transientFrameResourcesByID.find(id);
+		if (found == m_transientFrameResourcesByID.end()) continue;
+		if (found->second) {
+			if (const auto byName = m_transientFrameResourcesByName.find(found->second->GetName());
+				byName != m_transientFrameResourcesByName.end() && byName->second == found->second)
+				m_transientFrameResourcesByName.erase(byName);
+		}
+		m_transientFrameResourcesByID.erase(found);
+		++released;
+	}
+	spdlog::info("Persistent declarations moved off {} replaced versions in {} passes; {} transient pins released",
+		replaced.size(), passes, released);
+}
+
 // Steps 1-2 of a preparation: the passes' declarations, group memberships and backings, and the edits they make.
 void RenderGraph::BindPersistentFrame(bool bootstrap) {
 	auto& compiler = *m_compilerState;
@@ -975,6 +1073,9 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 		std::vector<RemapCandidate> remapCandidates;
 		std::optional<persistent::GraphEditTransaction> edit;
 		AdvancePersistentStructuralBuild(structural);
+		// Declarations of replaced versions move to the current ones. A pending build lowered the old declarations, so
+		// this waits until it installs.
+		if (!bootstrap && !state.pending) ReleaseReplacedVersionDeclarations();
 		// Alias re-placement when the packing strategy changed since the latest plan (plans run only on structural builds).
 		const bool packingChanged = m_getAutoAliasPackingStrategy && m_getAutoAliasPackingStrategy() != state.aliasPackingStrategy;
 		if (packingChanged && !state.pending) {

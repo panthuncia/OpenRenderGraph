@@ -1034,6 +1034,9 @@ public:
 private:
 	// Lets go of the transient pins of resources no execution binds any more (PersistentInstanceState::retiredPins).
 	void ReleaseRetiredPins(std::span<const compiler::ExecutionTimelinePoint> reached);
+	// Moves the passes' declarations of a versioned resource off a replaced version, so the graph holds it no more.
+	// Owner thread, in BindPersistentFrame.
+	void ReleaseReplacedVersionDeclarations();
 	void TrackTransientFrameResource(Resource* resource);
 	void ShutdownOwnedState();
 

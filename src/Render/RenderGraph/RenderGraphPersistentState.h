@@ -349,6 +349,9 @@ struct RenderGraph::PersistentInstanceState {
 			FrozenExecutionBindings::ResourceBinding binding;
 		};
 		std::optional<FrameBinding> frameBinding;
+		// A versioned slot's current version number when the passes' declarations last moved to it
+		// (RenderGraph::ReleaseReplacedVersionDeclarations).
+		uint64_t sweptVersion = 0;
 		bool multiDevice = false;          // A pass on another device than the primary uses it: bound with representations.
 		bool retired = false;              // Slot removed from the program; the index may be reclaimed.
 		std::vector<uint32_t> subscribers; // Main pass indices resolving this slot.
