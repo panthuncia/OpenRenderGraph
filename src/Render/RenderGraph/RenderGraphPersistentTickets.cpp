@@ -35,6 +35,12 @@ std::shared_ptr<RenderGraph::PersistentTicket> RenderGraph::PreparePersistentTic
 	execute.hostData = hostData.get();
 	execute.ownedHostData = hostData;
 	Execute(execute);
+	// The host data was this preparation's, and the caller keeps it while its recording lives. Kept on the graph too, it would
+	// hold what it names, such as a revision's versions, until the graph's next preparation. A revision-driven epoch may not
+	// prepare again for many frames.
+	m_resolverCaptureContext.reset();
+	m_asyncUpdateHostData.reset();
+	if (hostData && m_compilerState->lastSubmittedFrameData == hostData) m_compilerState->lastSubmittedFrameData.reset();
 	return ticket;
 }
 
