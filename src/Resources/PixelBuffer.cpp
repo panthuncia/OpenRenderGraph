@@ -297,6 +297,13 @@ bool PixelBuffer::AdoptRelocatedBacking(std::unique_ptr<GpuTextureBacking>& next
     return true;
 }
 
+rhi::Result PixelBuffer::MakeDefragmentationResource(const rhi::ma::Allocation& source, rhi::ma::Allocation& destination, rhi::ResourcePtr& out) {
+    std::scoped_lock lock(m_materializationMutex);
+    if (!m_backing || m_backing->GetAllocation() != &source || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid())
+        return rhi::Result::InvalidCall;
+    return m_backing->CreateResourceAt(destination, name.empty() ? nullptr : name.c_str(), out);
+}
+
 rhi::ma::Allocation* PixelBuffer::RelocationAllocation() noexcept {
     std::scoped_lock lock(m_materializationMutex);
     return m_backing ? m_backing->GetAllocation() : nullptr;

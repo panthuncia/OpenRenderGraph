@@ -85,9 +85,48 @@ rhi::ResourceDesc TextureResourceDesc(const TextureDescription& desc)
 	return textureDesc;
 }
 
+namespace {
+// The clear value a texture of this description is created with. False when it has none (no RTV or DSV).
+bool ClearValueOf(const TextureDescription& desc, rhi::ClearValue& out)
+{
+	out = {};
+	if (desc.hasDSV) {
+		out.type = rhi::ClearValueType::DepthStencil;
+		out.format = desc.dsvFormat == rhi::Format::Unknown ? desc.format : desc.dsvFormat;
+		out.depthStencil.depth = desc.depthClearValue;
+		out.depthStencil.stencil = 0;
+		return true;
+	}
+	if (desc.hasRTV) {
+		out.type = rhi::ClearValueType::Color;
+		out.format = desc.rtvFormat == rhi::Format::Unknown ? desc.format : desc.rtvFormat;
+		out.rgba[0] = desc.clearColor[0];
+		out.rgba[1] = desc.clearColor[1];
+		out.rgba[2] = desc.clearColor[2];
+		out.rgba[3] = desc.clearColor[3];
+		return true;
+	}
+	return false;
+}
+}
+
 GpuTextureBacking::GpuTextureBacking(CreateTag)
 {
 
+}
+
+rhi::Result GpuTextureBacking::CreateResourceAt(rhi::ma::Allocation& destination, const char* name, rhi::ResourcePtr& out) const
+{
+	rhi::ResourceDesc textureDesc = TextureResourceDesc(m_desc);
+	rhi::ClearValue clearValue{};
+	textureDesc.texture.optimizedClear = ClearValueOf(m_desc, clearValue) ? &clearValue : nullptr;
+	// Both APIs: a placed texture made over memory another resource used starts Undefined.
+	textureDesc.texture.initialLayout = rhi::ResourceLayout::Undefined;
+	const auto castableCount = static_cast<UINT32>(m_desc.castableFormats.size());
+	const rhi::Format* castable = castableCount ? m_desc.castableFormats.data() : nullptr;
+	const auto result = DeviceManager::GetInstance().CreateResourceAt(destination, textureDesc, castableCount, castable, out);
+	if (rhi::IsOk(result) && out && name) out->SetName(name);
+	return result;
 }
 
 GpuTextureBacking::~GpuTextureBacking()
@@ -134,25 +173,8 @@ void GpuTextureBacking::initialize(const TextureDescription& desc,
 	DescriptorHeapManager& rm = DescriptorHeapManager::GetInstance();
 
 	// Handle clear values for RTV and DSV
-	rhi::ClearValue* clearValue = nullptr;
-	rhi::ClearValue depthClearValue = {};
-	rhi::ClearValue colorClearValue = {};
-	if (desc.hasDSV) {
-		depthClearValue.type = rhi::ClearValueType::DepthStencil;
-		depthClearValue.format = desc.dsvFormat == rhi::Format::Unknown ? desc.format : desc.dsvFormat;
-		depthClearValue.depthStencil.depth = desc.depthClearValue;
-		depthClearValue.depthStencil.stencil = 0;
-		clearValue = &depthClearValue;
-	}
-	else if (desc.hasRTV) {
-		colorClearValue.type = rhi::ClearValueType::Color;
-		colorClearValue.format = desc.rtvFormat == rhi::Format::Unknown ? desc.format : desc.rtvFormat;
-		colorClearValue.rgba[0] = desc.clearColor[0];
-		colorClearValue.rgba[1] = desc.clearColor[1];
-		colorClearValue.rgba[2] = desc.clearColor[2];
-		colorClearValue.rgba[3] = desc.clearColor[3];
-		clearValue = &colorClearValue;
-	}
+	rhi::ClearValue clearStorage{};
+	rhi::ClearValue* clearValue = ClearValueOf(desc, clearStorage) ? &clearStorage : nullptr;
 
 	rhi::ResourceDesc textureDesc = TextureResourceDesc(desc);
 	textureDesc.texture.optimizedClear = clearValue;

@@ -27,7 +27,9 @@ public:
     };
 
     static std::shared_ptr<Buffer> CreateShared(rhi::HeapType accessType, uint64_t bufferSize, bool unorderedAccess = false) {
-        return std::shared_ptr<Buffer>(new Buffer(accessType, bufferSize, unorderedAccess, true));
+        auto buffer = std::shared_ptr<Buffer>(new Buffer(accessType, bufferSize, unorderedAccess, true));
+        buffer->NoteRelocationOwner();
+        return buffer;
     }
 
     static std::shared_ptr<Buffer> CreateSharedUnmaterialized(rhi::HeapType accessType, uint64_t bufferSize, bool unorderedAccess = false) {

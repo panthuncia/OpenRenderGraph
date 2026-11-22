@@ -34,7 +34,9 @@
 #include "HostUploadExtension.h"
 #include "FramePlacement.h"
 #include "Resources/PixelBuffer.h"
+#include "Resources/Defragmenter.h"
 #include "Resources/Relocation.h"
+#include "Managers/Singletons/DeviceManager.h"
 #include "../Render/RenderGraph/AliasPacking.h"
 
 #include <unordered_map>
@@ -1821,6 +1823,55 @@ size_t GraphHost::CommitRelocationsNow(bool gpuIdle) {
 		spdlog::error("GraphHost: committing relocations failed: {}", error.what());
 		return 0;
 	}
+}
+
+relocation::DefragmentReport GraphHost::DefragmentAtIdle(const relocation::DefragmentBudget& budget) {
+	CheckOwner("DefragmentAtIdle");
+	relocation::DefragmentReport report;
+	auto* allocator = DeviceManager::GetInstance().GetAllocator();
+	if (!AnyGraph() || !allocator) return report;
+	auto& defragmenter = relocation::Defragmenter::Get();
+	if (!defragmenter.WantsCall(budget, *allocator)) return report;
+	BT_ZONE_SCOPE("ORG.Defragmenter.Call");
+	using Clock = std::chrono::steady_clock;
+	const auto milliseconds = [](Clock::time_point from, Clock::time_point to) {
+		return std::chrono::duration<double, std::milli>(to - from).count();
+	};
+	const auto start = Clock::now();
+	// Every queue the graphs use reaches what was submitted so far. A bounded wait: a GPU that does not go idle in time skips the
+	// call rather than stall the loading screen.
+	constexpr uint32_t kIdleTimeoutMs = 2000;
+	bool idle = true;
+	const auto waitIdle = [&] {
+		const auto from = Clock::now();
+		DrainSubmissions("defragmentation");
+		idle = SubmittedPoint().Wait(kIdleTimeoutMs);
+		report.waitMilliseconds += milliseconds(from, Clock::now());
+	};
+	while (report.passes < budget.maxPasses && milliseconds(start, Clock::now()) < budget.maxMilliseconds) {
+		waitIdle();
+		if (!idle) {
+			spdlog::warn("ORG defragmenter: the GPU did not go idle within {} ms. No pass this call", kIdleTimeoutMs);
+			break;
+		}
+		// Retirements whose GPU work is done go now. Old ranges of the last pass free their blocks here, so the next pass counts them.
+		(void)DescriptorHeapManager::GetInstance().ProcessDeferredReleasesElsewhere();
+		if (!defragmenter.ArmPass(budget, *allocator)) break;
+		const auto passStart = Clock::now();
+		(void)CommitRelocationsNow(true);
+		const double passMs = milliseconds(passStart, Clock::now());
+		defragmenter.FinishPass(passMs, report, waitIdle);
+		report.passMilliseconds += passMs;
+		++report.passes;
+	}
+	report.campaignActive = defragmenter.CampaignActive();
+	if (report.moves) basic_telemetry::AddCounter("ORG.Defragmenter.Moves", static_cast<int64_t>(report.moves));
+	return report;
+}
+
+void GraphHost::EndDefragmentation() {
+	CheckOwner("EndDefragmentation");
+	relocation::Defragmenter::Get().EndCampaign("the idle point ended");
 }
 
 void GraphHost::PassSeal(const std::shared_ptr<GpuPoint::Pending>& a_marker) {

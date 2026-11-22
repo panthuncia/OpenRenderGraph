@@ -28,6 +28,7 @@ public:
     static std::shared_ptr<PixelBuffer> CreateShared(const TextureDescription& desc)
     {
         auto pb = std::shared_ptr<PixelBuffer>(new PixelBuffer(desc, true));
+        pb->NoteRelocationOwner();
         return pb;
     }
 
@@ -146,6 +147,9 @@ public:
     //   the slots rotate: frames in flight keep the old ones, and new work gets new indices.
     // Bumps the backing generation and drops the cached publication snapshot. False when nothing changed.
     bool AdoptRelocatedBacking(std::unique_ptr<GpuTextureBacking>& next, uint64_t fromGeneration, bool rewriteInPlace);
+    // Defragmentation. Creates the current backing's texture again at the start of destination, when the current backing's
+    // allocation is source. Fails when the backing changed, or for an attached representation. The caller owns the result.
+    rhi::Result MakeDefragmentationResource(const rhi::ma::Allocation& source, rhi::ma::Allocation& destination, rhi::ResourcePtr& out);
 
     void EnsureVirtualDescriptorSlotsAllocated() override;
 

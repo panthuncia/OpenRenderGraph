@@ -3,9 +3,15 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 
 namespace rhi::ma {
 class Allocation;
+}
+
+namespace org {
+class Resource;
 }
 
 // Owner records for relocation (docs: org-relocation.md, "Movability").
@@ -51,11 +57,18 @@ public:
     uint64_t ResourceID() const noexcept { return m_resourceID.load(std::memory_order_acquire); }
     void SetResourceID(uint64_t id) noexcept { m_resourceID.store(id, std::memory_order_release); }
     uint64_t SizeBytes() const noexcept { return m_sizeBytes; }
+    // The resource whose backing this allocation is. The defragmenter, which only sees allocations, moves the resource through it.
+    // Set by the owner (BackedResource::ApplyRelocationClass, BackedResource::NoteRelocationOwner). Null when no resource owns the
+    // allocation, or when the resource is gone.
+    std::shared_ptr<Resource> Owner() const;
+    void SetOwner(std::weak_ptr<Resource> owner);
 
 private:
     std::atomic<Class> m_class;
     std::atomic<uint64_t> m_resourceID;
     uint64_t m_sizeBytes = 0;
+    mutable std::mutex m_ownerMutex;
+    std::weak_ptr<Resource> m_owner;
 };
 
 // The record of an allocation. Null when the allocation has none (untracked allocations, placed resources).
@@ -73,6 +86,16 @@ struct Stats {
     std::array<uint64_t, static_cast<size_t>(Class::Count)> records{};      // live: owner records by class
     std::array<uint64_t, static_cast<size_t>(Class::Count)> recordBytes{};  // live: their allocation sizes
     uint64_t journalHead = 0;  // entries written to the relocation journal
+    // The defragmenter (relocation::Defragmenter).
+    uint64_t defragCampaigns = 0;      // campaigns started
+    uint64_t defragPasses = 0;         // passes run
+    uint64_t defragMoves = 0;          // moves handed to the commit
+    uint64_t defragMovedBytes = 0;     // their sizes
+    uint64_t defragIgnored = 0;        // moves the allocator proposed that the defragmenter left in place
+    uint64_t defragBlocksFreed = 0;    // blocks fewer at the start of a pass than at the start of the one before
+    uint64_t defragMicroseconds = 0;   // time in passes, without the waits for the GPU
+    uint64_t defragLingering = 0;      // live: old ranges kept until no recording names them
+    uint64_t defragLingeringBytes = 0; // live: their sizes
 };
 // Any thread.
 Stats GetStats() noexcept;
@@ -84,6 +107,11 @@ void NoteIgnored(IgnoreReason reason) noexcept;
 void NoteAwaitingRetirement(uint64_t bytes) noexcept;
 void NoteRetired(uint64_t bytes) noexcept;
 void NoteJournalHead(uint64_t head) noexcept;
+void NoteDefragCampaign() noexcept;
+// One pass: the moves handed to the commit, their bytes, the proposed moves left in place, the blocks freed since the last pass
+// and the pass's time.
+void NoteDefragPass(uint64_t moves, uint64_t bytes, uint64_t ignored, uint64_t blocksFreed, uint64_t microseconds) noexcept;
+void NoteDefragLingering(int64_t count, int64_t bytes) noexcept;
 }
 
 } // namespace org::relocation

@@ -62,6 +62,9 @@ public:
     }
 	// The backing's own allocation. Null for a texture placed in an alias heap.
 	rhi::ma::Allocation* GetAllocation() noexcept { return m_textureHandle.GetAllocation(); }
+	// Defragmentation. Creates this texture's resource again, with the same description and clear value, at the start of
+	// destination. It starts Undefined: a copy into it discards what the memory held. The caller owns the result.
+	rhi::Result CreateResourceAt(rhi::ma::Allocation& destination, const char* name, rhi::ResourcePtr& out) const;
 
 	//rhi::HeapHandle GetPlacedResourceHeap() const {
 	//	return m_placedResourceHeap;
