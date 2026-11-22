@@ -3002,6 +3002,12 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 				if (const auto recording = weak.lock()) AddRevisionCandidate(state, epochIndex, *ticket, *recording);
 		} else {
 			const auto version = state.backingVersion.load(std::memory_order_acquire);
+			// A kept recording of an older build or older versions never binds again, yet holds what it bound. Every copy's goes
+			// now, not only when its copy is next taken: a copy may not be taken again for a long time. A run still in flight
+			// holds its own reference.
+			if (keepsLive)
+				for (auto& entry : state.liveKept[epochIndex])
+					if (entry.recording && (entry.generation != state.generation[epochIndex] || entry.version != version)) entry = {};
 			// A live epoch's kept copy.
 			const bool liveCopy = keepsLive && lease->copy != RunRef::kNoCopy;
 			if (liveCopy && !reprepare) {
