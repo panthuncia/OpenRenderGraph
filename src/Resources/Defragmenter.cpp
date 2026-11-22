@@ -10,6 +10,7 @@
 #include <spdlog/spdlog.h>
 #include <BasicTelemetry/Tracy.h>
 
+#include "Managers/Singletons/DeviceManager.h"
 #include "Resources/AllocationRelease.h"
 #include "Resources/BackedResource.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
@@ -22,7 +23,8 @@ namespace {
 
 constexpr double kMiB = 1024.0 * 1024.0;
 
-// The device-local block vectors' figures. Committed allocations count as blocks with no free space in them.
+// The device-local block vectors' figures. Committed allocations count as blocks with no free space in them. The PerFrame pool's
+// blocks are left out: the defragmenter never moves into or out of them.
 struct DeviceLocalBlocks {
     uint32_t blocks = 0;
     uint64_t blockBytes = 0;
@@ -36,6 +38,14 @@ DeviceLocalBlocks MeasureDeviceLocal(rhi::ma::Allocator& allocator) {
     DeviceLocalBlocks out;
     out.blocks = local.blockCount;
     out.blockBytes = local.blockBytes;
+    rhi::ma::Statistics perFrame{};
+    if (DeviceManager::GetInstance().MemoryGroupStatistics(MemoryGroup::PerFrame, rhi::HeapType::DeviceLocal, perFrame)) {
+        out.blocks = out.blocks > perFrame.blockCount ? out.blocks - perFrame.blockCount : 0;
+        out.blockBytes = out.blockBytes > perFrame.blockBytes ? out.blockBytes - perFrame.blockBytes : 0;
+        const uint64_t allocationBytes = local.allocationBytes > perFrame.allocationBytes ? local.allocationBytes - perFrame.allocationBytes : 0;
+        out.slack = out.blockBytes > allocationBytes ? out.blockBytes - allocationBytes : 0;
+        return out;
+    }
     out.slack = local.blockBytes > local.allocationBytes ? local.blockBytes - local.allocationBytes : 0;
     return out;
 }
@@ -177,10 +187,15 @@ void Defragmenter::PruneLingering() {
     });
 }
 
+void Defragmenter::BeginCommit(const CommitContext& context) {
+    m_commitIdle = context.gpuIdle;
+}
+
 size_t Defragmenter::Poll(std::span<Relocation> out) {
     if (!m_pass) {
         PruneLingering();
-        if (!m_armed || !m_context) return 0;
+        // Passes run only in DefragmentAtIdle's idle commits. A frame's own commit leaves an armed pass for the idle one.
+        if (!m_armed || !m_context || !m_commitIdle) return 0;
         m_armed = false;
         OpenPass();
         if (!m_pass) return 0;
@@ -233,7 +248,7 @@ bool Defragmenter::Prepare(uint32_t moveIndex, IgnoreReason& why) {
     auto& move = pass.info.pMoves[moveIndex];
     auto* record = move.pSrcAllocation ? move.pSrcAllocation->GetOwnerRecord<RelocationRecord>() : nullptr;
     // A null record: an allocation ORG does not track (a host's AllocatedResource, such as a streaming window).
-    if (!MayMove(record, true, &why)) return false;
+    if (!MayMove(record, m_commitIdle, &why)) return false;
     auto owner = record->Owner();
     if (!owner) {
         why = IgnoreReason::NoRecord;
@@ -250,6 +265,8 @@ bool Defragmenter::Prepare(uint32_t moveIndex, IgnoreReason& why) {
         why = IgnoreReason::Pinned;
         return false;
     }
+    // PerFrame buffers never move, and buffers with a view ref pair move only at idle.
+    if (buffer && !BufferMayMove(*buffer, m_commitIdle, &why)) return false;
     // An externally immutable resource gets no barriers from the ledgers, so the copy could not move it to CopySource. An attached
     // representation replaces the backing.
     if (owner->GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource
@@ -305,6 +322,8 @@ bool Defragmenter::Prepare(uint32_t moveIndex, IgnoreReason& why) {
     relocation.fromGeneration = backed->GetBackingGeneration();
     relocation.sizeBytes = prepared.bytes;
     relocation.source = Source::Defragmenter;
+    // After EndPass the allocation names the new buffer. The switch needs the old one for the view ref pair and the old address.
+    if (buffer) relocation.fromBuffer = move.pSrcAllocation->GetResource().GetHandle();
     try {
         // The new resource belongs to the destination allocation until EndPass, then to the backing's allocation. The lease keeps the
         // backing's allocation alive while the copy target lives.

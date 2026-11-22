@@ -21,7 +21,9 @@ class DefragmentationContext;
 // 2. For each kept move it creates the resource again at the destination and hands a relocation to the commit. The commit copies
 //    the old resource into the new one in the relocation batch.
 // 3. EndPass (CopyRetain) points each allocation at its new resource. The old range comes back as a retained allocation.
-// 4. The commit rewrites the descriptors in place, since the GPU is idle, so bindless indices keep their values.
+// 4. The commit rewrites the descriptors in place, since the GPU is idle, so bindless indices keep their values. A moved buffer's
+//    buffer view ref pair goes to the new buffer (rhi::Device::RetargetBufferViewRef), so its ref keeps its slot, and the journal
+//    entry carries the old and new device addresses for clients that wrote the address into GPU data.
 // 5. The old range is freed once the GPU is past the copy and no recording names the old backing any more.
 //
 // A campaign is the run of passes from the start rule to the end: it starts when the device-local blocks' free space is large,
@@ -45,8 +47,10 @@ struct DefragmentBudget {
     uint32_t passesWithoutFreedBlock = 4;
     // After a campaign ends, the start rule is checked again only once this many calls have passed.
     uint32_t recheckCalls = 120;
-    // Whether graph buffers move too. Off by default: a moved buffer's GPU address changes, and ORG does not know which addresses
-    // the application handed out.
+    // Whether graph buffers move too. A moved buffer's device address changes. Its descriptors and its buffer view ref keep their
+    // slots, and the journal names the old and new addresses. The application must pin (Class::Pinned) every buffer whose address
+    // it keeps and does not rebase from the journal. Off by default for that reason. A PerFrame buffer never moves. Moves happen
+    // only in idle commits, so Written buffers and buffers with view refs move too.
     bool moveBuffers = false;
 };
 
@@ -82,6 +86,7 @@ public:
     bool CampaignActive() const noexcept { return m_context != nullptr; }
 
     // IRelocationSource.
+    void BeginCommit(const CommitContext& context) override;
     size_t Poll(std::span<Relocation> out) override;
     void BeforeAdopt(std::span<Relocation> polled) override;
     void AfterAdopt(std::span<Relocation> polled) override;
@@ -111,6 +116,8 @@ private:
     DefragmentBudget m_budget{};
     std::unique_ptr<Pass> m_pass;
     bool m_armed = false;
+    // The current commit's CommitContext::gpuIdle. A pass opens only in an idle commit.
+    bool m_commitIdle = false;
     bool m_nothingLeft = false;
     uint64_t m_calls = 0;
     uint64_t m_nextCheck = 0;

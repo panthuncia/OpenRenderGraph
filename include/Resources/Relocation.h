@@ -16,6 +16,7 @@
 #include "Resources/RelocationRecord.h"
 
 namespace org {
+class BufferBase;
 class Resource;
 class ExternalClient;
 class GpuTextureBacking;
@@ -49,9 +50,9 @@ const char* SourceName(Source value) noexcept;
 // What each source fills in:
 // - DXVK: resource (an ExternalTextureResource or ExternalBufferResource), next (the new storage, imported), ready (DXVK's
 //   copy), retired (whose deleter gives DXVK its storage back).
-// - Defragmenter: resource, fromGeneration, copyTarget (a wrapper of the new resource at the destination), and in BeforeAdopt
-//   retired (the retained allocation). nextTexture and nextBuffer stay null: after EndPass the backing's Allocation names the new
-//   resource.
+// - Defragmenter: resource, fromGeneration, copyTarget (a wrapper of the new resource at the destination), fromBuffer for a
+//   buffer, and in BeforeAdopt retired (the retained allocation). nextTexture and nextBuffer stay null: after EndPass the
+//   backing's Allocation names the new resource.
 // - Graph resources made again (MakeGraphRelocation, the stress switch): resource, fromGeneration, nextTexture or nextBuffer,
 //   copyTarget.
 struct Relocation {
@@ -85,11 +86,21 @@ struct Relocation {
     runtime::SubmittedPoint ready{};
     // The size of the old backing, for the counters. Commit fills it from the owner record when 0.
     uint64_t sizeBytes = 0;
+    // Buffers: the native buffer the move leaves. Needed when the backing's Allocation already names the new resource at the
+    // switch (the defragmenter), so the switch can hand the buffer's view ref pair over and read the old device address. Commit
+    // takes the current native buffer when it is not set.
+    rhi::ResourceHandle fromBuffer{};
+    // Buffers: the device addresses before and after the move, set by Commit when it adopts the move. 0 when the buffer has
+    // none, and for textures.
+    uint64_t oldAddress = 0;
+    uint64_t newAddress = 0;
     Source source = Source::Owner;
     // Set by Commit when it will not adopt the relocation (its resource is gone, its backing changed, its copy failed). A source
     // reads it in BeforeAdopt, and may set it there itself to call the move off.
     bool skipped = false;
 };
+
+struct CommitContext;
 
 // A producer of relocations. Registered with Service::AddSource.
 class IRelocationSource {
@@ -99,6 +110,9 @@ public:
     // from its start. Returns how many it wrote. A source decides what may move (MayMove); Commit only skips moves whose
     // resource is gone, whose backing changed, or whose kind it cannot move.
     virtual size_t Poll(std::span<Relocation> out) = 0;
+    // Owner thread, once per commit, before the first Poll. A source that must know whether the GPU is idle (the defragmenter
+    // moves Written backings only then) reads it here.
+    virtual void BeginCommit(const CommitContext& context) { (void)context; }
     // Owner thread, once per commit in which Poll returned any: after the relocation batch was submitted and before the
     // backings switch. A defragmenter ends its pass here (EndPass), so each Allocation names its new resource by then.
     virtual void BeforeAdopt(std::span<Relocation> polled) { (void)polled; }
@@ -110,6 +124,11 @@ public:
 // Whether a backing with this record may move now. When it may not, why says why.
 bool MayMove(const RelocationRecord* record, bool gpuIdle, IgnoreReason* why = nullptr) noexcept;
 
+// The rules a buffer adds to MayMove. A PerFrame buffer (MemoryGroup::PerFrame) never moves (Pinned). A buffer with a buffer view
+// ref pair (rhi::Device::HasBufferViewRef) moves only while the GPU is idle (WrittenNotIdle otherwise), because the move rewrites
+// the pair in place. Owner thread.
+bool BufferMayMove(BufferBase& buffer, bool gpuIdle, IgnoreReason* why = nullptr);
+
 // The journal of committed relocations: what moved, and to which backing generation. Clients that cache a resource's bindless
 // index or raw handle read it once a frame with a cursor of their own and refresh what moved.
 struct JournalEntry {
@@ -117,13 +136,17 @@ struct JournalEntry {
     uint64_t resourceID = 0;
     uint64_t toGeneration = 0;
     Source reason = Source::Owner;
+    // Buffers: the device address before and after the move, so a client that wrote the old address into GPU data can rebase
+    // it (new = old + (newAddress - oldAddress) for an address inside the buffer). 0 when the buffer has none, and for textures.
+    uint64_t oldAddress = 0;
+    uint64_t newAddress = 0;
 };
 
 class RelocationJournal {
 public:
     explicit RelocationJournal(size_t capacity = 4096) : m_capacity(capacity ? capacity : 1) {}
     // Owner thread (Service::Commit).
-    void Append(uint64_t resourceID, uint64_t toGeneration, Source reason);
+    void Append(uint64_t resourceID, uint64_t toGeneration, Source reason, uint64_t oldAddress = 0, uint64_t newAddress = 0);
     // Any thread. The sequence the next entry gets. A new client starts its cursor here.
     uint64_t Head() const noexcept { return m_head.load(std::memory_order_acquire); }
     // Any thread. Appends the entries from `cursor` on to `out`, and moves `cursor` to Head(). Returns false when entries

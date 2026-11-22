@@ -9,6 +9,7 @@
 #include <BasicTelemetry/Tracy.h>
 
 #include "Managers/Singletons/DescriptorHeapManager.h"
+#include "Managers/Singletons/DeviceManager.h"
 #include "OpenRenderGraph/ExternalClient.h"
 #include "Resources/Buffers/DynamicBufferBase.h"
 #include "Resources/ExternalBackingResource.h"
@@ -47,12 +48,31 @@ bool MayMove(const RelocationRecord* record, bool gpuIdle, IgnoreReason* why) no
     return false;
 }
 
+bool BufferMayMove(BufferBase& buffer, bool gpuIdle, IgnoreReason* why) {
+    IgnoreReason reason = IgnoreReason::Count;
+    if (buffer.GetMemoryGroup() == MemoryGroup::PerFrame) {
+        reason = IgnoreReason::Pinned;
+    } else if (!gpuIdle) {
+        rhi::ResourceHandle handle{};
+        try {
+            handle = buffer.GetAPIResource().GetHandle();
+        } catch (const std::exception&) {
+            // Not materialized: nothing to move.
+            reason = IgnoreReason::Unsupported;
+        }
+        if (handle.valid() && DeviceManager::GetInstance().GetDevice().HasBufferViewRef(handle)) reason = IgnoreReason::WrittenNotIdle;
+    }
+    if (reason == IgnoreReason::Count) return true;
+    if (why) *why = reason;
+    return false;
+}
+
 // ---- journal ----
 
-void RelocationJournal::Append(uint64_t resourceID, uint64_t toGeneration, Source reason) {
+void RelocationJournal::Append(uint64_t resourceID, uint64_t toGeneration, Source reason, uint64_t oldAddress, uint64_t newAddress) {
     std::scoped_lock lock(m_mutex);
     const auto sequence = m_head.load(std::memory_order_relaxed);
-    m_entries.push_back({sequence, resourceID, toGeneration, reason});
+    m_entries.push_back({sequence, resourceID, toGeneration, reason, oldAddress, newAddress});
     while (m_entries.size() > m_capacity) m_entries.pop_front();
     m_head.store(sequence + 1, std::memory_order_release);
 }
@@ -81,6 +101,21 @@ constexpr size_t kMovedFromKept = 16;
 uint64_t HandleKey(rhi::Resource resource) noexcept {
     const auto handle = resource.GetHandle();
     return (uint64_t{handle.generation} << 32) | handle.index;
+}
+
+// A resource's current native resource, or an invalid handle when it has none.
+rhi::ResourceHandle CurrentHandle(Resource& resource) noexcept {
+    try {
+        return resource.GetAPIResource().GetHandle();
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+// A native buffer's device address. 0 without one.
+uint64_t DeviceAddressOf(rhi::ResourceHandle buffer) noexcept {
+    if (!buffer.valid()) return 0;
+    return DeviceManager::GetInstance().GetDevice().GetBufferDeviceAddress({buffer, 0});
 }
 
 // What a relocation leaves behind: the old backing, the copy target and the source's own retired object. They go together
@@ -125,7 +160,12 @@ bool Adopt(Relocation& relocation, bool inPlace, uint64_t& from, IgnoreReason& w
     if (auto* buffer = dynamic_cast<BufferBase*>(resource)) {
         if (relocation.nextTexture || relocation.next) { why = IgnoreReason::Unsupported; return false; }
         from = relocation.fromGeneration ? relocation.fromGeneration : buffer->GetBackingGeneration();
-        if (!buffer->AdoptRelocatedBacking(relocation.nextBuffer, from, inPlace)) { why = IgnoreReason::Stale; return false; }
+        if (!buffer->AdoptRelocatedBacking(relocation.nextBuffer, from, inPlace, relocation.fromBuffer)) {
+            // A buffer with a view ref pair outside an idle point refuses. Otherwise its backing changed.
+            why = !inPlace && relocation.fromBuffer.valid() && DeviceManager::GetInstance().GetDevice().HasBufferViewRef(relocation.fromBuffer)
+                ? IgnoreReason::WrittenNotIdle : IgnoreReason::Stale;
+            return false;
+        }
         relocation.toGeneration = buffer->GetBackingGeneration();
         return true;
     }
@@ -265,11 +305,14 @@ std::unique_ptr<Relocation> MakeGraphRelocation(const std::shared_ptr<Resource>&
     IgnoreReason reason = IgnoreReason::Failed;
     // Placed backings have no record of their own, so they stop here as NoRecord.
     if (!MayMove(backed->CurrentRelocationRecord(), gpuIdle, &reason)) return fail(reason);
+    auto* movingBuffer = dynamic_cast<BufferBase*>(resource.get());
+    if (movingBuffer && !BufferMayMove(*movingBuffer, gpuIdle, &reason)) return fail(reason);
     auto relocation = std::make_unique<Relocation>();
     relocation->resource = resource;
     relocation->resourceID = resource->GetGlobalResourceID();
     relocation->fromGeneration = backed->GetBackingGeneration();
     relocation->source = source;
+    if (movingBuffer) relocation->fromBuffer = CurrentHandle(*resource);
     try {
         // The copy target is a short-lived wrapper. It needs no memory statistics entity.
         Resource::ScopedECSRegistrationSuppression noEntity;
@@ -469,6 +512,7 @@ size_t Service::Commit(const CommitContext& context) {
         size_t first = 0, last = 0;
     };
     std::vector<Polled> polled;
+    for (const auto& source : sources) source->BeginCommit(context);
     for (const auto& source : sources) {
         const size_t first = pending.size();
         for (;;) {
@@ -547,10 +591,20 @@ size_t Service::Commit(const CommitContext& context) {
         uint64_t from = 0;
         IgnoreReason why = IgnoreReason::Failed;
         bool adopted = false;
+        // A buffer's device address before the move. The defragmenter names the old buffer, since its allocation already names
+        // the new one.
+        uint64_t byteSize = 0;
+        const bool isBuffer = relocation.resource->TryGetBufferByteSize(byteSize);
+        if (isBuffer && !relocation.fromBuffer.valid()) relocation.fromBuffer = CurrentHandle(*relocation.resource);
+        const uint64_t oldAddress = isBuffer ? DeviceAddressOf(relocation.fromBuffer) : 0;
         try {
             adopted = Adopt(relocation, context.gpuIdle, from, why);
         } catch (const std::exception& error) {
             spdlog::error("ORG relocation: moving '{}' failed: {}", relocation.resource->GetName(), error.what());
+        }
+        if (adopted && isBuffer) {
+            relocation.oldAddress = oldAddress;
+            relocation.newAddress = DeviceAddressOf(CurrentHandle(*relocation.resource));
         }
         if (!adopted) {
             ignore(i, why);
@@ -558,7 +612,7 @@ size_t Service::Commit(const CommitContext& context) {
             continue;
         }
         NoteMovedFrom(relocation.resourceID, from);
-        m_journal.Append(relocation.resourceID, relocation.toGeneration, relocation.source);
+        m_journal.Append(relocation.resourceID, relocation.toGeneration, relocation.source, relocation.oldAddress, relocation.newAddress);
         detail::NoteMoved(relocation.sizeBytes);
         Retire(relocation, true);
         ++committed;

@@ -167,7 +167,14 @@ public:
     // Relocation. Switches to a new backing of the same size while the buffer keeps its identity, as
     // PixelBuffer::AdoptRelocatedBacking does for textures. On success `next` holds the old backing (or stays null when it
     // was null: the allocation already names the new resource). False when nothing changed.
-    bool AdoptRelocatedBacking(std::unique_ptr<GpuBufferBacking>& next, uint64_t fromGeneration, bool rewriteInPlace);
+    //
+    // `previous` is the native buffer the move leaves: the current one when `next` is set, else the one the allocation named
+    // before the defragmenter's EndPass (it need not be given when `next` is set). When it has a buffer view ref pair
+    // (rhi::Device::HasBufferViewRef), the pair goes to the new native buffer (RetargetBufferViewRef), so refs already handed out
+    // keep their slot. That rewrites the pair in place, so it is done only with rewriteInPlace (the GPU idle); without it a buffer
+    // with a pair does not move and this returns false.
+    bool AdoptRelocatedBacking(std::unique_ptr<GpuBufferBacking>& next, uint64_t fromGeneration, bool rewriteInPlace,
+        rhi::ResourceHandle previous = {});
     // Defragmentation. Creates the current backing's buffer again at the start of destination, when the current backing's
     // allocation is source. Fails when the backing changed, is placed, or for an attached representation. The caller owns the result.
     rhi::Result MakeDefragmentationResource(const rhi::ma::Allocation& source, rhi::ma::Allocation& destination, rhi::ResourcePtr& out);

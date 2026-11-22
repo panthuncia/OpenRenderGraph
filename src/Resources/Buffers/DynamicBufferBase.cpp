@@ -605,7 +605,8 @@ std::unique_ptr<GpuBufferBacking> BufferBase::MakeRelocationBacking() {
     return backing;
 }
 
-bool BufferBase::AdoptRelocatedBacking(std::unique_ptr<GpuBufferBacking>& next, uint64_t fromGeneration, bool rewriteInPlace) {
+bool BufferBase::AdoptRelocatedBacking(std::unique_ptr<GpuBufferBacking>& next, uint64_t fromGeneration, bool rewriteInPlace,
+    rhi::ResourceHandle previous) {
     // The swap is a backing change that concurrent captures must not see half done. The backing lock below orders it
     // against them, and the scope tells the buffer checks that it is allowed here.
     ScopedBackingMutation mutation;
@@ -613,9 +614,21 @@ bool BufferBase::AdoptRelocatedBacking(std::unique_ptr<GpuBufferBacking>& next, 
     if (!m_dataBuffer || m_backingGeneration != fromGeneration || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid())
         return false;
     if (next && next->GetSize() != m_dataBuffer->GetSize()) return false;
+    // A buffer view ref pair is rewritten in place for the new buffer. Shaders may read it while frames are in flight, so the
+    // buffer moves only when the GPU is idle.
+    auto device = DeviceManager::GetInstance().GetDevice();
+    if (next) previous = m_dataBuffer->GetAPIResource().GetHandle();
+    const bool hasViewRef = previous.valid() && device.HasBufferViewRef(previous);
+    if (hasViewRef && !rewriteInPlace) return false;
     if (!rewriteInPlace) RotateDescriptorSlotsForPublication();
     if (next) std::swap(m_dataBuffer, next);
     RefreshDescriptorContents();
+    if (hasViewRef) {
+        const auto current = m_dataBuffer->GetAPIResource().GetHandle();
+        if (const auto result = device.RetargetBufferViewRef(previous, current); !rhi::IsOk(result))
+            spdlog::error("BufferBase: '{}' moved, and its buffer view ref could not follow ({}). Refs handed out read the old buffer",
+                GetName(), rhi::ResultName(result));
+    }
     ApplyRelocationClass(GetGlobalResourceID());
     ++m_backingGeneration;
     ForgetPublishedAllocation();
