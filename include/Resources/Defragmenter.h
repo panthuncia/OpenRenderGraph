@@ -128,6 +128,7 @@ private:
     uint32_t m_blocksFreedThisPass = 0;
     uint32_t m_blocksAtStart = 0;
     uint64_t m_slackAtStart = 0;
+    uint64_t m_futileSlack = 0;  // the slack a campaign that freed no block started from, else 0
     uint64_t m_campaignMoves = 0;
     uint64_t m_campaignBytes = 0;
     double m_campaignMilliseconds = 0.0;

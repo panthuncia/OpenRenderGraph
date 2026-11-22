@@ -110,7 +110,10 @@ bool Defragmenter::WantsCall(const DefragmentBudget& budget, rhi::ma::Allocator&
     if (m_calls < m_nextCheck) return false;
     m_nextCheck = m_calls + (std::max)(budget.recheckCalls, 1u);
     const auto measured = MeasureDeviceLocal(allocator);
-    const bool start = measured.slack > budget.minSlackBytes
+    // After a campaign that freed no block, another starts only once the slack grew by half the minimum: the same layout would be
+    // packed again for nothing.
+    const bool grown = !m_futileSlack || measured.slack > m_futileSlack + budget.minSlackBytes / 2;
+    const bool start = grown && measured.slack > budget.minSlackBytes
         && static_cast<double>(measured.slack) > budget.minSlackFraction * static_cast<double>(measured.blockBytes);
     if (!start) {
         // Say why no campaign starts, a few times, so a run with the switch on shows the slack it measured.
@@ -162,6 +165,8 @@ void Defragmenter::EndCampaign(const char* why) {
     m_context = nullptr;
     m_armed = false;
     m_nextCheck = m_calls + (std::max)(m_budget.recheckCalls, 1u);
+    // Freed no block: the next campaign waits until the slack grew (WantsCall).
+    m_futileSlack = m_blocksAtLastPass < m_blocksAtStart ? 0 : m_slackAtStart;
     spdlog::info("ORG defragmenter: campaign ended ({}). {} passes, {} moves, {:.1f} MB moved, {:.1f} ms in passes; blocks {} -> {}; "
         "free space at the start {:.1f} MB; {} old ranges still held by recordings",
         why, m_passes, m_campaignMoves, static_cast<double>(m_campaignBytes) / kMiB, m_campaignMilliseconds, m_blocksAtStart,
