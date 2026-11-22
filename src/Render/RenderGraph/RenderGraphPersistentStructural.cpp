@@ -854,9 +854,10 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			if (!c.firstUseIsWrite)
 				throw std::runtime_error("Aliasing candidate '" + c.concrete->GetName() + "' in manual pool has a first-use read");
 			c.poolID = *c.manualPool; c.pooled = true;
+		// A gated first writer (MayNotWrite) does not keep a resource out of this graph's own pools: its readers in the graph
+		// share the gate. It only keeps the resource out of frame placement, where another epoch may read it.
 		} else if (mode == AutoAliasMode::Off) c.exclusion = "auto aliasing off";
 		else if (!c.firstUseIsWrite) c.exclusion = "first use is read";
-		else if (!c.writeGuaranteed) c.exclusion = "first writer may not write";
 		else if (!c.scoreOk) c.exclusion = "score below threshold";
 		else { c.poolID = kAutoPoolGlobal; c.pooled = true; }
 		if (c.pooled && c.shared) {
