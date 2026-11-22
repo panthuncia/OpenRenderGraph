@@ -544,6 +544,31 @@ bool NoteAliasPlaced(const void* resource, bool placed) {
 	return g_aliasPlaced.erase(resource) != 0;
 }
 
+// Resources placed from a frame placement: where, and at which backing generation. A graph that finds a resource already at its
+// frame placement binds it as it is. Another epoch's graph placed it there from the same version, and its bindings stay valid.
+struct FramePlacedRecord {
+	std::weak_ptr<Resource> resource;
+	const AliasHeapGeneration* heap = nullptr;
+	uint64_t offset = 0, generation = 0;
+};
+std::mutex g_framePlacedMutex;
+std::unordered_map<const void*, FramePlacedRecord> g_framePlaced;
+
+bool AtFramePlacement(Resource* concrete, const AliasHeapGeneration* heap, uint64_t offset, uint64_t generation) {
+	std::lock_guard lock(g_framePlacedMutex);
+	const auto found = g_framePlaced.find(concrete);
+	if (found == g_framePlaced.end()) return false;
+	const auto& record = found->second;
+	return record.resource.lock().get() == concrete && record.heap == heap && record.offset == offset && record.generation == generation;
+}
+
+void NoteFramePlaced(Resource* concrete, const AliasHeapGeneration* heap, uint64_t offset, uint64_t generation) {
+	std::lock_guard lock(g_framePlacedMutex);
+	// Records of resources that are gone are dropped now and then.
+	if (g_framePlaced.size() > 4096) std::erase_if(g_framePlaced, [](const auto& entry) { return entry.second.resource.expired(); });
+	g_framePlaced[concrete] = {concrete->weak_from_this(), heap, offset, generation};
+}
+
 // A candidate's key in usage summaries (PlacementUse::key): its name and memory description. Resources are made again when a
 // graph is built again, so their ids change. Their names and descriptions do not.
 uint64_t PlacementKey(const std::string& name, uint64_t size, uint64_t alignment, uint8_t resourceClass, uint64_t backendMask) {
@@ -661,6 +686,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		bool scoreOk = false;
 		bool eligible = false;
 		const char* ineligible = nullptr;
+		// Placed from the host's frame placement (FramePlacementVersion): poolID and offset are its block's and its entry's.
+		bool framePlaced = false;
+		uint32_t frameBlock = UINT32_MAX;
+		// Several epochs use it, by the frame placement. Its placement is then not this graph's own: the graph's end leaves it.
+		bool frameShared = false;
 	};
 	std::vector<Candidate> candidates;
 	std::unordered_map<Resource*, uint32_t> candidateByConcrete;
@@ -791,6 +821,54 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		if (c.exclusion) ++excludedCount;
 	}
 
+	// Frame placement (SetFramePlacementSource). The graph's first plan takes the host's current version, and every later plan of the
+	// graph keeps it. So a new version reaches the epoch through a new build. A candidate the version covers takes the version's
+	// offset in its block instead of a place in this graph's pools. Covered means:
+	// - the planner would pool it on one backend if its first use wrote (eligible),
+	// - the version placed its key,
+	// - its ranks here lie inside the ranks the version reserved for this epoch,
+	// - in the frame's first epoch that uses it, its first use here is a guaranteed write.
+	// Byte overlaps between epochs are ordered by the alias ledger, as for any placed resource.
+	if (!state.framePlacementTaken) {
+		state.framePlacementTaken = true;
+		state.framePlacement = m_framePlacementSource ? m_framePlacementSource() : nullptr;
+		if (state.framePlacement)
+			spdlog::info("Persistent alias plan: epoch {} places from frame placement {}", m_passEpochFilter, state.framePlacement->Id());
+	}
+	const auto framePlacement = state.framePlacement;
+	uint64_t framePlacedBytes = 0, framePlacedCount = 0, frameWithheld = 0;
+	if (framePlacement) {
+		for (auto& c : candidates) {
+			if (!c.eligible) continue;
+			const auto* entry = framePlacement->Find(PlacementKey(c.concrete->GetName(), c.sizeBytes, c.alignment, c.resourceClass, c.backendMask));
+			// A resource the version does not know (new since it was computed) stays on the graph's own path.
+			if (!entry) continue;
+			const auto* use = entry->UseIn(m_passEpochFilter);
+			const bool firstInFrame = use && entry->uses.front().epoch == m_passEpochFilter;
+			const bool covered = entry->placed && use && use->firstRank <= c.firstUse && c.lastUse <= use->lastRank
+				&& (!firstInFrame || (c.firstUseIsWrite && c.writeGuaranteed));
+			if (covered) {
+				if (c.exclusion) --excludedCount;
+				c.exclusion = nullptr;
+				c.pooled = true;
+				c.framePlaced = true;
+				c.frameBlock = entry->block;
+				c.frameShared = entry->MultiEpoch();
+				c.poolID = framePlacement->Blocks().at(entry->block).poolID;
+				c.offset = entry->offset;
+				framePlacedBytes += c.sizeBytes;
+				++framePlacedCount;
+			} else if (entry->MultiEpoch()) {
+				// Other epochs use it too. This graph's own pools see only its own uses, so they could hand its bytes to something
+				// live in another epoch. It keeps memory of its own until a version covers it.
+				if (!c.exclusion) ++excludedCount;
+				c.pooled = false;
+				c.exclusion = "frame placement does not cover it (used by several epochs)";
+				++frameWithheld;
+			}
+		}
+	}
+
 	// Pack per pool, into the arena's pools (shared with the other graphs of a host): each graph from offset 0.
 	if (!state.aliasArena) state.aliasArena = PersistentAliasArena::Create();
 	std::lock_guard arenaLock(state.aliasArena->mutex);
@@ -804,11 +882,37 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		if (const auto found = newFrameRegions.find(poolID); found != newFrameRegions.end()) return found->second->Heap();
 		return aliasPools.at(poolID).heap;
 	};
-	for (uint32_t i = 0; i < candidates.size(); ++i) if (candidates[i].pooled) byPool[candidates[i].poolID].push_back(i);
+	// The frame placement's candidates are placed already. They are kept by block.
+	std::map<uint64_t, std::vector<uint32_t>> byFrameBlock;
+	for (uint32_t i = 0; i < candidates.size(); ++i) {
+		if (!candidates[i].pooled) continue;
+		if (candidates[i].framePlaced) byFrameBlock[candidates[i].poolID].push_back(i);
+		else byPool[candidates[i].poolID].push_back(i);
+	}
 	std::vector<std::pair<uint32_t, uint32_t>> edges; // (logical slot, logical slot)
 	uint64_t independentBytes = 0, requiredBytes = 0, reservedBytes = 0;
 	std::array<uint64_t, 4> requiredByClass{};
 	size_t overlapPairs = 0;
+	// Placement orderings between byte-overlapping occupants of one pool or block.
+	auto orderOverlaps = [&](const std::vector<uint32_t>& members) {
+		for (size_t i = 0; i < members.size(); ++i) for (size_t j = i + 1; j < members.size(); ++j) {
+			const auto& a = candidates[members[i]]; const auto& b = candidates[members[j]];
+			if (a.offset >= b.offset + b.sizeBytes || b.offset >= a.offset + a.sizeBytes) continue;
+			const auto& earlier = a.lastUse < b.firstUse ? a : b;
+			const auto& later = a.lastUse < b.firstUse ? b : a;
+			if (!(earlier.lastUse < later.firstUse))
+				throw std::logic_error("Persistent alias plan produced overlapping lifetimes for '" + a.concrete->GetName() + "' and '" + b.concrete->GetName() + "'");
+			++overlapPairs;
+			// Which transients share memory, for checking a plan by hand (with alias logging on).
+			if (logging)
+				spdlog::info("Persistent alias overlap: '{}' [{}, {}) ranks {}-{} then '{}' [{}, {}) ranks {}-{}", earlier.concrete->GetName(),
+					earlier.offset, earlier.offset + earlier.sizeBytes, earlier.firstUse, earlier.lastUse, later.concrete->GetName(), later.offset,
+					later.offset + later.sizeBytes, later.firstUse, later.lastUse);
+			for (const auto u : earlier.users) for (const auto v : later.users)
+				edges.emplace_back(structure.passes[u].preparedPassIndex, structure.passes[v].preparedPassIndex);
+		}
+	};
+	for (const auto& [blockPool, members] : byFrameBlock) orderOverlaps(members);
 	for (auto& [poolID, members] : byPool) {
 		std::sort(members.begin(), members.end(), [&](uint32_t l, uint32_t r) {
 			const auto& a = candidates[l]; const auto& b = candidates[r];
@@ -955,23 +1059,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		pool.resourceClass = candidates[members.front()].resourceClass;
 		reservedBytes += pool.capacityBytes;
 		}
-		// Placement orderings between byte-overlapping occupants.
-		for (size_t i = 0; i < members.size(); ++i) for (size_t j = i + 1; j < members.size(); ++j) {
-			const auto& a = candidates[members[i]]; const auto& b = candidates[members[j]];
-			if (a.offset >= b.offset + b.sizeBytes || b.offset >= a.offset + a.sizeBytes) continue;
-			const auto& earlier = a.lastUse < b.firstUse ? a : b;
-			const auto& later = a.lastUse < b.firstUse ? b : a;
-			if (!(earlier.lastUse < later.firstUse))
-				throw std::logic_error("Persistent alias plan produced overlapping lifetimes for '" + a.concrete->GetName() + "' and '" + b.concrete->GetName() + "'");
-			++overlapPairs;
-			// Which transients share memory, for checking a plan by hand (with alias logging on).
-			if (logging)
-				spdlog::info("Persistent alias overlap: '{}' [{}, {}) ranks {}-{} then '{}' [{}, {}) ranks {}-{}", earlier.concrete->GetName(),
-					earlier.offset, earlier.offset + earlier.sizeBytes, earlier.firstUse, earlier.lastUse, later.concrete->GetName(), later.offset,
-					later.offset + later.sizeBytes, later.firstUse, later.lastUse);
-			for (const auto u : earlier.users) for (const auto v : later.users)
-				edges.emplace_back(structure.passes[u].preparedPassIndex, structure.passes[v].preparedPassIndex);
-		}
+		orderOverlaps(members);
 	}
 	std::sort(edges.begin(), edges.end());
 	edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
@@ -1015,7 +1103,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		if (!backed) continue;
 		if (c.pooled) {
 			++placed;
-			const auto& heap = heapOf(c.poolID);
+			// A frame placement's block is allocated by the first graph that places into it.
+			const std::shared_ptr<const AliasHeapGeneration> frameHeap = c.framePlaced ? framePlacement->AcquireBlock(c.frameBlock) : nullptr;
+			const auto& heap = c.framePlaced ? frameHeap : heapOf(c.poolID);
 			const State::AliasPlacementRecord record{c.poolID, c.offset, c.sizeBytes, heap.get()};
 			const auto previous = state.aliasPlaced.find(c.concrete);
 			if (c.shared) {
@@ -1029,7 +1119,21 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				rebind(c.concrete);
 				continue;
 			}
-			if (previous != state.aliasPlaced.end() && previous->second == record && backed->IsMaterialized()) continue;
+			const bool atFramePlacement = c.framePlaced && backed->IsMaterialized()
+				&& AtFramePlacement(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration());
+			if (previous != state.aliasPlaced.end() && previous->second == record && backed->IsMaterialized()
+				&& (!c.framePlaced || atFramePlacement)) continue;
+			if (atFramePlacement) {
+				// Already at its frame placement, by another epoch's graph. Its backing stays, so that graph's bindings stay valid.
+				state.aliasPlaced[c.concrete] = record;
+				NoteAliasPlaced(c.concrete, true);
+				if (c.frameShared) state.aliasPlacementOwners.erase(c.concrete);
+				else state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
+				bool unbound = false;
+				for (const auto entryIndex : entriesByConcrete[c.concrete]) unbound = unbound || !state.entries[entryIndex].isBound;
+				if (unbound) rebind(c.concrete);
+				continue;
+			}
 			if (backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
 			if (c.texture) {
 				PixelBuffer::MaterializeOptions options{};
@@ -1043,7 +1147,10 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			TrackTransientFrameResource(c.concrete);
 			state.aliasPlaced[c.concrete] = record;
 			NoteAliasPlaced(c.concrete, true);
-			state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
+			if (c.framePlaced) NoteFramePlaced(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration());
+			// A resource several epochs use is not this graph's alone: the graph's end leaves its placement to the others.
+			if (c.frameShared) state.aliasPlacementOwners.erase(c.concrete);
+			else state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
 			rebind(c.concrete);
 		} else {
 			state.aliasPlacementOwners.erase(c.concrete);
@@ -1058,6 +1165,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		}
 	}
 	state.aliasRematerializations += rematerialized;
+	m_framePlacementVersion.store(framePlacement ? framePlacement->Id() : 0, std::memory_order_release);
+	m_framePlacementPlaced.store(framePlacedCount, std::memory_order_release);
+	m_framePlacementPlanned.store(true, std::memory_order_release);
 	// The previous plan's ranges go. Its placements that this plan did not replace keep their memory through their leases.
 	state.frameRegions = std::move(newFrameRegions);
 	// The usage summary: every used candidate with its ranks, for the host's frame-wide placement.
@@ -1067,6 +1177,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		summary.rankCount = nextRank;
 		summary.pooledBytesByClass = requiredByClass;
 		summary.pooledBytes = requiredBytes;
+		summary.framePlacedBytes = framePlacedBytes;
 		summary.uses.reserve(candidates.size());
 		for (const auto& c : candidates) {
 			if (c.firstUse == UINT32_MAX || !c.direct) continue;
@@ -1152,10 +1263,12 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	if (rematerialized) basic_telemetry::AddCounter("ORG.Persistent.AliasRematerializations", static_cast<int64_t>(rematerialized));
 	if (logging || state.aliasPlans <= 2 || rematerialized)
 		spdlog::info("Persistent alias plan #{}: epoch={} inHostStream={} candidates={} placed={} excluded={} pools={} overlapPairs={} "
-			"orderings={} rematerialized={} standalone={} independentMB={:.2f} requiredMB={:.2f} reservedMB={:.2f} rebuild={}",
+			"orderings={} rematerialized={} standalone={} independentMB={:.2f} requiredMB={:.2f} reservedMB={:.2f} rebuild={} "
+			"framePlacement={} framePlaced={} framePlacedMB={:.2f} frameWithheld={}",
 			state.aliasPlans, m_passEpochFilter, PassEpochInHostStream(), candidates.size(), placed, excludedCount, byPool.size(),
 			overlapPairs, edges.size(), rematerialized, standalone, independentBytes / (1024.0 * 1024.0), requiredBytes / (1024.0 * 1024.0),
-			reservedBytes / (1024.0 * 1024.0), changed);
+			reservedBytes / (1024.0 * 1024.0), changed, framePlacement ? framePlacement->Id() : 0, framePlacedCount,
+			framePlacedBytes / (1024.0 * 1024.0), frameWithheld);
 	// Which queue slots this epoch's batches use, once per plan under logging: with inHostStream, which of them are in the host's stream.
 	if (logging) {
 		std::vector<uint32_t> queues;

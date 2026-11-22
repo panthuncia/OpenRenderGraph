@@ -406,8 +406,8 @@ public:
 	AttachStats AttachStatsTotal() const noexcept;
 	/**
 	 * @brief Owner thread: the epochs whose graph has alias placements in a pool generation another graph replaced (the pool
-	 * grew). With Desc::reportStaleAliasPlacements the application rebuilds them (BuildEpochGraph). Otherwise the next build point
-	 * does.
+	 * grew), or placed from a frame placement that is no longer current (FramePlacementSettings). With
+	 * Desc::reportStaleAliasPlacements the application rebuilds them (BuildEpochGraph). Otherwise the next build point does.
 	 */
 	std::vector<uint32_t> StaleAliasPlacementEpochs() const;
 
@@ -586,6 +586,12 @@ public:
 	 * need against today's pools and frame arena.
 	 */
 	struct FramePlacementSettings {
+		// Graphs place their transients from the frame placement (off by default). Each epoch graph's first alias plan takes the
+		// current version and keeps it for the graph's life. A candidate the version covers goes at the version's offset in its
+		// blocks, instead of in the graph's own pools, the shared arena or the frame arena. Everything else stays on those paths.
+		// A new version makes the epochs that placed from an older one stale (StaleAliasPlacementEpochs), so they are built
+		// again and take it. Off: graphs place exactly as without the frame placement, and graphs that placed from it are stale.
+		bool enabled = false;
 		// Epochs that may run more than once a frame. A resource several epochs use spans the whole slot of a repeated epoch
 		// at either end of its lifetime. Epochs given several tickets ahead (SetEpochTicketsAhead) count as repeated too.
 		std::vector<uint32_t> repeatedEpochs;
@@ -1241,6 +1247,9 @@ private:
 	// several tickets ahead (ApplyFramePlacementSettings).
 	FramePlacementSettings m_framePlacementSettings;
 	void ApplyFramePlacementSettings();
+	// Whether a graph placed from a frame placement other than the current one, where that matters: it placed something from
+	// its version, or the current version places something in its epoch. A graph that has not planned yet is never stale.
+	bool FramePlacementStale(const RenderGraph& graph, uint32_t epoch) const;
 	// The frame-wide placement: summaries, the worker and its versions. Made with the host. Graphs hold it weakly.
 	std::shared_ptr<FramePlacement> m_framePlacement;
 	std::vector<uint32_t> m_externalEpochs;  // SetExternalEpochs; set on every build's graph

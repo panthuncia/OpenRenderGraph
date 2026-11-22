@@ -299,6 +299,22 @@ private:
 	// throw. The graph fills in epoch, ranks, uses and pooled bytes; the host fills in memory. Set before the first frame.
 	using PlacementSummaryObserver = std::function<void(PlacementSummary)>;
 	void SetPlacementSummaryObserver(PlacementSummaryObserver observer) { m_placementSummaryObserver = std::move(observer); }
+	// Frame placement (GraphHost::FramePlacementSettings::enabled). The graph's first alias plan asks source for the host's
+	// current version and keeps it for the graph's life, so a new version reaches a graph only through a new build. Each plan
+	// places the candidates the version covers at its offsets in its blocks. The rest go to the graph's own pools, as without
+	// it. A null source or version: the graph places on its own. Set before the first frame.
+	using FramePlacementSource = std::function<std::shared_ptr<const FramePlacementVersion>()>;
+	void SetFramePlacementSource(FramePlacementSource source) { m_framePlacementSource = std::move(source); }
+	// What the graph's latest alias plan took from a frame placement. Any thread.
+	struct FramePlacementUse {
+		bool planned = false;   // the graph has made an alias plan
+		uint64_t version = 0;   // the version it placed from (FramePlacementVersion::Id), 0 for none
+		uint64_t placed = 0;    // the candidates it placed from it
+	};
+	FramePlacementUse FramePlacementInUse() const noexcept {
+		return {m_framePlacementPlanned.load(std::memory_order_acquire), m_framePlacementVersion.load(std::memory_order_acquire),
+			m_framePlacementPlaced.load(std::memory_order_acquire)};
+	}
 	// False while some of its placements are in a pool generation another graph has replaced (the pool grew): placed again, by a
 	// rebuild, they share the pool's memory again.
 	bool PersistentAliasPlacementsCurrent() const;
@@ -943,6 +959,10 @@ private:
 	uint32_t m_frameAliasLane = 0;
 	FrameTransientObserver m_frameTransientObserver;  // SetFrameTransientObserver
 	PlacementSummaryObserver m_placementSummaryObserver;  // SetPlacementSummaryObserver
+	FramePlacementSource m_framePlacementSource;          // SetFramePlacementSource
+	// FramePlacementInUse, written by each alias plan.
+	std::atomic<bool> m_framePlacementPlanned{false};
+	std::atomic<uint64_t> m_framePlacementVersion{0}, m_framePlacementPlaced{0};
 	// SetExternalPersistentEpochs; and the secondary lists their tickets record into, per queue slot in the host's stream (graphics
 	// lists, made at their first ticket).
 	std::vector<uint32_t> m_externalPersistentEpochs;

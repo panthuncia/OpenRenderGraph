@@ -1203,6 +1203,11 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 				summary.Finish();
 				if (const auto locked = placement.lock()) locked->Publish(std::move(summary));
 			});
+			// The version the graph's first plan takes: null while the frame placement is off.
+			graph->SetFramePlacementSource([placement = std::weak_ptr<FramePlacement>(m_framePlacement)]() -> std::shared_ptr<const FramePlacementVersion> {
+				const auto locked = placement.lock();
+				return locked ? locked->Current() : nullptr;
+			});
 		}
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
 		graph->SetPersistentRecordingTimestampMode(m_recordingTimestamps.load(std::memory_order_acquire));
@@ -1397,9 +1402,12 @@ GraphHost::AttachResult GraphHost::AttachEpochGraph(std::unique_ptr<EpochGraph>&
 std::vector<uint32_t> GraphHost::StaleAliasPlacementEpochs() const {
 	CheckOwner("StaleAliasPlacementEpochs");
 	std::vector<uint32_t> stale;
-	// An epoch with a staged graph is not stale: the staged graph's placement grew the pool, and it replaces the attached one.
+	// An epoch with a staged graph is not stale: the staged graph's placement grew the pool, or took the current frame placement,
+	// and it replaces the attached one.
 	for (const auto& instance : m_instances)
-		if (instance.graph && !instance.staged && !instance.graph->PersistentAliasPlacementsCurrent()) stale.push_back(instance.epoch);
+		if (instance.graph && !instance.staged
+			&& (!instance.graph->PersistentAliasPlacementsCurrent() || FramePlacementStale(*instance.graph, instance.epoch)))
+			stale.push_back(instance.epoch);
 	return stale;
 }
 
@@ -1680,6 +1688,11 @@ bool GraphHost::BuildDueInstances(bool all) {
 			&& !instance.graph->PersistentAliasPlacementsCurrent()) {
 			MarkRebuild(instance, "its alias placements are in a pool another epoch's build grew");
 			basic_telemetry::AddCounter("ORG.Host.AliasArenaRebuilds");
+		}
+		if (!m_desc.reportStaleAliasPlacements && instance.graph && !instance.rebuildRequested && !instance.staged
+			&& FramePlacementStale(*instance.graph, instance.epoch)) {
+			MarkRebuild(instance, "it placed from a frame placement that is no longer current");
+			basic_telemetry::AddCounter("ORG.Host.FramePlacementRebuilds");
 		}
 		// A failed build waits for a rebuild request (BuildDue).
 		if (all ? (!instance.graph && !instance.failed) || instance.rebuildRequested : BuildDue(index)) due.push_back(index);
@@ -2274,6 +2287,7 @@ void GraphHost::ApplyFramePlacementSettings() {
 	FramePlacement::Settings applied;
 	{
 		std::scoped_lock lock(m_configMutex);
+		applied.enabled = m_framePlacementSettings.enabled;
 		applied.repeatedEpochs = m_framePlacementSettings.repeatedEpochs;
 		applied.beamSearch = m_framePlacementSettings.beamSearch;
 		applied.logLifetimes = m_framePlacementSettings.logLifetimes;
@@ -2282,6 +2296,18 @@ void GraphHost::ApplyFramePlacementSettings() {
 	for (const auto& [epoch, most] : m_ticketsAhead)
 		if (std::ranges::find(applied.repeatedEpochs, epoch) == applied.repeatedEpochs.end()) applied.repeatedEpochs.push_back(epoch);
 	m_framePlacement->SetSettings(std::move(applied));
+}
+
+bool GraphHost::FramePlacementStale(const RenderGraph& graph, uint32_t epoch) const {
+	const auto use = graph.FramePlacementInUse();
+	if (!use.planned || !m_framePlacement) return false;
+	const auto current = m_framePlacement->Current();
+	if (!current) return use.placed != 0;
+	if (use.version == current->Id()) return false;
+	if (use.placed != 0) return true;
+	return std::ranges::any_of(current->Entries(), [&](const FramePlacementVersion::Entry& entry) {
+		return entry.placed && entry.UseIn(epoch) != nullptr;
+	});
 }
 
 void GraphHost::LogFramePlacement(bool detailed) const {
