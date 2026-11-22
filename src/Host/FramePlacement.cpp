@@ -127,7 +127,9 @@ void FramePlacement::Run() {
 		lock.unlock();
 		std::shared_ptr<const FramePlacementVersion> version;
 		try {
-			version = FramePlacementVersion::Compute(inputs, id);
+			auto computed = FramePlacementVersion::Compute(inputs, id);
+			if (computed) computed->SetMemory(m_memory);
+			version = std::move(computed);
 		} catch (const std::exception& error) {
 			spdlog::error("Frame placement: the computation failed: {}", error.what());
 		}
@@ -140,6 +142,7 @@ void FramePlacement::Run() {
 		bool published = false;
 		if (m_settings.enabled && (!m_current || m_current->LayoutHash() != m_latest->LayoutHash())) {
 			m_current = m_latest;
+			m_currentId.store(m_current->Id(), std::memory_order_release);
 			published = true;
 		}
 		if (!newLayout && !published) continue;

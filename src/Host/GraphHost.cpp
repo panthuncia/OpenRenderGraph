@@ -1208,6 +1208,10 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 				const auto locked = placement.lock();
 				return locked ? locked->Current() : nullptr;
 			});
+			graph->SetFramePlacementProbe([placement = std::weak_ptr<FramePlacement>(m_framePlacement)]() -> uint64_t {
+				const auto locked = placement.lock();
+				return locked ? locked->CurrentId() : 0;
+			});
 		}
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
 		graph->SetPersistentRecordingTimestampMode(m_recordingTimestamps.load(std::memory_order_acquire));

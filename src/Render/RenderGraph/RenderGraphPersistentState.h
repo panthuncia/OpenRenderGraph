@@ -165,7 +165,8 @@ struct AliasPlacementOwner {
 };
 // A graph's end: each transient it placed that no other graph placed since is given back (dematerialized). Otherwise the
 // placement stayed bound with no graph that uses it, and kept its pool's memory alive.
-void ReleaseOwnAliasPlacements(const std::unordered_map<Resource*, AliasPlacementOwner>& owners) noexcept;
+// self: the state ending. Placements another state claimed since are left alone.
+void ReleaseOwnAliasPlacements(const std::unordered_map<Resource*, AliasPlacementOwner>& owners, const void* self) noexcept;
 
 struct RotationKey {
 	uint64_t concreteID = 0, backingGeneration = 0;
@@ -448,7 +449,7 @@ struct RenderGraph::PersistentInstanceState {
 	PersistentInstanceState(const PersistentInstanceState&) = delete;
 	PersistentInstanceState& operator=(const PersistentInstanceState&) = delete;
 	~PersistentInstanceState() {
-		ReleaseOwnAliasPlacements(aliasPlacementOwners);
+		ReleaseOwnAliasPlacements(aliasPlacementOwners, this);
 		if (!aliasArena) return;
 		std::lock_guard lock(aliasArena->mutex);
 		for (auto& [id, pool] : aliasArena->pools) pool.required.erase(this);

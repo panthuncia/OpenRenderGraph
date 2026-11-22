@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <map>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -97,6 +98,39 @@ struct FramePlacementInputs {
  *
  * Deterministic: the same inputs give the same layout and the same LayoutHash.
  */
+/**
+ * @brief Block memory shared by the versions of one host.
+ *
+ * A version's block takes the heap an earlier version used for the same memory class and backend set when it is big enough.
+ * So a new version with the same layout, or a similar one, allocates nothing. Graphs that still place from the earlier version
+ * share the heap with the new one for a frame or two. The alias ledger orders their uses of the same bytes, as it does for
+ * any placed resource. A heap too small, or more than twice too big, is replaced. The replaced memory stays alive through the
+ * placements made in it.
+ *
+ * Any thread.
+ */
+class FramePlacementMemory {
+public:
+	FramePlacementMemory() = default;
+	~FramePlacementMemory();
+	FramePlacementMemory(const FramePlacementMemory&) = delete;
+	FramePlacementMemory& operator=(const FramePlacementMemory&) = delete;
+	/** @brief A heap of at least capacity bytes. poolID and versionID are for memory statistics and the log. Throws on failure. */
+	std::shared_ptr<const AliasHeapGeneration> Acquire(uint8_t memoryClass, uint64_t backendMask, uint64_t capacity, uint64_t alignment,
+		uint64_t poolID, uint64_t versionID);
+	/** @brief The heaps' capacities now, in bytes. */
+	uint64_t Bytes() const;
+
+private:
+	struct Heap {
+		uint64_t capacity = 0, alignment = 1, generation = 0;
+		TrackedHandle allocation;
+		std::shared_ptr<const AliasHeapGeneration> heap;
+	};
+	mutable std::mutex m_mutex;
+	std::map<std::pair<uint8_t, uint64_t>, Heap> m_heaps;  // by memory class and backend mask
+};
+
 class FramePlacementVersion {
 public:
 	/** @brief An epoch's slot in the frame's timeline. */
@@ -168,6 +202,8 @@ public:
 	std::shared_ptr<const AliasHeapGeneration> AcquireBlock(uint32_t block) const;
 	/** @brief Whether any block's memory was allocated. */
 	bool Allocated() const;
+	/** @brief Takes block memory from memory (shared with the host's other versions) instead of allocating its own. Before any AcquireBlock. */
+	void SetMemory(std::shared_ptr<FramePlacementMemory> memory) { m_memory = std::move(memory); }
 
 private:
 	uint64_t m_id = 0;
@@ -180,6 +216,7 @@ private:
 	mutable std::mutex m_memoryMutex;
 	mutable std::vector<TrackedHandle> m_allocations;
 	mutable std::vector<std::shared_ptr<const AliasHeapGeneration>> m_heaps;
+	std::shared_ptr<FramePlacementMemory> m_memory;  // SetMemory
 };
 
 }  // namespace org

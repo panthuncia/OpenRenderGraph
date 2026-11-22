@@ -550,6 +550,9 @@ struct FramePlacedRecord {
 	std::weak_ptr<Resource> resource;
 	const AliasHeapGeneration* heap = nullptr;
 	uint64_t offset = 0, generation = 0;
+	// The graph state that gives the placement back at its end. A newer build of the same epoch that finds the resource at its
+	// frame placement claims it, so the build it replaces does not take the backing away from it when it ends.
+	const void* owner = nullptr;
 };
 std::mutex g_framePlacedMutex;
 std::unordered_map<const void*, FramePlacedRecord> g_framePlaced;
@@ -562,11 +565,24 @@ bool AtFramePlacement(Resource* concrete, const AliasHeapGeneration* heap, uint6
 	return record.resource.lock().get() == concrete && record.heap == heap && record.offset == offset && record.generation == generation;
 }
 
-void NoteFramePlaced(Resource* concrete, const AliasHeapGeneration* heap, uint64_t offset, uint64_t generation) {
+void NoteFramePlaced(Resource* concrete, const AliasHeapGeneration* heap, uint64_t offset, uint64_t generation, const void* owner) {
 	std::lock_guard lock(g_framePlacedMutex);
 	// Records of resources that are gone are dropped now and then.
 	if (g_framePlaced.size() > 4096) std::erase_if(g_framePlaced, [](const auto& entry) { return entry.second.resource.expired(); });
-	g_framePlaced[concrete] = {concrete->weak_from_this(), heap, offset, generation};
+	g_framePlaced[concrete] = {concrete->weak_from_this(), heap, offset, generation, owner};
+}
+
+// Makes owner the graph state that gives the frame placement of concrete back.
+void ClaimFramePlaced(const void* concrete, const void* owner) {
+	std::lock_guard lock(g_framePlacedMutex);
+	if (const auto found = g_framePlaced.find(concrete); found != g_framePlaced.end()) found->second.owner = owner;
+}
+
+// Whether another graph state claimed the frame placement of concrete since owner placed it.
+bool FramePlacementClaimedByOther(const void* concrete, const void* owner) {
+	std::lock_guard lock(g_framePlacedMutex);
+	const auto found = g_framePlaced.find(concrete);
+	return found != g_framePlaced.end() && !found->second.resource.expired() && found->second.owner && found->second.owner != owner;
 }
 
 // A candidate's key in usage summaries (PlacementUse::key): its name and memory description. Resources are made again when a
@@ -581,9 +597,11 @@ uint64_t PlacementKey(const std::string& name, uint64_t size, uint64_t alignment
 }
 }
 
-void persistent_impl::ReleaseOwnAliasPlacements(const std::unordered_map<Resource*, AliasPlacementOwner>& owners) noexcept {
+void persistent_impl::ReleaseOwnAliasPlacements(const std::unordered_map<Resource*, AliasPlacementOwner>& owners, const void* self) noexcept {
 	size_t released = 0;
 	for (const auto& [concrete, owner] : owners) {
+		// A newer build placed from the same frame placement uses it now.
+		if (FramePlacementClaimedByOther(concrete, self)) continue;
 		const auto resource = owner.resource.lock();
 		auto* backed = resource ? dynamic_cast<BackedResource*>(resource.get()) : nullptr;
 		if (!backed || !backed->IsMaterialized() || backed->GetBackingGeneration() != owner.generation) continue;
@@ -691,6 +709,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		uint32_t frameBlock = UINT32_MAX;
 		// Several epochs use it, by the frame placement. Its placement is then not this graph's own: the graph's end leaves it.
 		bool frameShared = false;
+		// The frame placement knows other epochs use it, but does not cover it here. Another epoch's graph may have placed it,
+		// so this graph keeps whatever backing it has rather than move it under that graph's executable.
+		bool keepBacking = false;
 	};
 	std::vector<Candidate> candidates;
 	std::unordered_map<Resource*, uint32_t> candidateByConcrete;
@@ -858,11 +879,14 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				c.offset = entry->offset;
 				framePlacedBytes += c.sizeBytes;
 				++framePlacedCount;
-			} else if (entry->MultiEpoch()) {
-				// Other epochs use it too. This graph's own pools see only its own uses, so they could hand its bytes to something
-				// live in another epoch. It keeps memory of its own until a version covers it.
+			} else if (entry->MultiEpoch() || !use) {
+				// Other epochs use it too, or the version knows it only from other epochs (it was computed before this build).
+				// This graph's own pools see only its own uses, so they could hand its bytes to something live in another
+				// epoch. It is not pooled here. If another graph already gave it a backing, that backing stays: moving it would
+				// break that graph's executable. A later version covers it.
 				if (!c.exclusion) ++excludedCount;
 				c.pooled = false;
+				c.keepBacking = true;
 				c.exclusion = "frame placement does not cover it (used by several epochs)";
 				++frameWithheld;
 			}
@@ -1125,13 +1149,20 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				&& (!c.framePlaced || atFramePlacement)) continue;
 			if (atFramePlacement) {
 				// Already at its frame placement, by another epoch's graph. Its backing stays, so that graph's bindings stay valid.
+				// This graph's bindings may still name the backing it had before that graph placed it. Then they are bound again
+				// here, in this structural edit. Otherwise the next recording would meet the new placement as a plain binding
+				// change, which the executable refuses.
+				const bool movedSincePlan = previous == state.aliasPlaced.end() || !(previous->second == record);
 				state.aliasPlaced[c.concrete] = record;
 				NoteAliasPlaced(c.concrete, true);
 				if (c.frameShared) state.aliasPlacementOwners.erase(c.concrete);
-				else state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
+				else {
+					state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
+					ClaimFramePlaced(c.concrete, &state);
+				}
 				bool unbound = false;
 				for (const auto entryIndex : entriesByConcrete[c.concrete]) unbound = unbound || !state.entries[entryIndex].isBound;
-				if (unbound) rebind(c.concrete);
+				if (unbound || movedSincePlan) rebind(c.concrete);
 				continue;
 			}
 			if (backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
@@ -1147,10 +1178,15 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			TrackTransientFrameResource(c.concrete);
 			state.aliasPlaced[c.concrete] = record;
 			NoteAliasPlaced(c.concrete, true);
-			if (c.framePlaced) NoteFramePlaced(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration());
+			if (c.framePlaced) NoteFramePlaced(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration(), &state);
 			// A resource several epochs use is not this graph's alone: the graph's end leaves its placement to the others.
 			if (c.frameShared) state.aliasPlacementOwners.erase(c.concrete);
 			else state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
+			rebind(c.concrete);
+		} else if (c.keepBacking && backed->IsMaterialized() && !state.aliasPlaced.contains(c.concrete)) {
+			// Placed by another graph and shared with it: bound as it is, in this structural edit, so the executable admits its
+			// current placement.
+			state.aliasPlacementOwners.erase(c.concrete);
 			rebind(c.concrete);
 		} else {
 			state.aliasPlacementOwners.erase(c.concrete);

@@ -300,11 +300,17 @@ private:
 	using PlacementSummaryObserver = std::function<void(PlacementSummary)>;
 	void SetPlacementSummaryObserver(PlacementSummaryObserver observer) { m_placementSummaryObserver = std::move(observer); }
 	// Frame placement (GraphHost::FramePlacementSettings::enabled). The graph's first alias plan asks source for the host's
-	// current version and keeps it for the graph's life, so a new version reaches a graph only through a new build. Each plan
+	// current version and keeps it until the host publishes a newer one (SetFramePlacementProbe). Each plan
 	// places the candidates the version covers at its offsets in its blocks. The rest go to the graph's own pools, as without
 	// it. A null source or version: the graph places on its own. Set before the first frame.
 	using FramePlacementSource = std::function<std::shared_ptr<const FramePlacementVersion>()>;
 	void SetFramePlacementSource(FramePlacementSource source) { m_framePlacementSource = std::move(source); }
+	// The id of the version source would return now (0 for none). Each preparation compares it with the version the graph
+	// placed from. When they differ, the graph places its aliases again, from the new version, in a structural edit. So every
+	// graph moves to a new version before it records against it, and a resource that several epochs share never reaches a
+	// graph as a plain binding change. It must be cheap: it runs once per preparation.
+	using FramePlacementProbe = std::function<uint64_t()>;
+	void SetFramePlacementProbe(FramePlacementProbe probe) { m_framePlacementProbe = std::move(probe); }
 	// What the graph's latest alias plan took from a frame placement. Any thread.
 	struct FramePlacementUse {
 		bool planned = false;   // the graph has made an alias plan
@@ -959,6 +965,7 @@ private:
 	uint32_t m_frameAliasLane = 0;
 	FrameTransientObserver m_frameTransientObserver;  // SetFrameTransientObserver
 	PlacementSummaryObserver m_placementSummaryObserver;  // SetPlacementSummaryObserver
+	FramePlacementProbe m_framePlacementProbe;            // SetFramePlacementProbe
 	FramePlacementSource m_framePlacementSource;          // SetFramePlacementSource
 	// FramePlacementInUse, written by each alias plan.
 	std::atomic<bool> m_framePlacementPlanned{false};

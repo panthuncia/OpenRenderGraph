@@ -290,6 +290,10 @@ std::shared_ptr<const AliasHeapGeneration> FramePlacementVersion::AcquireBlock(u
 	std::lock_guard lock(m_memoryMutex);
 	if (m_heaps[blockIndex]) return m_heaps[blockIndex];
 	const auto& block = m_blocks[blockIndex];
+	if (m_memory) {
+		m_heaps[blockIndex] = m_memory->Acquire(block.memoryClass, block.backendMask, block.capacity, block.alignment, block.poolID, m_id);
+		return m_heaps[blockIndex];
+	}
 	rhi::ma::AllocationDesc allocDesc{};
 	allocDesc.heapType = rhi::HeapType::DeviceLocal;
 	allocDesc.flags = rhi::ma::AllocationFlagCanAlias;
@@ -312,6 +316,63 @@ std::shared_ptr<const AliasHeapGeneration> FramePlacementVersion::AcquireBlock(u
 	spdlog::info("Frame placement {}: block {:#x} allocated: class={} capacity={} resources={}", m_id, block.poolID, block.memoryClass,
 		block.capacity, block.members);
 	return m_heaps[blockIndex];
+}
+
+FramePlacementMemory::~FramePlacementMemory() {
+	for (auto& [key, heap] : m_heaps) {
+		if (!heap.allocation.GetAllocation()) continue;
+		try {
+			DeletionManager::GetInstance().MarkForDelete(std::move(heap.allocation), "RenderGraph frame placement block");
+		} catch (...) {
+		}
+	}
+}
+
+std::shared_ptr<const AliasHeapGeneration> FramePlacementMemory::Acquire(uint8_t memoryClass, uint64_t backendMask, uint64_t capacity,
+	uint64_t alignment, uint64_t poolID, uint64_t versionID) {
+	std::lock_guard lock(m_mutex);
+	auto& cached = m_heaps[{memoryClass, backendMask}];
+	// Room to grow a little, so small changes between versions reuse the heap.
+	constexpr double kHeadroom = 1.25;
+	const bool fits = cached.heap && cached.capacity >= capacity && cached.alignment >= alignment;
+	const bool tooBig = cached.heap && cached.capacity > 2 * static_cast<uint64_t>(static_cast<double>(capacity) * kHeadroom);
+	if (fits && !tooBig) return cached.heap;
+	const auto size = static_cast<uint64_t>(static_cast<double>(capacity) * kHeadroom + 65535.0) / 65536ull * 65536ull;
+	rhi::ma::AllocationDesc allocDesc{};
+	allocDesc.heapType = rhi::HeapType::DeviceLocal;
+	allocDesc.flags = rhi::ma::AllocationFlagCanAlias;
+	rhi::ResourceAllocationInfo allocInfo{};
+	allocInfo.alignment = (std::max)(alignment, cached.alignment);
+	allocInfo.sizeInBytes = size;
+	AllocationTrackDesc trackDesc(0);
+	trackDesc.attach
+		.Set<MemoryStatisticsComponents::ResourceName>({"RenderGraph Frame Placement"})
+		.Set<MemoryStatisticsComponents::ResourceType>({rhi::ResourceType::Unknown})
+		.Set<MemoryStatisticsComponents::ResourceUsage>({"RenderGraph alias pools"})
+		.Set<MemoryStatisticsComponents::AliasingPool>({poolID});
+	TrackedHandle allocation;
+	if (!rhi::IsOk(DeviceManager::GetInstance().AllocateMemoryTracked(allocDesc, allocInfo, allocation, trackDesc)))
+		throw std::runtime_error("Failed to allocate frame placement memory");
+	// Frame targets and per-frame working memory: over the OS budget, the costliest to leave in system memory.
+	DeviceManager::GetInstance().SetResidencyPriority(allocation, rhi::ResidencyPriorityHigh);
+	// The placements in the replaced heap keep it alive through their leases until they go.
+	if (cached.allocation.GetAllocation())
+		DeletionManager::GetInstance().MarkForDelete(std::move(cached.allocation), "RenderGraph frame placement block (replaced)");
+	cached.allocation = std::move(allocation);
+	cached.capacity = size;
+	cached.alignment = allocInfo.alignment;
+	++cached.generation;
+	cached.heap = AliasHeapGeneration::Capture(cached.allocation, cached.generation);
+	spdlog::info("Frame placement {}: heap for class {} {}: capacity={} (needed {}) generation={}", versionID, memoryClass,
+		fits ? "shrank" : cached.generation == 1 ? "allocated" : "grew", size, capacity, cached.generation);
+	return cached.heap;
+}
+
+uint64_t FramePlacementMemory::Bytes() const {
+	std::lock_guard lock(m_mutex);
+	uint64_t bytes = 0;
+	for (const auto& [key, heap] : m_heaps) bytes += heap.capacity;
+	return bytes;
 }
 
 bool FramePlacementVersion::Allocated() const {

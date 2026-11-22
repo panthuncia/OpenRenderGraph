@@ -1100,7 +1100,10 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 		if (!bootstrap && !state.pending) ReleaseReplacedVersionDeclarations();
 		// Alias re-placement when the packing strategy changed since the latest plan (plans run only on structural builds).
 		const bool packingChanged = m_getAutoAliasPackingStrategy && m_getAutoAliasPackingStrategy() != state.aliasPackingStrategy;
-		if (packingChanged && !state.pending) {
+		// Alias re-placement when the host published a new frame placement since this graph's plan took one.
+		const bool framePlacementChanged = m_framePlacementProbe && state.framePlacementTaken
+			&& m_framePlacementProbe() != (state.framePlacement ? state.framePlacement->Id() : 0);
+		if ((packingChanged || framePlacementChanged) && !state.pending) {
 			BT_ZONE_SCOPE("ORG.Persistent.ForcedRealias");
 			auto forced = state.program.BeginEdit();
 			// Re-placement is only valid in a structural edit (the executable must
@@ -1109,11 +1112,14 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 			forced.ClearPlacementOrderings();
 			state.aliasEdges.clear();
 			state.forceNewAliasHeaps = true;
+			// The plan takes the host's current version again.
+			if (framePlacementChanged) state.framePlacementTaken = false;
 			auto ready = BuildPersistentStructural(forced);
 			state.forceNewAliasHeaps = false;
 			if (!ready || !state.program.Install(forced, ready)) throw std::runtime_error("Persistent forced alias re-placement failed to install");
 			++state.structuralBuilds;
-			spdlog::info("Persistent alias re-placement ({}): frame={}", packingChanged ? "packing strategy changed" : "forced", state.frameNumber);
+			spdlog::info("Persistent alias re-placement ({}): frame={}",
+				packingChanged ? "packing strategy changed" : framePlacementChanged ? "new frame placement" : "forced", state.frameNumber);
 		}
 		auto ensureEdit = [&]() -> persistent::GraphEditTransaction& {
 			if (!edit) edit.emplace(state.program.BeginEdit());

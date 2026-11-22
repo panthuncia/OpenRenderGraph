@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -51,6 +52,8 @@ public:
 	void Publish(PlacementSummary summary);
 	/** @brief The version graphs place from: null while disabled or before the first one. */
 	std::shared_ptr<const FramePlacementVersion> Current() const;
+	/** @brief Current()'s id, 0 for none. Lock-free, for each graph preparation. */
+	uint64_t CurrentId() const noexcept { return m_currentId.load(std::memory_order_acquire); }
 	/** @brief The last layout computed, enabled or not. Null before the first one. */
 	std::shared_ptr<const FramePlacementVersion> Latest() const;
 	/** @brief The latest summary of each epoch, in ascending epoch order. */
@@ -74,6 +77,9 @@ private:
 	std::chrono::steady_clock::time_point m_lastChange{};
 	uint64_t m_nextId = 1;
 	std::shared_ptr<const FramePlacementVersion> m_latest, m_current;
+	// Block memory every version shares (FramePlacementMemory).
+	const std::shared_ptr<FramePlacementMemory> m_memory = std::make_shared<FramePlacementMemory>();
+	std::atomic<uint64_t> m_currentId{0};  // m_current's id
 	bool m_stopping = false;
 	std::thread m_thread;
 };

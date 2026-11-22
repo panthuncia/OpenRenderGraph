@@ -1,6 +1,7 @@
 #include "Render/RenderGraph/PersistentGraph.h"
 #include "Render/PreparedPass.h"
 #include <stdexcept>
+#include <spdlog/fmt/fmt.h>
 #include <exception>
 #include <algorithm>
 #include <iterator>
@@ -886,16 +887,20 @@ void GraphEditTransaction::ReplaceBinding(ResourceSlotId slot, BindingVersion bi
     if (!m_structuralChanged && !previous && binding.admission) {
         // Introducing placement metadata is not a compatible backing update:
         // the selected executable has never checked these physical overlaps.
-        Require(!binding.admission->aliasSize && !binding.admission->aliasHeapIdentity
-            && !binding.admission->aliasPoolID && !binding.admission->aliasOffset,
-            "Binding replacement requires a structural alias edit");
+        if (binding.admission->aliasSize || binding.admission->aliasHeapIdentity || binding.admission->aliasPoolID
+            || binding.admission->aliasOffset)
+            throw std::invalid_argument(fmt::format("Binding replacement requires a structural alias edit: resource {} was not placed "
+                "and is now at pool {:#x} offset {} size {}", structure.resourceIDs.at(slot.index), binding.admission->aliasPoolID,
+                binding.admission->aliasOffset, binding.admission->aliasSize));
     }
     if (!m_structuralChanged && previous) {
         Require(bool(binding.admission), "Binding lost its admission contract");
         const auto& next = *binding.admission;
-        Require(previous->aliasHeapIdentity == next.aliasHeapIdentity && previous->aliasPoolID == next.aliasPoolID
-            && previous->aliasOffset == next.aliasOffset && previous->aliasSize == next.aliasSize,
-            "Binding replacement requires a structural alias edit");
+        if (!(previous->aliasHeapIdentity == next.aliasHeapIdentity && previous->aliasPoolID == next.aliasPoolID
+            && previous->aliasOffset == next.aliasOffset && previous->aliasSize == next.aliasSize))
+            throw std::invalid_argument(fmt::format("Binding replacement requires a structural alias edit: resource {} moved from pool {:#x} "
+                "offset {} size {} to pool {:#x} offset {} size {}", structure.resourceIDs.at(slot.index), previous->aliasPoolID,
+                previous->aliasOffset, previous->aliasSize, next.aliasPoolID, next.aliasOffset, next.aliasSize));
     }
     const auto newBucket = static_cast<uint32_t>(binding.identity % BindingTable::IdentityBuckets);
     auto editBucket = [&](uint32_t index) -> BindingTable::IdentityBucket& {
