@@ -135,14 +135,31 @@ public:
 
     void Dematerialize();
 
+    // Relocation (relocation::Service). A standalone backing of the same description as the current one, for the current
+    // backing to move into. Null without a backing of its own.
+    std::unique_ptr<GpuTextureBacking> MakeRelocationBacking();
+    // Relocation. Switches to a new backing while the resource keeps its identity, under the backing lock:
+    // - next: the new backing. On success it holds the old one, for the caller to retire. Null when the current backing's
+    //   allocation already names the new resource (a defragmentation move); the backing stays and only its views change.
+    // - fromGeneration: the generation the move was made for. Nothing changes when the backing changed since.
+    // - rewriteInPlace: the GPU is idle, so the same descriptor slots are written again and bindless indices stay. Otherwise
+    //   the slots rotate: frames in flight keep the old ones, and new work gets new indices.
+    // Bumps the backing generation and drops the cached publication snapshot. False when nothing changed.
+    bool AdoptRelocatedBacking(std::unique_ptr<GpuTextureBacking>& next, uint64_t fromGeneration, bool rewriteInPlace);
+
     void EnsureVirtualDescriptorSlotsAllocated() override;
 
     ~PixelBuffer() override;
+
+protected:
+    rhi::ma::Allocation* RelocationAllocation() noexcept override;
 
 private:
     PixelBuffer(const TextureDescription& desc, bool materialize);
 
     void EnsureMaterializedLocked(const char* operation) const;
+    // The description the backing is made with: the logical one, padded to powers of two when it asks for that.
+    TextureDescription BackingDescription() const;
     void EnsureVirtualDescriptorSlotsAllocatedLocked();
 
     void ApplyMetadataComponentBundle(const EntityComponentBundle& bundle) override;

@@ -583,8 +583,47 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
 
     RefreshDescriptorContents();
     ProbeVirtualShadowBufferStep(GetName(), "after descriptor refresh");
+    ApplyRelocationClass(GetGlobalResourceID());
     ++m_backingGeneration;
     OnBackingMaterialized();
+}
+
+std::unique_ptr<GpuBufferBacking> BufferBase::MakeRelocationBacking() {
+    std::scoped_lock lock(m_materializationMutex);
+    if (!m_dataBuffer || m_dataBuffer->GetAliasHeap()) return {};
+    auto backing = GpuBufferBacking::CreateUnique(
+        m_accessType,
+        m_bufferSize,
+        GetGlobalResourceID(),
+        m_unorderedAccess,
+        nullptr,
+        false,
+        BackingResourceFlags());
+    if (m_residencyPriority) DeviceManager::GetInstance().SetResidencyPriority(backing->m_bufferAllocation, *m_residencyPriority);
+    return backing;
+}
+
+bool BufferBase::AdoptRelocatedBacking(std::unique_ptr<GpuBufferBacking>& next, uint64_t fromGeneration, bool rewriteInPlace) {
+    // The swap is a backing change that concurrent captures must not see half done. The backing lock below orders it
+    // against them, and the scope tells the buffer checks that it is allowed here.
+    ScopedBackingMutation mutation;
+    std::scoped_lock lock(m_materializationMutex);
+    if (!m_dataBuffer || m_backingGeneration != fromGeneration || GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid())
+        return false;
+    if (next && next->GetSize() != m_dataBuffer->GetSize()) return false;
+    if (!rewriteInPlace) RotateDescriptorSlotsForPublication();
+    if (next) std::swap(m_dataBuffer, next);
+    RefreshDescriptorContents();
+    ApplyRelocationClass(GetGlobalResourceID());
+    ++m_backingGeneration;
+    ForgetPublishedAllocation();
+    if (next) OnBackingMaterialized();
+    return true;
+}
+
+rhi::ma::Allocation* BufferBase::RelocationAllocation() noexcept {
+    std::scoped_lock lock(m_materializationMutex);
+    return m_dataBuffer ? m_dataBuffer->GetAllocation() : nullptr;
 }
 
 BackingAllocationSnapshot BufferBase::CaptureBackingAllocation(bool retain) {
@@ -771,6 +810,7 @@ void BufferBase::SetBacking(std::unique_ptr<GpuBufferBacking> backing, uint64_t 
     m_dataBuffer = std::move(backing);
     m_bufferSize = bufferSize;
     RefreshDescriptorContents();
+    ApplyRelocationClass(GetGlobalResourceID());
     ++m_backingGeneration;
     if (m_dataBuffer) {
         OnBackingMaterialized();

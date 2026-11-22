@@ -937,8 +937,21 @@ public:
 	// With a submission thread, it drains the thread first, so the sealed point is complete. With Desc::queuedSeals it queues the
 	// seal on the thread instead, behind the tickets queued so far.
 	// Seals SubmittedPoint's current value as SealedPoint, and counts a frame boundary (Seals): a run is waited for only once a seal
-	// came after it. Also trims the frame arena's idle chunks.
+	// came after it. Also trims the frame arena's idle chunks, then commits pending relocations (CommitRelocations): the seal is
+	// the frame boundary, and no preparation of the next frame has started on this thread.
 	void SealSubmitted();
+	/**
+	 * @brief Owner thread, at a frame boundary before any preparation: commits the relocations the sources have ready
+	 * (relocation::Service::Commit). SealSubmitted calls it; a host that never seals calls it between frames itself.
+	 *
+	 * The copies go through the first graph's external client on the graphics queue, so they come before the next frame's
+	 * graph work, and the ledgers carry their states and waits to that work. Every queue the graphs use waits for the ready
+	 * points of data another API copied.
+	 * @param gpuIdle The GPU has no work in flight (a loading screen after a wait): descriptors are rewritten in place, so
+	 * bindless indices stay, and Written backings may move.
+	 * @return How many relocations were committed. 0 before the first graph is built.
+	 */
+	size_t CommitRelocations(bool gpuIdle = false);
 	// Any thread: the SealSubmitted calls so far, queued seals included.
 	uint64_t Seals() const noexcept { return m_sealsPushed.load(std::memory_order_acquire); }
 	// Any thread: the point SealSubmitted last captured (none before the first). It names only work already on the device, and
@@ -1206,6 +1219,8 @@ private:
 	std::atomic<uint64_t> m_sealsPushed{0};
 	// Where a seal is passed: on the submission thread for a queued seal (a_marker set), else on the calling thread.
 	void PassSeal(const std::shared_ptr<GpuPoint::Pending>& a_marker);
+	// CommitRelocations without the owner check, for SealSubmitted.
+	size_t CommitRelocationsNow(bool gpuIdle);
 	// Submitting thread: an admitted ticket of a_segment, and the frame's end (the seal).
 	uint64_t m_buildGeneration = 0;
 	std::unique_ptr<Async> m_async;

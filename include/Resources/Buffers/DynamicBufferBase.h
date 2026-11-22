@@ -160,6 +160,14 @@ public:
 
     void Dematerialize();
 
+    // Relocation (relocation::Service). A standalone backing like the current one, for the current backing to move into.
+    // Null without a backing of its own.
+    std::unique_ptr<GpuBufferBacking> MakeRelocationBacking();
+    // Relocation. Switches to a new backing of the same size while the buffer keeps its identity, as
+    // PixelBuffer::AdoptRelocatedBacking does for textures. On success `next` holds the old backing (or stays null when it
+    // was null: the allocation already names the new resource). False when nothing changed.
+    bool AdoptRelocatedBacking(std::unique_ptr<GpuBufferBacking>& next, uint64_t fromGeneration, bool rewriteInPlace);
+
     void SetDescriptorRequirements(const DescriptorRequirements& requirements);
 
     bool HasDescriptorRequirements() const;
@@ -240,6 +248,8 @@ protected:
     void UnregisterUploadPolicyClient();
 
     virtual void OnBackingMaterialized() {}
+
+    rhi::ma::Allocation* RelocationAllocation() noexcept override;
 
 	// Engine representation of a GPU buffer- owns a handle to the actual GPU resource.
     std::unique_ptr<GpuBufferBacking> m_dataBuffer;

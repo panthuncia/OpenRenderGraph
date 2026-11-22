@@ -2,6 +2,7 @@
 #include "RenderGraphPersistentState.h"
 #include "Resources/Buffers/VersionedBuffer.h"
 #include "Render/Runtime/StagedUploadBatch.h"
+#include "Resources/Relocation.h"
 
 namespace org {
 
@@ -197,6 +198,7 @@ bool RenderGraph::BindPersistentTicketRecording(PersistentTicket& ticket, std::s
 		|| recording->samplerHeap.index != segment.samplerHeap.index || recording->samplerHeap.generation != segment.samplerHeap.generation)
 		return fail("recorded for other descriptor heaps");
 	if (recording->hostTag != hostTag) return fail("recorded under another backing version");
+	if (!PersistentRecordingBackingsCurrent(*recording)) return fail("recorded with a backing that moved since");
 	recording->lastUse.store(ticket.hostFrame, std::memory_order_relaxed);
 	segment.recording = std::move(recording);
 	ticket.revisions = segment.recording->revisions;
@@ -241,6 +243,45 @@ std::string RenderGraph::PersistentRecordingStaleVersion(const PersistentRecordi
 			+ ", recorded with " + std::to_string(number) + ")";
 	}
 	return {};
+}
+
+namespace {
+// The first snapshot the recording bound whose backing moved away since (relocation::Service::MovedFrom), or null.
+const ResourceBindingSnapshot* FirstMovedBacking(const RenderGraph::PersistentRecording& recording) {
+	const auto& service = relocation::Service::Get();
+	const auto moved = [&](const ResourceBindingSnapshot* snapshot) {
+		return snapshot && service.MovedFrom(snapshot->resourceID, snapshot->backingGeneration);
+	};
+	if (recording.publication) {
+		const auto& table = recording.publication->bindings;
+		for (uint32_t index = 0; index < table.Size(); ++index) {
+			const auto* binding = table.TryAt(index);
+			if (binding && binding->bound && moved(binding->recording.get())) return binding->recording.get();
+		}
+	}
+	for (const auto& rebinding : recording.rebindings)
+		if (moved(rebinding.recording.get())) return rebinding.recording.get();
+	return nullptr;
+}
+}
+
+bool RenderGraph::PersistentRecordingBackingsCurrent(const PersistentRecording& recording) noexcept {
+	try {
+		const auto head = relocation::Service::Get().Journal().Head();
+		if (recording.backingsCheckedAt.load(std::memory_order_acquire) == head) return true;
+		if (FirstMovedBacking(recording)) return false;
+		recording.backingsCheckedAt.store(head, std::memory_order_release);
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
+std::string RenderGraph::PersistentRecordingStaleBacking(const PersistentRecording& recording) {
+	const auto* snapshot = FirstMovedBacking(recording);
+	if (!snapshot) return {};
+	return "resource id " + std::to_string(snapshot->resourceID) + " (its backing of generation "
+		+ std::to_string(snapshot->backingGeneration) + " moved)";
 }
 
 bool RenderGraph::PersistentTicketCurrent(const PersistentTicket& ticket) {

@@ -26,6 +26,9 @@ public:
 		rhi::ResourceSyncState, rhi::ResourceSyncState) override;
 	SymbolicTracker* GetStateTracker() override { return &m_stateTracker; }
 	bool TryGetBufferByteSize(uint64_t& out) const override { out = m_byteSize; return true; }
+	uint64_t GetByteSize() const noexcept { return m_byteSize; }
+	// The views it was imported with (CreateShared, RefreshShared).
+	const ViewRequirements& GetViews() const noexcept { return m_views; }
 
 private:
 	ExternalBufferResource(rhi::ResourcePtr resource, uint64_t byteSize, ViewRequirements views);

@@ -189,6 +189,10 @@ add_library(OpenRenderGraph STATIC
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/ResourceStateTracker.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/GPUBacking/GpuBufferBacking.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/GPUBacking/GPUTextureBacking.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/RelocationRecord.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Resources/RelocationRecord.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Resources/Relocation.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/Resources/Relocation.h"
 )
 
 add_library(OpenRenderGraph::OpenRenderGraph ALIAS OpenRenderGraph)

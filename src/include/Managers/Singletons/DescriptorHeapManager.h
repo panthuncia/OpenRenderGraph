@@ -60,6 +60,9 @@ public:
 	// latest graph fence snapshot has finished using it.
 	void RetireNativeResource(rhi::ResourcePtr resource);
 	void RetireBufferBacking(std::unique_ptr<GpuBufferBacking> backing);
+	// Relocation (relocation::Service): keeps the old backing of a moved resource until every queue reaches the frontier taken
+	// now, behind the assignment gate. Call it after the relocation batch was submitted, so the frontier covers its copy.
+	void RetireRelocated(std::shared_ptr<const void> retired);
     void RetireExecutionLease(std::shared_ptr<const void> lease);
 	struct QueueFenceSnapshotPoint {
 		rhi::Timeline timeline;
@@ -72,6 +75,7 @@ public:
 		uint64_t descriptorSlotCount = 0;
 		uint64_t bufferBackingCount = 0;
 		uint64_t resourceCount = 0;
+		uint64_t relocatedBackingCount = 0;
 		uint64_t blockedReleaseCount = 0;
 		uint64_t invalidTimelineCount = 0;
 		uint64_t deviceErrorTimelineCount = 0;
@@ -161,6 +165,7 @@ private:
 		std::vector<std::shared_ptr<Resource>> resources;
 		std::vector<rhi::ResourcePtr> nativeResources;
         std::vector<std::shared_ptr<const void>> executionLeases;
+		std::vector<std::shared_ptr<const void>> relocatedBackings;
 		std::vector<QueueFenceSnapshotPoint> requiredFences;
 		bool open = false;  // made while an assignment scope was open: requiredFences is not taken yet
 		uint64_t mark = 0;  // the gate's mark when made, for an open one
