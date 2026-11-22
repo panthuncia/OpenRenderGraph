@@ -1124,7 +1124,11 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 			// the planner re-derives them for the new placements.
 			forced.ClearPlacementOrderings();
 			state.aliasEdges.clear();
-			state.forceNewAliasHeaps = true;
+			// A packing strategy change re-places every pool in new memory. A new frame placement does not: the candidates it
+			// covers move to its heaps, and the rest stay in the graph's pools and frame arena ranges, which grow or shrink as for
+			// any plan. New pool memory here made a new pool generation at each version, so every other graph placed in the pool
+			// went stale and was built again, and the frame arena took new bytes beside the graph's current ranges.
+			state.forceNewAliasHeaps = packingChanged;
 			// The plan takes the host's current version again.
 			if (framePlacementChanged) state.framePlacementTaken = false;
 			auto ready = BuildPersistentStructural(forced);
