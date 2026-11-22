@@ -147,6 +147,87 @@ void DeviceManager::SetResidencyPriority(TrackedHandle& allocation, rhi::Residen
     (void)m_device.Get().SetResidencyPriority(rhi::Span<rhi::PageableRef>{ &pageable, 1u }, priority);
 }
 
+namespace {
+
+// The heap types a memory group gets a pool for: the allocator's standard heaps. Others keep the allocator's own blocks.
+const char* PerFramePoolName(rhi::HeapType heapType) noexcept {
+    switch (heapType) {
+    case rhi::HeapType::DeviceLocal: return "ORG PerFrame (DeviceLocal)";
+    case rhi::HeapType::Upload: return "ORG PerFrame (Upload)";
+    case rhi::HeapType::Readback: return "ORG PerFrame (Readback)";
+    case rhi::HeapType::GPUUpload: return "ORG PerFrame (GPUUpload)";
+    default: return nullptr;
+    }
+}
+
+} // namespace
+
+rhi::ma::Pool* DeviceManager::MemoryGroupPool(MemoryGroup group, rhi::HeapType heapType) noexcept {
+    if (group != MemoryGroup::PerFrame) return nullptr;
+    const char* name = PerFramePoolName(heapType);
+    const auto index = static_cast<size_t>(heapType);
+    if (!name || index >= kPoolHeapTypes) return nullptr;
+    std::scoped_lock lock(m_poolMutex);
+    if (!m_allocator) return nullptr;
+    if (auto* pool = m_perFramePools[index]) return pool;
+    if (m_perFramePoolFailed[index]) return nullptr;
+    rhi::ma::PoolDesc desc{};
+    desc.heapType = heapType;
+    desc.blockSize = kPerFrameBlockBytes;
+    desc.debugName = name;
+    rhi::ma::Pool* pool = nullptr;
+    const auto result = m_allocator->CreatePool(&desc, &pool);
+    if (!rhi::IsOk(result) || !pool) {
+        // Tried once. Its buffers go to the allocator's own blocks.
+        m_perFramePoolFailed[index] = true;
+        spdlog::warn("ORG memory: the pool '{}' could not be made ({}); its buffers share the allocator's blocks", name, rhi::ResultName(result));
+        return nullptr;
+    }
+    pool->SetName(name);
+    m_perFramePools[index] = pool;
+    spdlog::info("ORG memory: pool '{}' made, {} MB blocks", name, kPerFrameBlockBytes >> 20);
+    return pool;
+}
+
+bool DeviceManager::MemoryGroupStatistics(MemoryGroup group, rhi::HeapType heapType, rhi::ma::Statistics& out) noexcept {
+    out = {};
+    if (group != MemoryGroup::PerFrame) return false;
+    const auto index = static_cast<size_t>(heapType);
+    if (index >= kPoolHeapTypes) return false;
+    std::scoped_lock lock(m_poolMutex);
+    auto* pool = m_perFramePools[index];
+    if (!pool) return false;
+    pool->GetStatistics(&out);
+    return true;
+}
+
+bool DeviceManager::MemoryGroupStatistics(MemoryGroup group, rhi::ma::Statistics& out) noexcept {
+    out = {};
+    if (group != MemoryGroup::PerFrame) return false;
+    std::scoped_lock lock(m_poolMutex);
+    bool any = false;
+    for (auto* pool : m_perFramePools) {
+        if (!pool) continue;
+        rhi::ma::Statistics stats{};
+        pool->GetStatistics(&stats);
+        out.blockCount += stats.blockCount;
+        out.allocationCount += stats.allocationCount;
+        out.blockBytes += stats.blockBytes;
+        out.allocationBytes += stats.allocationBytes;
+        any = true;
+    }
+    return any;
+}
+
+void DeviceManager::ReleasePools() noexcept {
+    std::scoped_lock lock(m_poolMutex);
+    for (auto*& pool : m_perFramePools) {
+        if (pool) pool->ReleaseThis();
+        pool = nullptr;
+    }
+    m_perFramePoolFailed = {};
+}
+
 rhi::Result DeviceManager::CreateResourceUntracked(
     const rhi::ma::AllocationDesc& allocDesc,
     const rhi::ResourceDesc& resourceDesc,
@@ -274,6 +355,7 @@ void DeviceManager::Cleanup() {
 		releaseAllocator = false;
     }
     if (releaseAllocator){
+        ReleasePools();
         m_allocator->ReleaseThis();
         m_allocator = nullptr;
     }

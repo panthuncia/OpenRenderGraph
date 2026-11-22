@@ -5,6 +5,7 @@
 #include <string>
 
 #include "rhi.h"
+#include "Resources/MemoryGroup.h"
 
 
 namespace org {
@@ -49,6 +50,11 @@ namespace MemoryStatisticsComponents
 	// as textures are.
 	struct HeapKind {
 		rhi::HeapType type = rhi::HeapType::DeviceLocal;
+	};
+
+	// The memory group of a buffer allocated from a group pool of its own (MemoryGroup::PerFrame). Absent: Default.
+	struct AllocationGroup {
+		::org::MemoryGroup group = ::org::MemoryGroup::Default;
 	};
 
 	struct TextureShape {

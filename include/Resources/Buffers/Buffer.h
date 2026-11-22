@@ -96,12 +96,13 @@ public:
 
     size_t GetSize() const { return m_bufferSize; }
 
-    // Makes a new buffer like this one, with the same heap, access, structure, descriptors, upload policy and name, but
-    // without a backing. Once resized and materialized, it is the next version of a growing buffer (VersionedBuffer).
+    // Makes a new buffer like this one, with the same heap, access, structure, descriptors, upload policy, memory group and
+    // name, but without a backing. Once resized and materialized, it is the next version of a growing buffer (VersionedBuffer).
     // This way nothing changes in place.
     std::shared_ptr<Buffer> UnmaterializedLike() const {
         auto buffer = CreateSharedUnmaterialized(m_accessType, m_bufferSize, m_unorderedAccess);
         buffer->m_structuredParams = m_structuredParams;
+        buffer->SetMemoryGroup(GetMemoryGroup());
         if (m_descriptorRequirements) buffer->SetDescriptorRequirements(*m_descriptorRequirements);
         buffer->SetUploadPolicyTag(GetUploadPolicyTag());
         buffer->SetName(GetName());

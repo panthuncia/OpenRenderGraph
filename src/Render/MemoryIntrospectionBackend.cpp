@@ -65,6 +65,9 @@ public:
                 row.aliased = true;
                 if (placed->poolID) row.aliasPoolID = placed->poolID;
             }
+            if (auto group = e.try_get<MemoryStatisticsComponents::AllocationGroup>()) {
+                row.memoryGroup = group->group;
+            }
             if (auto ident = e.try_get<ResourceIdentifier>()) {
                 row.identifier = ident->name;
             }

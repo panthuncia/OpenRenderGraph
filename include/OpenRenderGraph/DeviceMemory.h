@@ -7,6 +7,8 @@
 #include <rhi.h>
 #include <rhi_allocator.h>
 
+#include "Resources/MemoryGroup.h"
+
 // ORG's device allocator for a host: resources the host owns itself, and the allocator's VRAM report.
 namespace org::memory {
 
@@ -45,5 +47,9 @@ bool AllocatorBudget(rhi::ma::Budget& local, rhi::ma::Budget& nonLocal) noexcept
 
 // Any thread. The size of the memory a segment group's heaps hold (the card's VRAM for Local). 0 without an allocator.
 uint64_t MemoryCapacity(rhi::MemorySegmentGroup segmentGroup) noexcept;
+
+// Any thread. The blocks and allocations of a memory group's own pools, all heap types together (MemoryGroup::PerFrame). False
+// for MemoryGroup::Default, whose memory is the allocator's own blocks, and while the group has no pool yet.
+bool MemoryGroupStatistics(MemoryGroup group, rhi::ma::Statistics& out) noexcept;
 
 } // namespace org::memory

@@ -123,6 +123,7 @@ public:
 			world.component<MemoryStatisticsComponents::PlacedInAliasPool>();
 			world.component<MemoryStatisticsComponents::ResourceUsage>();
 			world.component<MemoryStatisticsComponents::HeapKind>();
+			world.component<MemoryStatisticsComponents::AllocationGroup>();
 			world.component<MemoryStatisticsComponents::TextureShape>();
 			world.component<ResourceIdentifier>();
 		});

@@ -83,6 +83,11 @@ bool AllocatorBudget(rhi::ma::Budget& local, rhi::ma::Budget& nonLocal) noexcept
     return true;
 }
 
+bool MemoryGroupStatistics(MemoryGroup group, rhi::ma::Statistics& out) noexcept
+{
+    return DeviceManager::GetInstance().MemoryGroupStatistics(group, out);
+}
+
 uint64_t MemoryCapacity(rhi::MemorySegmentGroup segmentGroup) noexcept
 {
     auto* allocator = DeviceManager::GetInstance().GetAllocator();

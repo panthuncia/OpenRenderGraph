@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "Interfaces/IHasMemoryMetadata.h"
+#include "Resources/MemoryGroup.h"
 
 namespace org::memory {
 
@@ -33,6 +34,8 @@ struct ResourceMemoryRecord {
     uint64_t aliasPoolID = 0;
     // Placed in an aliasing pool's memory: the pool's record already counts these bytes.
     bool placedInAliasPool = false;
+    // The block pool the allocation came from (MemoryGroupName names it): PerFrame for a per-frame buffer in its own blocks.
+    MemoryGroup memoryGroup = MemoryGroup::Default;
 
     // Whether the bytes add to a total; placements in an aliasing pool would count the pool's memory twice.
     bool CountsTowardTotal() const { return !placedInAliasPool; }

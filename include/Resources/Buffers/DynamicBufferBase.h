@@ -14,6 +14,7 @@
 #include "Resources/AliasingPlacement.h"
 #include "Resources/BackedResource.h"
 #include "Resources/GloballyIndexedResource.h"
+#include "Resources/MemoryGroup.h"
 #include "Resources/TrackedAllocation.h"
 #include "Render/Runtime/BufferUploadPolicy.h"
 #include "Render/Runtime/IUploadPolicyService.h"
@@ -171,6 +172,15 @@ public:
     // allocation is source. Fails when the backing changed, is placed, or for an attached representation. The caller owns the result.
     rhi::Result MakeDefragmentationResource(const rhi::ma::Allocation& source, rhi::ma::Allocation& destination, rhi::ResourcePtr& out);
 
+    /**
+     * @brief Chooses the block pool for this buffer's backings (MemoryGroup). Call it before Materialize: a backing made earlier
+     * keeps its memory, and later backings (a resize, a relocation) use the new group. A PerFrame buffer never shares a block with
+     * Default allocations and never moves in a defragmentation. Alias placements and shared buffers ignore it.
+     */
+    void SetMemoryGroup(MemoryGroup group) noexcept { m_memoryGroup = group; }
+    /** @brief The group SetMemoryGroup chose. Default unless set. */
+    MemoryGroup GetMemoryGroup() const noexcept { return m_memoryGroup; }
+
     void SetDescriptorRequirements(const DescriptorRequirements& requirements);
 
     bool HasDescriptorRequirements() const;
@@ -264,6 +274,7 @@ protected:
     std::optional<uint64_t> m_aliasingPoolID;
     rhi::ResourceFlags m_extraResourceFlags = rhi::RF_None;
     std::optional<rhi::ResidencyPriority> m_residencyPriority;
+    MemoryGroup m_memoryGroup = MemoryGroup::Default;
 
 private:
     // Two graphs that share a buffer may materialize it at the same time (RenderGraph::MaterializeUnmaterializedResources).

@@ -11,6 +11,7 @@
 #include <resource_states.h>
 
 #include "Resources/AliasingPlacement.h"
+#include "Resources/MemoryGroup.h"
 #include "Resources/TrackedAllocation.h"
 
 
@@ -27,8 +28,9 @@ public:
 		bool unorderedAccess = false,
 		const char* name = nullptr,
 		bool shared = false,
-		rhi::ResourceFlags extraFlags = rhi::RF_None) {
-		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, nullptr, shared, extraFlags));
+		rhi::ResourceFlags extraFlags = rhi::RF_None,
+		MemoryGroup group = MemoryGroup::Default) {
+		auto sp = std::unique_ptr<GpuBufferBacking>(new GpuBufferBacking(accessType, bufferSize, owningResourceID, unorderedAccess, name, nullptr, shared, extraFlags, group));
 		return sp;
 	}
 
@@ -55,6 +57,9 @@ public:
     std::shared_ptr<const TrackedHandle> CaptureAllocationLease() {
         return m_bufferAllocation.CaptureAllocationLease();
     }
+	// The memory group the backing was allocated for. A placed or shared backing, or one whose group pool could not be used, is
+	// Default whatever was asked.
+	MemoryGroup GetMemoryGroup() const noexcept { return m_memoryGroup; }
 	// The backing's own allocation. Null for a buffer placed in an alias heap.
 	rhi::ma::Allocation* GetAllocation() noexcept { return m_bufferAllocation.GetAllocation(); }
 	// Defragmentation. Creates this buffer's resource again, with the same description, at the start of destination. Its GPU
@@ -83,6 +88,7 @@ private:
 	uint64_t m_aliasPoolID = 0;
 	uint64_t m_aliasOffset = 0;
 	uint64_t m_aliasSize = 0;
+	MemoryGroup m_memoryGroup = MemoryGroup::Default;
 
 public:
 	std::shared_ptr<const AliasHeapGeneration> GetAliasHeap() const { return m_aliasHeap; }
@@ -100,7 +106,8 @@ private:
 		const char* name = nullptr,
 		const BufferAliasPlacement* aliasPlacement = nullptr,
 		bool shared = false,
-		rhi::ResourceFlags extraFlags = rhi::RF_None);
+		rhi::ResourceFlags extraFlags = rhi::RF_None,
+		MemoryGroup group = MemoryGroup::Default);
 
 	struct LiveAllocInfo {
 		size_t size = 0;

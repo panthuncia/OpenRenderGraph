@@ -3,6 +3,7 @@
 #include <rhi_helpers.h>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
+#include <string>
 
 #include "Managers/Singletons/DeviceManager.h"
 #include <BasicTelemetry/Tracy.h>
@@ -20,7 +21,8 @@ GpuBufferBacking::GpuBufferBacking(
     const char* name,
     const BufferAliasPlacement* aliasPlacement,
     const bool shared,
-    const rhi::ResourceFlags extraFlags) {
+    const rhi::ResourceFlags extraFlags,
+    const MemoryGroup group) {
     m_accessType = accessType;
     if (aliasPlacement && !aliasPlacement->heap) throw std::invalid_argument("Missing alias heap owner");
 
@@ -84,6 +86,17 @@ GpuBufferBacking::GpuBufferBacking(
     else {
         rhi::ma::AllocationDesc allocationDesc;
         allocationDesc.heapType = accessType;
+        // A group of its own: the group's pool, and an owner label that names the group in the allocator's owner report.
+        std::string groupOwner;
+        if (group != MemoryGroup::Default && !shared) {
+            if (auto* pool = DeviceManager::GetInstance().MemoryGroupPool(group, accessType)) {
+                allocationDesc.customPool = pool;
+                const char* scope = rhi::ma::CurrentAllocationOwner();
+                groupOwner = scope && scope[0] ? std::string(scope) + " [" + MemoryGroupName(group) + "]"
+                                               : std::string("[") + MemoryGroupName(group) + "]";
+                allocationDesc.owner = groupOwner.c_str();
+            }
+        }
 		if (shared) {
 			// D3D12 can only create a cross-process/API handle for committed resources
 			// (or heaps), not for an individual placed resource. D3D11 needs a resource
@@ -93,13 +106,28 @@ GpuBufferBacking::GpuBufferBacking(
 		}
         BT_ZONE_SCOPE("GpuBufferBacking::CreateResource");
         BT_ZONE_VALUE(static_cast<int64_t>(bufferSize));
-        const auto result = DeviceManager::GetInstance().CreateResourceTracked(
+        if (allocationDesc.customPool) {
+            trackDesc.attach.Set<MemoryStatisticsComponents::AllocationGroup>({ group });
+        }
+        auto result = DeviceManager::GetInstance().CreateResourceTracked(
             allocationDesc,
             desc,
             0,
             nullptr,
             m_bufferAllocation,
             trackDesc);
+        if (!rhi::IsOk(result) && allocationDesc.customPool) {
+            // The group's pool refused it (a heap the device lacks, or no memory for a new block). The allocator's own blocks
+            // take it, as a Default allocation.
+            spdlog::warn("GpuBufferBacking: the {} pool refused a {}-byte buffer ({}); it goes to the shared blocks", MemoryGroupName(group),
+                bufferSize, rhi::ResultName(result));
+            allocationDesc.customPool = nullptr;
+            allocationDesc.owner = nullptr;
+            trackDesc.attach.Set<MemoryStatisticsComponents::AllocationGroup>({ MemoryGroup::Default });
+            result = DeviceManager::GetInstance().CreateResourceTracked(allocationDesc, desc, 0, nullptr, m_bufferAllocation, trackDesc);
+        } else if (allocationDesc.customPool) {
+            m_memoryGroup = group;
+        }
         if (!rhi::IsOk(result)) {
             throw std::runtime_error("Failed to create committed buffer resource backing");
         }

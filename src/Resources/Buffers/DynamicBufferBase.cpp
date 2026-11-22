@@ -575,7 +575,8 @@ void BufferBase::Materialize(const MaterializeOptions* options) {
             m_unorderedAccess,
             nullptr,
             false,
-            BackingResourceFlags());
+            BackingResourceFlags(),
+            m_memoryGroup);
         if (m_residencyPriority) DeviceManager::GetInstance().SetResidencyPriority(m_dataBuffer->m_bufferAllocation, *m_residencyPriority);
     }
 
@@ -598,7 +599,8 @@ std::unique_ptr<GpuBufferBacking> BufferBase::MakeRelocationBacking() {
         m_unorderedAccess,
         nullptr,
         false,
-        BackingResourceFlags());
+        BackingResourceFlags(),
+        m_memoryGroup);
     if (m_residencyPriority) DeviceManager::GetInstance().SetResidencyPriority(backing->m_bufferAllocation, *m_residencyPriority);
     return backing;
 }
@@ -833,7 +835,8 @@ void BufferBase::CreateAndSetBacking(rhi::HeapType accessType, uint64_t bufferSi
         unorderedAccess,
         nullptr,
         false,
-        BackingResourceFlags());
+        BackingResourceFlags(),
+        m_memoryGroup);
     SetBacking(std::move(newBacking), bufferSize);
 }
 
