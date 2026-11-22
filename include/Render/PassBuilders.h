@@ -1145,6 +1145,20 @@ public:
 		return *this;
 	}
 
+	// The pass may skip its writes in some runs (ExternalPassDesc::mayNotWrite). A resource it writes first is then kept out of
+	// shared alias memory, unless a pass without this flag writes it first.
+	RenderPassBuilder& MayNotWrite()& {
+		m_mayNotWrite = true;
+		params.mayNotWrite = true;
+		return *this;
+	}
+
+	RenderPassBuilder MayNotWrite() && {
+		m_mayNotWrite = true;
+		params.mayNotWrite = true;
+		return std::move(*this);
+	}
+
     RenderPassBuilder& PreferQueue(QueueKind kind)& {
         if (!IsQueueKindSupportedByRenderPass(kind)) {
             throw std::invalid_argument("Render passes only support the graphics queue");
@@ -1276,6 +1290,7 @@ private:
         }
 
         params.isGeometryPass = m_isGeometryPass;
+        params.mayNotWrite = params.mayNotWrite || m_mayNotWrite;
         params.preferredQueueKind = m_preferredQueueKind;
         params.queueAssignmentPolicy = m_queueAssignmentPolicy;
 		params.backendAffinity = m_backendAffinity;
@@ -1315,6 +1330,7 @@ private:
         _declaredIds.clear();
         resolverSnapshots_.clear();
         m_isGeometryPass = false;
+        m_mayNotWrite = false;
 		m_preferredQueueKind = QueueKind::Graphics;
 		m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 		m_backendAffinity = {};
@@ -1742,6 +1758,7 @@ private:
 	std::shared_ptr<RenderPass> pass;
     bool built_ = false;
     bool m_isGeometryPass = false;
+    bool m_mayNotWrite = false;
 	QueueKind m_preferredQueueKind = QueueKind::Graphics;
     QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 	BackendAffinity m_backendAffinity{};

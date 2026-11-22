@@ -140,6 +140,7 @@ std::array<uint64_t, 5> FingerprintParts(const LoweredPass& lowered) {
 	const auto& d = lowered.declaration;
 	parts.push_back(d.backend); parts.push_back(d.preferredQueueSlot); parts.push_back(d.forceBatchIsolation ? 1 : 0);
 	parts.push_back(d.recordAtExecution ? 1 : 0);
+	parts.push_back(d.mayNotWrite ? 0x200 : 0);
 	{
 		auto slots = d.compatibleQueueSlots; std::sort(slots.begin(), slots.end());
 		for (auto slot : slots) parts.push_back(0x100 + slot);
@@ -180,7 +181,8 @@ std::string DescribeDeclaration(const LoweredPass& lowered) {
 	std::string slots;
 	for (const auto slot : d.compatibleQueueSlots) slots += std::to_string(slot) + ",";
 	return "backend=" + std::to_string(d.backend) + " preferred=" + std::to_string(d.preferredQueueSlot) + " slots=" + slots
-		+ " isolated=" + std::to_string(d.forceBatchIsolation) + " atExecution=" + std::to_string(d.recordAtExecution);
+		+ " isolated=" + std::to_string(d.forceBatchIsolation) + " atExecution=" + std::to_string(d.recordAtExecution)
+		+ " mayNotWrite=" + std::to_string(d.mayNotWrite);
 }
 
 const char* FingerprintPartName(size_t part) noexcept {
@@ -262,6 +264,7 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 	// A pass recorded at execution goes in a batch with only such passes. The host's execution records that batch. The other
 	// batches are recorded ahead of time.
 	declaration.recordAtExecution = pass.recordAtExecution;
+	declaration.mayNotWrite = resources.mayNotWrite;
 	// The pass's own waits. A resolver group's waits are not part of the declaration: every preparation takes the group's
 	// current ones. A resolver lowered as direct uses has no group, so its waits at declaration are added below.
 	result.explicitWaits = pass.explicitExternalWaitsBeforeTransitions;

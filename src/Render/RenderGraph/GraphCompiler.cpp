@@ -1140,7 +1140,7 @@ uint64_t HashCacheStructure(const GraphCompileStructure& s) {
     mix(s.passes.size());
     for (const auto& pass : s.passes) {
         mix(pass.originalOrder); mix(pass.backend); mix(pass.preferredQueueSlot); mix(pass.preparedPassIndex);
-        mix(pass.forceBatchIsolation); mix(pass.recordAtExecution);
+        mix(pass.forceBatchIsolation); mix(pass.recordAtExecution); mix(pass.mayNotWrite);
         mix(pass.accesses.size());
         for (const auto& access : pass.accesses) { mix(access.resourceIndex); mix(access.write); }
         mix(pass.compatibleQueueSlots.size());

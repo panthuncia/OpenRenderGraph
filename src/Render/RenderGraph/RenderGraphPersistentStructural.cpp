@@ -629,6 +629,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		uint64_t sizeBytes = 0, alignment = 1;
 		uint32_t firstUse = UINT32_MAX, lastUse = 0;
 		bool firstUseIsWrite = false;
+		// The pass of the first use, a compiled pass index. Its MayNotWrite flag decides whether the first write is guaranteed.
+		uint32_t firstPass = UINT32_MAX;
+		bool writeGuaranteed = false;
 		uint32_t criticality = 0;
 		uint64_t backendMask = 0;
 		std::optional<uint64_t> manualPool;
@@ -701,7 +704,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			if (index == UINT32_MAX) return;
 			auto& c = candidates[index];
 			const auto passRank = rank[p];
-			if (passRank < c.firstUse) { c.firstUse = passRank; c.firstUseIsWrite = write; }
+			if (passRank < c.firstUse) { c.firstUse = passRank; c.firstUseIsWrite = write; c.firstPass = p; }
 			else if (passRank == c.firstUse) c.firstUseIsWrite = c.firstUseIsWrite || write;
 			c.lastUse = (std::max)(c.lastUse, passRank);
 			c.criticality = (std::max)(c.criticality, graph.criticality.at(p));
@@ -727,6 +730,8 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	for (auto& c : candidates) {
 		std::sort(c.users.begin(), c.users.end());
 		c.users.erase(std::unique(c.users.begin(), c.users.end()), c.users.end());
+		// A first write by a pass that may skip it (MayNotWrite) leaves the memory's old content in the runs where it does.
+		c.writeGuaranteed = c.firstUseIsWrite && c.firstPass < structure.passes.size() && !structure.passes[c.firstPass].mayNotWrite;
 		if (c.firstUse == UINT32_MAX) { c.exclusion = "unused"; }
 		else if (!c.direct) { c.exclusion = "group member"; }
 		else if (c.manualPool) {
@@ -735,6 +740,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			c.poolID = *c.manualPool; c.pooled = true;
 		} else if (mode == AutoAliasMode::Off) c.exclusion = "auto aliasing off";
 		else if (!c.firstUseIsWrite) c.exclusion = "first use is read";
+		else if (!c.writeGuaranteed) c.exclusion = "first writer may not write";
 		else {
 			const float benefitMB = static_cast<float>(c.sizeBytes) / (1024.0f * 1024.0f);
 			const float critNorm = static_cast<float>(c.criticality) / static_cast<float>(maxCriticality);

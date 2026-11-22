@@ -88,6 +88,8 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(const Exte
 			par.resources.externalWaitsBeforeTransitions = b.params.externalWaitsBeforeTransitions;
 			par.resources.externalWaitBindingsBeforeTransitions = b.params.externalWaitBindingsBeforeTransitions;
 			par.resources.isGeometryPass = b.params.isGeometryPass;
+			// Set on the description, or by the pass on the builder while it declared.
+			par.resources.mayNotWrite = d.mayNotWrite || b.params.mayNotWrite;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
 			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
 			if (logStructuralMaterialize) {

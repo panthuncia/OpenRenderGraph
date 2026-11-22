@@ -84,6 +84,9 @@ struct CompilePass {
     // Recorded at execution (ExternalPassDesc::recordAtExecution): in a batch of such passes alone, which an external epoch's
     // host records when it executes the epoch (ExternalEpochExecution), not ahead.
     bool recordAtExecution = false;
+    // The pass may skip its writes in some runs (ExternalPassDesc::mayNotWrite). Its first writes are not guaranteed, so the
+    // alias planners do not count them as the write that starts a transient's lifetime.
+    bool mayNotWrite = false;
     bool operator==(const CompilePass&) const = default;
 };
 struct CompileQueue {

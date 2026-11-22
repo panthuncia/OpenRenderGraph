@@ -57,6 +57,8 @@ struct PassParameters {
 	mutable std::vector<ResourceRequirement> mergedFrameResourceRequirements; // Lazily built static + immediate requirements when a contiguous view is needed
 	mutable bool mergedFrameRequirementsDirty = false;
 	bool isGeometryPass = false;
+	// The pass may skip its writes in some runs (ExternalPassDesc::mayNotWrite, RenderPassBuilder::MayNotWrite).
+	bool mayNotWrite = false;
 	QueueKind preferredQueueKind = QueueKind::Graphics;
 	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 	BackendAffinity backendAffinity{};

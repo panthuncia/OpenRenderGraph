@@ -741,6 +741,7 @@ inline uint64_t FingerprintDeclaration(const compiler::CompilePass& d) {
 	uint64_t h = 0x9e3779b97f4a7c15ull;
 	auto mix = [&](uint64_t value) { h ^= value + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
 	mix(d.backend); mix(d.preferredQueueSlot); mix(d.forceBatchIsolation ? 1 : 0); mix(d.recordAtExecution ? 1 : 0);
+	mix(d.mayNotWrite ? 1 : 0);
 	auto slots = d.compatibleQueueSlots; std::sort(slots.begin(), slots.end());
 	for (const auto slot : slots) mix(0x100 + slot);
 	return h;

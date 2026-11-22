@@ -77,6 +77,10 @@ struct ExternalPassDesc {
 	// it knows then to be empty (TypedRenderGraphPass's SkipsAtExecution). An extension should ask
 	// RenderGraph::PassEpochRecordsAtExecution before it sets this: otherwise the graph refuses the pass.
 	bool recordAtExecution = false;
+	// Persistent execution only. The pass may skip its writes in some runs. A region graph's merged anchors are gated at run
+	// time, for example, and one may draw nothing. So a resource this pass writes first is not known to be written in every
+	// run. The alias planners then keep it out of shared memory, unless a pass without this flag writes it first.
+	bool mayNotWrite = false;
 
 	static ExternalPassDesc Render(std::string name, std::shared_ptr<RenderPass> renderPass) {
 		ExternalPassDesc desc{};
@@ -138,6 +142,16 @@ struct ExternalPassDesc {
 
 	ExternalPassDesc RecordAtExecution() && {
 		recordAtExecution = true;
+		return std::move(*this);
+	}
+
+	ExternalPassDesc& MayNotWrite() & {
+		mayNotWrite = true;
+		return *this;
+	}
+
+	ExternalPassDesc MayNotWrite() && {
+		mayNotWrite = true;
 		return std::move(*this);
 	}
 
