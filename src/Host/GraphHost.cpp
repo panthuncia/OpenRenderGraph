@@ -1219,6 +1219,11 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 				const auto locked = placement.lock();
 				return locked ? locked->CurrentId() : 0;
 			});
+			// Versioned slots are candidates only while the frame placement is on.
+			graph->SetFramePlacementEnabled([placement = std::weak_ptr<FramePlacement>(m_framePlacement)]() -> bool {
+				const auto locked = placement.lock();
+				return locked && locked->Enabled();
+			});
 		}
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
 		graph->SetPersistentRecordingTimestampMode(m_recordingTimestamps.load(std::memory_order_acquire));

@@ -272,6 +272,14 @@ State::SlotEntry::FrameBinding BindVersion(State::SlotEntry& entry, std::shared_
 	State::SlotEntry::FrameBinding made;
 	made.rebinding.slot = entry.slot;
 	made.rebinding.backing = BackingStateOf(*concrete, *snapshot, entry.slot.index, entry.shape);
+	// A version placed from a frame placement lies in a block it shares with other transients. Admission then treats it as an
+	// aliased backing: the alias ledger orders the other occupants of its bytes, and each execution enters it from Undefined.
+	// Without a frame placement no version is placed, and these stay empty.
+	made.rebinding.backing.aliasHeap = snapshot->aliasHeap;
+	made.rebinding.backing.aliasHeapIdentity = snapshot->aliasHeap.get();
+	made.rebinding.backing.aliasPoolID = snapshot->aliasPoolID;
+	made.rebinding.backing.aliasOffset = snapshot->aliasOffset;
+	made.rebinding.backing.aliasSize = snapshot->aliasSize;
 	made.rebinding.recording = snapshot;
 	made.rebinding.perFrame = entry.versioned->PerFrame();
 	auto owner = std::make_shared<const std::pair<std::shared_ptr<const ResourceVersion>, PublicationBindingBundle::Snapshot>>(version, snapshot);
@@ -1120,6 +1128,35 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 			++state.structuralBuilds;
 			spdlog::info("Persistent alias re-placement ({}): frame={}",
 				packingChanged ? "packing strategy changed" : framePlacementChanged ? "new frame placement" : "forced", state.frameNumber);
+		} else if (!state.pending && state.framePlacementTaken && m_framePlacementEnabled && m_framePlacementEnabled()) {
+			// A versioned candidate whose current version changed since the latest plan (a new extent, a new version). The new
+			// version has a key of its own, so the graph plans again to publish it in its usage summary. It keeps the memory its
+			// maker gave it until a frame placement covers it. The graph's own pools do not change, so their heaps stay. As for
+			// the deferred placement, the plan runs against the live publication and builds only when it changed something.
+			bool versionsMoved = false;
+			for (const auto& entry : state.entries) {
+				if (!entry.aliasPlannedVersion || entry.retired || !entry.versioned) continue;
+				const auto current = entry.versioned->SelectVersion(nullptr);
+				if (current && current->number != entry.aliasPlannedVersion) {
+					versionsMoved = true;
+					break;
+				}
+			}
+			if (versionsMoved) {
+				BT_ZONE_SCOPE("ORG.Persistent.VersionRealias");
+				auto moved = state.program.BeginEdit();
+				moved.ClearPlacementOrderings();
+				state.aliasEdges.clear();
+				const auto live = state.program.Select();
+				if (live && PlanPersistentAliasPlacement(moved, *live)) {
+					std::atomic_bool cancelled{false};
+					auto ready = moved.Build(compiler.synchronousCompileWorkspace, cancelled);
+					if (!ready || !state.program.Install(moved, ready))
+						throw std::runtime_error("Persistent alias re-placement for new versions failed to install");
+					++state.structuralBuilds;
+				}
+				spdlog::info("Persistent alias re-placement (new versions of versioned candidates): frame={}", state.frameNumber);
+			}
 		}
 		auto ensureEdit = [&]() -> persistent::GraphEditTransaction& {
 			if (!edit) edit.emplace(state.program.BeginEdit());

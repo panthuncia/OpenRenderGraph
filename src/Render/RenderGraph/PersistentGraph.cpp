@@ -1668,11 +1668,22 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
             Require(index < frame.backings.size(), "Frame rebinding has no compiled resource");
             Require(std::ranges::find(frame.rebound,index) == frame.rebound.end(), "Duplicate frame rebinding");
             Require(rebinding.backing.resource.valid() && rebinding.backing.regions
-                && rebinding.backing.shape == binding.shape && !rebinding.backing.aliasSize
+                && rebinding.backing.shape == binding.shape
                 && rebinding.backing.graphResourceID == uint64_t{rebinding.slot.index} + 1, "Invalid frame rebinding");
             Require(rebinding.recording && rebinding.recording->resource.GetHandle().index == rebinding.backing.resource.index
                 && rebinding.recording->resource.GetHandle().generation == rebinding.backing.resource.generation,
                 "Frame rebinding recording disagrees with admission");
+            // A version placed from a frame placement is an aliased backing. As for a publication's binding, only an ORG alias
+            // pool or frame placement block may place it, so the alias ledger knows every other occupant of its bytes.
+            if (rebinding.backing.aliasSize) {
+                Require(rebinding.backing.aliasHeap && rebinding.backing.aliasHeapIdentity == rebinding.backing.aliasHeap.get(),
+                    "Aliased frame rebinding has no exact heap owner");
+                Require(rebinding.backing.aliasPoolID != 0, "Aliased frame rebinding was not placed by an ORG alias pool");
+                Require(rebinding.backing.aliasOffset <= UINT64_MAX - rebinding.backing.aliasSize, "Aliased frame rebinding range overflow");
+                Require(rebinding.recording->aliasHeap == rebinding.backing.aliasHeap
+                    && rebinding.recording->aliasOffset == rebinding.backing.aliasOffset
+                    && rebinding.recording->aliasSize == rebinding.backing.aliasSize, "Frame rebinding recording disagrees with its placement");
+            }
             frame.rebound.push_back(index);
             rebound.emplace_back(index, rebinding.backing.resource);
             perFrame = perFrame || rebinding.perFrame;

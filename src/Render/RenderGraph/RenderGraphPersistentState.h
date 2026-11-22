@@ -356,7 +356,11 @@ struct RenderGraph::PersistentInstanceState {
 		// A versioned slot's current version number when the passes' declarations last moved to it
 		// (RenderGraph::ReleaseReplacedVersionDeclarations).
 		uint64_t sweptVersion = 0;
-		bool multiDevice = false;          // A pass on another device than the primary uses it: bound with representations.
+		// A versioned slot whose current version the latest alias plan took as a candidate (frame placement only): that version's
+		// number. 0 when it was not a candidate. A preparation that finds another current version places again, so the new
+		// version gets a key of its own in the next usage summary.
+		uint64_t aliasPlannedVersion = 0;
+		bool multiDevice = false;         // A pass on another device than the primary uses it: bound with representations.
 		bool retired = false;              // Slot removed from the program; the index may be reclaimed.
 		std::vector<uint32_t> subscribers; // Main pass indices resolving this slot.
 	};

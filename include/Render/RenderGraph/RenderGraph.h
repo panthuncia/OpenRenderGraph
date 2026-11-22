@@ -311,6 +311,12 @@ private:
 	// graph as a plain binding change. It must be cheap: it runs once per preparation.
 	using FramePlacementProbe = std::function<uint64_t()>;
 	void SetFramePlacementProbe(FramePlacementProbe probe) { m_framePlacementProbe = std::move(probe); }
+	// Whether the host places transients across the frame (GraphHost::FramePlacementSettings::enabled), even before its first
+	// version. Only then are the current versions of versioned slots alias candidates. A versioned resource is often used by
+	// several graphs, and a graph's own pools see only its own uses. So a version is placed only at a frame placement's offset,
+	// and keeps the backing it has otherwise. Unset or false: versioned slots are never candidates. Set before the first frame.
+	using FramePlacementEnabled = std::function<bool()>;
+	void SetFramePlacementEnabled(FramePlacementEnabled enabled) { m_framePlacementEnabled = std::move(enabled); }
 	// What the graph's latest alias plan took from a frame placement. Any thread.
 	struct FramePlacementUse {
 		bool planned = false;   // the graph has made an alias plan
@@ -973,6 +979,7 @@ private:
 	PlacementSummaryObserver m_placementSummaryObserver;  // SetPlacementSummaryObserver
 	FramePlacementProbe m_framePlacementProbe;            // SetFramePlacementProbe
 	FramePlacementSource m_framePlacementSource;          // SetFramePlacementSource
+	FramePlacementEnabled m_framePlacementEnabled;        // SetFramePlacementEnabled
 	// FramePlacementInUse, written by each alias plan.
 	std::atomic<bool> m_framePlacementPlanned{false};
 	std::atomic<uint64_t> m_framePlacementVersion{0}, m_framePlacementPlaced{0};
