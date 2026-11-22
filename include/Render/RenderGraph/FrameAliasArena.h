@@ -82,8 +82,8 @@ public:
 	/**
 	 * @brief Places unmaterialized textures for a span: one reservation per memory class, the textures one after another inside
 	 * it, each materialized at its place. The textures' placements last as long as the returned reservations. Throws on failure.
-	 * An empty span (AliasSpan::None) places them where nothing is reserved yet, or over ranges they may later grow beside
-	 * (Widen).
+	 * An empty span (AliasSpan::None) places them apart from every other frame transient, and over graphs' regions they may
+	 * later grow beside (Widen).
 	 */
 	std::vector<std::shared_ptr<Reservation>> ReserveTextures(AliasSpan span, std::span<const std::shared_ptr<PixelBuffer>> textures,
 		std::string name);
@@ -118,6 +118,10 @@ public:
 
 private:
 	struct Impl;
+	// Reserve, with frameTransient for the host's textures (ReserveTextures): those never share bytes with each other while
+	// either has no span, so a graph that uses two of them can always widen both.
+	std::shared_ptr<Reservation> ReserveRange(uint8_t resourceClass, AliasSpan span, uint32_t lane, uint64_t size, uint64_t alignment,
+		std::string name, bool frameTransient);
 	void Release(uint64_t id) noexcept;
 	std::shared_ptr<Impl> m_impl;
 	std::weak_ptr<FrameAliasArena> m_self;

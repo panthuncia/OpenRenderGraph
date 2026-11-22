@@ -27,6 +27,7 @@ struct FrameAliasArena::Impl {
 		uint64_t id = 0;
 		alias::SpannedRange range;
 		std::string name;
+		bool frameTransient = false;  // the host's (ReserveTextures), not a graph's region
 	};
 	struct Block {
 		uint64_t poolID = 0, capacity = 0, alignment = 1;
@@ -53,6 +54,11 @@ FrameAliasArena::Reservation::~Reservation() {
 
 std::shared_ptr<FrameAliasArena::Reservation> FrameAliasArena::Reserve(uint8_t resourceClass, AliasSpan span, uint32_t lane, uint64_t size,
 	uint64_t alignment, std::string name) {
+	return ReserveRange(resourceClass, span, lane, size, alignment, std::move(name), false);
+}
+
+std::shared_ptr<FrameAliasArena::Reservation> FrameAliasArena::ReserveRange(uint8_t resourceClass, AliasSpan span, uint32_t lane, uint64_t size,
+	uint64_t alignment, std::string name, bool frameTransient) {
 	if (!size) throw std::invalid_argument("A frame alias reservation needs bytes");
 	alignment = (std::max<uint64_t>)(alignment, 1);
 	auto& impl = *m_impl;
@@ -64,8 +70,21 @@ std::shared_ptr<FrameAliasArena::Reservation> FrameAliasArena::Reserve(uint8_t r
 		if (block.resourceClass != resourceClass || block.alignment < alignment) continue;
 		std::vector<alias::SpannedRange> occupied;
 		occupied.reserve(block.ranges.size());
-		for (const auto& range : block.ranges) occupied.push_back(range.range);
-		offset = alias::PlaceSpanned(occupied, block.capacity, size, alignment, span.first, span.last, lane);
+		for (const auto& range : block.ranges) {
+			auto placed = range.range;
+			// A frame transient nothing uses yet has no span, and its first use may be at any position. Another frame transient's
+			// bytes would then block its growth whenever one graph uses both, so frame transients never share bytes with each other
+			// before their spans are known. Graphs' regions placed later avoid them by their spans as they grow.
+			if (frameTransient && range.frameTransient) {
+				placed.first = 0;
+				placed.last = UINT32_MAX - 1;
+				placed.lane = 0;
+			}
+			occupied.push_back(placed);
+		}
+		const bool unused = frameTransient && span.Empty();
+		offset = alias::PlaceSpanned(occupied, block.capacity, size, alignment, unused ? 0 : span.first, unused ? UINT32_MAX - 1 : span.last,
+			unused ? 0 : lane);
 		if (offset != UINT64_MAX) { chosen = &block; break; }
 	}
 	if (!chosen) {
@@ -104,7 +123,7 @@ std::shared_ptr<FrameAliasArena::Reservation> FrameAliasArena::Reserve(uint8_t r
 	reservation->m_size = size;
 	reservation->m_poolID = chosen->poolID;
 	reservation->m_id = impl.nextRange++;
-	chosen->ranges.push_back({reservation->m_id, {offset, offset + size, span.first, span.last, lane}, name});
+	chosen->ranges.push_back({reservation->m_id, {offset, offset + size, span.first, span.last, lane}, name, frameTransient});
 	spdlog::info("Frame alias arena: '{}' reserved in block {:#x} at [{}, {}) for positions {}-{} lane {}", name, chosen->poolID, offset,
 		offset + size, span.first, span.last, lane);
 	return reservation;
@@ -184,7 +203,7 @@ std::vector<std::shared_ptr<FrameAliasArena::Reservation>> FrameAliasArena::Rese
 			end = member.offset + member.size;
 			alignment = (std::max)(alignment, member.alignment);
 		}
-		auto reservation = Reserve(resourceClass, span, 0, end, alignment, name);
+		auto reservation = ReserveRange(resourceClass, span, 0, end, alignment, name, true);
 		for (const auto& member : members) {
 			PixelBuffer::MaterializeOptions options{};
 			options.aliasPlacement = TextureAliasPlacement{reservation->Heap(), reservation->Offset() + member.offset, reservation->PoolID()};
