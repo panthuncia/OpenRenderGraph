@@ -39,6 +39,7 @@ void FramePlacement::SetSettings(Settings settings) {
 	{
 		std::lock_guard lock(m_mutex);
 		m_settings = std::move(settings);
+		m_enabled.store(m_settings.enabled, std::memory_order_release);
 		// Disabled: graphs place on their own from their next plan. Enabled: the next computation publishes a version.
 		if (!m_settings.enabled) m_current.reset();
 		++m_changes;

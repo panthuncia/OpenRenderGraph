@@ -54,6 +54,8 @@ public:
 	std::shared_ptr<const FramePlacementVersion> Current() const;
 	/** @brief Current()'s id, 0 for none. Lock-free, for each graph preparation. */
 	uint64_t CurrentId() const noexcept { return m_currentId.load(std::memory_order_acquire); }
+	/** @brief Settings::enabled. Lock-free, for each graph preparation. True before the first version too. */
+	bool Enabled() const noexcept { return m_enabled.load(std::memory_order_acquire); }
 	/** @brief The last layout computed, enabled or not. Null before the first one. */
 	std::shared_ptr<const FramePlacementVersion> Latest() const;
 	/** @brief The latest summary of each epoch, in ascending epoch order. */
@@ -80,6 +82,7 @@ private:
 	// Block memory every version shares (FramePlacementMemory).
 	const std::shared_ptr<FramePlacementMemory> m_memory = std::make_shared<FramePlacementMemory>();
 	std::atomic<uint64_t> m_currentId{0};  // m_current's id
+	std::atomic<bool> m_enabled{false};    // m_settings.enabled
 	bool m_stopping = false;
 	std::thread m_thread;
 };

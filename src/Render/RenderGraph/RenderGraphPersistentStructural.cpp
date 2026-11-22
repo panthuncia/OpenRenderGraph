@@ -664,6 +664,10 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	const auto packingStrategy = m_getAutoAliasPackingStrategy ? m_getAutoAliasPackingStrategy() : AutoAliasPackingStrategy::GreedySweepLine;
 	state.aliasPackingStrategy = packingStrategy;
 	++state.aliasPlans;
+	// Versioned slots are candidates only while the host places transients across the frame (SetFramePlacementEnabled). Off,
+	// nothing here touches them.
+	const bool placeVersions = m_framePlacementEnabled && m_framePlacementEnabled();
+	for (auto& entry : state.entries) entry.aliasPlannedVersion = 0;
 
 	std::vector<uint32_t> rank(structure.passes.size(), UINT32_MAX);
 	std::vector<uint8_t> backendByPass(structure.passes.size(), 0);
@@ -712,6 +716,12 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		// The frame placement knows other epochs use it, but does not cover it here. Another epoch's graph may have placed it,
 		// so this graph keeps whatever backing it has rather than move it under that graph's executable.
 		bool keepBacking = false;
+		// The current version of a versioned slot (frame placement only). It is placed only at a frame placement's offset, never
+		// in the graph's own pools. The graph's end never gives it back, since the version outlives the graph. version keeps
+		// the version alive for the plan. Its key in usage summaries holds the version number, so each version is an entry of
+		// its own.
+		std::shared_ptr<const ResourceVersion> version;
+		uint32_t versionedEntry = UINT32_MAX;
 	};
 	std::vector<Candidate> candidates;
 	std::unordered_map<Resource*, uint32_t> candidateByConcrete;
@@ -727,8 +737,21 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		const auto slot = executable.resourceSlots[resourceIndex];
 		if (slot.index >= state.entries.size()) return UINT32_MAX;
 		const auto& entry = state.entries[slot.index];
-		if (!entry.resource || entry.versioned) return UINT32_MAX;
-		auto* concrete = UnwrapDynamic(entry.resource);
+		Resource* concrete = nullptr;
+		std::shared_ptr<const ResourceVersion> version;
+		if (entry.versioned) {
+			// A versioned slot's current version, while the frame placement is on. Never a per-frame resource (the swapchain), a
+			// late-bound one or one used on several devices. A graph lowered for a pending slice count binds another version
+			// than the current one, so it leaves the slot out.
+			if (!placeVersions || entry.retired || entry.multiDevice || entry.versioned->PerFrame() || entry.versioned->LateBound())
+				return UINT32_MAX;
+			version = entry.versioned->SelectVersion(nullptr);
+			if (!version || !version->resource || lowering::ShapeOf(*version->resource) != entry.shape) return UINT32_MAX;
+			concrete = UnwrapDynamic(version->resource.get());
+		} else if (entry.resource) {
+			concrete = UnwrapDynamic(entry.resource);
+		}
+		if (!concrete) return UINT32_MAX;
 		if (!IsPersistentAliasCandidate(concrete)) {
 			if (logging) notAliasable.insert(concrete);
 			return UINT32_MAX;
@@ -736,6 +759,10 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		if (const auto found = candidateByConcrete.find(concrete); found != candidateByConcrete.end()) return found->second;
 		Candidate c;
 		c.concrete = concrete;
+		if (version) {
+			c.version = std::move(version);
+			c.versionedEntry = slot.index;
+		}
 		for (const auto entryIndex : entriesByConcrete[concrete]) c.direct = c.direct && state.entries[entryIndex].direct;
 		rhi::ResourceDesc desc{};
 		if (auto* texture = dynamic_cast<PixelBuffer*>(concrete)) {
@@ -750,6 +777,8 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			c.manualPool = buffer->GetAliasingPoolHint();
 			desc = alias::AliasBufferResourceDesc(buffer->GetBufferSize(), buffer->IsUnorderedAccessEnabled(), buffer->GetAccessType());
 		}
+		// A version's place comes from a frame placement alone, so a manual pool means nothing for it.
+		if (c.version) c.manualPool.reset();
 		c.shared = state.multiDeviceResources.contains(concrete);
 		if (c.shared) c.resourceClass = c.texture ? 3u : 1u; // Render targets and depth do not qualify (IsSharedAliasEligible).
 		rhi::ResourceAllocationInfo info{};
@@ -857,11 +886,18 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			spdlog::info("Persistent alias plan: epoch {} places from frame placement {}", m_passEpochFilter, state.framePlacement->Id());
 	}
 	const auto framePlacement = state.framePlacement;
+	// A candidate's key in usage summaries and frame placements. A version's key holds its number, so a new version is a new
+	// entry, placed by the next frame placement.
+	const auto keyOf = [](const Candidate& c) {
+		auto key = PlacementKey(c.concrete->GetName(), c.sizeBytes, c.alignment, c.resourceClass, c.backendMask);
+		if (c.version) boost::hash_combine(key, c.version->number);
+		return key;
+	};
 	uint64_t framePlacedBytes = 0, framePlacedCount = 0, frameWithheld = 0;
 	if (framePlacement) {
 		for (auto& c : candidates) {
 			if (!c.eligible) continue;
-			const auto* entry = framePlacement->Find(PlacementKey(c.concrete->GetName(), c.sizeBytes, c.alignment, c.resourceClass, c.backendMask));
+			const auto* entry = framePlacement->Find(keyOf(c));
 			// A resource the version does not know (new since it was computed) stays on the graph's own path.
 			if (!entry) continue;
 			const auto* use = entry->UseIn(m_passEpochFilter);
@@ -891,6 +927,20 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				++frameWithheld;
 			}
 		}
+	}
+	// A version goes only where a frame placement puts it. Other graphs may bind it, and this graph's pools see only its own
+	// uses. Otherwise it keeps the backing it has: memory of its own from whoever made it, or the frame placement another
+	// epoch's graph gave it.
+	for (auto& c : candidates) {
+		if (!c.version) continue;
+		if (c.versionedEntry < state.entries.size()) state.entries[c.versionedEntry].aliasPlannedVersion = c.version->number;
+		if (c.framePlaced) continue;
+		if (!c.exclusion) {
+			++excludedCount;
+			c.exclusion = "a version is placed only by a frame placement";
+		}
+		c.pooled = false;
+		c.keepBacking = true;
 	}
 
 	// Pack per pool, into the arena's pools (shared with the other graphs of a host): each graph from offset 0.
@@ -1155,11 +1205,14 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				const bool movedSincePlan = previous == state.aliasPlaced.end() || !(previous->second == record);
 				state.aliasPlaced[c.concrete] = record;
 				NoteAliasPlaced(c.concrete, true);
-				if (c.frameShared) state.aliasPlacementOwners.erase(c.concrete);
+				// A version outlives the graph, so the graph's end never gives it back.
+				if (c.frameShared || c.version) state.aliasPlacementOwners.erase(c.concrete);
 				else {
 					state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
 					ClaimFramePlaced(c.concrete, &state);
 				}
+				// A version's slot is bound by each preparation (BindVersion), never by the publication.
+				if (c.version) continue;
 				bool unbound = false;
 				for (const auto entryIndex : entriesByConcrete[c.concrete]) unbound = unbound || !state.entries[entryIndex].isBound;
 				if (unbound || movedSincePlan) rebind(c.concrete);
@@ -1179,10 +1232,21 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			state.aliasPlaced[c.concrete] = record;
 			NoteAliasPlaced(c.concrete, true);
 			if (c.framePlaced) NoteFramePlaced(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration(), &state);
-			// A resource several epochs use is not this graph's alone: the graph's end leaves its placement to the others.
-			if (c.frameShared) state.aliasPlacementOwners.erase(c.concrete);
+			// A resource several epochs use is not this graph's alone: the graph's end leaves its placement to the others. A version
+			// outlives the graph, so its end never gives one back.
+			if (c.frameShared || c.version) state.aliasPlacementOwners.erase(c.concrete);
 			else state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
-			rebind(c.concrete);
+			// A version's slot is bound by each preparation, which takes the new backing (BindVersion).
+			if (!c.version) rebind(c.concrete);
+		} else if (c.version) {
+			// A version this graph does not place keeps its backing: memory of its own, or the frame placement another epoch's
+			// graph gave it. Preparations bind it as it is, so nothing is bound here.
+			state.aliasPlacementOwners.erase(c.concrete);
+			state.aliasPlaced.erase(c.concrete);
+			if (!backed->IsMaterialized()) {
+				MaterializePersistentStandalone(std::span<Resource* const>{&c.concrete, 1}, false);
+				++standalone;
+			}
 		} else if (c.keepBacking && backed->IsMaterialized() && !state.aliasPlaced.contains(c.concrete)) {
 			// Placed by another graph and shared with it: bound as it is, in this structural edit, so the executable admits its
 			// current placement.
@@ -1219,7 +1283,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			if (c.firstUse == UINT32_MAX || !c.direct) continue;
 			PlacementUse use;
 			use.name = c.concrete->GetName();
-			use.key = PlacementKey(use.name, c.sizeBytes, c.alignment, c.resourceClass, c.backendMask);
+			use.key = keyOf(c);
 			use.firstRank = c.firstUse;
 			use.lastRank = c.lastUse;
 			use.firstUseWrites = c.firstUseIsWrite;
