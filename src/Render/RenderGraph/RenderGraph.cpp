@@ -1145,8 +1145,12 @@ void RenderGraph::RegisterResolver(ResourceIdentifier id, const std::shared_ptr<
 	if (_resolverMap.contains(id)) {
 		throw std::runtime_error("Resolver already registered for key: " + id.ToString());
 	}
-	// Resolve it and register its resources
-	for (const auto& resource : resolver->Resolve()) {
+	// Resolve it and register its resources. A versioned resource's current version is not registered: the graph would hold
+	// it for its life, after newer versions replaced it. Each declaration and each preparation takes the version it uses.
+	// A late-bound resource's stand-in and a per-frame resource's versions (the swapchain's) are registered as before.
+	const auto* versioned = dynamic_cast<const IVersionedResource*>(resolver.get());
+	const bool registersVersions = !versioned || versioned->LateBound() || versioned->PerFrame();
+	if (registersVersions) for (const auto& resource : resolver->Resolve()) {
 		if (resource) {
 			resourcesByID[resource->GetGlobalResourceID()] = resource;
 			if (auto dynamicResource = std::dynamic_pointer_cast<DynamicResource>(resource)) {
