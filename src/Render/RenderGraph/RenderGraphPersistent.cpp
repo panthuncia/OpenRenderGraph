@@ -77,7 +77,8 @@ bool BindEntryOnly(State& state, persistent::GraphEditTransaction& edit, uint32_
 	if (entry.versioned || !entry.resource) return false;
 	if (entry.multiDevice && state.ensureRepresentations) state.ensureRepresentations(*entry.resource);
 	state.deferredSharing.erase(entry.slot.index); // superseded
-	auto binding = CaptureSlotBinding(*entry.resource, entry.slot.index, entry.shape);
+	auto binding = CaptureSlotBinding(*entry.resource, entry.slot.index, entry.shape, nullptr,
+		state.aliasContinues.contains(UnwrapDynamic(entry.resource)));
 	if (binding && identity) *identity = binding->identity;
 	if (!binding) {
 		if (entry.isBound) { UnbindSlot(state, edit, entry); entry.isBound = false; entry.bound = {}; }
@@ -255,10 +256,13 @@ uint32_t VersionedEntry(const State& state, const State::MainPass& main, const v
 // The binding owns the version. So the version and its backing live while a preparation, a recording or an execution
 // holds the bindings. The slot keeps the binding for the next preparation that selects the same version, unless the
 // resource is per frame.
-State::SlotEntry::FrameBinding BindVersion(State::SlotEntry& entry, std::shared_ptr<const ResourceVersion> version) {
+// aliasContinues: the version continues from an earlier execution of the frame (State::aliasContinues).
+State::SlotEntry::FrameBinding BindVersion(State::SlotEntry& entry, std::shared_ptr<const ResourceVersion> version, bool aliasContinues) {
 	auto& resource = *version->resource;
 	const auto key = RotationKeyOfResource(resource);
-	if (entry.frameBinding && entry.frameBinding->version == version && entry.frameBinding->key == key) return *entry.frameBinding;
+	if (entry.frameBinding && entry.frameBinding->version == version && entry.frameBinding->key == key
+		&& entry.frameBinding->rebinding.backing.aliasContinues == (aliasContinues && entry.frameBinding->rebinding.backing.aliasSize != 0))
+		return *entry.frameBinding;
 	auto* concrete = UnwrapDynamic(&resource);
 	auto snapshot = concrete ? PublicationBindingBundle::Capture(resource) : nullptr;
 	if (!snapshot || !snapshot->resource.GetHandle().valid())
@@ -280,6 +284,7 @@ State::SlotEntry::FrameBinding BindVersion(State::SlotEntry& entry, std::shared_
 	made.rebinding.backing.aliasPoolID = snapshot->aliasPoolID;
 	made.rebinding.backing.aliasOffset = snapshot->aliasOffset;
 	made.rebinding.backing.aliasSize = snapshot->aliasSize;
+	made.rebinding.backing.aliasContinues = aliasContinues && snapshot->aliasSize != 0;
 	made.rebinding.recording = snapshot;
 	made.rebinding.perFrame = entry.versioned->PerFrame();
 	auto owner = std::make_shared<const std::pair<std::shared_ptr<const ResourceVersion>, PublicationBindingBundle::Snapshot>>(version, snapshot);
@@ -1541,7 +1546,8 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 			// images) belong to the host and get none, as before.
 			if (entry.multiDevice && !entry.versioned->PerFrame() && state.ensureRepresentations)
 				state.ensureRepresentations(*version->resource);
-			auto binding = BindVersion(entry, std::move(version));
+			const bool continues = state.aliasContinues.contains(UnwrapDynamic(version->resource.get()));
+			auto binding = BindVersion(entry, std::move(version), continues);
 			rebindings.push_back(std::move(binding.rebinding));
 			overlay.emplace_back(index, std::move(binding.binding));
 			perFrame = perFrame || entry.versioned->PerFrame();

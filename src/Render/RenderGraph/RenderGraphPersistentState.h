@@ -134,8 +134,10 @@ inline PreparedBackingState BackingStateOf(Resource& concrete, const ResourceBin
 
 // Exact binding for one slot from the live resource. Null when the resource has
 // no backing yet (unmaterialized) — the slot stays reserved for that frame.
+// aliasContinues: an aliased backing whose contents carry over from an earlier execution of the frame
+// (PreparedBackingState::aliasContinues). Only the graph's alias plan knows it (State::aliasContinues).
 inline std::optional<persistent::BindingVersion> CaptureSlotBinding(Resource& resource, uint32_t slotIndex, CompileResourceShape shape,
-	PublicationBindingBundle::Snapshot snapshot = nullptr) {
+	PublicationBindingBundle::Snapshot snapshot = nullptr, bool aliasContinues = false) {
 	if (!snapshot) { BT_ZONE_SCOPE("ORG.Persistent.CaptureSlotBinding.Snapshot"); snapshot = PublicationBindingBundle::Capture(resource); }
 	if (!snapshot || !snapshot->resource.GetHandle().valid()) return std::nullopt;
 	auto* concrete = UnwrapDynamic(&resource);
@@ -146,6 +148,7 @@ inline std::optional<persistent::BindingVersion> CaptureSlotBinding(Resource& re
 	initial.aliasPoolID = snapshot->aliasPoolID;
 	initial.aliasOffset = snapshot->aliasOffset;
 	initial.aliasSize = snapshot->aliasSize;
+	initial.aliasContinues = aliasContinues && snapshot->aliasSize != 0;
 	try {
 		return persistent::BindingVersion::FromSnapshot(std::move(snapshot), initial,
 			reinterpret_cast<uintptr_t>(initial.regions.get()), initial.resource.generation);
@@ -465,9 +468,15 @@ struct RenderGraph::PersistentInstanceState {
 	struct AliasPlacementRecord {
 		uint64_t poolID = 0, offset = 0, sizeBytes = 0;
 		const AliasHeapGeneration* heap = nullptr;
+		// The placement continues from an earlier execution of the frame (aliasContinues). A change binds it again.
+		bool continues = false;
 		bool operator==(const AliasPlacementRecord&) const = default;
 	};
 	std::unordered_map<Resource*, AliasPlacementRecord> aliasPlaced; // Concrete resources placed by this planner.
+	// Concrete resources the latest alias plan placed from a frame placement whose contents carry over into this graph's
+	// executions from an earlier one in the frame (PreparedBackingState::aliasContinues): a later epoch of a resource several
+	// epochs use, or a resource that keeps its contents across runs. Bindings of these enter without a discard.
+	std::unordered_set<Resource*> aliasContinues;
 	std::unordered_map<Resource*, AliasPlacementOwner> aliasPlacementOwners; // The same, for this state's end (ReleaseOwnAliasPlacements).
 	// With a frame alias arena (RenderGraph::SetFrameAliasRegion): the range reserved for each pool's transients, by pool id. Each
 	// plan reserves its ranges again and gives back the previous ones. The state's end gives back the last ones.

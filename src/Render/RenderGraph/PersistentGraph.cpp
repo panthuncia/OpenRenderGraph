@@ -67,8 +67,8 @@ void ValidateSharedBacking(const BindingVersion& a, const BindingVersion& b) {
             && x.heapType == y.heapType && x.aliasHeapIdentity == y.aliasHeapIdentity
             && x.aliasHeap.get() == y.aliasHeap.get() && !x.aliasHeap.owner_before(y.aliasHeap)
             && !y.aliasHeap.owner_before(x.aliasHeap) && x.aliasPoolID == y.aliasPoolID
-            && x.aliasOffset == y.aliasOffset && x.aliasSize == y.aliasSize && x.hostOwned == y.hostOwned
-            && x.exempt == y.exempt,
+            && x.aliasOffset == y.aliasOffset && x.aliasSize == y.aliasSize && x.aliasContinues == y.aliasContinues
+            && x.hostOwned == y.hostOwned && x.exempt == y.exempt,
             "Shared physical slots disagree on placement");
         Require(x.regions && y.regions && x.regions->size() == y.regions->size(),
             "Shared physical slots disagree on incoming state");
@@ -896,8 +896,10 @@ void GraphEditTransaction::ReplaceBinding(ResourceSlotId slot, BindingVersion bi
     if (!m_structuralChanged && previous) {
         Require(bool(binding.admission), "Binding lost its admission contract");
         const auto& next = *binding.admission;
+        // Whether an aliased backing continues decides where its entry barrier goes (body or entry), so a change is structural too.
         if (!(previous->aliasHeapIdentity == next.aliasHeapIdentity && previous->aliasPoolID == next.aliasPoolID
-            && previous->aliasOffset == next.aliasOffset && previous->aliasSize == next.aliasSize))
+            && previous->aliasOffset == next.aliasOffset && previous->aliasSize == next.aliasSize
+            && previous->aliasContinues == next.aliasContinues))
             throw std::invalid_argument(fmt::format("Binding replacement requires a structural alias edit: resource {} moved from pool {:#x} "
                 "offset {} size {} to pool {:#x} offset {} size {}", structure.resourceIDs.at(slot.index), previous->aliasPoolID,
                 previous->aliasOffset, previous->aliasSize, next.aliasPoolID, next.aliasOffset, next.aliasSize));
@@ -1694,6 +1696,10 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
             for (size_t i = 0; i < rebound.size(); ++i)
                 if (entry.rebound[i].first != rebound[i].first || entry.rebound[i].second.index != rebound[i].second.index
                     || entry.rebound[i].second.generation != rebound[i].second.generation) return false;
+            // The same backings, but one whose aliased entry now continues (or no longer does), are another set.
+            for (size_t i = 0; i < rebound.size(); ++i)
+                if (!entry.backings || rebound[i].first >= entry.backings->size()
+                    || (*entry.backings)[rebound[i].first].aliasContinues != rebindings[i].backing.aliasContinues) return false;
             return true;
         };
         const auto found = perFrame ? m_reboundSets.end() : std::ranges::find_if(m_reboundSets, same);

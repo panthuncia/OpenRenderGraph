@@ -146,10 +146,13 @@ std::shared_ptr<FramePlacementVersion> FramePlacementVersion::Compute(const Fram
 		entry.frameFirst = firstSlot.base + first.firstRank;
 		entry.frameLast = lastSlot.base + last.lastRank;
 		// A resource several epochs use, at an end that is a repeated epoch, crosses that epoch's runs. It spans the whole
-		// slot there. So does a resource a graph marked as crossing runs.
+		// slot there. A resource whose contents cross runs spans the whole slots at both ends, whether or not the host lists
+		// the epoch as repeated: the mark says it repeats.
+		entry.acrossRuns = pending.loopCrossing;
 		const bool spansSlots = entry.MultiEpoch() || pending.loopCrossing;
-		if (spansSlots && firstSlot.repeated) entry.frameFirst = firstSlot.base;
-		if (spansSlots && lastSlot.repeated) entry.frameLast = lastSlot.base + (std::max)(lastSlot.rankCount, 1u) - 1;
+		if (spansSlots && (firstSlot.repeated || pending.loopCrossing)) entry.frameFirst = firstSlot.base;
+		if (spansSlots && (lastSlot.repeated || pending.loopCrossing))
+			entry.frameLast = lastSlot.base + (std::max)(lastSlot.rankCount, 1u) - 1;
 		if (!pending.ineligible.empty()) entry.reason = pending.ineligible;
 		else if (!first.firstUseWrites)
 			entry.reason = "previous-frame read: its first use in frame order (epoch " + std::to_string(first.epoch) + ") reads";
@@ -237,7 +240,7 @@ std::shared_ptr<FramePlacementVersion> FramePlacementVersion::Compute(const Fram
 	}
 	for (const auto& entry : version->m_entries) {
 		hasher.Mix(entry.key);
-		hasher.Mix(entry.placed ? 1 : 0);
+		hasher.Mix((entry.placed ? 1 : 0) | (entry.acrossRuns ? 2 : 0));
 		hasher.Mix(entry.block);
 		hasher.Mix(entry.offset);
 		hasher.Mix(entry.frameFirst);

@@ -386,6 +386,18 @@ public:
 	bool HostHome() const noexcept { return m_hostHome; }
 	// Whether every execution gives it back in its home state under external home states: host-owned, or graph-owned with a host home.
 	bool GoesHome() const noexcept { return HostOwned() || m_hostHome; }
+	/**
+	 * @brief Marks a transient that keeps its contents between the runs of a repeated epoch (an epoch that runs several
+	 * times a frame). One run writes it and a later run of the same frame reads it.
+	 *
+	 * A whole-frame placement then gives it one lifetime over every run of its epochs. Each run enters it from the state the
+	 * previous run left, without discarding it. The graph's own alias pools never take it, since another epoch's transients
+	 * could use its bytes between two runs. Set it on the concrete resource (a dynamic resource's current one) before a graph
+	 * that uses it plans its aliases.
+	 */
+	void SetContentAcrossRuns(bool keep) noexcept { m_contentAcrossRuns = keep; }
+	/** @brief Whether the resource keeps its contents between the runs of a repeated epoch (SetContentAcrossRuns). */
+	bool ContentAcrossRuns() const noexcept { return m_contentAcrossRuns; }
 	void AddAliasedResource(Resource* resource) {
 		m_aliasedResources.push_back(resource);
 	}
@@ -448,6 +460,7 @@ private:
     uint64_t m_globalResourceID;
 	GraphOwnership m_graphOwnership = GraphOwnership::GraphManaged;
 	bool m_hostHome = false;
+	bool m_contentAcrossRuns = false;
 	ECSEntityHandle m_ecsEntity; // For access through ECS queries without dereferencing Flecs during teardown
 
     //friend class RenderGraph;

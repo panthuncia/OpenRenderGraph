@@ -32,6 +32,14 @@ struct PreparedBackingState {
     uint64_t aliasPoolID = 0;
     uint64_t aliasOffset = 0;
     uint64_t aliasSize = 0;
+    // An aliased backing whose contents carry over into this graph's executions from an earlier execution in the same frame:
+    // - a resource of a whole-frame placement in an epoch after its first one,
+    // - a resource that keeps its contents across the runs of a repeated epoch (Resource::SetContentAcrossRuns).
+    // No other occupant of its bytes is used in this graph before it. So it enters from the state the ledger holds, in its batch's
+    // entry barriers, like a backing of its own. It enters from Undefined only when another occupant took its bytes since its
+    // last use (an alias activation), or when the ledger has no state for it. A plain aliased backing enters every execution
+    // from Undefined, in its body barrier.
+    bool aliasContinues = false;
     // Immutable realization metadata used to encode legal backend barriers.
     // D3D12 upload/readback buffers remain in fixed states and must not receive
     // enhanced buffer transition barriers.

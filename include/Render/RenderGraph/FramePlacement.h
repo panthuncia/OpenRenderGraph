@@ -29,8 +29,9 @@ struct PlacementUse {
 	bool firstUseWrites = false;
 	// False when the pass of the first use may skip its writes (ExternalPassDesc::mayNotWrite).
 	bool writeGuaranteed = false;
-	// Used in more than one run of a repeated epoch. Graphs cannot see runs, so they leave it false. The host spans the
-	// whole slot of a repeated epoch for a resource several epochs use.
+	// Its contents cross the runs of a repeated epoch (Resource::SetContentAcrossRuns). The host spans the whole slot of each
+	// epoch that uses it, so it has one lifetime over every run. The host also spans the whole slot of a repeated epoch for a
+	// resource several epochs use.
 	bool loopCrossing = false;
 	// The graph's planner would place it in an automatic pool on one backend, if its first use wrote. False for manual pools,
 	// resources shared between devices, resources used on several backends, scores below the threshold and auto aliasing off.
@@ -167,6 +168,8 @@ public:
 		bool placed = false;
 		uint32_t block = UINT32_MAX;
 		uint64_t offset = 0;
+		// Its contents cross runs (PlacementUse::loopCrossing): its lifetime spans the whole slot of every epoch that uses it.
+		bool acrossRuns = false;
 		// Why it is not placed. Empty when placed.
 		std::string reason;
 		bool MultiEpoch() const noexcept { return uses.size() > 1; }

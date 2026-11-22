@@ -217,8 +217,9 @@ void FramePlacement::LogVersion(const FramePlacementVersion& version, const std:
 				+ (use.firstUseWrites ? "w" : "r");
 		if (entry.placed) {
 			const auto& block = version.Blocks()[entry.block];
-			spdlog::info("Frame placement {} resource '{}': uses {} frame {}-{} bytes={} block {:#x} [{}, {})", version.Id(), entry.name, uses,
-				entry.frameFirst, entry.frameLast, entry.size, block.poolID, entry.offset, entry.offset + entry.size);
+			spdlog::info("Frame placement {} resource '{}': uses {} frame {}-{} bytes={} block {:#x} [{}, {}){}", version.Id(), entry.name, uses,
+				entry.frameFirst, entry.frameLast, entry.size, block.poolID, entry.offset, entry.offset + entry.size,
+				entry.acrossRuns ? " across runs" : "");
 		} else {
 			spdlog::info("Frame placement {} resource '{}': uses {} frame {}-{} bytes={} not placed: {}", version.Id(), entry.name, uses,
 				entry.frameFirst, entry.frameLast, entry.size, entry.reason);
