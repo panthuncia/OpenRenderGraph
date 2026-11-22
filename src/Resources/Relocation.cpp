@@ -265,6 +265,8 @@ std::unique_ptr<Relocation> MakeGraphRelocation(const std::shared_ptr<Resource>&
     relocation->fromGeneration = backed->GetBackingGeneration();
     relocation->source = source;
     try {
+        // The copy target is a short-lived wrapper. It needs no memory statistics entity.
+        Resource::ScopedECSRegistrationSuppression noEntity;
         if (auto* texture = dynamic_cast<PixelBuffer*>(resource.get())) {
             const auto& description = texture->GetDescription();
             // A copy cannot carry a multisampled texture. On D3D12 it copies one plane, so a depth-stencil texture would
