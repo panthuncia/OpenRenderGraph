@@ -226,6 +226,9 @@ struct RenderGraph::PersistentRecording {
 	std::vector<std::shared_ptr<const void>> leases;
 	// The version number each versioned slot bound when it was recorded (RenderGraph::PersistentRecordingVersionsCurrent).
 	std::vector<std::pair<std::shared_ptr<const IVersionedResource>, uint64_t>> versions;
+	// The relocation journal's head when every backing it bound was last found current
+	// (RenderGraph::PersistentRecordingBackingsCurrent). While the head has not moved, nothing needs checking.
+	mutable std::atomic<uint64_t> backingsCheckedAt{0};
 
 	bool Recorded(uint64_t a_hostTag, const persistent::SelectedPublication* a_publication, const FrozenExecutionBindings* a_bindings,
 		rhi::DescriptorHeapHandle a_resourceHeap, rhi::DescriptorHeapHandle a_samplerHeap,

@@ -378,6 +378,12 @@ private:
 	// Any thread: the first versioned slot whose current version is not the one the recording bound, named with both version
 	// numbers. Empty when every slot is current.
 	static std::string PersistentRecordingStaleVersion(const PersistentRecording& recording);
+	// Any thread: whether no backing the recording bound has moved since (relocation::Service). A recording that bound a backing
+	// that moved still holds it, so it stays safe to submit; but it keeps the old memory alive and reads the old copy, so a
+	// kept recording that is not current is recorded again.
+	static bool PersistentRecordingBackingsCurrent(const PersistentRecording& recording) noexcept;
+	// Any thread: the first resource whose bound backing moved, by global ID. Empty when every backing is current.
+	static std::string PersistentRecordingStaleBacking(const PersistentRecording& recording);
 	// Submitting thread: binds a recording made ahead (PreparePersistentTicket for the same epoch and slot) to an admission-only
 	// ticket. It must have been recorded for the ticket's publication, bindings, descriptor heaps and hostTag (the host's backing
 	// version now); otherwise false, with why, and the ticket unchanged. A revision ticket (PrepareRevisionTicket) instead takes the

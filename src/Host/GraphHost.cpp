@@ -761,7 +761,12 @@ uint64_t GraphHost::BuildGeneration(uint32_t epoch) const noexcept {
 
 bool GraphHost::EpochRecordingCurrent(const EpochRecording& recording) const noexcept {
 	// The attached build is 0 while the epoch has no graph, and a recording's build is never 0.
-	return recording.buildGeneration != 0 && BuildsOf(recording.epoch).attached == recording.buildGeneration;
+	if (recording.buildGeneration == 0 || BuildsOf(recording.epoch).attached != recording.buildGeneration) return false;
+	// A copy that bound a backing that moved since is recorded again (relocation::Service). It still holds the old backing, so
+	// a submission of it meanwhile is safe.
+	return std::ranges::all_of(recording.copies, [](const auto& copy) {
+		return !copy || RenderGraph::PersistentRecordingBackingsCurrent(*copy);
+	});
 }
 
 GraphHost::Builds GraphHost::BuildsOf(uint32_t epoch) const noexcept {
@@ -3032,9 +3037,11 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 			// A kept recording of an older build or older versions never binds again, yet holds what it bound. Every copy's goes
 			// now, not only when its copy is next taken: a copy may not be taken again for a long time. A run still in flight
 			// holds its own reference.
+			// A kept recording that bound a backing that moved since goes too (relocation::Service): it would keep the old memory.
 			if (keepsLive)
 				for (auto& entry : state.liveKept[epochIndex])
-					if (entry.recording && (entry.generation != state.generation[epochIndex] || entry.version != version)) entry = {};
+					if (entry.recording && (entry.generation != state.generation[epochIndex] || entry.version != version
+						|| !RenderGraph::PersistentRecordingBackingsCurrent(*entry.recording))) entry = {};
 			// A live epoch's kept copy.
 			const bool liveCopy = keepsLive && lease->copy != RunRef::kNoCopy;
 			if (liveCopy && !reprepare) {
@@ -3161,12 +3168,15 @@ void GraphHost::NoteNewVersions() noexcept {
 }
 
 bool GraphHost::EpochRecordingVersionsCurrent(const EpochRecording& recording, uint32_t copy) const noexcept {
-	return copy < recording.copies.size() && recording.copies[copy] && RenderGraph::PersistentRecordingVersionsCurrent(*recording.copies[copy]);
+	// A backing that moved is a new version of what the copy bound, as far as the copy is concerned: it is recorded again.
+	return copy < recording.copies.size() && recording.copies[copy] && RenderGraph::PersistentRecordingVersionsCurrent(*recording.copies[copy])
+		&& RenderGraph::PersistentRecordingBackingsCurrent(*recording.copies[copy]);
 }
 
 std::string GraphHost::EpochRecordingStaleVersion(const EpochRecording& recording, uint32_t copy) const {
 	if (copy >= recording.copies.size() || !recording.copies[copy]) return "no copy " + std::to_string(copy);
-	return RenderGraph::PersistentRecordingStaleVersion(*recording.copies[copy]);
+	if (auto stale = RenderGraph::PersistentRecordingStaleVersion(*recording.copies[copy]); !stale.empty()) return stale;
+	return RenderGraph::PersistentRecordingStaleBacking(*recording.copies[copy]);
 }
 
 void GraphHost::StopAsync() {
