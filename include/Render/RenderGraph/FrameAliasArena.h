@@ -107,6 +107,13 @@ public:
 		uint8_t resourceClass = 0;
 		std::vector<RangeInfo> ranges;
 	};
+	/**
+	 * @brief Keeps the host's frame transients (ReserveTextures) in blocks of their own, apart from graphs' regions. For when the
+	 * frame placement packs the graphs: their regions then go, and a block a frame transient shares with them would stay at its
+	 * old size. Applies to reservations made after the call.
+	 */
+	void SetSeparateFrameTransients(bool separate);
+
 	/** @brief The blocks and their ranges now. */
 	std::vector<BlockInfo> Blocks() const;
 	/** @brief The blocks' memory now, in bytes. */

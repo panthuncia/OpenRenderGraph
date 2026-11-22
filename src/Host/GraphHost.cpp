@@ -1860,6 +1860,18 @@ relocation::DefragmentReport GraphHost::DefragmentAtIdle(const relocation::Defra
 	relocation::DefragmentReport report;
 	auto* allocator = DeviceManager::GetInstance().GetAllocator();
 	if (!AnyGraph() || !allocator) return report;
+	// Only at a settled point. A graph whose shared pools another graph changed (a resource it pooled went to memory of its own)
+	// waits for its rebuild. A move would make its kept recordings record again against the old placement, which the binding
+	// check refuses. The next call tries again.
+	for (const auto& instance : m_instances)
+		if (instance.graph && !instance.graph->PersistentAliasPlacementsCurrent()) {
+			static uint32_t logged = 0;
+			if (logged < 8) {
+				++logged;
+				spdlog::info("ORG defragmenter: waiting, epoch {}'s graph is waiting for a rebuild of its alias placements", instance.epoch);
+			}
+			return report;
+		}
 	auto& defragmenter = relocation::Defragmenter::Get();
 	if (!defragmenter.WantsCall(budget, *allocator)) return report;
 	BT_ZONE_SCOPE("ORG.Defragmenter.Call");
@@ -2390,6 +2402,9 @@ void GraphHost::SetFramePlacement(FramePlacementSettings settings) {
 	CheckOwner("SetFramePlacement");
 	{
 		std::scoped_lock lock(m_configMutex);
+		// The frame placement packs the graphs, so their arena regions go. Frame transients kept apart then free those blocks.
+		if (!m_frameAliasArena) m_frameAliasArena = FrameAliasArena::Create();
+		m_frameAliasArena->SetSeparateFrameTransients(settings.enabled);
 		m_framePlacementSettings = std::move(settings);
 	}
 	ApplyFramePlacementSettings();

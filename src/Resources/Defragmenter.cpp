@@ -112,7 +112,18 @@ bool Defragmenter::WantsCall(const DefragmentBudget& budget, rhi::ma::Allocator&
     const auto measured = MeasureDeviceLocal(allocator);
     const bool start = measured.slack > budget.minSlackBytes
         && static_cast<double>(measured.slack) > budget.minSlackFraction * static_cast<double>(measured.blockBytes);
-    if (!start) return false;
+    if (!start) {
+        // Say why no campaign starts, a few times, so a run with the switch on shows the slack it measured.
+        static uint32_t logged = 0;
+        if (logged < 8) {
+            ++logged;
+            spdlog::info("ORG defragmenter: no campaign. Device-local blocks: {}, {:.1f} MB, {:.1f} MB free in them ({:.0f} %, starts above {:.0f} MB and {:.0f} %)",
+                measured.blocks, static_cast<double>(measured.blockBytes) / kMiB, static_cast<double>(measured.slack) / kMiB,
+                measured.blockBytes ? 100.0 * static_cast<double>(measured.slack) / static_cast<double>(measured.blockBytes) : 0.0,
+                static_cast<double>(budget.minSlackBytes) / kMiB, 100.0 * budget.minSlackFraction);
+        }
+        return false;
+    }
     StartCampaign(allocator, measured.slack, measured.blockBytes, measured.blocks);
     return m_context != nullptr;
 }

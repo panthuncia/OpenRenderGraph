@@ -32,12 +32,14 @@ struct FrameAliasArena::Impl {
 	struct Block {
 		uint64_t poolID = 0, capacity = 0, alignment = 1;
 		uint8_t resourceClass = 0;
+		bool frameTransients = false;  // made for the host's frame transients while they are kept apart
 		TrackedHandle allocation;
 		std::shared_ptr<const AliasHeapGeneration> heap;
 		std::vector<Range> ranges;
 	};
 	mutable std::mutex mutex;
 	std::vector<Block> blocks;
+	bool separateFrameTransients = false;
 	uint64_t nextBlock = 1, nextRange = 1;
 };
 
@@ -68,6 +70,18 @@ std::shared_ptr<FrameAliasArena::Reservation> FrameAliasArena::ReserveRange(uint
 	// The first block of the class where the range fits beside the ranges it may not share bytes with.
 	for (auto& block : impl.blocks) {
 		if (block.resourceClass != resourceClass || block.alignment < alignment) continue;
+		// Kept apart: frame transients only in their own blocks, graphs' regions never in those.
+		if (impl.separateFrameTransients && block.frameTransients != frameTransient) continue;
+		// A block whose ranges went is not refilled by a much smaller range: a block never shrinks, so the range would keep all of
+		// it. The range gets a block of its size, and the old one is freed with its last range. A new build's region is reserved
+		// before the old build gives its region back, so without this a region that shrank kept its first size.
+		{
+			uint64_t used = size;
+			// Ranges of the same lane are the builds this one replaces: they go once it is in.
+			for (const auto& range : block.ranges)
+				if (lane == 0 || range.range.lane != lane) used += range.range.end - range.range.begin;
+			if (used * 2 < block.capacity) continue;
+		}
 		std::vector<alias::SpannedRange> occupied;
 		occupied.reserve(block.ranges.size());
 		for (const auto& range : block.ranges) {
@@ -92,6 +106,7 @@ std::shared_ptr<FrameAliasArena::Reservation> FrameAliasArena::ReserveRange(uint
 		Impl::Block block;
 		block.poolID = kFrameArenaPoolBase | impl.nextBlock++;
 		block.resourceClass = resourceClass;
+		block.frameTransients = impl.separateFrameTransients && frameTransient;
 		block.alignment = (std::max)(alignment, kBlockGranularity);
 		block.capacity = (size + kBlockGranularity - 1) / kBlockGranularity * kBlockGranularity;
 		rhi::ma::AllocationDesc allocDesc{};
@@ -212,6 +227,12 @@ std::vector<std::shared_ptr<FrameAliasArena::Reservation>> FrameAliasArena::Rese
 		kept.push_back(std::move(reservation));
 	}
 	return kept;
+}
+
+void FrameAliasArena::SetSeparateFrameTransients(bool separate) {
+	auto& impl = *m_impl;
+	std::lock_guard lock(impl.mutex);
+	impl.separateFrameTransients = separate;
 }
 
 std::vector<FrameAliasArena::BlockInfo> FrameAliasArena::Blocks() const {
