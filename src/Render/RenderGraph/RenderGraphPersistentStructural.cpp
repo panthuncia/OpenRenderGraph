@@ -553,6 +553,9 @@ struct FramePlacedRecord {
 	// The graph state that gives the placement back at its end. A newer build of the same epoch that finds the resource at its
 	// frame placement claims it, so the build it replaces does not take the backing away from it when it ends.
 	const void* owner = nullptr;
+	// For the memory log (FramePlacedResidents): its bytes, and the epoch whose graph placed it.
+	uint64_t size = 0;
+	uint32_t epoch = UINT32_MAX;
 };
 std::mutex g_framePlacedMutex;
 std::unordered_map<const void*, FramePlacedRecord> g_framePlaced;
@@ -565,11 +568,12 @@ bool AtFramePlacement(Resource* concrete, const AliasHeapGeneration* heap, uint6
 	return record.resource.lock().get() == concrete && record.heap == heap && record.offset == offset && record.generation == generation;
 }
 
-void NoteFramePlaced(Resource* concrete, const AliasHeapGeneration* heap, uint64_t offset, uint64_t generation, const void* owner) {
+void NoteFramePlaced(Resource* concrete, const AliasHeapGeneration* heap, uint64_t offset, uint64_t generation, const void* owner,
+	uint64_t size, uint32_t epoch) {
 	std::lock_guard lock(g_framePlacedMutex);
 	// Records of resources that are gone are dropped now and then.
 	if (g_framePlaced.size() > 4096) std::erase_if(g_framePlaced, [](const auto& entry) { return entry.second.resource.expired(); });
-	g_framePlaced[concrete] = {concrete->weak_from_this(), heap, offset, generation, owner};
+	g_framePlaced[concrete] = {concrete->weak_from_this(), heap, offset, generation, owner, size, epoch};
 }
 
 // Makes owner the graph state that gives the frame placement of concrete back.
@@ -595,6 +599,19 @@ uint64_t PlacementKey(const std::string& name, uint64_t size, uint64_t alignment
 	boost::hash_combine(key, backendMask);
 	return key;
 }
+}
+
+std::vector<FramePlacedResident> FramePlacedResidents() {
+	std::vector<FramePlacedResident> out;
+	std::lock_guard lock(g_framePlacedMutex);
+	for (const auto& [key, record] : g_framePlaced) {
+		const auto resource = record.resource.lock();
+		auto* backed = resource ? dynamic_cast<BackedResource*>(resource.get()) : nullptr;
+		// Only resources still at the placement the record names. A resource placed again elsewhere left that heap.
+		if (!backed || !backed->IsMaterialized() || backed->GetBackingGeneration() != record.generation) continue;
+		out.push_back({record.heap, resource->GetName(), record.offset, record.size, record.epoch});
+	}
+	return out;
 }
 
 void persistent_impl::ReleaseOwnAliasPlacements(const std::unordered_map<Resource*, AliasPlacementOwner>& owners, const void* self) noexcept {
@@ -1253,7 +1270,8 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			TrackTransientFrameResource(c.concrete);
 			state.aliasPlaced[c.concrete] = record;
 			NoteAliasPlaced(c.concrete, true);
-			if (c.framePlaced) NoteFramePlaced(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration(), &state);
+			if (c.framePlaced)
+				NoteFramePlaced(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration(), &state, c.sizeBytes, m_passEpochFilter);
 			// A resource several epochs use is not this graph's alone: the graph's end leaves its placement to the others. A version
 			// outlives the graph, so its end never gives one back.
 			if (c.frameShared || c.version) state.aliasPlacementOwners.erase(c.concrete);

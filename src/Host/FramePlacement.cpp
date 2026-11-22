@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
 #include <string>
 
+#include <spdlog/fmt/fmt.h>
 #include <spdlog/spdlog.h>
 
 #include "Render/RenderGraph/FrameAliasArena.h"
+#include "Render/RenderGraph/PersistentAliasArena.h"
 
 namespace org {
 
@@ -39,6 +42,7 @@ void FramePlacement::SetSettings(Settings settings) {
 	{
 		std::lock_guard lock(m_mutex);
 		m_settings = std::move(settings);
+		m_memory->SetSizing(m_settings.sizing);
 		m_enabled.store(m_settings.enabled, std::memory_order_release);
 		// Disabled: graphs place on their own from their next plan. Enabled: the next computation publishes a version.
 		if (!m_settings.enabled) m_current.reset();
@@ -100,6 +104,107 @@ void FramePlacement::Log(bool detailed) const {
 		return;
 	}
 	LogVersion(*latest, Summaries(), detailed);
+}
+
+bool FramePlacement::MemoryLogDue() {
+	std::lock_guard lock(m_mutex);
+	if (!m_settings.logLifetimes || m_settings.memoryLogPeriod.count() <= 0) return false;
+	const auto now = std::chrono::steady_clock::now();
+	// The first call starts the first period.
+	if (m_nextMemoryLog == std::chrono::steady_clock::time_point{}) {
+		m_nextMemoryLog = now + m_settings.memoryLogPeriod;
+		return false;
+	}
+	if (now < m_nextMemoryLog) return false;
+	m_nextMemoryLog = now + m_settings.memoryLogPeriod;
+	return true;
+}
+
+void FramePlacement::LogMemory(PersistentAliasArena* pools, const std::string& graphs) const {
+	std::shared_ptr<FrameAliasArena> arena;
+	std::shared_ptr<const FramePlacementVersion> current;
+	{
+		std::lock_guard lock(m_mutex);
+		arena = m_frameArena.lock();
+		current = m_current;
+	}
+	// The resources still placed from a frame placement, by heap generation.
+	struct Holders {
+		size_t count = 0;
+		uint64_t bytes = 0;
+		std::map<uint32_t, size_t> byEpoch;
+		std::vector<std::string> names;
+	};
+	std::map<const AliasHeapGeneration*, Holders> holders;
+	for (const auto& resident : FramePlacedResidents()) {
+		auto& held = holders[resident.heap];
+		++held.count;
+		held.bytes += resident.size;
+		++held.byEpoch[resident.epoch];
+		if (held.names.size() < 4) held.names.push_back(resident.name);
+	}
+	const auto heaps = m_memory->Heaps();
+	uint64_t currentBytes = 0, replacedBytes = 0;
+	for (const auto& heap : heaps) (heap.current ? currentBytes : replacedBytes) += heap.capacity;
+	uint64_t arenaBytes = 0, arenaReserved = 0;
+	size_t arenaBlocks = 0, arenaRanges = 0;
+	if (arena) {
+		for (const auto& block : arena->Blocks()) {
+			++arenaBlocks;
+			arenaBytes += block.capacity;
+			// Ranges whose spans do not overlap share bytes, so the bytes in use are the highest range end, not the sum.
+			uint64_t end = 0;
+			for (const auto& range : block.ranges) {
+				++arenaRanges;
+				end = (std::max)(end, range.end);
+			}
+			arenaReserved += end;
+		}
+	}
+	uint64_t poolBytes = 0, poolRequired = 0;
+	size_t poolCount = 0, poolsStale = 0;
+	std::string poolList;
+	if (pools) {
+		auto& locked = *pools;
+		std::lock_guard lock(locked.mutex);
+		for (const auto& [poolID, pool] : locked.pools) {
+			++poolCount;
+			poolBytes += pool.capacityBytes;
+			const auto required = PersistentAliasArena::Required(pool);
+			poolRequired += required;
+			poolList += (poolList.empty() ? "" : "; ") + fmt::format("{:#x} class {} {:.2f}/{:.2f} MB gen {} graphs {}{}", poolID, pool.resourceClass,
+				MB(required), MB(pool.capacityBytes), pool.generation, pool.required.size(), pool.idleSinceFrame ? " idle" : "");
+		}
+		poolsStale = locked.stale.size();
+	}
+	spdlog::info("Frame placement memory: placement heaps {:.2f} MB current + {:.2f} MB replaced and still alive ({} heaps); frame arena "
+				 "{:.2f} MB in {} blocks, {:.2f} MB of it reserved by {} ranges; shared arena pools {:.2f} MB in {} pools, {:.2f} MB required, "
+				 "{} graphs with placements in replaced pool generations; current version {}{}{}",
+		MB(currentBytes), MB(replacedBytes), heaps.size(), MB(arenaBytes), arenaBlocks, MB(arenaReserved), arenaRanges, MB(poolBytes), poolCount,
+		MB(poolRequired), poolsStale, current ? current->Id() : 0, graphs.empty() ? "" : "; graphs: ", graphs);
+	for (const auto& heap : heaps) {
+		const auto found = holders.find(heap.identity);
+		std::string held = "no resources";
+		if (found != holders.end()) {
+			std::string epochs;
+			for (const auto& [epoch, count] : found->second.byEpoch) epochs += (epochs.empty() ? "" : ",") + fmt::format("{}x{}", epoch, count);
+			std::string names;
+			for (const auto& name : found->second.names) names += (names.empty() ? "'" : ", '") + name + "'";
+			held = fmt::format("{} resources {:.2f} MB (by placing epoch {}: {}{})", found->second.count, MB(found->second.bytes), epochs, names,
+				found->second.count > found->second.names.size() ? ", ..." : "");
+		}
+		// What the current version packs for the heap's class and backends.
+		uint64_t packed = 0;
+		if (current)
+			for (const auto& block : current->Blocks())
+				if (block.memoryClass == heap.memoryClass && block.backendMask == heap.backendMask) packed += block.capacity;
+		spdlog::info("Frame placement memory: heap class {} backends {:#x} generation {} {}: reserved {:.2f} MB, current version packs "
+					 "{:.2f} MB{}; held by {} (references {})",
+			heap.memoryClass, heap.backendMask, heap.generation, heap.current ? "current" : "replaced", MB(heap.capacity), MB(packed),
+			heap.current && heap.needed ? fmt::format(", last taken by version {} for {:.2f} MB", heap.neededBy, MB(heap.needed)) : std::string(),
+			held, heap.references);
+	}
+	if (!poolList.empty()) spdlog::info("Frame placement memory: shared arena pools: {}", poolList);
 }
 
 void FramePlacement::Run() {
