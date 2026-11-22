@@ -176,7 +176,14 @@ A failure while one epoch's graph is built or prepared stays with that epoch.
 ### Contract for hosts
 
 -   A resource read in an epoch must have been written in that epoch or an earlier one, as in any frame. An aliased
-    transient keeps no contents across executions: each execution enters it from Undefined.
+    transient keeps no contents across executions: each execution enters it from Undefined. Two exceptions, both under the
+    host's frame placement (`FramePlacementSettings`):
+    -   A resource several epochs use keeps its contents from its first epoch in the frame to the later ones. A later epoch
+        enters it from the state the earlier one left.
+    -   A resource marked `Resource::SetContentAcrossRuns` keeps its contents between the runs of a repeated epoch.
+
+    Either one still enters from Undefined when another transient used its bytes since its last use, for example when the
+    earlier epoch did not run.
 -   A pass instance belongs to one epoch. Work that runs in two epochs is registered twice, with its epoch fixed per
     instance.
 
