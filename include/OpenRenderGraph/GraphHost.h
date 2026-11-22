@@ -757,6 +757,10 @@ public:
 	// not name versions checks this instead of counting NoteNewVersions: a version of a resource the epoch does not use leaves it
 	// true.
 	bool EpochRecordingVersionsCurrent(const EpochRecording& recording, uint32_t copy) const noexcept;
+	// Any thread: whether copy `copy` of the recording bound only backings that have not moved since (relocation::Service). A copy
+	// whose backing moved still holds the old backing, so submitting it stays safe while the application records it again. The
+	// application switches to the new recording once it is ready. False for a copy it does not have.
+	bool EpochRecordingBackingsCurrent(const EpochRecording& recording, uint32_t copy) const noexcept;
 	// Any thread: the versioned slot that makes copy `copy` of the recording not current, by name (empty when none).
 	std::string EpochRecordingStaleVersion(const EpochRecording& recording, uint32_t copy) const;
 	// Submitting thread: a versioned buffer (VersionedBuffer) published a new version. Nothing changed in place, so nothing waits;

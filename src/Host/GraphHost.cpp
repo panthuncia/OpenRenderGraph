@@ -765,12 +765,11 @@ uint64_t GraphHost::BuildGeneration(uint32_t epoch) const noexcept {
 
 bool GraphHost::EpochRecordingCurrent(const EpochRecording& recording) const noexcept {
 	// The attached build is 0 while the epoch has no graph, and a recording's build is never 0.
-	if (recording.buildGeneration == 0 || BuildsOf(recording.epoch).attached != recording.buildGeneration) return false;
-	// A copy that bound a backing that moved since is recorded again (relocation::Service). It still holds the old backing, so
-	// a submission of it meanwhile is safe.
-	return std::ranges::all_of(recording.copies, [](const auto& copy) {
-		return !copy || RenderGraph::PersistentRecordingBackingsCurrent(*copy);
-	});
+	return recording.buildGeneration != 0 && BuildsOf(recording.epoch).attached == recording.buildGeneration;
+}
+
+bool GraphHost::EpochRecordingBackingsCurrent(const EpochRecording& recording, uint32_t copy) const noexcept {
+	return copy < recording.copies.size() && recording.copies[copy] && RenderGraph::PersistentRecordingBackingsCurrent(*recording.copies[copy]);
 }
 
 GraphHost::Builds GraphHost::BuildsOf(uint32_t epoch) const noexcept {
@@ -3255,9 +3254,7 @@ void GraphHost::NoteNewVersions() noexcept {
 }
 
 bool GraphHost::EpochRecordingVersionsCurrent(const EpochRecording& recording, uint32_t copy) const noexcept {
-	// A backing that moved is a new version of what the copy bound, as far as the copy is concerned: it is recorded again.
-	return copy < recording.copies.size() && recording.copies[copy] && RenderGraph::PersistentRecordingVersionsCurrent(*recording.copies[copy])
-		&& RenderGraph::PersistentRecordingBackingsCurrent(*recording.copies[copy]);
+	return copy < recording.copies.size() && recording.copies[copy] && RenderGraph::PersistentRecordingVersionsCurrent(*recording.copies[copy]);
 }
 
 std::string GraphHost::EpochRecordingStaleVersion(const EpochRecording& recording, uint32_t copy) const {
