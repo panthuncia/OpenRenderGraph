@@ -16,7 +16,8 @@ enum class QueueTeardown : uint8_t {
 // A multi-producer, single-consumer queue. Producers on any thread push without blocking and without allocating while the ring
 // has room; a push to a full ring spills onto a lock-free stack. No event is ever lost.
 // The one consumer drains (Drain) or pops one at a time (Pop). It sees the ring's events in push order, then the spilled ones in
-// push order. A push still being written is seen by a later call.
+// push order. While spilled events wait, later pushes spill too, so one producer's events stay in push order. A push still being
+// written is seen by a later call.
 // A bounded Vyukov ring. T must be default-constructible and movable.
 template <class T, std::size_t Capacity = 4096, QueueTeardown Teardown = QueueTeardown::Free>
 class EventQueue {
@@ -67,14 +68,17 @@ public:
             ++count;
         }
         TakeSpill();
+        std::uint64_t spilled = 0;
         for (auto* node = m_popped; node;) {
             visit(std::move(node->value));
             auto* next = node->next;
             delete node;
             node = next;
             ++count;
+            ++spilled;
         }
         m_popped = nullptr;
+        m_spillWaiting.fetch_sub(spilled, std::memory_order_acq_rel);
         m_count.fetch_sub(count, std::memory_order_acq_rel);
         return count;
     }
@@ -95,6 +99,7 @@ public:
         m_popped = node->next;
         out = std::move(node->value);
         delete node;
+        m_spillWaiting.fetch_sub(1, std::memory_order_acq_rel);
         m_count.fetch_sub(1, std::memory_order_acq_rel);
         return true;
     }
@@ -110,6 +115,11 @@ public:
 
 private:
     void PushOnly(T value) {
+        // Spilled events not yet taken: this push follows them onto the stack, or the consumer would take it from the ring first.
+        if (m_spillWaiting.load(std::memory_order_acquire) != 0) {
+            Spill(std::move(value));
+            return;
+        }
         std::uint64_t position = m_head.load(std::memory_order_relaxed);
         for (;;) {
             auto& cell = m_cells[position & (Capacity - 1)];
@@ -125,20 +135,24 @@ private:
                 }
             } else if (difference < 0) {
                 // Full, so spill. Never drop.
-                auto* node = new Spill{std::move(value), m_spill.load(std::memory_order_relaxed)};
-                m_count.fetch_add(1, std::memory_order_acq_rel);
-                while (!m_spill.compare_exchange_weak(node->next, node, std::memory_order_release, std::memory_order_relaxed)) {
-                }
-                m_spilled.fetch_add(1, std::memory_order_relaxed);
+                Spill(std::move(value));
                 return;
             } else {
                 position = m_head.load(std::memory_order_relaxed);
             }
         }
     }
+    void Spill(T value) {
+        auto* node = new SpillNode{std::move(value), m_spill.load(std::memory_order_relaxed)};
+        m_count.fetch_add(1, std::memory_order_acq_rel);
+        m_spillWaiting.fetch_add(1, std::memory_order_acq_rel);
+        while (!m_spill.compare_exchange_weak(node->next, node, std::memory_order_release, std::memory_order_relaxed)) {
+        }
+        m_spilled.fetch_add(1, std::memory_order_relaxed);
+    }
     // The consumer's: appends the spilled events, in push order, to the ones it took before.
     void TakeSpill() {
-        Spill* reversed = nullptr;
+        SpillNode* reversed = nullptr;
         for (auto* node = m_spill.exchange(nullptr, std::memory_order_acquire); node;) {
             auto* next = node->next;
             node->next = reversed;
@@ -159,15 +173,16 @@ private:
         std::atomic<std::uint64_t> sequence{0};
         T value{};
     };
-    struct Spill {
+    struct SpillNode {
         T value;
-        Spill* next;
+        SpillNode* next;
     };
     Cell* m_cells = new Cell[Capacity];
     std::atomic<std::uint64_t> m_head{0};
     std::uint64_t m_tail = 0;     // the consumer's
-    Spill* m_popped = nullptr;    // the consumer's: spilled events taken from the stack, in push order
-    std::atomic<Spill*> m_spill{nullptr};
+    SpillNode* m_popped = nullptr;  // the consumer's: spilled events taken from the stack, in push order
+    std::atomic<SpillNode*> m_spill{nullptr};
+    std::atomic<std::uint64_t> m_spillWaiting{0};  // spilled events not yet taken
     std::atomic<std::uint64_t> m_count{0};
     std::atomic<std::uint64_t> m_spilled{0};
     void (*m_onPush)() = nullptr;  // set at construction, before the queue is shared
