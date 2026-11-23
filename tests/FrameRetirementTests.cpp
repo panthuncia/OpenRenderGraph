@@ -96,6 +96,12 @@ int TestFrameRetirement(rhi::Device device, rhi::Backend backend) {
         CHECK(!ownedViewWeak.expired()); // GPU completion alone cannot release a CPU-retained owner.
         cpuLease.reset();
         CHECK(ownedViewWeak.expired());
+        // The service's range: consecutive slots of the shader-visible heap, each retired on its own.
+        const auto range = retirement.AllocateDescriptorRange(rhi::DescriptorHeapType::CbvSrvUav, true, 3);
+        CHECK(range.size() == 3);
+        for (uint32_t i = 0; i < range.size(); ++i)
+            CHECK(range[i].heap.index == ownedSlot.heap.index && range[i].index == range[0].index + i);
+        for (const auto& slot : range) retirement.RetireDescriptorSlot(slot);
         CHECK(device.WaitIdle() == rhi::Result::Ok);
         retirement.DrainDeferredReleasesAfterDeviceIdle();
     }
@@ -165,6 +171,32 @@ int TestFrameRetirement(rhi::Device device, rhi::Backend backend) {
         retirement.ProcessDeferredReleases(0);
         CHECK(heap->AllocateDescriptor() == slot);
         heap->ReleaseDescriptor(slot);
+    }
+
+    {
+        // A range takes fresh consecutive slots from the tail, never the free list. Slot 0 of a shader-visible
+        // resource heap is reserved, so the first slot handed out is 1.
+        auto heap = std::make_shared<org::DescriptorHeap>(device,
+            rhi::DescriptorHeapType::CbvSrvUav, 8, true, "Descriptor range");
+        const auto loose = heap->AllocateDescriptor();
+        CHECK(loose == 1);
+        heap->ReleaseDescriptor(loose);
+        const auto first = heap->AllocateDescriptorRange(4);
+        CHECK(first == 2); // Not the freed slot 1.
+        bool tooLarge = false;
+        try { (void)heap->AllocateDescriptorRange(3); } catch (const std::runtime_error&) { tooLarge = true; }
+        CHECK(tooLarge); // Only slots 6 and 7 are left in the tail; the free slot does not count.
+        bool empty = false;
+        try { (void)heap->AllocateDescriptorRange(0); } catch (const std::invalid_argument&) { empty = true; }
+        CHECK(empty);
+        // Each slot of the range is released on its own and returns to the free list.
+        for (uint32_t i = 0; i < 4; ++i) heap->ReleaseDescriptor(first + i);
+        bool twice = false;
+        try { heap->ReleaseDescriptor(first); } catch (const std::logic_error&) { twice = true; }
+        CHECK(twice);
+        CHECK(heap->AllocateDescriptor() == loose);
+        CHECK(heap->AllocateDescriptor() == first);
+        CHECK(heap->AllocateDescriptorRange(2) == 6);
     }
 
     // Owners may release further owners, which in turn retire descriptors or

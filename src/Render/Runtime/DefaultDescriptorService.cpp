@@ -60,6 +60,10 @@ public:
 		return DescriptorHeapManager::GetInstance().AllocateDescriptorSlot(type, shaderVisible);
 	}
 
+	std::vector<rhi::DescriptorSlot> AllocateDescriptorSlotRange(rhi::DescriptorHeapType type, bool shaderVisible, uint32_t count) override {
+		return DescriptorHeapManager::GetInstance().AllocateDescriptorRange(type, shaderVisible, count);
+	}
+
 	void RetireDescriptorSlot(rhi::DescriptorSlot slot) override {
 		DescriptorHeapManager::GetInstance().RetireDescriptorSlot(slot);
 	}

@@ -46,6 +46,21 @@ UINT DescriptorHeap::AllocateDescriptor() {
     return index;
 }
 
+UINT DescriptorHeap::AllocateDescriptorRange(UINT count) {
+    std::lock_guard lock(m_allocationMutex);
+    if (count == 0)
+        throw std::invalid_argument("A descriptor range needs at least one slot");
+    // Only the tail is contiguous: free-list slots are scattered.
+    if (m_totalSize - m_numDescriptorsAllocated < count)
+        throw std::runtime_error("Out of descriptor heap space for a contiguous range");
+    const UINT first = m_numDescriptorsAllocated;
+    m_numDescriptorsAllocated += count;
+    m_slots.resize(m_numDescriptorsAllocated);
+    for (UINT index = first; index < m_numDescriptorsAllocated; ++index)
+        m_slots[index].allocated = true;
+    return first;
+}
+
 struct DescriptorHeap::Lease {
     std::shared_ptr<DescriptorHeap> heap;
     UINT index;

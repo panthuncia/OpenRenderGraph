@@ -114,6 +114,12 @@ public:
 	rhi::DescriptorSlot TranslateDescriptorSlot(rhi::DescriptorSlot slot, BackendInstanceId backendInstance) const;
 	UINT CreateIndexedSampler(const rhi::SamplerDesc& samplerDesc);
 	rhi::DescriptorSlot AllocateDescriptorSlot(rhi::DescriptorHeapType type, bool shaderVisible);
+	/**
+	 * @brief Allocates `count` contiguous slots in the heap AllocateDescriptorSlot would use (DescriptorHeap::AllocateDescriptorRange).
+	 *
+	 * Each slot is retired on its own (RetireDescriptorSlot). Returned in slot order.
+	 */
+	std::vector<rhi::DescriptorSlot> AllocateDescriptorRange(rhi::DescriptorHeapType type, bool shaderVisible, uint32_t count);
 	void RetireDescriptorSlot(rhi::DescriptorSlot slot);
 	void RetireDescriptorSlotWithOwner(rhi::DescriptorSlot slot, std::shared_ptr<const void> owner);
 
@@ -124,6 +130,8 @@ public:
 	const std::shared_ptr<DescriptorHeap>& GetNonShaderVisibleHeap() const { return m_nonShaderVisibleHeap; }
 
 private:
+	// The heap AllocateDescriptorSlot and AllocateDescriptorRange take slots from. Caller holds m_descriptorMutationMutex.
+	std::shared_ptr<DescriptorHeap> AllocationHeap(rhi::DescriptorHeapType type, bool shaderVisible) const;
 	DescriptorHeapManager() = default;
     std::shared_ptr<runtime::ResourceCleanupQueue> m_resourceCleanup;
     uint64_t m_deviceGeneration = 0;

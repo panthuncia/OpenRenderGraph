@@ -25,6 +25,15 @@ public:
     rhi::DescriptorHeap GetHeap();
 
     UINT AllocateDescriptor();
+    /**
+     * @brief Allocates `count` consecutive fresh slots and returns the first.
+     *
+     * The slots come from the never-used tail of the heap, not from the free list, so they are contiguous (one
+     * descriptor table can cover them). Release each slot on its own with ReleaseDescriptor; released slots go to
+     * the free list like any other.
+     * @throws std::runtime_error when the tail has fewer than `count` slots left.
+     */
+    UINT AllocateDescriptorRange(UINT count);
     void ReleaseDescriptor(UINT index, std::shared_ptr<const void> owner = {});
     // CPU frames retain slots before they have submission fences. Retirement
     // requests reclamation; a retained slot cannot return to the free list.

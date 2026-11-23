@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include <rhi.h>
 
@@ -43,6 +44,15 @@ public:
 	// Extension-owned exact views still allocate from ORG's global arenas and
 	// retire against ORG's queue-fence snapshot.
 	virtual rhi::DescriptorSlot AllocateDescriptorSlot(rhi::DescriptorHeapType type, bool shaderVisible) = 0;
+	/**
+	 * @brief Allocates `count` contiguous slots in the heap AllocateDescriptorSlot uses, in slot order.
+	 *
+	 * For views one descriptor table covers. Each slot is retired on its own (RetireDescriptorSlot or
+	 * RetireDescriptorSlotWithOwner). Empty when the service cannot allocate ranges.
+	 */
+	virtual std::vector<rhi::DescriptorSlot> AllocateDescriptorSlotRange(rhi::DescriptorHeapType, bool /*shaderVisible*/, uint32_t /*count*/) {
+		return {};
+	}
 	virtual void RetireDescriptorSlot(rhi::DescriptorSlot slot) = 0;
 	// Retire an extension-owned view and its backing at the same GPU completion
 	// point as its descriptor. Outstanding CPU descriptor leases also retain the

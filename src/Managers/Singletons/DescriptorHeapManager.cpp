@@ -1088,9 +1088,8 @@ UINT DescriptorHeapManager::CreateIndexedSampler(const rhi::SamplerDesc& sampler
     return index;
 }
 
-rhi::DescriptorSlot DescriptorHeapManager::AllocateDescriptorSlot(
-	rhi::DescriptorHeapType type, bool shaderVisible) {
-	std::scoped_lock lock(m_descriptorMutationMutex);
+std::shared_ptr<DescriptorHeap> DescriptorHeapManager::AllocationHeap(
+	rhi::DescriptorHeapType type, bool shaderVisible) const {
 	std::shared_ptr<DescriptorHeap> heap;
 	switch (type) {
 	case rhi::DescriptorHeapType::CbvSrvUav:
@@ -1107,7 +1106,27 @@ rhi::DescriptorSlot DescriptorHeapManager::AllocateDescriptorSlot(
 	default: throw std::invalid_argument("Unknown descriptor heap type");
 	}
 	if (!heap) throw std::runtime_error("Descriptor service is not initialized");
+	return heap;
+}
+
+rhi::DescriptorSlot DescriptorHeapManager::AllocateDescriptorSlot(
+	rhi::DescriptorHeapType type, bool shaderVisible) {
+	std::scoped_lock lock(m_descriptorMutationMutex);
+	const std::shared_ptr<DescriptorHeap> heap = AllocationHeap(type, shaderVisible);
 	return { heap->GetHeap().GetHandle(), heap->AllocateDescriptor() };
+}
+
+std::vector<rhi::DescriptorSlot> DescriptorHeapManager::AllocateDescriptorRange(
+	rhi::DescriptorHeapType type, bool shaderVisible, uint32_t count) {
+	std::scoped_lock lock(m_descriptorMutationMutex);
+	const std::shared_ptr<DescriptorHeap> heap = AllocationHeap(type, shaderVisible);
+	const UINT first = heap->AllocateDescriptorRange(count);
+	const rhi::DescriptorHeapHandle handle = heap->GetHeap().GetHandle();
+	std::vector<rhi::DescriptorSlot> slots;
+	slots.reserve(count);
+	for (uint32_t i = 0; i < count; ++i)
+		slots.emplace_back(handle, first + i);
+	return slots;
 }
 
 void DescriptorHeapManager::RetireDescriptorSlot(rhi::DescriptorSlot slot) {
