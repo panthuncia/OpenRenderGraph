@@ -1340,7 +1340,8 @@ inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, 
     m_replayable = m_deferred->replayable
         && std::all_of(m_deferred->passes.begin(), m_deferred->passes.end(), [](const PreparedPass& pass) { return pass.IsReplayable(); });
     if (!m_replayable) m_submissionEffects = m_deferred->passes;
-    m_keyedBySkips = m_inline && m_replayable
+    // Only on a stable run, whose latch regions are pinned: a pass keyed by its skips may record a latch region's address.
+    m_keyedBySkips = m_inline && m_replayable && m_deferred->run.Stable()
         && std::all_of(m_deferred->passes.begin(), m_deferred->passes.end(), [](const PreparedPass& pass) { return pass.KeyedBySkip(); });
 }
 
