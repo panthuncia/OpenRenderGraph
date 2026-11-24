@@ -60,6 +60,9 @@ struct NoPassBindings {};
 // `static constexpr bool kRecordKeyedBySkip = true;` (optional, with SkipsAtExecution): Record's commands for a run depend on
 // the run only through SkipsAtExecution's answer. A gated copy or clear is such a pass. A kept recording's late batch made only
 // of such passes keeps its list while the answers stay the same (PreparedPass::KeyedBySkip).
+// `static uint64_t RecordKeyAtExecution(const Bindings&, const FrameData&, const PassRecordContext&);` (optional, with
+// kRecordKeyedBySkip): what else Record's commands depend on, as a key, such as a hash of a run's draw list whose values a latch
+// carries. The kept list is reused only while the keys stay the same too. It may read only Run().
 template<class Derived, OwnedPassFrameData FrameData = EmptyPassFrameData, class Bindings = NoPassBindings>
 class TypedRenderGraphPass : public RenderPass {
 public:
@@ -203,6 +206,12 @@ private:
             }) return Derived::SkipsAtExecution(frame.bindings, frame.data, context);
             else return false;
         }
+        static uint64_t RecordKeyAtExecution(const DeclaredFrame& frame, const PassRecordContext& context) {
+            if constexpr (requires(const PassRecordContext& record) {
+                { Derived::RecordKeyAtExecution(frame.bindings, frame.data, record) } -> std::convertible_to<uint64_t>;
+            }) return Derived::RecordKeyAtExecution(frame.bindings, frame.data, context);
+            else return 0;
+        }
         static constexpr bool kKeyedBySkip = KeyedBySkipOf();
     };
     struct UndeclaredFrame {
@@ -229,6 +238,12 @@ private:
                 { Derived::SkipsAtExecution(frame.data, record) } -> std::convertible_to<bool>;
             }) return Derived::SkipsAtExecution(frame.data, context);
             else return false;
+        }
+        static uint64_t RecordKeyAtExecution(const UndeclaredFrame& frame, const PassRecordContext& context) {
+            if constexpr (requires(const PassRecordContext& record) {
+                { Derived::RecordKeyAtExecution(frame.data, record) } -> std::convertible_to<uint64_t>;
+            }) return Derived::RecordKeyAtExecution(frame.data, context);
+            else return 0;
         }
         static constexpr bool kKeyedBySkip = KeyedBySkipOf();
     };

@@ -816,6 +816,10 @@ public:
     // Whether the pass's commands for a run depend on the run only through SkipsAtExecution's answer (a typed pass's
     // kRecordKeyedBySkip). Then a list recorded for one answer can be submitted again for a run with the same answer.
     bool KeyedBySkip() const noexcept { return m_storage && m_storage->KeyedBySkip(); }
+    // With KeyedBySkip: what else the pass's commands for a run depend on, as a key (a typed pass's static RecordKeyAtExecution;
+    // 0 without one). A kept list is submitted again only for a run with the same answers and the same keys. Asked with the skip
+    // questions' context, so it may read only Run().
+    uint64_t RecordKey(const RecordingContext& context) const { return m_storage ? m_storage->RecordKey(context) : 0; }
     // Consumes the packet as Record does, recording nothing (SkipsAtExecution). Its submission and completion follow as usual.
     void RecordNothing() const {
         if (!m_storage) throw std::logic_error("Legacy pass has no owned recording packet");
@@ -882,6 +886,7 @@ private:
         virtual bool HasCallbacks() const noexcept { return false; }
         virtual bool SkipsAtExecution(const RecordingContext&) const { return false; }
         virtual bool KeyedBySkip() const noexcept { return false; }
+        virtual uint64_t RecordKey(const RecordingContext&) const { return 0; }
         mutable std::atomic<LifecycleState> state{LifecycleState::Prepared};
         mutable std::shared_ptr<const PreparedDependencySnapshot> dependencies;
         std::vector<ExternalTimelinePoint> externalSignals;
@@ -929,6 +934,12 @@ private:
         bool KeyedBySkip() const noexcept override {
             if constexpr (requires { Derived::kKeyedBySkip; }) return Derived::kKeyedBySkip;
             else return false;
+        }
+        uint64_t RecordKey(const RecordingContext& context) const override {
+            if constexpr (requires(const Data& value, const RecordingContext& recording) {
+                { Derived::RecordKeyAtExecution(value, recording) } -> std::convertible_to<uint64_t>;
+            }) return data ? static_cast<uint64_t>(Derived::RecordKeyAtExecution(*data, context)) : 0;
+            else return 0;
         }
 		mutable std::optional<Data> data;
     };

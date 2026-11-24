@@ -653,6 +653,7 @@ private:
     bool m_keyedBySkips = false;
     mutable bool m_keptList = false;
     mutable std::vector<uint8_t> m_keptSkips;
+    mutable std::vector<uint64_t> m_keptKeys;  // the passes' record keys the kept list was recorded with (PreparedPass::RecordKey)
     mutable uint64_t m_keptUntouched = 0;  // the untouched resources' signature the kept list was recorded with
     mutable std::atomic_bool m_deferredRecorded{false};
     mutable uint64_t m_deferredSignal = 0;  // set by CommitExternal. RecordDeferred commits its passes with it.
@@ -1397,8 +1398,15 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline(std::span<const 
         std::vector<uint8_t> skips(a_skips.begin(), a_skips.end());
         if (skips.size() != m_deferred->passes.size()) AskSkips(skips);
         const uint64_t untouched = a_untouched ? a_untouched->signature : 0;
+        thread_local std::vector<uint64_t> keys;
+        keys.clear();
+        if (m_keyedBySkips) {
+            const auto context = RecordingContext::ForSkipQuestions(m_deferred->run);
+            keys.reserve(m_deferred->passes.size());
+            for (const auto& pass : m_deferred->passes) keys.push_back(pass.RecordKey(context));
+        }
         if (m_keyedBySkips && m_keptList && allocation.closed && allocation.pool && allocation.pair.list) {
-            if (skips == m_keptSkips && untouched == m_keptUntouched) {
+            if (skips == m_keptSkips && untouched == m_keptUntouched && keys == m_keptKeys) {
                 return allocation.pair.list.Get();
             }
         }
@@ -1424,6 +1432,7 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline(std::span<const 
         allocation.Close();
         if (m_keyedBySkips) {
             m_keptSkips = std::move(skips);
+            m_keptKeys = keys;
             m_keptUntouched = untouched;
             m_keptList = true;
         }
