@@ -56,6 +56,12 @@ std::vector<const LatchBlock*> StableAt(uint32_t lease) {
 	const auto& lists = StableBlocks();
 	return lease < lists.size() ? lists[lease] : std::vector<const LatchBlock*>{};
 }
+// Appends lease's blocks to `out`, which keeps its capacity across calls.
+void AppendStableAt(uint32_t lease, std::vector<const LatchBlock*>& out) {
+	std::scoped_lock lock(StableMutex());
+	const auto& lists = StableBlocks();
+	if (lease < lists.size()) out.insert(out.end(), lists[lease].begin(), lists[lease].end());
+}
 }
 
 void LatchBlock::ZeroStableRun(uint32_t lease) {
@@ -86,9 +92,11 @@ void LatchBlock::CopyStableRun(uint32_t from, uint32_t to) {
 	// move: the source's written part (all of it unless `from` is host-only), and the target's part a write or an earlier copy left
 	// non-zero. A block written at neither costs nothing, so a stage's clients that staged nothing this frame cost nothing.
 	const bool hostOnly = IsHostOnly(from);
-	auto blocks = StableAt(to);
-	const auto staged = StableAt(from);
-	blocks.insert(blocks.end(), staged.begin(), staged.end());
+	// Reused: a stage's commit copies a run every frame. Callers hold RegistryMutex, so one thread uses it at a time.
+	static std::vector<const LatchBlock*> blocks;
+	blocks.clear();
+	AppendStableAt(to, blocks);
+	AppendStableAt(from, blocks);
 	std::sort(blocks.begin(), blocks.end());
 	blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
 	for (const auto* block : blocks) {

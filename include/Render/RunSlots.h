@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -18,10 +20,27 @@ public:
 		virtual void MoveRun(const RunRef& from, const RunRef& to) const = 0;
 	};
 
+	// Only the RunSlots that stored a value at `from`'s lease index since its last move are asked (NoteStored), not every one.
 	static void MoveAll(const RunRef& from, const RunRef& to) {
 		auto& registry = Get();
 		std::scoped_lock lock(registry.m_mutex);
-		for (const auto* entry : registry.m_entries) entry->MoveRun(from, to);
+		if (from.lease >= registry.m_stored.size() || from.lease == to.lease) return;
+		auto moved = std::move(registry.m_stored[from.lease]);
+		registry.m_stored[from.lease].clear();
+		for (const auto* entry : moved) entry->MoveRun(from, to);
+		if (registry.m_stored.size() <= to.lease) registry.m_stored.resize(static_cast<std::size_t>(to.lease) + 1);
+		auto& target = registry.m_stored[to.lease];
+		for (const auto* entry : moved)
+			if (std::find(target.begin(), target.end(), entry) == target.end()) target.push_back(entry);
+	}
+
+	// A RunSlots stored a value at lease index `lease`.
+	static void NoteStored(const Entry* entry, uint32_t lease) {
+		auto& registry = Get();
+		std::scoped_lock lock(registry.m_mutex);
+		if (registry.m_stored.size() <= lease) registry.m_stored.resize(static_cast<std::size_t>(lease) + 1);
+		auto& stored = registry.m_stored[lease];
+		if (std::find(stored.begin(), stored.end(), entry) == stored.end()) stored.push_back(entry);
 	}
 
 	static void Add(const Entry* entry) {
@@ -34,6 +53,7 @@ public:
 		auto& registry = Get();
 		std::scoped_lock lock(registry.m_mutex);
 		std::erase(registry.m_entries, entry);
+		for (auto& stored : registry.m_stored) std::erase(stored, entry);
 	}
 
 private:
@@ -45,6 +65,7 @@ private:
 
 	std::mutex m_mutex;
 	std::vector<const Entry*> m_entries;
+	std::vector<std::vector<const Entry*>> m_stored;  // by lease index: the entries that stored a value there since its last move
 };
 
 // One value per run, stored by a client's commit and taken by the pass that records that run.
@@ -67,9 +88,12 @@ public:
 	}
 
 	void Store(const RunRef& run, std::shared_ptr<const T> value) const {
-		std::scoped_lock lock(m_mutex);
-		if (m_entries.size() <= run.lease) m_entries.resize(static_cast<std::size_t>(run.lease) + 1);
-		m_entries[run.lease] = {run, std::move(value)};
+		{
+			std::scoped_lock lock(m_mutex);
+			if (m_entries.size() <= run.lease) m_entries.resize(static_cast<std::size_t>(run.lease) + 1);
+			m_entries[run.lease] = {run, std::move(value)};
+		}
+		RunSlotsRegistry::NoteStored(this, run.lease);
 	}
 
 	// The run's value, left in place for a pass that reads it more than once.
