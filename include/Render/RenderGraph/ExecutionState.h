@@ -350,6 +350,7 @@ private:
         CompileResourceShape shape{};
         std::vector<Cell> cells;
         uint64_t fingerprint = 0;  // of the cells' references, kept by every change (AccessPrediction)
+        uint64_t changedIn = 0;    // the last Commit that changed it (m_commits), whose end hashes it once
     };
     struct Producer {
         ExecutionTimelinePoint signal{};  // the latest; its timeline is set by the first commit
@@ -368,6 +369,7 @@ private:
     size_t m_closedProducers = 0;
     std::unordered_map<uint64_t, std::vector<uint32_t>> m_streams;  // id -> its batches' producers
     uint64_t m_nextStream = 1;
+    uint64_t m_commits = 0;  // Commit calls so far
 };
 
 // Tracks submitted use of physical placed-resource ranges. Different graph

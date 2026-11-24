@@ -1314,6 +1314,11 @@ void BackingAccessAdmissionLedger::Commit(const Schedule& graph,
     }
     batchCount = (std::min)(batchCount, static_cast<uint32_t>(graph.batches.size()));
     auto& resolved = m_accesses.Resolve(resources, backingSet);
+    // The grids this commit changes, each hashed once at the end: a grid's fingerprint covers all its cells, and a resource
+    // has several accesses a frame.
+    const uint64_t commit = ++m_commits;
+    thread_local std::vector<AccessGrid*> changedGrids;
+    changedGrids.clear();
     for (uint32_t batchIndex = 0; batchIndex < batchCount; ++batchIndex) {
         const auto signal = execution.batches[batchIndex].signal;
         if (!signal.timeline || !signal.value) throw std::invalid_argument("Unsubmitted hazard point");
@@ -1369,9 +1374,13 @@ void BackingAccessAdmissionLedger::Commit(const Schedule& graph,
                 else return;
                 changed = true;
             });
-            if (changed) grid.fingerprint = Fingerprint(grid);
+            if (changed && grid.changedIn != commit) {
+                grid.changedIn = commit;
+                changedGrids.push_back(&grid);
+            }
         }
     }
+    for (auto* grid : changedGrids) grid->fingerprint = Fingerprint(*grid);
 }
 
 namespace {

@@ -648,9 +648,11 @@ private:
     bool m_replayable = false;
     std::shared_ptr<OwnedRecordingList> m_deferred;
     bool m_inline = false;  // m_deferred->inlineAtExecution
-    // An inline replayable batch whose passes are all keyed by their skip answers (PreparedPass::KeyedBySkip). Its list
-    // is recorded again only when the answers differ from those it was recorded with (m_keptSkips). Submitting thread only.
+    // An inline replayable batch on a stable run, keyed by its passes' skip answers. Its list is recorded again only when the
+    // answers differ from those it was recorded with (m_keptSkips). Each pass must be keyed by its skip answer
+    // (PreparedPass::KeyedBySkip) or skipped: a skipped pass records nothing, and its answer is in the key. Submitting thread only.
     bool m_keyedBySkips = false;
+    std::vector<uint32_t> m_unkeyedPasses;  // the passes that are not keyed by their skip answer
     mutable bool m_keptList = false;
     mutable std::vector<uint8_t> m_keptSkips;
     mutable std::vector<uint64_t> m_keptKeys;  // the passes' record keys the kept list was recorded with (PreparedPass::RecordKey)
@@ -1342,8 +1344,9 @@ inline PreparedRhiExecutionBatch::PreparedRhiExecutionBatch(uint32_t queueSlot, 
         && std::all_of(m_deferred->passes.begin(), m_deferred->passes.end(), [](const PreparedPass& pass) { return pass.IsReplayable(); });
     if (!m_replayable) m_submissionEffects = m_deferred->passes;
     // Only on a stable run, whose latch regions are pinned: a pass keyed by its skips may record a latch region's address.
-    m_keyedBySkips = m_inline && m_replayable && m_deferred->run.Stable()
-        && std::all_of(m_deferred->passes.begin(), m_deferred->passes.end(), [](const PreparedPass& pass) { return pass.KeyedBySkip(); });
+    m_keyedBySkips = m_inline && m_replayable && m_deferred->run.Stable();
+    for (uint32_t pass = 0; pass < m_deferred->passes.size(); ++pass)
+        if (!m_deferred->passes[pass].KeyedBySkip()) m_unkeyedPasses.push_back(pass);
 }
 
 inline void PreparedRhiExecutionBatch::AskSkips(std::vector<uint8_t>& a_out) const {
@@ -1398,14 +1401,16 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline(std::span<const 
         std::vector<uint8_t> skips(a_skips.begin(), a_skips.end());
         if (skips.size() != m_deferred->passes.size()) AskSkips(skips);
         const uint64_t untouched = a_untouched ? a_untouched->signature : 0;
+        // Keyed this run: every pass not keyed by its answer is skipped.
+        const bool keyed = m_keyedBySkips && std::ranges::all_of(m_unkeyedPasses, [&](uint32_t pass) { return skips[pass] != 0; });
         thread_local std::vector<uint64_t> keys;
         keys.clear();
-        if (m_keyedBySkips) {
+        if (keyed) {
             const auto context = RecordingContext::ForSkipQuestions(m_deferred->run);
             keys.reserve(m_deferred->passes.size());
             for (const auto& pass : m_deferred->passes) keys.push_back(pass.RecordKey(context));
         }
-        if (m_keyedBySkips && m_keptList && allocation.closed && allocation.pool && allocation.pair.list) {
+        if (keyed && m_keptList && allocation.closed && allocation.pool && allocation.pair.list) {
             if (skips == m_keptSkips && untouched == m_keptUntouched && keys == m_keptKeys) {
                 return allocation.pair.list.Get();
             }
@@ -1430,7 +1435,7 @@ inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline(std::span<const 
             return {};
         }
         allocation.Close();
-        if (m_keyedBySkips) {
+        if (keyed) {
             m_keptSkips = std::move(skips);
             m_keptKeys = keys;
             m_keptUntouched = untouched;

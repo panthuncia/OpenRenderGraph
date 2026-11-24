@@ -993,6 +993,22 @@ public:
 	// Render owner: runs a_closure on the submission thread, in order after everything queued so far. Without a submission thread
 	// it runs at once on the calling thread. A closure that throws is logged. Waits for room when the queue is full.
 	void EnqueueOnSubmitThread(std::function<void()> a_closure);
+	// Render owner: holds back what this thread hands the submission thread (tickets, closures) until the matching
+	// ReleaseSubmissions, then hands it over in one push. Tickets that arrive together are finished as one group, so their queue
+	// submissions can share one vkQueueSubmit. Calls nest; the outermost release pushes. A drain or a SubmittedPoint on this
+	// thread pushes what is held first, so this thread never waits for an entry it still holds. Hold only across work
+	// that ends soon and never waits for the GPU work it holds back.
+	void HoldSubmissions();
+	void ReleaseSubmissions();
+	// HoldSubmissions for a scope.
+	struct SubmissionGroup {
+		explicit SubmissionGroup(GraphHost& host) : m_host(host) { m_host.HoldSubmissions(); }
+		~SubmissionGroup() { m_host.ReleaseSubmissions(); }
+		SubmissionGroup(const SubmissionGroup&) = delete;
+		SubmissionGroup& operator=(const SubmissionGroup&) = delete;
+	private:
+		GraphHost& m_host;
+	};
 	// Any thread, for a failure message only: the host's thread's state (each async epoch's pause and ticket, the run leases in
 	// flight and what each waits for, the queued requests, the wake), read racily.
 	// a_pollTimelines false: no RHI call and no blocking lock. Use it where the caller may hold an RHI lock, such as inside a

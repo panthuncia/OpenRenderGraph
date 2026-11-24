@@ -438,6 +438,10 @@ struct GraphHost::SubmitQueue {
 	std::string error;  // the first failure, written under the mutex before failed is set
 	std::thread thread;
 	std::thread::id threadId;
+	// HoldSubmissions: the holding thread's entries, not yet pushed. Under the mutex.
+	std::thread::id holder;
+	uint32_t holdDepth = 0;
+	std::vector<Entry> held;
 	// Statistics, under the mutex.
 	GraphHost::SubmitThreadStats stats;
 	std::map<std::string, std::pair<uint64_t, double>> drains;  // by caller
@@ -1733,9 +1737,53 @@ void GraphHost::SetFrameWaitTimeline(std::shared_ptr<rhi::TimelinePtr> timeline)
 	if (AnyGraph()) RequestRebuild("frame-wait timeline set");
 }
 
+namespace {
+// Pushes a_entries onto the submission thread's queue, in order, waiting for room first when it is full. The thread never
+// waits for the render thread, so the wait ends. a_lock holds the queue's mutex; it is released before the wake.
+template <class Queue, class Entries>
+void PushSubmitEntries(Queue& queue, std::unique_lock<std::mutex>& a_lock, Entries&& a_entries) {
+	if (queue.entries.size() >= Queue::kCapacity) {
+		BT_ZONE_SCOPE("ORG.Host.SubmitBackpressure");
+		const auto start = std::chrono::steady_clock::now();
+		queue.progress.wait(a_lock, [&] { return queue.entries.size() < Queue::kCapacity; });
+		++queue.stats.backpressureWaits;
+		queue.stats.backpressureUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+	}
+	for (auto& entry : a_entries) queue.entries.push_back(std::move(entry));
+	queue.pushed += a_entries.size();
+	queue.stats.peakDepth = (std::max)(queue.stats.peakDepth, queue.pushed - queue.passed);
+	a_lock.unlock();
+	queue.work.notify_one();
+}
+
+// Pushes a_entry, or keeps it with the held ones when the calling thread holds (GraphHost::HoldSubmissions).
+template <class Queue>
+void PushOrHold(Queue& queue, typename Queue::Entry a_entry) {
+	std::unique_lock lock(queue.mutex);
+	if (queue.holdDepth && queue.holder == std::this_thread::get_id()) {
+		queue.held.push_back(std::move(a_entry));
+		return;
+	}
+	std::array<typename Queue::Entry, 1> one{std::move(a_entry)};
+	PushSubmitEntries(queue, lock, one);
+}
+
+// Pushes what the calling thread holds, with a_lock held; a_lock is held again on return.
+template <class Queue>
+void PushHeld(Queue& queue, std::unique_lock<std::mutex>& a_lock) {
+	if (queue.held.empty()) return;
+	BT_ZONE_SCOPE("ORG.Host.PushHeldSubmissions");
+	auto held = std::exchange(queue.held, {});
+	PushSubmitEntries(queue, a_lock, held);
+	a_lock.lock();
+}
+}  // namespace
+
 GraphHost::GpuPoint GraphHost::SubmittedPoint() const {
 	if (auto* queue = m_submitQueue.get()) {
 		std::unique_lock lock(queue->mutex);
+		// What this thread holds goes first: the point must come after it.
+		if (queue->holder == std::this_thread::get_id()) PushHeld(*queue, lock);
 		// Tickets still queued have no values yet. The point waits for the thread to get past them: a marker behind them, which
 		// the thread fills in with the values then. The thread's own calls are in order already.
 		if (std::this_thread::get_id() != queue->threadId && queue->passed < queue->pushed) {
@@ -3687,53 +3735,45 @@ void GraphHost::StopSubmitThread() {
 	m_submitQueue->thread.join();
 }
 
+
+void GraphHost::HoldSubmissions() {
+	auto* queue = m_submitQueue.get();
+	if (!queue) return;
+	std::scoped_lock lock(queue->mutex);
+	if (queue->holdDepth && queue->holder != std::this_thread::get_id())
+		throw std::logic_error("HoldSubmissions: another thread holds the submission thread's entries");
+	queue->holder = std::this_thread::get_id();
+	++queue->holdDepth;
+}
+
+void GraphHost::ReleaseSubmissions() {
+	auto* queue = m_submitQueue.get();
+	if (!queue) return;
+	std::unique_lock lock(queue->mutex);
+	if (!queue->holdDepth || queue->holder != std::this_thread::get_id()) return;
+	if (--queue->holdDepth) return;
+	queue->holder = {};
+	PushHeld(*queue, lock);
+}
+
 void GraphHost::EnqueueTicket(Async& async, TicketCommit commit) {
 	BT_ZONE_SCOPE("ORG.Host.EnqueueTicket");
-	auto& queue = *m_submitQueue;
 	SubmitQueue::Entry entry;
 	entry.kind = SubmitQueue::Entry::Kind::Ticket;
 	entry.async = &async;
 	entry.commit.emplace(std::move(commit));
-	std::unique_lock lock(queue.mutex);
-	if (queue.entries.size() >= SubmitQueue::kCapacity) {
-		// The thread is this far behind. Waiting here keeps the render thread from running further ahead. The thread never waits
-		// for the render thread, so the wait ends.
-		BT_ZONE_SCOPE("ORG.Host.SubmitBackpressure");
-		const auto start = std::chrono::steady_clock::now();
-		queue.progress.wait(lock, [&] { return queue.entries.size() < SubmitQueue::kCapacity; });
-		++queue.stats.backpressureWaits;
-		queue.stats.backpressureUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
-	}
-	queue.entries.push_back(std::move(entry));
-	++queue.pushed;
-	queue.stats.peakDepth = (std::max)(queue.stats.peakDepth, queue.pushed - queue.passed);
-	lock.unlock();
-	queue.work.notify_one();
+	PushOrHold(*m_submitQueue, std::move(entry));
 }
 
 void GraphHost::EnqueueOnSubmitThread(std::function<void()> a_closure) {
-	auto* queue = m_submitQueue.get();
-	if (!queue) {
+	if (!m_submitQueue) {
 		a_closure();
 		return;
 	}
 	SubmitQueue::Entry entry;
 	entry.kind = SubmitQueue::Entry::Kind::Closure;
 	entry.closure = std::move(a_closure);
-	std::unique_lock lock(queue->mutex);
-	if (queue->entries.size() >= SubmitQueue::kCapacity) {
-		// As for a ticket (EnqueueTicket): the thread never waits for this thread, so the wait ends.
-		BT_ZONE_SCOPE("ORG.Host.SubmitBackpressure");
-		const auto start = std::chrono::steady_clock::now();
-		queue->progress.wait(lock, [&] { return queue->entries.size() < SubmitQueue::kCapacity; });
-		++queue->stats.backpressureWaits;
-		queue->stats.backpressureUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
-	}
-	queue->entries.push_back(std::move(entry));
-	++queue->pushed;
-	queue->stats.peakDepth = (std::max)(queue->stats.peakDepth, queue->pushed - queue->passed);
-	lock.unlock();
-	queue->work.notify_one();
+	PushOrHold(*m_submitQueue, std::move(entry));
 }
 
 void GraphHost::DrainSubmissions(const char* why) {
@@ -3742,6 +3782,8 @@ void GraphHost::DrainSubmissions(const char* why) {
 	std::unique_lock lock(queue->mutex);
 	// The thread's own work (a pass recorded there that reaches a drain) is already in order.
 	if (std::this_thread::get_id() == queue->threadId) return;
+	// What this thread holds goes first, or the drain would wait for entries never pushed.
+	if (queue->holder == std::this_thread::get_id()) PushHeld(*queue, lock);
 	const auto target = queue->pushed;
 	if (queue->passed >= target) return;
 	BT_ZONE_SCOPE("ORG.Host.DrainSubmissions");
