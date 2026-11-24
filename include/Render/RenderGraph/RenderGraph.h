@@ -591,6 +591,10 @@ private:
 	}
 
 public:
+	// The group held for the next ticket, submitted now if this thread is recording an inline late batch while one is held (else
+	// nothing). Whatever submits on a queue while a pass records at execution calls it first: the held batches are committed as
+	// submitted, so nothing may come ahead of them on the queue (a wait on a value they signal would never end).
+	static bool FlushRecordingSubmitCarry();
 	// Hosts that share a queue with another API (for example an adopted DXVK
 	// VkQueue whose translated D3D11 work is submitted before and after the graph)
 	// order that work against the graph with full memory barriers: `entry` at the

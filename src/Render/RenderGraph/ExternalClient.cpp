@@ -113,6 +113,8 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 	const std::function<void(rhi::CommandList&)>& record, std::span<const rhi::TimelinePoint> signals,
 	std::shared_ptr<const void> keepAlive, std::span<const rhi::TimelinePoint> extraWaits, bool cachePublication) {
 	BT_ZONE_SCOPE("ORG.ExternalClient.Submit");
+	// Called while a pass records at execution: the submitting thread's held group goes to the queue first.
+	if (!RenderGraph::FlushRecordingSubmitCarry()) throw std::runtime_error("ExternalClient: a held queue submission was refused");
 	std::lock_guard lock(m_mutex);
 	auto& slot = Slot(slotIndex);
 	{ BT_ZONE_SCOPE("ORG.ExternalClient.Retire"); RetireLocked(); }

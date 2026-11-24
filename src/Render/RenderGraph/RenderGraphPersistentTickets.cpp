@@ -367,6 +367,15 @@ std::shared_ptr<RenderGraph::SubmitCarry> RenderGraph::MakeSubmitCarry() { retur
 
 uint64_t RenderGraph::TakeSubmitCarryJoins(SubmitCarry& carry) noexcept { return std::exchange(carry.joins, 0); }
 
+namespace {
+// The held group while this thread records an inline late batch (SubmitPersistentTicket).
+thread_local void* t_recordingCarry = nullptr;  // a RenderGraph::SubmitCarry
+}
+
+bool RenderGraph::FlushRecordingSubmitCarry() {
+	return !t_recordingCarry || FlushSubmitCarry(*static_cast<SubmitCarry*>(t_recordingCarry));
+}
+
 bool RenderGraph::FlushSubmitCarry(SubmitCarry& carry, uint32_t* merged) {
 	if (merged) *merged = carry.tickets;
 	if (!carry.Active()) return true;
@@ -1060,9 +1069,18 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			batches[i].untouched = untouched.Empty() ? nullptr : &untouched;
 			if (handoff[i]) batches[i].leading = {&handoff[i], 1};
 			// An inline late batch is recorded here, and a pass recorded at execution may submit work of its own on the queue (an
-			// external client's, after a drain). The held group goes first, so nothing comes ahead of it on the queue.
-			if (packet->Inline() && carry && !FlushSubmitCarry(*carry)) return false;
-			if (!packet->Gather(batches[i], gathered)) {
+			// external client's). Such a submission sends the held group first (FlushRecordingSubmitCarry), so nothing comes ahead
+			// of it on the queue. Otherwise the group stays held and the next group may join it.
+			bool gatheredOk = false;
+			{
+				struct RecordingCarry {
+					void* previous;
+					explicit RecordingCarry(void* held) : previous(std::exchange(t_recordingCarry, held)) {}
+					~RecordingCarry() { t_recordingCarry = previous; }
+				} recordingCarry(packet->Inline() ? carry : nullptr);
+				gatheredOk = static_cast<bool>(packet->Gather(batches[i], gathered));
+			}
+			if (!gatheredOk) {
 				// Its effects are abandoned. The batches gathered before it still go to the queue.
 				(void)flush(false);
 				return false;
