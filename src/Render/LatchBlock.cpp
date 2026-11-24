@@ -207,6 +207,19 @@ LatchBlock::Region LatchBlock::At(const RunRef& run) const {
 	return entry.region;
 }
 
+void LatchBlock::Zero(const RunRef& run) const {
+	if (m_buffer || !run.Stable() || !IsHostOnly(run.lease)) {
+		const auto region = At(run);
+		std::memset(region.mapped, 0, region.size);
+		return;
+	}
+	std::scoped_lock lock(m_mutex);
+	const auto region = StableRegion(run.lease);
+	auto& high = m_stableHigh[run.lease];
+	if (high) std::memset(region.mapped, 0, (std::min)(high, region.size));
+	high = 0;
+}
+
 void LatchBlock::Write(const RunRef& run, uint32_t offset, std::span<const std::byte> bytes) const {
 	if (uint64_t(offset) + bytes.size() > m_stride)
 		throw std::out_of_range("Latch block '" + m_name + "' write past its region");

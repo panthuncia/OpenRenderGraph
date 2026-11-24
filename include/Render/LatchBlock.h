@@ -62,6 +62,9 @@ public:
 		const auto region = At(run);
 		return {region.mapped, region.size};
 	}
+	// Zeroes the run's region. A host-only run's (MarkHostOnlyRun) only as far as anything was written to it, which it then resets,
+	// so CopyStableRun moves nothing for it until something is written again. Unlike Bytes, which marks a host-only region written.
+	void Zero(const RunRef& run) const;
 	// Copies bytes to the run's region at offset; throws if they do not fit.
 	void Write(const RunRef& run, uint32_t offset, std::span<const std::byte> bytes) const;
 	template<class T> void WriteValue(const RunRef& run, uint32_t offset, const T& value) const {

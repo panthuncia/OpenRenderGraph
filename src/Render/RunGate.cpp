@@ -97,8 +97,8 @@ void RunGate::Write(const RunRef& run, uint32_t entry, const std::array<uint32_t
 }
 
 void RunGate::Close(const RunRef& run) const {
-	const auto bytes = m_latch->Bytes(run);
-	std::memset(bytes.data(), 0, static_cast<size_t>(m_entries) * kEntryBytes);
+	// Only what was opened is cleared in a staging run, so the stage's copy moves only the entries opened since.
+	m_latch->Zero(run);
 	if (run.lease >= Runtime::kMaxSlots) return;
 	for (uint32_t i = 0; i < m_words; ++i) m_open[static_cast<size_t>(run.lease) * m_words + i].store(0, std::memory_order_release);
 }
