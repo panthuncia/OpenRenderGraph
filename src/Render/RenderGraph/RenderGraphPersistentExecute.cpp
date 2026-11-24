@@ -751,8 +751,15 @@ void RenderGraph::RetirePersistentExecutions(CompletedTimelineValues* known) {
 	}
 	state.timelines->RetireCompleted(completed);
 	const auto reached = completed;  // what the queues finished, before the admission's limit below
-	for (auto& point : completed) point.value = (std::min)(point.value, state.admission->Submitted(point.timeline));
-	state.admission->RetireCompleted(completed);
+	// The admission's part needs the sequencer, which a submission holds through its recording. Rather than wait for it,
+	// the pass leaves that part to its next call (the watch is not skippable then).
+	bool admissionDeferred = false;
+	if (auto sequencer = state.admission->TryHoldSequencer(); sequencer.owns_lock()) {
+		for (auto& point : completed) point.value = (std::min)(point.value, state.admission->Submitted(point.timeline));
+		state.admission->RetireCompleted(completed);
+	} else {
+		admissionDeferred = true;
+	}
 	std::erase_if(state.trailingLeases, [&](const auto& lease) {
 		const auto found = std::ranges::find(reached, lease.first.timeline, &compiler::ExecutionTimelinePoint::timeline);
 		return found != reached.end() && found->value >= lease.first.value;
@@ -791,7 +798,7 @@ void RenderGraph::RetirePersistentExecutions(CompletedTimelineValues* known) {
 		lowest = (std::min)(lowest, value);
 		return true;
 	};
-	bool skippable = fewSlots && state.timelines->LowestRetainedSignals(watch.lowest)
+	bool skippable = fewSlots && !admissionDeferred && state.timelines->LowestRetainedSignals(watch.lowest)
 		&& state.admission->LowestRetainedCompletions(identities, watch.lowest);
 	for (const auto& lease : state.trailingLeases) skippable = skippable && lower(lease.first.timeline, lease.first.value);
 	for (const auto& record : state.pendingExecutions) {

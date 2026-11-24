@@ -605,6 +605,11 @@ public:
     std::unique_lock<std::recursive_mutex> HoldSequencer() const {
         return std::unique_lock(m_sequencer->mutex);
     }
+    // The sequencer if no other thread holds it. A submission holds it through its recording, so a retirement pass that
+    // would wait for it comes back later instead.
+    std::unique_lock<std::recursive_mutex> TryHoldSequencer() const {
+        return std::unique_lock(m_sequencer->mutex, std::try_to_lock);
+    }
     void Commit(const FrameAdmission& frame, const compiler::GraphExecutionTimeline& receipt,
         uint32_t signaledBatches = UINT32_MAX);
     void Abandon(const FrameAdmission& frame);
