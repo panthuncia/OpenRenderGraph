@@ -102,6 +102,7 @@ void VersionedResource::AdoptVersion(const std::shared_ptr<const ResourceVersion
         m_state->shaped = true;
     }
     m_state->current.store(version, std::memory_order_release);
+    m_state->currentNumber.store(version ? version->number : 0, std::memory_order_release);
     {
         // The reshaped version is pending no more once it, or a newer version, is current.
         std::scoped_lock lock(m_state->reshapeMutex);
@@ -151,6 +152,7 @@ std::shared_ptr<const BufferVersion> VersionedBuffer::PublishLate(std::shared_pt
     version->resource = backing;
     version->buffer = std::move(backing);
     m_state->current.store(version, std::memory_order_release);
+    m_state->currentNumber.store(version ? version->number : 0, std::memory_order_release);
     return version;
 }
 

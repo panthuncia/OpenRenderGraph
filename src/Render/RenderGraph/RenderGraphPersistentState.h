@@ -226,7 +226,7 @@ struct RenderGraph::PersistentRecording {
 	// What a revision ticket admits it with (AddPersistentTicketCandidate): its producer waits, the versions it bound (its frame
 	// rebindings), and the leases its preparation held.
 	std::vector<persistent::FrameProducerWait> waits;
-	std::vector<persistent::FrameRebinding> rebindings;
+	persistent::SharedFrameRebindings rebindings;
 	std::vector<std::shared_ptr<const void>> leases;
 	// The version number each versioned slot bound when it was recorded (RenderGraph::PersistentRecordingVersionsCurrent).
 	std::vector<std::pair<std::shared_ptr<const IVersionedResource>, uint64_t>> versions;
@@ -261,7 +261,7 @@ struct RenderGraph::PersistentTicket {
 		// What the admission at submission is prepared with: the producers' waits and the frame's rebindings (the versions of its
 		// versioned slots).
 		std::vector<persistent::FrameProducerWait> waits;
-		std::vector<persistent::FrameRebinding> rebindings;
+		persistent::SharedFrameRebindings rebindings;
 		bool admitted = false;   // admission is the submission's, pending
 		bool committed = false;  // and committed
 	};
@@ -600,7 +600,7 @@ struct RenderGraph::PersistentExecution {
 		std::shared_ptr<const persistent::SelectedPublication> publication;
 		std::vector<PreparedPass> invocations;
 		std::shared_ptr<const std::vector<std::string>> names; // Per logical pass slot, for statistics/present detection.
-		std::vector<persistent::FrameRebinding> rebindings;
+		persistent::SharedFrameRebindings rebindings;
 		// The version each versioned slot bound (its number), for a recording's VersionsCurrent check.
 		std::vector<std::pair<std::shared_ptr<const IVersionedResource>, uint64_t>> versions;
 		bool perFrame = false;  // a rebinding is a per-frame resource's (IVersionedResource::PerFrame): never kept

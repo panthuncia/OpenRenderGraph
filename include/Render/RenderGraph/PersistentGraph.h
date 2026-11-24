@@ -494,6 +494,12 @@ struct FrameRebinding {
     bool perFrame = false;
 };
 
+// A frame's rebindings, shared by its segment, the segment's recording and each ticket that binds the recording. Null: none.
+using SharedFrameRebindings = std::shared_ptr<const std::vector<FrameRebinding>>;
+inline std::span<const FrameRebinding> RebindingsOf(const SharedFrameRebindings& rebindings) {
+    return rebindings ? std::span<const FrameRebinding>(*rebindings) : std::span<const FrameRebinding>{};
+}
+
 // Producer completion requirements are invocation data, not graph structure or
 // binding compatibility. Stable consumers resolve through the selected layout.
 struct FrameProducerWait {

@@ -227,10 +227,8 @@ std::string RenderGraph::PersistentTicketStaleReason(const PersistentTicket& tic
 }
 
 bool RenderGraph::PersistentRecordingVersionsCurrent(const PersistentRecording& recording) noexcept {
-	for (const auto& [versioned, number] : recording.versions) {
-		const auto current = versioned ? versioned->SelectVersion(nullptr) : nullptr;
-		if (!current || current->number != number) return false;
-	}
+	for (const auto& [versioned, number] : recording.versions)
+		if (!versioned || versioned->CurrentNumber() != number) return false;
 	return true;
 }
 
@@ -259,7 +257,7 @@ const ResourceBindingSnapshot* FirstMovedBacking(const RenderGraph::PersistentRe
 			if (binding && binding->bound && moved(binding->recording.get())) return binding->recording.get();
 		}
 	}
-	for (const auto& rebinding : recording.rebindings)
+	for (const auto& rebinding : persistent::RebindingsOf(recording.rebindings))
 		if (moved(rebinding.recording.get())) return rebinding.recording.get();
 	return nullptr;
 }
@@ -329,7 +327,7 @@ void RenderGraph::AdmitPersistentTicket(PersistentTicket& ticket, std::span<cons
 		auto publication = segment.admission.publication;
 		if (!publication) throw std::logic_error("A ticket's segment without a publication");
 		// Its body was recorded from a plan of this publication and these rebindings: the ledgers' part alone.
-		segment.admission = state.admission->PrepareAtSubmission(std::move(publication), queues, segment.waits, segment.rebindings);
+		segment.admission = state.admission->PrepareAtSubmission(std::move(publication), queues, segment.waits, persistent::RebindingsOf(segment.rebindings));
 		segment.admitted = true;
 	}
 }

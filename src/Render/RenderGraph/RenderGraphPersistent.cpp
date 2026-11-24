@@ -1600,7 +1600,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 	PersistentExecution::PreparedSegment main;
 	main.label = "Main";
 	main.publication = executing;
-	main.rebindings = std::move(rebindings);
+	if (!rebindings.empty()) main.rebindings = std::make_shared<const std::vector<persistent::FrameRebinding>>(std::move(rebindings));
 	main.versions = std::move(versionStamps);
 	main.perFrame = perFrame;
 	main.bindings = preparation.bindings;

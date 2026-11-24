@@ -139,8 +139,8 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 		BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
 		// A ticket's body is recorded from a plan: it is admitted when it is submitted (AdmitPersistentTicket).
 		if (run.execution.options.ticket)
-			return state.admission->PreparePlan(segment.publication, queues, segment.waits, segment.rebindings);
-		return state.admission->Prepare(segment.publication, queues, segment.waits, {}, segment.rebindings);
+			return state.admission->PreparePlan(segment.publication, queues, segment.waits, persistent::RebindingsOf(segment.rebindings));
+		return state.admission->Prepare(segment.publication, queues, segment.waits, {}, persistent::RebindingsOf(segment.rebindings));
 	}();
 	auto& admission = run.admission;
 	// A segment with no batches (an epoch none of whose passes the graph has, as in the empty bootstrap graph) records and submits

@@ -46,6 +46,11 @@ public:
     // The version a preparation binds. That is the one the revision in `context` names (IResourceVersions), or else the
     // current one. Null when there is none.
     virtual std::shared_ptr<const ResourceVersion> SelectVersion(const ResolverCaptureContext* context) const = 0;
+    // Any thread: the current version's number, 0 when there is none. For a currency check that needs only the number.
+    virtual uint64_t CurrentNumber() const noexcept {
+        const auto version = SelectVersion(nullptr);
+        return version ? version->number : 0;
+    }
     // True when a recording made with one version may only run while that version is selected, such as a swapchain's
     // acquired image. The graph never keeps such recordings for reuse.
     virtual bool PerFrame() const noexcept { return false; }
@@ -132,6 +137,7 @@ protected:
     struct State {
         std::atomic<std::shared_ptr<const ResourceVersion>> current;
         std::atomic<uint64_t> published{0};  // number of the last version made, on any thread
+        std::atomic<uint64_t> currentNumber{0};  // current's number, stored after current (CurrentNumber)
         // The dependency identity of every declaration this resource makes. It is a token of its own, not the state.
         // The state holds the current version, and the version holds its declaration. If the declaration held the state,
         // the three would keep each other alive, and the last version would never be released.
@@ -157,6 +163,8 @@ protected:
     [[nodiscard]] std::shared_ptr<const ResourceVersion> CurrentVersion() const noexcept {
         return m_state->current.load(std::memory_order_acquire);
     }
+    // The current version's number without taking the version (an atomic shared_ptr load locks).
+    uint64_t CurrentNumber() const noexcept override { return m_state->currentNumber.load(std::memory_order_acquire); }
     // Any thread. Fills `version` as the next version, around `resource`, kept alive with `owner`. It is not current.
     // Throws when `resource` has another shape class than the first version.
     void MakeVersion(ResourceVersion& version, std::shared_ptr<Resource> resource, std::shared_ptr<const void> owner) const;
