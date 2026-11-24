@@ -915,7 +915,13 @@ private:
             };
             if (!validBound(range.range.mipLower, concrete->GetMipLevels()) || !validBound(range.range.mipUpper, concrete->GetMipLevels())
                 || !validBound(range.range.sliceLower, concrete->GetArraySize()) || !validBound(range.range.sliceUpper, concrete->GetArraySize()))
-                throw std::invalid_argument("Resource access range outside resource bounds");
+            {
+                const auto boundText = [](Bound bound) { return bound.type == BoundType::All ? std::string("all") : std::to_string(bound.value); };
+                throw std::invalid_argument("Resource access range outside resource bounds: '" + concrete->GetName() + "' has "
+                    + std::to_string(concrete->GetMipLevels()) + " mips and " + std::to_string(concrete->GetArraySize()) + " slices; the use names mips "
+                    + boundText(range.range.mipLower) + ".." + boundText(range.range.mipUpper) + ", slices " + boundText(range.range.sliceLower) + ".."
+                    + boundText(range.range.sliceUpper));
+            }
             const auto resolvedRange = ResolveRangeSpec(range.range, concrete->GetMipLevels(), concrete->GetArraySize());
             if (resolvedRange.isEmpty()) throw std::invalid_argument("Empty resource access range");
             for (const auto view : specification.views)

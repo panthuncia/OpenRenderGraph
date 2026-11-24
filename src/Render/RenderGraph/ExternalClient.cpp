@@ -109,22 +109,28 @@ void ExternalClient::RetireLocked() {
 	if (advanced) m_admission->RetireCompleted(completed);
 }
 
+// What Record took for SubmitRecorded.
+struct ExternalClient::Recorded {
+	uint32_t slot = 0;
+	std::shared_ptr<const persistent::SelectedPublication> publication;
+	CommandListPair body;  // closed
+	std::vector<rhi::TimelinePoint> signals;
+	std::vector<rhi::TimelinePoint> waits;
+	std::shared_ptr<const void> keepAlive;
+};
+
 ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<const Access> accesses,
 	const std::function<void(rhi::CommandList&)>& record, std::span<const rhi::TimelinePoint> signals,
 	std::shared_ptr<const void> keepAlive, std::span<const rhi::TimelinePoint> extraWaits, bool cachePublication) {
-	BT_ZONE_SCOPE("ORG.ExternalClient.Submit");
-	// Called while a pass records at execution: the submitting thread's held group goes to the queue first.
-	if (!RenderGraph::FlushRecordingSubmitCarry()) throw std::runtime_error("ExternalClient: a held queue submission was refused");
+	return SubmitRecorded(Record(slotIndex, accesses, record, signals, std::move(keepAlive), extraWaits, cachePublication));
+}
+
+std::shared_ptr<ExternalClient::Recorded> ExternalClient::Record(uint32_t slotIndex, std::span<const Access> accesses,
+	const std::function<void(rhi::CommandList&)>& record, std::span<const rhi::TimelinePoint> signals,
+	std::shared_ptr<const void> keepAlive, std::span<const rhi::TimelinePoint> extraWaits, bool cachePublication) {
+	BT_ZONE_SCOPE("ORG.ExternalClient.RecordWork");
 	std::lock_guard lock(m_mutex);
 	auto& slot = Slot(slotIndex);
-	{ BT_ZONE_SCOPE("ORG.ExternalClient.Retire"); RetireLocked(); }
-	// The admission keeps each submission's publication until the GPU finishes it. When it is full, wait for the oldest.
-	while (m_admission->RetainedFrames() + 1 >= m_desc.capacity && !m_inFlight.empty()) {
-		BT_ZONE_SCOPE("ORG.ExternalClient.WaitForCapacity");
-		const auto oldest = m_inFlight.front();
-		m_slots[oldest.slot]->timeline->HostWait(oldest.value);
-		RetireLocked();
-	}
 	std::vector<compiler::CompileQueue> queues;
 	for (const auto& queue : m_desc.queues)
 		queues.push_back({0, true, queue.kind == rhi::QueueKind::Copy && m_desc.runtime->Backend() == rhi::Backend::D3D12});
@@ -182,6 +188,38 @@ ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<cons
 	{ BT_ZONE_SCOPE("ORG.ExternalClient.Record"); if (record) record(bodyList); }
 	if (bodyList.EndChecked() != rhi::Result::Ok) throw std::runtime_error("ExternalClient command list close failed");
 	body.EndRecording();
+	auto recorded = std::make_shared<Recorded>();
+	recorded->slot = slotIndex;
+	recorded->publication = std::move(publication);
+	recorded->body = std::move(body);
+	recorded->signals.assign(signals.begin(), signals.end());
+	recorded->waits.assign(extraWaits.begin(), extraWaits.end());
+	recorded->keepAlive = std::move(keepAlive);
+	return recorded;
+}
+
+ExternalClient::Signal ExternalClient::SubmitRecorded(std::shared_ptr<Recorded> recorded) {
+	BT_ZONE_SCOPE("ORG.ExternalClient.Submit");
+	if (!recorded || !recorded->body.list) throw std::invalid_argument("ExternalClient: SubmitRecorded needs work from Record, once");
+	// Called while a pass records at execution: the submitting thread's held group goes to the queue first.
+	if (!RenderGraph::FlushRecordingSubmitCarry()) throw std::runtime_error("ExternalClient: a held queue submission was refused");
+	std::lock_guard lock(m_mutex);
+	const uint32_t slotIndex = recorded->slot;
+	auto& slot = Slot(slotIndex);
+	{ BT_ZONE_SCOPE("ORG.ExternalClient.Retire"); RetireLocked(); }
+	// The admission keeps each submission's publication until the GPU finishes it. When it is full, wait for the oldest.
+	while (m_admission->RetainedFrames() + 1 >= m_desc.capacity && !m_inFlight.empty()) {
+		BT_ZONE_SCOPE("ORG.ExternalClient.WaitForCapacity");
+		const auto oldest = m_inFlight.front();
+		m_slots[oldest.slot]->timeline->HostWait(oldest.value);
+		RetireLocked();
+	}
+	const auto& publication = recorded->publication;
+	auto& body = recorded->body;
+	auto bodyList = body.list.Get();
+	const std::span<const rhi::TimelinePoint> signals = recorded->signals;
+	const std::span<const rhi::TimelinePoint> extraWaits = recorded->waits;
+	auto keepAlive = std::move(recorded->keepAlive);
 
 	std::vector<compiler::ExecutionTimelinePoint> points;
 	for (uint32_t index = 0; index < m_slots.size(); ++index) {

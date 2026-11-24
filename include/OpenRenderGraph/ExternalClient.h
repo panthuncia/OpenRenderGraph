@@ -84,6 +84,17 @@ public:
 		std::span<const rhi::TimelinePoint> signals = {}, std::shared_ptr<const void> keepAlive = {},
 		std::span<const rhi::TimelinePoint> waits = {}, bool cachePublication = true);
 
+	// Work recorded by Record and not yet submitted. Dropping it unsubmitted drops its commands.
+	struct Recorded;
+	// Submit in two steps, for a caller that records on one thread and submits on another. Record runs `record` now, as Submit
+	// does, and takes what the submission needs. SubmitRecorded admits and submits it later, in its place among the runtime's
+	// submissions then. The accesses' backings are the ones current at Record. Takes the same arguments as Submit.
+	std::shared_ptr<Recorded> Record(uint32_t slot, std::span<const Access> accesses, const std::function<void(rhi::CommandList&)>& record,
+		std::span<const rhi::TimelinePoint> signals = {}, std::shared_ptr<const void> keepAlive = {},
+		std::span<const rhi::TimelinePoint> waits = {}, bool cachePublication = true);
+	// Throws if the submission fails, as Submit does.
+	Signal SubmitRecorded(std::shared_ptr<Recorded> recorded);
+
 	// Frees what finished submissions held. Submit also does this.
 	void Retire();
 	// Stops the background work of its command-list pools. Call it before the task service shuts down.
