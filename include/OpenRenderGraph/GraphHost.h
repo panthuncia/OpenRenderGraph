@@ -285,6 +285,13 @@ public:
 	 * (or a pool with workers to spare), never from the last free worker of a small pool.
 	 */
 	std::unique_ptr<EpochGraph> BuildEpochGraph(uint32_t epoch, std::string_view reason = {});
+	/**
+	 * @brief As above, with the context the build captures its resolvers' declarations in. An application whose resolvers read
+	 * a publication of its own (a frame's manifest) gives the one the build is made for; the build then lowers versioned
+	 * textures for their current versions, as a frame with that context would. Null: the reshaped versions, as above.
+	 */
+	std::unique_ptr<EpochGraph> BuildEpochGraph(uint32_t epoch, std::string_view reason,
+		std::shared_ptr<const ResolverCaptureContext> captureContext);
 	// Why a build was refused at its attach or staging. Counted per reason (AttachStats).
 	enum class AttachRefusal : uint8_t {
 		None,
@@ -502,6 +509,11 @@ public:
 	// reported (PollEpochFailures), and the other epochs run on.
 	void ExecuteFrame(const IHostExecutionData* hostData = nullptr, const FrameCallback& beforePrepare = {},
 		uint32_t epoch = UINT32_MAX, std::shared_ptr<const void> resourceOwner = {});  // persistent::AllEpochs
+	// As ExecuteFrame, with the caller's update context for the preparation. The graph gets its host data, owned host data,
+	// resolver capture context, delta time and beforeCompileFrame. The host sets the slot, run and fence fields itself.
+	// For a host that selects a publication per frame (its resolvers read the capture context).
+	void ExecuteFrame(const UpdateExecutionContext& frame, const FrameCallback& beforePrepare = {},
+		uint32_t epoch = UINT32_MAX, std::shared_ptr<const void> resourceOwner = {});
 
 	// Retires every graph: stops frame production and waits for their work.
 	void DestroyGraph();
@@ -1285,6 +1297,8 @@ private:
 	std::vector<std::shared_ptr<void>> m_uncertainUploadOwners;
 	// Submitting thread: CurrentRun's sources.
 	RunRef m_syncRun{}, m_asyncRun{};
+	// The caller's update context during ExecuteFrame(const UpdateExecutionContext&), null otherwise.
+	const UpdateExecutionContext* m_frameContext = nullptr;
 	std::optional<RunRef> m_externalRun;
 	std::optional<RunRef> m_heldRun;  // UseRun's, until EndHeldRun
 	// Submitting thread, with async epochs: what releases at an external run's start retired, handed to the host's thread with the

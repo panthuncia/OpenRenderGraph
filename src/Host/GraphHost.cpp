@@ -1108,6 +1108,8 @@ struct GraphHost::BuildInputs {
 	RenderGraph::GpuPassRangeBegin gpuPassRangeBegin;
 	RenderGraph::GpuPassRangeEnd gpuPassRangeEnd;
 	uint64_t hostConfiguration = 0, epochConfiguration = 0, requests = 0, serial = 0;
+	// A detached build's resolver capture context (BuildEpochGraph); null: the reshaped versions.
+	std::shared_ptr<const ResolverCaptureContext> captureContext;
 };
 
 GraphHost::BuildInputs GraphHost::SnapshotBuildInputs(size_t index) {
@@ -1174,7 +1176,7 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 	auto graph = std::make_unique<RenderGraph>(m_desc.runtime);
 	try {
 		// A detached build may be staged ahead of a new slice count, so it lowers for the pending version.
-		if (detached) graph->SetBuildCaptureContext(ReshapedCaptureContext());
+		if (detached) graph->SetBuildCaptureContext(inputs.captureContext ? inputs.captureContext : ReshapedCaptureContext());
 		graph->SetSharedQueueTimelines(inputs.timelines);
 		graph->SetPassEpochFilter(inputs.epoch);
 		// Before the extensions gather their passes: one may record a pass at execution when the epoch is external
@@ -1339,6 +1341,11 @@ GraphHost::EpochGraph::~EpochGraph() {
 }
 
 std::unique_ptr<GraphHost::EpochGraph> GraphHost::BuildEpochGraph(uint32_t epoch, std::string_view reason) {
+	return BuildEpochGraph(epoch, reason, nullptr);
+}
+
+std::unique_ptr<GraphHost::EpochGraph> GraphHost::BuildEpochGraph(uint32_t epoch, std::string_view reason,
+	std::shared_ptr<const ResolverCaptureContext> captureContext) {
 	BT_ZONE_SCOPE("ORG.Host.BuildEpochGraph");
 	const auto index = m_desc.epochOrder.empty() && epoch == persistent::AllEpochs ? 0 : InstanceOf(epoch);
 	if (index == kNoInstance) throw std::invalid_argument("BuildEpochGraph: epoch " + std::to_string(epoch) + " is not one of the host's");
@@ -1348,7 +1355,8 @@ std::unique_ptr<GraphHost::EpochGraph> GraphHost::BuildEpochGraph(uint32_t epoch
 	result->m_index = index;
 	result->m_reason = reason.empty() ? std::string("unnamed request") : std::string(reason);
 	try {
-		const auto inputs = SnapshotBuildInputs(index);
+		auto inputs = SnapshotBuildInputs(index);
+		inputs.captureContext = std::move(captureContext);
 		result->m_hostConfiguration = inputs.hostConfiguration;
 		result->m_epochConfiguration = inputs.epochConfiguration;
 		result->m_requests = inputs.requests;
@@ -2070,6 +2078,16 @@ bool GraphHost::BuildIfRequested() {
 	return BuildDueInstances(true);
 }
 
+void GraphHost::ExecuteFrame(const UpdateExecutionContext& frame, const FrameCallback& beforePrepare, uint32_t epoch,
+	std::shared_ptr<const void> resourceOwner) {
+	struct Restore {
+		const UpdateExecutionContext*& context;
+		~Restore() { context = nullptr; }
+	} restore{m_frameContext};
+	m_frameContext = &frame;
+	ExecuteFrame(frame.hostData, beforePrepare, epoch, std::move(resourceOwner));
+}
+
 void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCallback& beforePrepare,
 	uint32_t epoch, std::shared_ptr<const void> resourceOwner) {
 	BT_ZONE_SCOPE("ORG.Host.ExecuteFrame");
@@ -2143,6 +2161,12 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	update.run = m_syncRun;
 	update.frameFenceValue = m_frameNumber + 1;
 	update.hostData = hostData;
+	if (m_frameContext) {
+		update.resolverCaptureContext = m_frameContext->resolverCaptureContext;
+		update.deltaTime = m_frameContext->deltaTime;
+		update.ownedHostData = m_frameContext->ownedHostData;
+		update.beforeCompileFrame = m_frameContext->beforeCompileFrame;
+	}
 	try {
 		graph.Update(update, m_device);
 	} catch (const std::exception& e) {
@@ -2154,6 +2178,7 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	execute.frameIndex = slot;
 	execute.frameFenceValue = m_frameNumber + 1;
 	execute.hostData = hostData;
+	if (m_frameContext) execute.ownedHostData = m_frameContext->ownedHostData;
 	// Reserve CPU ownership before submission. Execute may fail after accepting a
 	// prefix of its batches, in which case recovery retains this owner.
 	const bool heldResources = static_cast<bool>(resourceOwner);

@@ -78,7 +78,8 @@ PixelBuffer::PixelBuffer(const TextureDescription& desc, bool materialize)
     m_desc = desc;
     // Graph declarations can come before the backing is allocated. So from
     // construction on, range validation uses the logical texture description.
-    m_mipLevels = ResolveTextureMipLevels(desc);
+    // A padded texture's mips are those of its padded size, as its backing's are.
+    m_mipLevels = ResolveTextureMipLevels(BackingDescription());
     m_arraySize = desc.isCubemap ? 6u * desc.arraySize : (desc.isArray ? desc.arraySize : 1u);
     RequireValidMultisampling(desc, m_mipLevels);
     if (materialize) {
@@ -202,7 +203,7 @@ void PixelBuffer::RefreshAPIRepresentationDescriptors(BackendInstanceId backendI
 	// An attached representation replaces the normal GpuTextureBacking, and may
 	// be created before it. Do not take cached dimensions from that replaced
 	// backing. The logical description sets the dimensions of every representation.
-	const uint16_t resolvedMipLevels = ResolveTextureMipLevels(m_desc);
+	const uint16_t resolvedMipLevels = ResolveTextureMipLevels(BackingDescription());
 	const uint32_t resolvedArraySize = m_desc.isCubemap
 		? 6u * m_desc.arraySize : (m_desc.isArray ? m_desc.arraySize : 1u);
 	{
@@ -352,7 +353,8 @@ void PixelBuffer::EnsureVirtualDescriptorSlotsAllocatedLocked() {
     }
 
     auto& rm = DescriptorHeapManager::GetInstance();
-    const uint16_t mipLevels = ResolveTextureMipLevels(m_desc);
+    // The slots cover the backing's mips: a padded texture has those of its padded size.
+    const uint16_t mipLevels = ResolveTextureMipLevels(BackingDescription());
     const uint32_t arraySize = m_desc.isCubemap
         ? 6u * m_desc.arraySize
         : (m_desc.isArray ? m_desc.arraySize : 1u);

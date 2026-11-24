@@ -32,6 +32,9 @@ struct AsyncBufferBackingResizeRequest {
     uint64_t byteSize = 0;
     bool unorderedAccess = false;
     std::string debugName;
+    // Extra resource flags for the new backing, e.g. rhi::RF_OwnResource for a structured buffer whose stride does not
+    // divide the packed-buffer alignment.
+    rhi::ResourceFlags extraFlags = rhi::RF_None;
 };
 
 struct AsyncBufferBackingResizeResult {

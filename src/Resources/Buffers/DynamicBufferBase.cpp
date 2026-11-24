@@ -254,7 +254,9 @@ void AsyncBufferBackingResizeState::Schedule(
                 request.byteSize,
                 request.resourceID,
                 request.unorderedAccess,
-                request.debugName.empty() ? nullptr : request.debugName.c_str());
+                request.debugName.empty() ? nullptr : request.debugName.c_str(),
+                false,
+                request.extraFlags);
             spdlog::debug(
                 "Async buffer backing resize '{}' id={} create complete bytes={} token={}",
                 request.debugName,
