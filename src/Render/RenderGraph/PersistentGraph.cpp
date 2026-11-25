@@ -1663,12 +1663,16 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
         BT_ZONE_SCOPE("ORG.Persistent.ApplyFrameRebindings");
         std::vector<std::pair<uint32_t, rhi::ResourceHandle>> rebound;
         rebound.reserve(rebindings.size());
+        frame.rebound.reserve(rebindings.size());
+        // Which compiled resources are rebound so far: a duplicate check without a search per rebinding.
+        thread_local std::vector<uint8_t> seen;
+        seen.assign(frame.backings.size(), 0);
         for (const auto& rebinding : rebindings) {
             const auto& binding = frame.publication->bindings.At(rebinding.slot);
             Require(!binding.bound, "Frame rebinding targets a publication-owned slot");
             const auto index = frame.publication->executable->resourceIndexBySlot.at(rebinding.slot.index);
             Require(index < frame.backings.size(), "Frame rebinding has no compiled resource");
-            Require(std::ranges::find(frame.rebound,index) == frame.rebound.end(), "Duplicate frame rebinding");
+            Require(!std::exchange(seen[index], uint8_t{1}), "Duplicate frame rebinding");
             Require(rebinding.backing.resource.valid() && rebinding.backing.regions
                 && rebinding.backing.shape == binding.shape
                 && rebinding.backing.graphResourceID == uint64_t{rebinding.slot.index} + 1, "Invalid frame rebinding");

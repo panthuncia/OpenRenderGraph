@@ -727,7 +727,8 @@ public:
 	/**
 	 * @brief Submitting thread, after SubmitEpoch of an external epoch: its execution (null: none since the last call). The caller
 	 * must execute its segments (ExternalEpochExecution::Execute), or signal the ones it did not unexecuted: the graphs' later
-	 * work on their timelines waits for those signals.
+	 * work on their timelines waits for those signals. Until it is taken, the next external tickets' segments are appended to it,
+	 * so a caller that takes it after several SubmitEpoch calls executes their tickets in order as one execution.
 	 */
 	std::shared_ptr<ExternalEpochExecution> TakeExternalExecution() noexcept { return std::move(m_externalExecution); }
 	/**

@@ -1171,6 +1171,8 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 	if (!graph.structure || backings.size() != graph.structure->resourceIDs.size() || packets.size() != batchCount
 		|| graph.boundaryAccessesByBatch.size() != batchCount)
 		return false;
+	// Every batch on the graphics queue: nothing to route and no batch to spare a wait, so the plan would change nothing.
+	if (std::ranges::all_of(graph.batches, [&](const auto& batch) { return batch.queue == graphicsQueue; })) return false;
 	uint32_t queueCount = 0;
 	for (const auto& batch : graph.batches) queueCount = (std::max)(queueCount, batch.queue + 1);
 	out.firstOnQueue.assign(queueCount, UINT32_MAX);
