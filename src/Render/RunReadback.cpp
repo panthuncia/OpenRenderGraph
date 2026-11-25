@@ -109,6 +109,25 @@ struct RunReadback::State {
 		if (scheme != Scheme::Parts) return;
 		std::scoped_lock lock(RegistryMutex());
 		std::erase(Registry(), this);
+		std::scoped_lock committed(CommittedMutex());
+		for (auto& list : CommittedAt()) std::erase(list, this);
+	}
+	// By lease index: the part readbacks with a commit there that no move took yet, so a stage's move asks only those. A leaf lock,
+	// taken inside a state's mutex (Commit) and inside RegistryMutex.
+	static std::mutex& CommittedMutex() {
+		static auto* mutex = new std::mutex;
+		return *mutex;
+	}
+	static std::vector<std::vector<State*>>& CommittedAt() {
+		static auto* lists = new std::vector<std::vector<State*>>;
+		return *lists;
+	}
+	void NoteCommitted(uint32_t lease) {
+		if (scheme != Scheme::Parts) return;
+		std::scoped_lock lock(CommittedMutex());
+		auto& lists = CommittedAt();
+		if (lists.size() <= lease) lists.resize(size_t{lease} + 1);
+		if (std::ranges::find(lists[lease], this) == lists[lease].end()) lists[lease].push_back(this);
 	}
 
 	void Fail(const std::string& why) const { Report(onError, why); }
@@ -340,6 +359,7 @@ uint32_t RunReadback::Commit(const RunRef& run) {
 	const uint32_t stamp = state.NextStamp();
 	state.runs[run.lease] = {.ref = run, .stamp = stamp, .committed = true};
 	state.lastCommitted = run.lease;
+	state.NoteCommitted(run.lease);
 	return stamp;
 }
 
@@ -357,7 +377,13 @@ std::vector<std::byte> RunReadback::Take(uint32_t part, uint32_t* stamp) {
 
 void RunReadback::MoveStagingRun(const RunRef& from, const RunRef& to) {
 	std::scoped_lock lock(State::RegistryMutex());
-	for (auto* state : State::Registry()) state->MoveRun(from, to);
+	std::vector<State*> committed;
+	{
+		std::scoped_lock lists(State::CommittedMutex());
+		auto& at = State::CommittedAt();
+		if (from.lease < at.size()) committed.swap(at[from.lease]);
+	}
+	for (auto* state : committed) state->MoveRun(from, to);
 }
 
 std::shared_ptr<RunReadback> RunReadback::CreateList(std::string_view name, const List& list, uint32_t items, ErrorHandler onError) {

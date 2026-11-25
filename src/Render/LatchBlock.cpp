@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <utility>
 
 #include "OpenRenderGraph/Runtime.h"
 #include "Managers/Singletons/DeviceManager.h"
@@ -38,6 +39,25 @@ void NoteStable(const LatchBlock* block, uint32_t lease) {
 	if (lists.size() <= lease) lists.resize(size_t{lease} + 1);
 	lists[lease].push_back(block);
 }
+// By stable lease index: the arena blocks whose region there may be non-zero (m_stableHigh above zero). A stage's commit copies
+// its staging run every frame, and most blocks are written at neither run, so the copy walks only these. Under StableMutex.
+std::vector<std::vector<const LatchBlock*>>& LiveBlocks() {
+	static std::vector<std::vector<const LatchBlock*>> blocks;
+	return blocks;
+}
+// A block's region at lease became non-zero. Called when its m_stableHigh leaves zero, under the block's mutex.
+void NoteLive(const LatchBlock* block, uint32_t lease) {
+	std::scoped_lock lock(StableMutex());
+	auto& lists = LiveBlocks();
+	if (lists.size() <= lease) lists.resize(size_t{lease} + 1);
+	lists[lease].push_back(block);
+}
+// A block's region at lease is all zeros again.
+void ForgetLive(const LatchBlock* block, uint32_t lease) {
+	std::scoped_lock lock(StableMutex());
+	auto& lists = LiveBlocks();
+	if (lease < lists.size()) std::erase(lists[lease], block);
+}
 // The stable lease indices whose regions are host memory (MarkHostOnlyRun). Read in At under a block's mutex: a leaf lock.
 std::mutex& HostOnlyMutex() {
 	static std::mutex mutex;
@@ -66,10 +86,17 @@ void AppendStableAt(uint32_t lease, std::vector<const LatchBlock*>& out) {
 
 void LatchBlock::ZeroStableRun(uint32_t lease) {
 	std::scoped_lock registry(RegistryMutex());
-	// A host-only run's region is cleared only as far as anything was written to it (m_stableHigh). Any other run's whole region: its
-	// recordings may write through the region's pointer.
+	// A host-only run's region is cleared only as far as anything was written to it (m_stableHigh): only its live blocks. Any other
+	// run's whole region: its recordings may write through the region's pointer.
 	const bool hostOnly = IsHostOnly(lease);
-	for (const auto* block : StableAt(lease)) {
+	std::vector<const LatchBlock*> blocks;
+	{
+		std::scoped_lock lock(StableMutex());
+		auto& live = LiveBlocks();
+		if (lease < live.size()) blocks.swap(live[lease]);
+	}
+	if (!hostOnly) blocks = StableAt(lease);
+	for (const auto* block : blocks) {
 		std::scoped_lock lock(block->m_mutex);
 		if (lease >= block->m_stable.size() || !block->m_stable[lease]) continue;
 		auto& high = block->m_stableHigh[lease];
@@ -93,12 +120,23 @@ void LatchBlock::CopyStableRun(uint32_t from, uint32_t to) {
 	// non-zero. A block written at neither costs nothing, so a stage's clients that staged nothing this frame cost nothing.
 	const bool hostOnly = IsHostOnly(from);
 	// Reused: a stage's commit copies a run every frame. Callers hold RegistryMutex, so one thread uses it at a time.
+	// From a host-only run, only blocks live at either run can move a byte; from any other, every block with a region at `from`.
 	static std::vector<const LatchBlock*> blocks;
 	blocks.clear();
-	AppendStableAt(to, blocks);
-	AppendStableAt(from, blocks);
+	{
+		std::scoped_lock lock(StableMutex());
+		auto& live = LiveBlocks();
+		const auto size = size_t{(std::max)(from, to)} + 1;
+		if (live.size() < size) live.resize(size);
+		blocks.swap(live[to]);
+		if (hostOnly) blocks.insert(blocks.end(), live[from].begin(), live[from].end());
+	}
+	if (!hostOnly) AppendStableAt(from, blocks);
 	std::sort(blocks.begin(), blocks.end());
 	blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+	// The blocks left non-zero at `to`, which become its live list.
+	static std::vector<const LatchBlock*> nonZero;
+	nonZero.clear();
 	for (const auto* block : blocks) {
 		std::scoped_lock lock(block->m_mutex);
 		const bool hasSource = from < block->m_stable.size() && block->m_stable[from];
@@ -111,7 +149,12 @@ void LatchBlock::CopyStableRun(uint32_t from, uint32_t to) {
 		if (copied) std::memcpy(target.mapped, block->m_stable[from].mapped, copied);
 		if (left > copied) std::memset(target.mapped + copied, 0, (std::min)(left, target.size) - copied);
 		block->m_stableHigh[to] = copied;
+		if (copied) nonZero.push_back(block);
 	}
+	std::scoped_lock lock(StableMutex());
+	auto& live = LiveBlocks()[to];
+	// A write at `to` since the swap above (none is allowed while its run is copied) would have noted itself here.
+	live.insert(live.end(), nonZero.begin(), nonZero.end());
 }
 
 LatchBlock::LatchBlock(std::string name, uint32_t bytesPerRun)
@@ -158,6 +201,7 @@ LatchBlock::~LatchBlock() {
 		std::erase(Registry(), this);
 		std::scoped_lock stable(StableMutex());
 		for (auto& list : StableBlocks()) std::erase(list, this);
+		for (auto& list : LiveBlocks()) std::erase(list, this);
 	}
 	if (m_buffer && m_mapped) m_buffer->GetAPIResource().Unmap(0, m_stride);
 	// A leased run's region belongs to its lease, which frees it when the run retires. The pinned ones are the block's: they
@@ -195,7 +239,7 @@ LatchBlock::Region LatchBlock::At(const RunRef& run) const {
 	if (run.Stable()) {
 		const auto region = StableRegion(run.lease);
 		// A host-only run's region handed out: whoever asked may write any of it.
-		if (IsHostOnly(run.lease)) m_stableHigh[run.lease] = region.size;
+		if (IsHostOnly(run.lease) && std::exchange(m_stableHigh[run.lease], region.size) == 0) NoteLive(this, run.lease);
 		return region;
 	}
 	if (m_runs.size() <= run.lease) m_runs.resize(size_t{run.lease} + 1);
@@ -216,7 +260,10 @@ void LatchBlock::Zero(const RunRef& run) const {
 	std::scoped_lock lock(m_mutex);
 	const auto region = StableRegion(run.lease);
 	auto& high = m_stableHigh[run.lease];
-	if (high) std::memset(region.mapped, 0, (std::min)(high, region.size));
+	if (high) {
+		std::memset(region.mapped, 0, (std::min)(high, region.size));
+		ForgetLive(this, run.lease);
+	}
 	high = 0;
 }
 
@@ -232,6 +279,7 @@ void LatchBlock::Write(const RunRef& run, uint32_t offset, std::span<const std::
 	const auto region = StableRegion(run.lease);
 	std::memcpy(region.mapped + offset, bytes.data(), bytes.size());
 	auto& high = m_stableHigh[run.lease];
+	if (!high && !bytes.empty()) NoteLive(this, run.lease);
 	high = (std::max)(high, offset + static_cast<uint32_t>(bytes.size()));
 }
 
