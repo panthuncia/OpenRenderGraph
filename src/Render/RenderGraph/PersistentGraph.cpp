@@ -1845,7 +1845,7 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
     const auto& graph = *frame.publication->executable->graph;
     frame.incomingWaits = frame.ownWaits;
     frame.boundaryAccessWaits.clear();
-    const auto invalidated = m_sequencer->aliases.ApplyInitialStates(graph, frame.backings);
+    const auto invalidated = m_sequencer->aliases.Resolve(graph, frame.backings, frame.queuePoints, frame.incomingWaits);
     frame.aliasActivations = invalidated;
     frame.sharedBarriers.reset();
     frame.prediction.reset();
@@ -1950,7 +1950,6 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
     if (!predictedWaits)
         m_sequencer->accesses.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, frame.incomingWaits, frame.backings.Id(),
             frame.stream ? &predictionSlot->access : nullptr);
-    m_sequencer->aliases.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, frame.incomingWaits);
     // Points already reached (a retired timeline's among them: another graph's, destroyed since) need no wait.
     for (auto& waits : frame.incomingWaits)
         std::erase_if(waits, [&](compiler::ExecutionTimelinePoint point) { return m_sequencer->Reached(point); });

@@ -126,7 +126,7 @@ struct PreparedExecutionBarrierPlan {
 // finds what the same executable found the frame before.
 struct StatePrediction {
     std::shared_ptr<const PreparedExecutionBarrierPlan> plan;
-    // The aliased backings the plan was made with entering from Undefined (AliasAccessAdmissionLedger::ApplyInitialStates). A graph
+    // The aliased backings the plan was made with entering from Undefined (AliasAccessAdmissionLedger::Resolve). A graph
     // whose transients share memory activates the same ones at every execution: the plan stands for an admission that activates
     // the same backings.
     std::vector<rhi::ResourceHandle> activations;
@@ -443,10 +443,9 @@ private:
 // no interval fragmentation, so steady-state placements cost O(occupants).
 class AliasAccessAdmissionLedger {
 public:
-    std::vector<rhi::ResourceHandle> ApplyInitialStates(
-        const Schedule& graph,
-        std::span<const PreparedBackingState> resources) const;
-    void AppendIncomingWaits(const Schedule& graph,
+    // Appends each batch's waits for the other occupants of the bytes its first uses take over, and returns the
+    // aliased backings that replace an occupant (they enter from Undefined).
+    std::vector<rhi::ResourceHandle> Resolve(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         std::span<const ExecutionTimelinePoint> queues,
         std::vector<std::vector<ExecutionTimelinePoint>>& incoming) const;

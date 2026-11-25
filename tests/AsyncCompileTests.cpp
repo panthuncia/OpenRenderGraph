@@ -404,14 +404,16 @@ int main() {
 
         auto secondGraph = makeGraph(102, 1);
         std::vector<std::vector<ExecutionTimelinePoint>> waits(1);
-        ledger.AppendIncomingWaits(secondGraph, std::span{&second, size_t{1}}, queues, waits);
+        ENSURE(ledger.Resolve(secondGraph, std::span{&second, size_t{1}}, queues, waits).size() == 1);
         ENSURE(waits[0] == std::vector<ExecutionTimelinePoint>{{11, 9}});
         GraphExecutionTimeline secondSubmitted;
         secondSubmitted.batches = {{{22, 12}, {}}};
         ledger.Commit(secondGraph, std::span{&second, size_t{1}}, secondSubmitted);
 
         std::vector firstAgain{first};
-        auto activations = ledger.ApplyInitialStates(firstGraph, firstAgain);
+        waits.assign(1, {});
+        auto activations = ledger.Resolve(firstGraph, firstAgain, queues, waits);
+        ENSURE(waits[0] == std::vector<ExecutionTimelinePoint>{{22, 12}});
         ENSURE(activations.size() == 1);
         ENSURE(activations[0].index == first.resource.index && activations[0].generation == first.resource.generation);
         // Activation is returned to state admission; this ledger does not
@@ -420,10 +422,9 @@ int main() {
 
         auto disjointGraph = makeGraph(103, 1);
         waits.assign(1, {});
-        ledger.AppendIncomingWaits(disjointGraph, std::span{&disjoint, size_t{1}}, queues, waits);
-        ENSURE(waits[0].empty());
         std::vector disjointCopy{disjoint};
-        ENSURE(ledger.ApplyInitialStates(disjointGraph, disjointCopy).empty());
+        ENSURE(ledger.Resolve(disjointGraph, disjointCopy, queues, waits).empty());
+        ENSURE(waits[0].empty());
     }
 
     // Independent linear-ready selection and recursive longest-path oracle.

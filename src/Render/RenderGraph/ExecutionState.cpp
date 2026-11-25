@@ -1524,28 +1524,7 @@ void AliasAccessAdmissionLedger::ForEachConflict(const PreparedBackingState& res
     }
 }
 
-std::vector<rhi::ResourceHandle> AliasAccessAdmissionLedger::ApplyInitialStates(
-    const Schedule& graph,
-    std::span<const PreparedBackingState> resources) const {
-    BT_ZONE_SCOPE("ORG.Execution.ResolveAliasActivations");
-    const auto ordered = OrderBackings(graph, resources);
-    if (graph.aliasFinalResourcesByBatch.size() != graph.batches.size())
-        throw std::invalid_argument("Compiled graph has no alias final-use stream");
-    std::vector<rhi::ResourceHandle> activated;
-    for (const auto& resource : ordered) {
-        if (!resource.aliasHeapIdentity || !resource.aliasSize) continue;
-        bool replacesOccupant = false;
-        ForEachConflict(resource, [&](const Occupant&) { replacesOccupant = true; });
-        if (!replacesOccupant) continue;
-        activated.push_back(resource.resource);
-    }
-    BT_PLOT("ORG.Execution.AliasActivations", static_cast<int64_t>(activated.size()));
-    if (!activated.empty()) basic_telemetry::AddCounter(
-        "ORG.Execution.AliasActivations", static_cast<int64_t>(activated.size()));
-    return activated;
-}
-
-void AliasAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
+std::vector<rhi::ResourceHandle> AliasAccessAdmissionLedger::Resolve(const Schedule& graph,
     std::span<const PreparedBackingState> resources,
     std::span<const ExecutionTimelinePoint> queues,
     std::vector<std::vector<ExecutionTimelinePoint>>& incoming) const {
@@ -1553,27 +1532,44 @@ void AliasAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
     if (incoming.size() != graph.batches.size() || queues.size() != graph.structure->queues.size())
         throw std::invalid_argument("Invalid alias hazard dimensions");
     const auto ordered = OrderBackings(graph, resources);
-    if (graph.aliasFirstResourcesByBatch.size() != graph.batches.size())
-        throw std::invalid_argument("Compiled graph has no alias entry stream");
+    if (graph.aliasFirstResourcesByBatch.size() != graph.batches.size()
+        || graph.aliasFinalResourcesByBatch.size() != graph.batches.size())
+        throw std::invalid_argument("Compiled graph has no alias use streams");
+    // One conflict scan per resource gives both its waits and its activation.
+    enum : uint8_t { kUnseen, kClear, kConflicts };
+    std::vector<uint8_t> seen(ordered.size(), kUnseen);
     uint64_t waitsAdded = 0, overlapsFound = 0;
     for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
-        const auto& batch = graph.batches[batchIndex];
-        const auto consumerTimeline = queues[batch.queue].timeline;
+        const auto consumerTimeline = queues[graph.batches[batchIndex].queue].timeline;
         const auto before = incoming[batchIndex].size();
         for (const auto resourceIndex : graph.aliasFirstResourcesByBatch[batchIndex]) {
-            const auto& resource = ordered[resourceIndex];
-            ForEachConflict(resource, [&](const Occupant& occupant) {
+            bool conflicts = false;
+            ForEachConflict(ordered[resourceIndex], [&](const Occupant& occupant) {
+                conflicts = true;
                 ++overlapsFound;
                 for (const auto point : occupant.accesses)
                     AppendWait(incoming[batchIndex], point, consumerTimeline);
             });
+            seen[resourceIndex] = conflicts ? kConflicts : kClear;
         }
         waitsAdded += incoming[batchIndex].size() - before;
     }
+    std::vector<rhi::ResourceHandle> activated;
+    for (size_t index = 0; index < ordered.size(); ++index) {
+        const auto& resource = ordered[index];
+        if (!resource.aliasHeapIdentity || !resource.aliasSize) continue;
+        // A resource no batch uses first still activates when it replaces an occupant.
+        if (seen[index] == kUnseen) ForEachConflict(resource, [&](const Occupant&) { seen[index] = kConflicts; });
+        if (seen[index] == kConflicts) activated.push_back(resource.resource);
+    }
     BT_PLOT("ORG.Execution.AliasHazardWaits", static_cast<int64_t>(waitsAdded));
     BT_PLOT("ORG.Execution.AliasOverlaps", static_cast<int64_t>(overlapsFound));
+    BT_PLOT("ORG.Execution.AliasActivations", static_cast<int64_t>(activated.size()));
     if (waitsAdded) basic_telemetry::AddCounter(
         "ORG.Execution.AliasHazardWaits", static_cast<int64_t>(waitsAdded));
+    if (!activated.empty()) basic_telemetry::AddCounter(
+        "ORG.Execution.AliasActivations", static_cast<int64_t>(activated.size()));
+    return activated;
 }
 
 void AliasAccessAdmissionLedger::Commit(const Schedule& graph,
