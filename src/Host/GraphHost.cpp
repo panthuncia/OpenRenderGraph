@@ -3352,19 +3352,8 @@ void GraphHost::PrepareTicket(Async& state, uint32_t epochIndex, RunLease* repre
 	// holds its allocator, and on Vulkan each allocator is a command pool with driver memory of its own, so a queue of tickets
 	// with open lists would make a pool for each.
 	lease->queueUploads.resize(state.queueUploadKinds.size());
-	// Only an external epoch's: any other epoch's lists are begun by SubmitTicket, and only for a ticket with uploads (most
-	// have none).
-	if ((reprepare || state.inHand[epochIndex] == 0) && graph.IsExternalPersistentEpoch(state.epochs[epochIndex])) {
-		// A reprepared lease's lists are still open from its first preparation, and nothing is recorded into them before the
-		// ticket is submitted. Each is begun only when it is not open already: D3D12 cannot reset a list that records.
-		// The render thread records an external epoch's uploads into the secondary, which its execution runs first.
-		if (!lease->uploadSecondary.Recording()) state.uploadSecondaryPool->Begin(lease->uploadSecondary);
-		// The run's queue upload lists likewise.
-		for (size_t queue = 0; queue < state.queueUploadKinds.size(); ++queue) {
-			if (!state.queueUploadKinds[queue] || lease->queueUploads[queue].Recording()) continue;
-			state.queueUploadPools[static_cast<size_t>(*state.queueUploadKinds[queue])]->Begin(lease->queueUploads[queue]);
-		}
-	}
+	// Every epoch's lists, external ones' too, are begun by FinishTicket, and only for a ticket with uploads (most have none):
+	// a list begun here would have to be closed on the render thread for nothing.
 	// The descriptors are released here; the objects behind them and the deferred deletions are freed on the runtime's deleter
 	// thread. A driver free can block until the GPU is done with the memory. The GPU may be waiting for a signal of work this
 	// thread prepares, so a free here could wait forever.
@@ -4092,10 +4081,9 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
 	// An external epoch's uploads go into the slot's secondary, which its execution runs first: nothing is submitted here.
 	const bool external = commit.external;
-	// Taken at the commit: a ticket without uploads begins, records and closes no list.
-	const bool hasUploads = external || commit.uploads.Any() || !commit.uploads.supported;
-	// An external epoch's ticket prepared behind others of its epoch has its upload lists begun here (PrepareTicket begins only
-	// the first one's); any other epoch's are begun here when it has uploads.
+	// Taken at the commit: a ticket without uploads begins, records and closes no list (most have none). Its lists are begun
+	// here, external epochs' too.
+	const bool hasUploads = commit.uploads.Any() || !commit.uploads.supported;
 	if (hasUploads && !(external ? lease.uploadSecondary : lease.upload).Recording()) {
 		BT_ZONE_SCOPE("ORG.Host.BeginUploadLists");
 		if (external) async.uploadSecondaryPool->Begin(lease.uploadSecondary);
@@ -4147,7 +4135,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	std::shared_ptr<void> keepAlive;
 	bool recorded = false;
 	auto& secondary = lease.uploadSecondary;
-	if (external) {
+	if (external && hasUploads) {
 		rhi::SecondaryInheritance outside{};
 		outside.insideRendering = false;
 		outside.debugName = "ORG external ticket uploads";
@@ -4254,7 +4242,18 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 			auto& leading = execution->segments.front().leading;
 			leading.insert(leading.begin(), commands);
 		}
-		m_externalExecution = std::move(execution);
+		if (!m_externalExecution) {
+			m_externalExecution = std::move(execution);
+		} else {
+			// The caller has not taken the earlier tickets' execution (TakeExternalExecution): this ticket's segments run after
+			// theirs, in one execution. When a batch of that execution off the stream waits for one of its segments, its exit
+			// needed a host submission of its own (exitSplit): this ticket's segments, which may wait for that batch, start one.
+			auto& into = *m_externalExecution;
+			if (!execution->segments.empty() && into.exitSplit) execution->segments.front().split = true;
+			into.exitSplit = into.exitSplit || execution->exitSplit;
+			for (auto& segment : execution->segments) into.segments.push_back(std::move(segment));
+			into.keepAlive.insert(into.keepAlive.end(), execution->keepAlive.begin(), execution->keepAlive.end());
+		}
 	}
 	if (submitted.uploadSignal.second) stats.sparedUploadWaits += RenderGraph::PersistentTicketSparedUploadWaits(*ticket);
 	{
