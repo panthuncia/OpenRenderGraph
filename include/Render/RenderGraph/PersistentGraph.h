@@ -596,11 +596,12 @@ public:
         std::span<const FrameProducerWait> producerWaits = {},
         std::span<const FrameRebinding> rebindings = {});
     // Prepare for an execution whose body was recorded from a plan (PreparePlan) of the same publication and rebindings: the
-    // ledgers' part alone (FrameAdmission::entryOnly), which is all a submission records and commits.
+    // ledgers' part alone (FrameAdmission::entryOnly), which is all a submission records and commits. The rebindings are the
+    // recording's shared list: a ticket that binds the same recording again finds them checked already.
     FrameAdmission PrepareAtSubmission(std::shared_ptr<const SelectedPublication> publication,
         std::span<const compiler::ExecutionTimelinePoint> queues,
         std::span<const FrameProducerWait> producerWaits = {},
-        std::span<const FrameRebinding> rebindings = {});
+        const SharedFrameRebindings& rebindings = {});
     // An open admission, again, at submission: the ledger's part (the batches' entry barriers and seeds, the states it commits, the
     // waits on earlier executions) recomputed against the ledgers as they are now. The rest of the plan depends on the compiled graph
     // alone, so what was recorded from it stands (docs/job-graphs.md, "Phase 2 investigation"). Hold the sequencer (HoldSequencer)
@@ -633,7 +634,7 @@ private:
     FrameAdmission PrepareFrame(std::shared_ptr<const SelectedPublication> publication,
         std::span<const compiler::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
         std::span<const FrameIncomingState> incomingStates, std::span<const FrameRebinding> rebindings, bool pending,
-        bool entryOnly = false);
+        bool entryOnly = false, const SharedFrameRebindings* shared = nullptr);
     // The ledgers' part of an admission (caller holds the sequencer). cacheEligible: nothing frame-specific feeds the plan.
     // plan: a PreparePlan admission, whose body barriers alone are used.
     void AdmitLedger(FrameAdmission& frame, bool cacheEligible, bool plan = false);
@@ -674,6 +675,17 @@ private:
         uint64_t id = 0;
     };
     std::vector<ReboundSet> m_reboundSets;
+    // Shared rebinding lists (PrepareAtSubmission) checked before, with what they gave: the compiled resources rebound and the
+    // rebound set. A list never changes, and a publication's bindings never do, so the same pair gives the same answer.
+    // Per-frame rebindings make no entry. The oldest goes first.
+    struct CheckedRebindings {
+        std::weak_ptr<const SelectedPublication> publication;
+        std::weak_ptr<const std::vector<FrameRebinding>> rebindings;
+        std::vector<uint32_t> rebound;
+        std::shared_ptr<const std::vector<compiler::PreparedBackingState>> backings;
+        uint64_t id = 0;
+    };
+    std::vector<CheckedRebindings> m_checkedRebindings;
     // Per executable: the prediction of its entry-only plan (AdmitLedger), for the backings and execution kind it was made for, and
     // of its access waits; its access stream (the publication's own backings only); the resources batches off the upload queue use.
     struct PredictionSlot {

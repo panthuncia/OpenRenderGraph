@@ -327,7 +327,7 @@ void RenderGraph::AdmitPersistentTicket(PersistentTicket& ticket, std::span<cons
 		auto publication = segment.admission.publication;
 		if (!publication) throw std::logic_error("A ticket's segment without a publication");
 		// Its body was recorded from a plan of this publication and these rebindings: the ledgers' part alone.
-		segment.admission = state.admission->PrepareAtSubmission(std::move(publication), queues, segment.waits, persistent::RebindingsOf(segment.rebindings));
+		segment.admission = state.admission->PrepareAtSubmission(std::move(publication), queues, segment.waits, segment.rebindings);
 		segment.admitted = true;
 	}
 }
@@ -1154,6 +1154,46 @@ struct TicketUploadRouting {
 	uint32_t undeclared = 0;  // destinations no batch declares (statistics)
 };
 
+// Every backing's uses in an executable's batches for one backing set: (batch, compiler resource) in batch order, and whether
+// any of its resources is aliased. They depend only on the compiled graph and the backings, so a steady frame finds them kept
+// instead of walking every boundary access again. Render thread: the ticket's submission plans its uploads.
+struct BackingUses {
+	std::vector<std::pair<uint32_t, uint32_t>> uses;
+	bool aliased = false;
+};
+struct KeptBackingUses {
+	std::weak_ptr<const persistent::ExecutableGeneration> executable;
+	uint64_t backings = 0;  // AdmissionBackingSet::Id
+	std::unordered_map<uint64_t, BackingUses> byBacking;
+};
+
+const std::unordered_map<uint64_t, BackingUses>& BackingUsesOf(const std::shared_ptr<const persistent::ExecutableGeneration>& executable,
+	const persistent::AdmissionBackingSet& backings) {
+	// A few executables upload in a frame (two in a steady scene); the oldest entry goes first.
+	thread_local std::vector<KeptBackingUses> kept;
+	const auto id = backings.Id();
+	for (auto& entry : kept)
+		if (entry.backings == id && !entry.executable.owner_before(executable) && !executable.owner_before(entry.executable)
+			&& !entry.executable.expired())
+			return entry.byBacking;
+	BT_ZONE_SCOPE("ORG.Persistent.BackingUses");
+	if (kept.size() >= 8) kept.erase(kept.begin());
+	auto& entry = kept.emplace_back();
+	entry.executable = executable;
+	entry.backings = id;
+	const auto& graph = *executable->graph;
+	for (uint32_t batch = 0; batch < graph.boundaryAccessesByBatch.size(); ++batch)
+		for (const auto& access : graph.boundaryAccessesByBatch[batch]) {
+			if (access.resource >= backings.size()) continue;
+			const auto& backing = backings[access.resource];
+			if (!backing.resource.valid()) continue;
+			auto& found = entry.byBacking[UploadBufferKey(backing.resource)];
+			if (found.uses.empty() || found.uses.back() != std::pair{batch, access.resource}) found.uses.push_back({batch, access.resource});
+			if (backing.aliasSize || backing.aliasHeapIdentity || backing.aliasHeap) found.aliased = true;
+		}
+	return entry.byBacking;
+}
+
 // graphicsBuffers: everything the graphics list and the recorded lists touch (known). staged: the staged copies' destinations, one
 // per copy. False when the ticket cannot be planned: every batch off the graphics queue then waits for the uploads, as before.
 bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t graphicsQueue, std::span<rhi::CommandList> queueLists,
@@ -1210,24 +1250,25 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 		for (const auto handle : graphicsBuffers) bindLate(handle);
 		for (const auto handle : staged) bindLate(handle);
 	}
-	auto addUse = [](Destination& destination, uint32_t batch, uint32_t resource) {
-		auto& uses = destination.uses;
-		if (uses.empty() || uses.back() != std::pair{batch, resource}) uses.push_back({batch, resource});
-	};
-	for (uint32_t batch = 0; batch < batchCount; ++batch)
-		for (const auto& access : graph.boundaryAccessesByBatch[batch]) {
-			if (access.resource >= backings.size()) continue;
-			const auto& backing = backings[access.resource];
-			if (!backing.resource.valid()) continue;
-			const auto key = UploadBufferKey(backing.resource);
-			if (const auto found = destinations.find(key); found != destinations.end()) {
-				addUse(found->second, batch, access.resource);
-				if (backing.aliasSize || backing.aliasHeapIdentity || backing.aliasHeap) found->second.aliased = true;
-			}
-			// The stand-in's own aliasing says nothing of its destinations' memory.
-			if (const auto standIn = lateDestinations.find(key); standIn != lateDestinations.end())
-				for (const auto member : standIn->second) addUse(destinations.at(member), batch, access.resource);
+	const auto& uses = BackingUsesOf(segment.admission.publication->executable, backings);
+	for (auto& [key, destination] : destinations)
+		if (const auto found = uses.find(key); found != uses.end()) {
+			destination.uses = found->second.uses;
+			destination.aliased = found->second.aliased;
 		}
+	// The stand-in's own aliasing says nothing of its destinations' memory. Its uses join each destination's in batch order.
+	for (const auto& [standIn, members] : lateDestinations) {
+		const auto found = uses.find(standIn);
+		if (found == uses.end()) continue;
+		for (const auto member : members) {
+			auto& destination = destinations.at(member);
+			std::vector<std::pair<uint32_t, uint32_t>> merged;
+			merged.reserve(destination.uses.size() + found->second.uses.size());
+			std::ranges::merge(destination.uses, found->second.uses, std::back_inserter(merged));
+			merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+			destination.uses = std::move(merged);
+		}
+	}
 
 	// Whether each batch is ordered after a queue's first batch: on that queue, or behind a batch that is (its queue's order,
 	// or a wait). Only waits on earlier batches count; anything else is taken as unordered.

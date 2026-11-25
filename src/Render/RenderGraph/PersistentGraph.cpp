@@ -1610,8 +1610,8 @@ FrameAdmission SynchronousAdmission::PreparePlan(std::shared_ptr<const SelectedP
 }
 FrameAdmission SynchronousAdmission::PrepareAtSubmission(std::shared_ptr<const SelectedPublication> publication,
     std::span<const compiler::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
-    std::span<const FrameRebinding> rebindings) {
-    return PrepareFrame(std::move(publication), queues, producerWaits, {}, rebindings, true, true);
+    const SharedFrameRebindings& rebindings) {
+    return PrepareFrame(std::move(publication), queues, producerWaits, {}, RebindingsOf(rebindings), true, true, &rebindings);
 }
 std::pair<std::shared_ptr<const std::vector<compiler::PreparedBackingState>>, uint64_t> SelectedPublication::AdmissionBackings() const {
     std::lock_guard lock(m_epochMutex);
@@ -1631,7 +1631,8 @@ std::pair<std::shared_ptr<const std::vector<compiler::PreparedBackingState>>, ui
 }
 FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const SelectedPublication> publication,
     std::span<const compiler::ExecutionTimelinePoint> queues, std::span<const FrameProducerWait> producerWaits,
-    std::span<const FrameIncomingState> incomingStates, std::span<const FrameRebinding> rebindings, bool pending, bool entryOnly) {
+    std::span<const FrameIncomingState> incomingStates, std::span<const FrameRebinding> rebindings, bool pending, bool entryOnly,
+    const SharedFrameRebindings* shared) {
     BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
     std::lock_guard lock(m_sequencer->mutex);
     Require(publication && publication->executable && publication->executable->graph, "No executable publication");
@@ -1659,7 +1660,17 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
     }
     frame.entryOnly = entryOnly;
     bool perFrame = false;
-    if (!rebindings.empty()) {
+    const auto sameOwner = [](const auto& weak, const auto& strong) {
+        return !weak.owner_before(strong) && !strong.owner_before(weak) && !weak.expired();
+    };
+    const auto checked = shared && *shared ? std::ranges::find_if(m_checkedRebindings, [&](const CheckedRebindings& entry) {
+        return sameOwner(entry.rebindings, *shared) && sameOwner(entry.publication, frame.publication);
+    }) : m_checkedRebindings.end();
+    if (checked != m_checkedRebindings.end()) {
+        // The same list for the same publication was checked and rebound into this set before.
+        frame.rebound = checked->rebound;
+        frame.backings = AdmissionBackingSet(checked->backings, false, checked->id);
+    } else if (!rebindings.empty()) {
         BT_ZONE_SCOPE("ORG.Persistent.ApplyFrameRebindings");
         std::vector<std::pair<uint32_t, rhi::ResourceHandle>> rebound;
         rebound.reserve(rebindings.size());
@@ -1727,6 +1738,10 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
                 if (m_reboundSets.size() >= 16) m_reboundSets.erase(m_reboundSets.begin());
                 m_reboundSets.push_back({base, std::move(rebound), frame.backings.Shared(), frame.backings.Id()});
             }
+        }
+        if (!perFrame && shared && *shared) {
+            if (m_checkedRebindings.size() >= 16) m_checkedRebindings.erase(m_checkedRebindings.begin());
+            m_checkedRebindings.push_back({frame.publication, *shared, frame.rebound, frame.backings.Shared(), frame.backings.Id()});
         }
     }
     frame.incomingWaits.resize(graph.batches.size());
