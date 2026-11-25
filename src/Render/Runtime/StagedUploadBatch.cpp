@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
-#include <map>
+#include <vector>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -132,17 +132,41 @@ size_t StagedUploadBatch::RecordCopies(rhi::CommandList& a_list, std::span<const
     size_t copies = 0;
     // Copies in one list are unordered without a barrier. Batches can also overlap. For example, a producer's batch
     // that was never submitted can be followed by its replacement. The later write has to win. So for each backing,
-    // track the ranges written since the last barrier, kept disjoint as begin -> end. An overlap records a barrier and
-    // starts tracking again.
-    std::unordered_map<uint64_t, std::map<uint64_t, uint64_t>> written;
-    written.reserve(32);
-    auto ordered = [&] {
+    // track the ranges written since the last barrier, sorted and disjoint. An overlap records a barrier and starts
+    // tracking again. The tracking is kept between calls (render thread), so a steady frame allocates nothing.
+    struct Written {
+        uint64_t key = 0;
+        uint64_t size = UINT64_MAX;  // the target buffer's size, for the producer check below
+        std::string_view name;
+        uint64_t maxEnd = 0;
+        std::vector<std::pair<uint64_t, uint64_t>> ranges;  // begin, end
+    };
+    thread_local std::vector<Written> written;
+    thread_local std::unordered_map<uint64_t, uint32_t> writtenIndex;
+    uint32_t writtenUsed = 0;
+    const auto clearWritten = [&] {
+        for (uint32_t i = 0; i < writtenUsed; ++i) written[i].ranges.clear(), written[i].maxEnd = 0;
+    };
+    // Back-to-back copies into one target from one page, both contiguous, are recorded as one.
+    struct Pending {
+        rhi::ResourceHandle target, page;
+        uint64_t dstOffset = 0, srcOffset = 0, size = 0;
+    } pending;
+    const auto flushPending = [&] {
+        if (!pending.size) return;
+        a_list.CopyBufferRegion(pending.target, pending.dstOffset, pending.page, pending.srcOffset, pending.size);
+        pending.size = 0;
+    };
+    const auto ordered = [&] {
+        flushPending();
         const auto full = rhi::FullMemoryBarrier();
         rhi::BarrierBatch barriers{};
         barriers.globals = {&full, 1u};
         a_list.Barriers(barriers);
-        written.clear();
+        clearWritten();
     };
+    writtenIndex.clear();
+    uint32_t last = UINT32_MAX;  // the slot of the last copy's target
     for (const auto& batch : a_batches) {
         if (!batch) continue;
         for (const auto& entry : batch->Entries()) {
@@ -152,23 +176,56 @@ size_t StagedUploadBatch::RecordCopies(rhi::CommandList& a_list, std::span<const
             if (a_include && !a_include(target)) continue;
             const uint64_t begin = entry.dstOffset, end = entry.dstOffset + entry.size;
             const uint64_t key = (uint64_t{target.generation} << 32) | target.index;
-            auto* ranges = &written[key];
-            auto after = ranges->upper_bound(begin);
-            const bool overlaps = (after != ranges->end() && after->first < end) || (after != ranges->begin() && std::prev(after)->second > begin);
-            if (overlaps) {
-                ordered();
-                ranges = &written[key];
+            if (last == UINT32_MAX || written[last].key != key) {
+                const auto [found, added] = writtenIndex.try_emplace(key, writtenUsed);
+                if (added) {
+                    if (written.size() == writtenUsed) written.emplace_back();
+                    auto& slot = written[writtenUsed++];
+                    slot.key = key;
+                    slot.maxEnd = 0;
+                    slot.ranges.clear();
+                    slot.size = UINT64_MAX;
+                    slot.name = {};
+                    if (const auto* buffer = dynamic_cast<const Buffer*>(entry.target.pinned.get())) {
+                        slot.size = buffer->GetSize();
+                        slot.name = buffer->GetName();
+                    }
+                }
+                last = found->second;
             }
-            ranges->emplace(begin, end);
+            auto& slot = written[last];
+            if (begin >= slot.maxEnd) {
+                // Past everything written: the common case, appended in order.
+                slot.ranges.emplace_back(begin, end);
+            } else {
+                auto after = std::upper_bound(slot.ranges.begin(), slot.ranges.end(), begin,
+                    [](uint64_t value, const std::pair<uint64_t, uint64_t>& range) { return value < range.first; });
+                const bool overlaps = (after != slot.ranges.end() && after->first < end) || (after != slot.ranges.begin() && std::prev(after)->second > begin);
+                if (overlaps) {
+                    ordered();
+                    slot.ranges.emplace_back(begin, end);
+                } else {
+                    slot.ranges.insert(after, {begin, end});
+                }
+            }
+            slot.maxEnd = (std::max)(slot.maxEnd, end);
             // A copy past the end of the target's current backing is a bug in the producer, which staged it against another
             // size. The RHI rejects it and the submission fails. So report it here, where the target's name is known.
-            if (const auto* buffer = dynamic_cast<const Buffer*>(entry.target.pinned.get()); buffer && end > buffer->GetSize())
-                spdlog::error("{}: staged upload of {} bytes at {} into '{}' is past its {} bytes", a_owner, entry.size, entry.dstOffset,
-                    buffer->GetName(), buffer->GetSize());
-            a_list.CopyBufferRegion(target, entry.dstOffset, entry.page->GetAPIResource().GetHandle(), entry.pageOffset, entry.size);
+            if (end > slot.size)
+                spdlog::error("{}: staged upload of {} bytes at {} into '{}' is past its {} bytes", a_owner, entry.size, entry.dstOffset, slot.name, slot.size);
+            const auto page = entry.page->GetAPIResource().GetHandle();
+            if (pending.size && pending.target.index == target.index && pending.target.generation == target.generation
+                && pending.page.index == page.index && pending.page.generation == page.generation && pending.dstOffset + pending.size == begin
+                && pending.srcOffset + pending.size == entry.pageOffset) {
+                pending.size += entry.size;
+            } else {
+                flushPending();
+                pending = {target, page, begin, entry.pageOffset, entry.size};
+            }
             ++copies;
         }
     }
+    flushPending();
     // Fresh textures: Undefined to CopyDest once each, every copy in order, then Common. A subresource written again is
     // ordered behind its earlier write.
     std::vector<rhi::TextureBarrier> toCopy, toCommon;
