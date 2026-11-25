@@ -2050,7 +2050,7 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const compiler::G
     // Allocate retention before mutating submission-backed ledgers.
     if (!retained.completions.empty()) m_retained.push_back(std::move(retained));
     const auto& barriers = frame.Barriers();
-    for (uint32_t i = 0; i < count; ++i) m_sequencer->states.CommitBatch(barriers.batches[i], frame.backings, frame.backings.Id(), frame.unmoved);
+    m_sequencer->states.CommitBatches(std::span(barriers.batches).first(count), frame.backings, frame.backings.Id(), frame.unmoved);
     for (const auto& effect : frame.incomingEffects) if (effect.firstBatch < count)
         m_sequencer->incomingRevisions.insert_or_assign((uint64_t{effect.resource.generation} << 32) | effect.resource.index,
             ResourceSequencer::IncomingRevision{effect.revision,effect.completion});

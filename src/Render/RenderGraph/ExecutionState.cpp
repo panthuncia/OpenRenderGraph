@@ -94,12 +94,22 @@ void Visit(const CompileResourceShape& shape, CompileRange range, auto&& fn) {
             fn(mip, slice);
 }
 
+// A state grid's fingerprint is the XOR of its cells' hashes, so a commit updates it for the cells it changes alone.
+uint64_t MixBits(uint64_t value) {
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
+    return value ^ (value >> 31);
+}
+uint64_t CellHash(size_t cell, const CompileResourceState& state, uint32_t queue) {
+    uint64_t hash = MixBits(cell * 0x9E3779B97F4A7C15ull + state.access);
+    hash = MixBits(hash ^ state.layout);
+    hash = MixBits(hash ^ state.sync);
+    return MixBits(hash ^ ((uint64_t{state.write} << 32) | queue));
+}
 template<class Grid>
 uint64_t Fingerprint(const Grid& grid) {
-    uint64_t hash = 1469598103934665603ull;
-    const auto mix = [&](uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
-    for (const auto& cell : grid.cells) { mix(cell.access); mix(cell.layout); mix(cell.sync); mix(cell.write); }
-    for (const auto queue : grid.queues) mix(queue);
+    uint64_t hash = 0;
+    for (size_t cell = 0; cell < grid.cells.size(); ++cell) hash ^= CellHash(cell, grid.cells[cell], grid.queues[cell]);
     return hash;
 }
 
@@ -867,6 +877,32 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         output.committedStates.resize(next);
         output.committedQueues.resize(next);
     }
+    // Across batches: per resource and cell, the nearest later batch that commits it (from the last batch back). A commit is
+    // superseded from the latest of those over its cells on.
+    std::vector<std::vector<uint32_t>> nextCommit(ordered.size());
+    for (size_t batch = result.batches.size(); batch-- > 0;) {
+        auto& output = result.batches[batch];
+        const auto count = output.committedStates.size();
+        output.committedSupersededAt.assign(count, UINT32_MAX);
+        for (size_t i = 0; i < count; ++i) {
+            const auto resource = output.committedIndices[i];
+            if (resource >= ordered.size() || nextCommit[resource].empty()) continue;
+            const auto& shape = ordered[resource].shape;
+            uint32_t at = 0;
+            Visit(shape, output.committedStates[i].range,
+                [&](uint32_t mip, uint32_t slice) { at = (std::max)(at, nextCommit[resource][CellIndex(shape, mip, slice)]); });
+            output.committedSupersededAt[i] = at;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const auto resource = output.committedIndices[i];
+            if (resource >= ordered.size()) continue;
+            const auto& shape = ordered[resource].shape;
+            auto& cells = nextCommit[resource];
+            if (cells.empty()) cells.assign(size_t{shape.mips} * shape.slices, UINT32_MAX);
+            Visit(shape, output.committedStates[i].range,
+                [&](uint32_t mip, uint32_t slice) { cells[CellIndex(shape, mip, slice)] = static_cast<uint32_t>(batch); });
+        }
+    }
     BT_PLOT("ORG.Execution.StateBarrierSteps", static_cast<int64_t>(entrySteps));
     BT_PLOT("ORG.Execution.IntraBatchStateBarrierSteps", static_cast<int64_t>(intraBatchSteps));
     BT_PLOT("ORG.Execution.CrossQueueStateBarrierSteps", static_cast<int64_t>(crossQueueSteps));
@@ -884,6 +920,7 @@ void BackingStateAdmissionLedger::SeedBatch(const PreparedBatchBarriers& batch) 
         if (m_states.Contains(key) && !authoritative) continue;
         auto& grid = m_states.Emplace(key);
         grid = StateGrid{};
+        grid.changedIn = ++m_changes;
         grid.shape = seed.shape;
         grid.cells.resize(size_t{grid.shape.mips} * grid.shape.slices);
         grid.queues.assign(grid.cells.size(), UINT32_MAX);
@@ -905,6 +942,7 @@ void BackingStateAdmissionLedger::SeedUniform(rhi::ResourceHandle resource, cons
     if (m_states.Contains(key)) throw std::logic_error("A backing the ledger holds cannot be seeded again");
     auto& grid = m_states.Emplace(key);
     grid = StateGrid{};
+    grid.changedIn = ++m_changes;
     grid.shape = shape;
     grid.cells.assign(size_t{shape.mips} * shape.slices, state);
     grid.queues.assign(grid.cells.size(), queue);
@@ -921,14 +959,23 @@ void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch
         auto* grid = m_states.Find(key);
         if (!grid)
             throw std::logic_error("Backing state was not seeded before commit");
-        const auto& update = batch.committedStates[i];
-        Visit(grid->shape, update.range, [&](uint32_t mip, uint32_t slice) {
-            const auto cellIndex = CellIndex(grid->shape, mip, slice);
-            grid->cells[cellIndex] = update.state;
-            grid->queues[cellIndex] = batch.committedQueues[i];
-        });
-        grid->fingerprint = Fingerprint(*grid);
+        if (CommitCells(*grid, batch.committedStates[i], batch.committedQueues[i])) grid->changedIn = ++m_changes;
     }
+}
+
+bool BackingStateAdmissionLedger::CommitCells(StateGrid& grid, const PreparedStateRegion& update, uint32_t queue) {
+    // A commit that leaves the cells as they were (an execution that returns what it touches to where it found it, a closed one's
+    // home states) writes nothing, and the fingerprint stands.
+    bool changed = false;
+    Visit(grid.shape, update.range, [&](uint32_t mip, uint32_t slice) {
+        const auto cell = CellIndex(grid.shape, mip, slice);
+        if (grid.cells[cell] == update.state && grid.queues[cell] == queue) return;
+        grid.fingerprint ^= CellHash(cell, grid.cells[cell], grid.queues[cell]) ^ CellHash(cell, update.state, queue);
+        grid.cells[cell] = update.state;
+        grid.queues[cell] = queue;
+        changed = true;
+    });
+    return changed;
 }
 
 UntouchedResources FindUntouched(const Schedule& graph, std::span<const PreparedBackingState> backings,
@@ -978,7 +1025,7 @@ UntouchedResources FindUntouched(const Schedule& graph, std::span<const Prepared
 }
 
 void BackingStateAdmissionLedger::Invalidate(std::span<const rhi::ResourceHandle> resources) {
-    for (const auto resource : resources) if (resource.valid()) m_states.Erase(Key(resource));
+    for (const auto resource : resources) if (resource.valid() && m_states.Erase(Key(resource))) ++m_changes;
 }
 
 void BackingStateAdmissionLedger::Capture(StatePrediction& prediction, const Schedule& graph,
@@ -1017,44 +1064,63 @@ bool BackingStateAdmissionLedger::Predicts(const StatePrediction& prediction, st
     return true;
 }
 
-void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch, std::span<const PreparedBackingState> backings,
-    uint64_t backingSet, std::span<const uint32_t> unmoved) {
+void BackingStateAdmissionLedger::CommitBatches(std::span<const PreparedBatchBarriers> batches,
+    std::span<const PreparedBackingState> backings, uint64_t backingSet, std::span<const uint32_t> unmoved) {
     BT_ZONE_SCOPE("ORG.Execution.CommitStates");
-    if (batch.committedResources.size() != batch.committedStates.size()
-        || batch.committedQueues.size() != batch.committedStates.size()
-        || batch.committedIndices.size() != batch.committedStates.size())
-        throw std::invalid_argument("Invalid backing-state commit");
-    // Seeds first: the first executions of a backing, and the aliased backings that enter from Undefined, whose grids are made
-    // again. Making a grid moves no address (the table's entries stay put), so the commits below still find them by index.
-    if (!batch.seeds.empty() && batch.committedIndices.size() != batch.committedStates.size()) {
-        CommitBatch(batch);
-        return;
-    }
-    SeedBatch(batch);
-    auto& resolved = m_states.Resolve(backings, backingSet);
-    for (size_t i = 0; i < batch.committedStates.size(); ++i) {
-        const auto index = batch.committedIndices[i];
-        // No running pass touched it: it stays as the execution found it.
-        if (!unmoved.empty() && std::binary_search(unmoved.begin(), unmoved.end(), index)) continue;
-        StateGrid* grid = index < resolved.size() ? resolved[index] : nullptr;
-        if (!grid) {
-            grid = m_states.Find(Key(batch.committedResources[i]));
-            if (!grid) throw std::logic_error("Backing state was not seeded before commit");
-            if (index < resolved.size()) resolved[index] = grid;
+    // What a batch's commit depends on besides the batch: how many batches commit with it (superseded commits), and the
+    // unmoved resources.
+    uint64_t key = (1469598103934665603ull ^ batches.size()) * 1099511628211ull;
+    for (const auto index : unmoved) key = (key ^ index) * 1099511628211ull;
+    // The same call as the last one to commit these batches (backings, key): a grid that has not changed since is as that call
+    // left it, so its commits write nothing there. A grid is skipped or committed as a whole (in batch order): its commits from
+    // one batch redone without a later batch's could leave a cell they share in the earlier state. Commits to different grids
+    // are independent.
+    uint64_t since = 0;
+    if (!batches.empty() && std::ranges::all_of(batches, [&](const PreparedBatchBarriers& batch) {
+            const auto& last = batch.lastCommit;
+            return last.ledger == this && last.changes == batches.front().lastCommit.changes && last.backingSet == backingSet
+                && last.key == key;
+        }))
+        since = batches.front().lastCommit.changes;
+    // Nothing in the ledger changed since.
+    if (since == m_changes) return;
+    {
+        BT_ZONE_SCOPE("ORG.Execution.CommitStateCells");
+        basic_telemetry::AddCounter("ORG.Execution.StateCommitVisits");
+        // Found once: a seed makes a grid without moving another's address (the table's entries stay put), and a grid the set had
+        // none of when resolved is found by key below and kept.
+        auto& resolved = m_states.Resolve(backings, backingSet);
+        for (const auto& batch : batches) {
+            if (batch.committedResources.size() != batch.committedStates.size()
+                || batch.committedQueues.size() != batch.committedStates.size()
+                || batch.committedIndices.size() != batch.committedStates.size()
+                || (!batch.committedSupersededAt.empty() && batch.committedSupersededAt.size() != batch.committedStates.size()))
+                throw std::invalid_argument("Invalid backing-state commit");
+            const bool superseding = !batch.committedSupersededAt.empty();
+            // Seeds first: the first executions of a backing, and the aliased backings that enter from Undefined, whose grids are made
+            // again.
+            if (!batch.seeds.empty()) SeedBatch(batch);
+            for (size_t i = 0; i < batch.committedStates.size(); ++i) {
+                // A later batch committed here commits its cells again.
+                if (superseding && batch.committedSupersededAt[i] < batches.size()) continue;
+                const auto index = batch.committedIndices[i];
+                // No running pass touched it: it stays as the execution found it.
+                if (!unmoved.empty() && std::binary_search(unmoved.begin(), unmoved.end(), index)) continue;
+                StateGrid* grid = index < resolved.size() ? resolved[index] : nullptr;
+                if (!grid) {
+                    grid = m_states.Find(Key(batch.committedResources[i]));
+                    if (!grid) throw std::logic_error("Backing state was not seeded before commit");
+                    if (index < resolved.size()) resolved[index] = grid;
+                }
+                // Unchanged since this call last left it. A grid this call changes keeps a stamp after `since`, so its later
+                // commits in this call are made too.
+                if (grid->changedIn <= since) continue;
+                if (CommitCells(*grid, batch.committedStates[i], batch.committedQueues[i])) grid->changedIn = ++m_changes;
+            }
         }
-        const auto& update = batch.committedStates[i];
-        // A commit that leaves the cells as they were (an execution that returns what it touches to where it found it, a closed
-        // one's home states) writes nothing, and the fingerprint stands.
-        bool changed = false;
-        Visit(grid->shape, update.range, [&](uint32_t mip, uint32_t slice) {
-            const auto cellIndex = CellIndex(grid->shape, mip, slice);
-            if (grid->cells[cellIndex] == update.state && grid->queues[cellIndex] == batch.committedQueues[i]) return;
-            grid->cells[cellIndex] = update.state;
-            grid->queues[cellIndex] = batch.committedQueues[i];
-            changed = true;
-        });
-        if (changed) grid->fingerprint = Fingerprint(*grid);
     }
+    // The ledger as this call leaves it.
+    for (const auto& batch : batches) batch.lastCommit = {this, m_changes, backingSet, key};
 }
 
 namespace {

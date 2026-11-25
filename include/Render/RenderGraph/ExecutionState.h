@@ -76,14 +76,28 @@ struct PreparedBatchBarriers {
     std::vector<PreparedStateRegion> committedStates;
     std::vector<rhi::ResourceHandle> committedResources;
     // The compiler resource index of each committed backing (parallel to committedResources): where an indexed commit finds its
-    // ledger entry (BackingStateAdmissionLedger::CommitBatch with backings).
+    // ledger entry (BackingStateAdmissionLedger::CommitBatches).
     std::vector<uint32_t> committedIndices;
     // Queue slot that performed each committed state update. Kept parallel to
     // committedStates/resources so the admission ledger can distinguish a
     // same-queue memory dependency from a timeline-ordered queue handoff.
     std::vector<uint32_t> committedQueues;
+    // Per commit (parallel to committedStates): the batch from which on later batches of the execution commit all its cells again,
+    // or UINT32_MAX. When that batch commits too (CommitBatches), the ledger's cells end in the later states, so this commit is
+    // left out: a resource used in two batches is not taken through its earlier state every frame.
+    std::vector<uint32_t> committedSupersededAt;
     std::vector<PreparedBackingState> seeds;
     std::vector<rhi::ResourceHandle> authoritativeSeeds;
+    // The state ledger's last commit of this batch (BackingStateAdmissionLedger::CommitBatches): the ledger, its change count
+    // after the commit, and what the commit was made with. A grid that has not changed since is as that commit left it, so the
+    // same commit again writes nothing there and skips it. Touched only under the ledger's lock.
+    struct LastCommit {
+        const void* ledger = nullptr;
+        uint64_t changes = 0;
+        uint64_t backingSet = 0;
+        uint64_t key = 0;  // of the batches committed with it and the unmoved resources
+    };
+    mutable LastCommit lastCommit;
 };
 
 struct PreparedExecutionBarrierPlan {
@@ -243,7 +257,7 @@ void ValidatePreparedBackingOrder(const GraphCompileStructure& structure, std::s
 
 // The resources no running pass of an execution touches: every pass that uses one skips this execution (skipped ahead, or
 // skipped at execution). Such a resource stays as the execution found it. Its barriers (entry, body, releases) are left out,
-// and the ledger keeps the state it had (BackingStateAdmissionLedger::CommitBatch's unmoved).
+// and the ledger keeps the state it had (BackingStateAdmissionLedger::CommitBatches' unmoved).
 struct UntouchedResources {
     std::vector<uint32_t> indices;  // compiler resource indices, ascending
     std::vector<uint64_t> keys;     // their backings' handles on every device, (generation << 32) | index, ascending
@@ -283,11 +297,12 @@ public:
         std::span<const rhi::ResourceHandle> invalidated = {}, bool entryOnly = false,
         bool validated = false, uint64_t backingSet = 0, bool externalHome = false) const;
     void CommitBatch(const PreparedBatchBarriers&);
-    // The same, each commit's entry found by its compiler resource index (PreparedBatchBarriers::committedIndices) in the backings'
-    // set (backingSet as for Prepare). unmoved: compiler resource indices (ascending) no running pass touched
-    // (UntouchedResources). Their commits are left out, so the ledger keeps the state the execution found them in.
-    void CommitBatch(const PreparedBatchBarriers& batch, std::span<const PreparedBackingState> backings, uint64_t backingSet,
-        std::span<const uint32_t> unmoved = {});
+    // The same for an execution's submitted batches, in order, each commit's entry found by its compiler resource index
+    // (PreparedBatchBarriers::committedIndices) in the backings' set (backingSet as for Prepare). unmoved: compiler resource indices
+    // (ascending) no running pass touched (UntouchedResources). Their commits are left out, so the ledger keeps the state the
+    // execution found them in.
+    void CommitBatches(std::span<const PreparedBatchBarriers> batches, std::span<const PreparedBackingState> backings,
+        uint64_t backingSet, std::span<const uint32_t> unmoved = {});
     // A batch's seeds: the grids of backings the ledger does not hold yet, and of those whose state the batch makes again.
     void SeedBatch(const PreparedBatchBarriers& batch);
     // Whether the ledger holds a state for the backing.
@@ -308,8 +323,12 @@ private:
         std::vector<CompileResourceState> cells;
         std::vector<uint32_t> queues;
         uint64_t fingerprint = 0;  // of cells and queues, kept by every change (StatePrediction)
+        uint64_t changedIn = 0;    // m_changes at its last change (made, or a cell written)
     };
+    // Commits one region's state: writes the cells it changes and updates the fingerprint for them. True when it changed one.
+    static bool CommitCells(StateGrid& grid, const PreparedStateRegion& update, uint32_t queue);
     detail::BackingTable<StateGrid> m_states;
+    uint64_t m_changes = 1;  // changes to the grids so far: a commit that wrote cells, a grid made or gone
 };
 
 // Ordered, submission-backed cross-frame hazard state. Unlike symbolic graph

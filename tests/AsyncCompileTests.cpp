@@ -841,7 +841,7 @@ int main() {
     ENSURE(crossQueueBarriers.batches[crossQueueStep->batch]
         .beforePass[consumerPosition].textures.front().queueOwnership == rhi::QueueOwnership::None);
     {
-        // An execution that leaves a resource untouched commits nothing for it (CommitBatch's unmoved): the ledger keeps the state
+        // An execution that leaves a resource untouched commits nothing for it (CommitBatches' unmoved): the ledger keeps the state
         // the execution found it in, and the next execution's entry barriers start from there.
         rhi::ResourceHandle handle{};
         handle.index = 52; handle.generation = 3;
@@ -862,7 +862,7 @@ int main() {
                 for (const auto& texture : batch.textures) fromSeed = fromSeed || static_cast<uint64_t>(texture.beforeLayout) == writeState.layout;
             ENSURE(fromSeed);
             const std::vector<uint32_t> unmoved = ledger == &kept ? std::vector<uint32_t>{0} : std::vector<uint32_t>{};
-            for (const auto& batch : plan.batches) ledger->CommitBatch(batch, backings, 0, unmoved);
+            ledger->CommitBatches(plan.batches, backings, 0, unmoved);
         }
         const auto entryFrom = [&](const BackingStateAdmissionLedger& ledger, uint64_t layout) {
             const auto plan = ledger.Prepare(*stateGraph, backings);
@@ -875,6 +875,41 @@ int main() {
         ENSURE(entryFrom(moved, writeState.layout) == 0);
         // Left unmoved: it still enters from the seeded state.
         ENSURE(entryFrom(kept, writeState.layout) > 0);
+        // The last batch reads the whole texture again, so it supersedes the earlier batches' commits: a full commit leaves them
+        // out (the `moved` ledger above). A commit of the first two batches alone keeps them, and leaves the two cells the second
+        // batch wrote (mips 1 and 2 of slice 1) in the write state.
+        const auto plan = BackingStateAdmissionLedger{}.Prepare(*stateGraph, backings);
+        ENSURE(plan.batches.size() == 3);
+        for (uint32_t batch = 0; batch < 2; ++batch)
+            ENSURE(std::ranges::all_of(plan.batches[batch].committedSupersededAt, [](uint32_t at) { return at == 2; }));
+        ENSURE(std::ranges::all_of(plan.batches[2].committedSupersededAt, [](uint32_t at) { return at == UINT32_MAX; }));
+        BackingStateAdmissionLedger partial;
+        const auto first = partial.Prepare(*stateGraph, backings);
+        partial.CommitBatches(std::span(first.batches).first(2), backings, 0);
+        ENSURE(entryFrom(partial, writeState.layout) == 2);
+        // A commit that repeats the last commit of the same batches, with nothing in the ledger changed since, writes nothing and
+        // is skipped. Any change in between (here a partial commit from another plan) makes it visit the cells again.
+        const auto visits = [&](BackingStateAdmissionLedger& ledger, const PreparedExecutionBarrierPlan& plan, uint32_t count) {
+            basic_telemetry::Session session({ .mode = basic_telemetry::CaptureMode::Trace,
+                .traceRootScopes = {"ORG.Execution.CommitStates"} });
+            ledger.CommitBatches(std::span(plan.batches).first(count), backings, 0);
+            const auto snapshot = session.Snapshot();
+            const auto metric = std::ranges::find_if(snapshot.metrics,
+                [](const auto& m) { return m.name == "ORG.Execution.StateCommitVisits"; });
+            return metric == snapshot.metrics.end() ? 0 : static_cast<int>(metric->current);
+        };
+        const auto full = partial.Prepare(*stateGraph, backings, {}, true);
+        ENSURE(visits(partial, full, 3) == 1);
+        ENSURE(entryFrom(partial, writeState.layout) == 0);
+        ENSURE(visits(partial, full, 3) == 0);
+        ENSURE(visits(partial, first, 2) == 1);
+        ENSURE(entryFrom(partial, writeState.layout) == 2);
+        ENSURE(visits(partial, full, 3) == 1);
+        ENSURE(entryFrom(partial, writeState.layout) == 0);
+        // The same batches with fewer committing (a partial receipt) are another commit.
+        ENSURE(visits(partial, full, 2) == 1);
+        ENSURE(visits(partial, full, 2) == 0);
+        ENSURE(visits(partial, full, 3) == 1);
     }
     {
         // FindUntouched: a resource every pass of which skips is untouched. A pass of a batch recorded ahead counts as running,
