@@ -18,6 +18,13 @@ struct ScheduleTraceNames {
     std::function<std::string(uint32_t preparedPassIndex)> pass;  // a logical pass slot's name, empty when unnamed
     std::function<std::string(uint32_t slotIndex)> resource;      // a resource slot's name, empty when unnamed
     std::vector<std::string> queues;                              // by queue slot
+    // Optional: a resource slot's identity, alias candidacy and size (ScheduleTrace::Resource).
+    struct ResourceFacts {
+        uint64_t objectId = 0;
+        bool aliasCandidate = false;
+        uint64_t bytes = 0;
+    };
+    std::function<ResourceFacts(uint32_t slotIndex)> resourceFacts;
 };
 
 // Builds the executable's schedule with explanations (ScheduleTrace). The compiler does not record why it adds a

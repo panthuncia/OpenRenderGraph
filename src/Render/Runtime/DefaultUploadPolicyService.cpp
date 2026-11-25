@@ -52,6 +52,8 @@ public:
             return;
         }
 
+        // Waits for a BeginFrame or FlushAll calling clients on another thread: it may be about to call this one.
+        std::scoped_lock calls(m_callsMutex);
         std::scoped_lock lock(m_mutex);
         m_clients.erase(client);
         m_dirtyClients.erase(client);
@@ -77,6 +79,7 @@ public:
         // render-thread frame boundary into a global rendezvous with concurrent
         // graph publication writers. So the client hook is kept, but only the
         // small dirty set gets it.
+        std::scoped_lock calls(m_callsMutex);
         auto clients = SnapshotDirtyClients(false);
         for (auto* client : clients) {
             if (client) client->OnUploadPolicyBeginFrame();
@@ -88,6 +91,7 @@ public:
 
     void FlushAll() override {
         BT_ZONE_SCOPE("DefaultUploadPolicyService::FlushAll");
+        std::scoped_lock calls(m_callsMutex);
         auto clients = SnapshotDirtyClients(true);
         uint64_t flushedClients = 0;
         uint64_t flushedWrites = 0;
@@ -141,6 +145,11 @@ private:
     }
 
     mutable std::mutex m_mutex;
+    // Held while clients are called (BeginFrame, FlushAll), and taken by UnregisterClient before m_mutex. A client destroyed
+    // on another thread (a retired graph's buffers, on the runtime's deleter thread) unregisters first in its destructor, so
+    // it is never called during or after it. Registering and marking dirty do not wait for it. Recursive: a client called
+    // may drop another on this thread.
+    std::recursive_mutex m_callsMutex;
     std::unordered_set<IUploadPolicyClient*> m_clients;
     std::unordered_set<IUploadPolicyClient*> m_dirtyClients;
     UploadPolicyServiceStats m_stats{};

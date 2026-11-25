@@ -136,6 +136,11 @@ public:
 		// and the thread passes it in order. Until then SealedPoint has a pending part (GpuPoint::Pending), and Seals counts the
 		// seal already. Off: SealSubmitted drains the thread first.
 		bool queuedSeals = false;
+		// A retired graph (replaced by an attach) is destroyed on the runtime's deleter thread once its work completes
+		// (ReleaseRetiredGraphs), instead of on the owner thread. Its extensions and task workers are shut down, and its alias
+		// placements given back (RenderGraph::ReleaseAliasPlacements), on the owner thread first. For a host whose passes,
+		// extensions and resources may be destroyed on any thread. Only without async epochs.
+		bool destroyRetiredGraphsDetached = false;
 	};
 
 	using ExtensionFactory = std::function<std::unique_ptr<RenderGraph::IRenderGraphExtension>()>;
@@ -344,12 +349,17 @@ public:
 	 * staged, the attached graph keeps the backings it bound (RenderGraph::FreezeAliasedBindings) and takes no new recording: a request
 	 * for it is dropped (EpochRecordingDropped). Its kept recordings still submit.
 	 *
-	 * A second staging replaces the first, whose graph is retired. AttachEpochGraph on the epoch drops a staged graph too. Without async
-	 * epochs, or for an epoch with no graph, the graph is attached at once (StageResult::attached).
+	 * A second staging replaces the first, whose graph is retired. AttachEpochGraph on the epoch drops a staged graph too.
+	 * DropStagedEpochGraphs drops staged graphs without attaching anything.
+	 *
+	 * Without async epochs the graph is staged too, so several epochs can be switched in one step (AttachStagedEpochGraphs). Nothing
+	 * records for it while it is staged, and its alias placement waits for the attach. So the attached graph keeps running as it is,
+	 * and its bindings are not frozen. For an epoch with no graph, or while the host's thread is held, the graph is attached at once
+	 * (StageResult::attached).
 	 */
 	struct StageResult {
 		bool staged = false;      // the host's thread records it for the staged generation from now on
-		bool attached = false;    // no staging was needed: it was attached (no async epochs, or the epoch had no graph)
+		bool attached = false;    // no staging was needed: it was attached (the epoch had no graph, or the host's thread was held)
 		uint64_t generation = 0;  // the build generation it runs at once attached
 		std::string reason;       // why it was rejected (neither staged nor attached)
 		AttachRefusal refusal = AttachRefusal::None;
@@ -387,8 +397,19 @@ public:
 	 * If any check fails, nothing is attached and the result names the first refused epoch and why. A refusal drops no staged
 	 * graph: the caller decides what to do. Otherwise the host's thread is held once and every staged graph is swapped in with its
 	 * recordings. An empty set attaches nothing and succeeds.
+	 *
+	 * Without async epochs the swapped graphs then place their transients at once, in the host's epoch order (AttachEpochGraph does
+	 * the same for one graph). A frame placement version that a later epoch's graph makes, for a resource it now shares with an
+	 * earlier epoch, then exists before the earlier graph's next preparation, which takes it before it records. If the graphs placed
+	 * at their first preparations instead, the earlier graph would write the shared resource where the later one no longer reads it
+	 * in that frame.
 	 */
 	AttachResult AttachStagedEpochGraphs(std::span<const uint32_t> epochs);
+	/**
+	 * @brief Owner thread, where no epoch is being submitted: retires the staged graphs of these epochs (a refused set the caller
+	 * gives up). An epoch with nothing staged, or not the host's, is skipped. Returns how many staged graphs were dropped.
+	 */
+	size_t DropStagedEpochGraphs(std::span<const uint32_t> epochs);
 	/**
 	 * @brief Any thread: the epochs whose attached or staged graph declares any of `slots` (a closure's members). In the host's epoch
 	 * order, each once.
@@ -418,8 +439,9 @@ public:
 	AttachStats AttachStatsTotal() const noexcept;
 	/**
 	 * @brief Owner thread: the epochs whose graph has alias placements in a pool generation another graph replaced (the pool
-	 * grew), or placed from a frame placement that is no longer current (FramePlacementSettings). With
-	 * Desc::reportStaleAliasPlacements the application rebuilds them (BuildEpochGraph). Otherwise the next build point does.
+	 * grew). With Desc::reportStaleAliasPlacements the application rebuilds them (BuildEpochGraph). Otherwise the next build
+	 * point does. A graph placed from a frame placement that is no longer current is not listed: it places again from the
+	 * current one in place, at its next preparation (FramePlacementSettings).
 	 */
 	std::vector<uint32_t> StaleAliasPlacementEpochs() const;
 
@@ -603,11 +625,18 @@ public:
 	 * need against today's pools and frame arena.
 	 */
 	struct FramePlacementSettings {
-		// Graphs place their transients from the frame placement (off by default). Each epoch graph's first alias plan takes the
-		// current version and keeps it for the graph's life. A candidate the version covers goes at the version's offset in its
-		// blocks, instead of in the graph's own pools, the shared arena or the frame arena. Everything else stays on those paths.
-		// A new version makes the epochs that placed from an older one stale (StaleAliasPlacementEpochs), so they are built
-		// again and take it. Off: graphs place exactly as without the frame placement, and graphs that placed from it are stale.
+		// Graphs place their transients from the frame placement (off by default). Each epoch graph's alias plan takes the
+		// current version. A candidate the version covers goes at the version's offset in its blocks, instead of in the graph's
+		// own pools, the shared arena or the frame arena. Everything else stays on those paths. A new version is taken in place:
+		// each graph places again from it at its next preparation, before it records. Off: graphs place exactly as without it.
+		// - The first plan with candidates makes the first version at once from the summaries so far, and places from it. A
+		//   later epoch's first plan fits its candidates into the version's free bytes; what it leaves uncovered (a resource an
+		//   earlier epoch shares with it) makes the next version at once, which that plan places from. Without a plan, the
+		//   worker thread makes none until every epoch with a frame position (SetFramePositions; without positions, every epoch
+		//   of the order) has a summary.
+		// - A candidate's key is its name, memory description and ordinal among the graph's candidates with the same name and
+		//   description, so a rebuilt graph's new resources find their entries. Several epochs' uses are one resource only when
+		//   they are one object (its identity).
 		bool enabled = false;
 		// Epochs that may run more than once a frame. A resource several epochs use spans the whole slot of a repeated epoch
 		// at either end of its lifetime. Epochs given several tickets ahead (SetEpochTicketsAhead) count as repeated too.
@@ -618,10 +647,13 @@ public:
 		// frame placement heap (reserved against packed bytes, generation, what holds it), the frame arena and the shared pools.
 		bool logLifetimes = false;
 		uint32_t settleMilliseconds = 250;
-		// Frame placement heaps: a new heap is heapHeadroom times its need, and a heap more than heapShrinkFactor times its need
-		// with headroom is replaced by a smaller one.
+		// Frame placement heaps: a heap is made at its need, a heap that grows takes the larger of its need and heapHeadroom times
+		// its old capacity, and a heap more than heapShrinkFactor times its need with headroom is replaced by a smaller one.
 		double heapHeadroom = 1.25;
 		double heapShrinkFactor = 2.0;
+		// Once the versions have been quiet this long, heaps larger than their need (headroom, an unused class) are trimmed to
+		// it: the current layout is published again with exact heaps, under a new id. 0: never.
+		uint32_t heapTrimMilliseconds = 2000;
 		// The memory breakdown's period while logLifetimes is set, in seconds. 0: never.
 		uint32_t memoryLogSeconds = 10;
 	};
@@ -634,6 +666,15 @@ public:
 	std::vector<std::shared_ptr<const PlacementSummary>> PlacementSummaries() const;
 	/** @brief Any thread: the latest frame placement computed, or null. */
 	std::shared_ptr<const FramePlacementVersion> LatestFramePlacement() const;
+	/** @brief Any thread: the frame placement's heaps, the current ones first, then the replaced ones still alive. */
+	std::vector<FramePlacementMemory::HeapInfo> FramePlacementHeaps() const;
+	/** @brief What a frame placement the epoch's attached graph's latest alias plan took. Owner thread. */
+	struct FramePlacementUse {
+		bool planned = false;  // its graph has made an alias plan
+		uint64_t version = 0;  // the version it placed from, 0 for none
+		uint64_t placed = 0;   // the candidates it placed from it
+	};
+	FramePlacementUse FramePlacementInUse(uint32_t epoch) const;
 	/**
 	 * @brief Submitting thread, for a revision-driven async epoch: its runs take their published copies by the caller's index
 	 * from now on, starting with copy `copy` for the next SubmitEpoch.
@@ -1116,6 +1157,9 @@ private:
 	void RetireStaged(size_t index);
 	// Owner thread, the instance not in the host's thread's hands: swaps its staged graph in, with the recordings made on it.
 	bool SwapStagedIn(size_t index);
+	// Owner thread, without async epochs: the attached graph places the transients its detached build left to its first
+	// preparation (RenderGraph::PlaceDeferredAliasesNow). A failure marks the epoch failed, as a failed preparation does.
+	void PlaceAttachedAliases(size_t index);
 	// Owner thread: publishes what the instance's attached and staged graphs declare, for EpochsDeclaring, and their build
 	// generations, for BuildsOf. Every change of either graph calls it.
 	void PublishDeclared(size_t index);
@@ -1234,6 +1278,13 @@ private:
 	std::vector<std::pair<uint32_t, std::vector<RunLease*>>> m_liveCopyLeases;
 	// The sync path's frame pacing: its runs of the last framesInFlight frames, by position.
 	std::vector<RunLease*> m_syncLeases;
+	// The submission each position's run had (RunLease::submission). A lease is taken again once its run retired: a pointer whose
+	// lease now holds another submission names a newer run, which must not be waited for (that waited each epoch for the one
+	// before it, in the same frame, and the GPU ran dry between the epochs' graphs).
+	std::vector<uint64_t> m_syncSubmissions;
+	// Each epoch instance's executions so far, and the position this execution paces on (framesInFlight per instance).
+	std::vector<uint64_t> m_syncExecutions;
+	size_t m_syncPosition = 0;
 	// Opens a live lease (or, at Runtime::kMaxSlots, null). With m_leaseMutex held.
 	RunLease* OpenLeaseLocked(bool external);
 	// Opens a live lease. At Runtime::kMaxSlots in flight, waits for the oldest sealed run and retires it first (throws when none
@@ -1321,9 +1372,6 @@ private:
 	// several tickets ahead (ApplyFramePlacementSettings).
 	FramePlacementSettings m_framePlacementSettings;
 	void ApplyFramePlacementSettings();
-	// Whether a graph placed from a frame placement other than the current one, where that matters: it placed something from
-	// its version, or the current version places something in its epoch. A graph that has not planned yet is never stale.
-	bool FramePlacementStale(const RenderGraph& graph, uint32_t epoch) const;
 	// Owner thread: the frame placement's memory breakdown (FramePlacement::LogMemory), with which version each graph placed from.
 	void LogFramePlacementMemory() const;
 	// The frame-wide placement: summaries, the worker and its versions. Made with the host. Graphs hold it weakly.

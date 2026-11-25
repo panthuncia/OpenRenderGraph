@@ -75,6 +75,12 @@ struct ScheduleTrace {
         std::string name;
         uint64_t id = 0;
         bool hasLayout = false;  // true for a texture (layout transitions), false for a buffer
+        // Filled by RenderGraph::TraceSelectedSchedule only. The registry object's identity (its concrete resource's
+        // Resource::GetGlobalResourceID, the same in every graph that uses the object), whether the alias planner may place
+        // it in shared memory, and its size (0 when unknown).
+        uint64_t objectId = 0;
+        bool aliasCandidate = false;
+        uint64_t bytes = 0;
     };
 
     std::string label;           // the executable's: "frame" or "epoch <n>"

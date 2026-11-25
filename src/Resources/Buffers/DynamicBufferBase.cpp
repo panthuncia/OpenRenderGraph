@@ -32,6 +32,11 @@ namespace {
     // The number of owners that capture backings on their own threads. See BufferBase::RegisterConcurrentBackingCapture.
     std::atomic<uint32_t> g_concurrentBackingCaptures{0};
     std::mutex g_deferredBackingResizeClientsMutex;
+    // Held while the clients are called (PublishReadyDeferredBackingResizes). Unregistering takes it too, so a client
+    // destroyed on another thread (a retired graph's buffers, on the runtime's deleter thread) is never called during or
+    // after its destructor, which unregisters first. Registering does not wait for it. Recursive: a client called may drop
+    // another on this thread.
+    std::recursive_mutex g_deferredBackingResizeCallsMutex;
     std::vector<IDeferredBackingResizeClient*> g_deferredBackingResizeClients;
     std::mutex g_asyncResizeSchedulerMutex;
     AsyncBufferBackingResizeScheduler g_asyncResizeScheduler;
@@ -332,6 +337,7 @@ void UnregisterDeferredBackingResizeClient(IDeferredBackingResizeClient* client)
         return;
     }
 
+    std::lock_guard calls(g_deferredBackingResizeCallsMutex);
     std::lock_guard<std::mutex> lock(g_deferredBackingResizeClientsMutex);
     g_deferredBackingResizeClients.erase(
         std::remove(g_deferredBackingResizeClients.begin(), g_deferredBackingResizeClients.end(), client),
@@ -343,6 +349,7 @@ uint32_t PublishReadyDeferredBackingResizes(bool wait) {
         return 0u;
     }
 
+    std::lock_guard calls(g_deferredBackingResizeCallsMutex);
     std::vector<IDeferredBackingResizeClient*> clients;
     {
         std::lock_guard<std::mutex> lock(g_deferredBackingResizeClientsMutex);

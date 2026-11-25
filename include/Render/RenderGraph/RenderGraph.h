@@ -622,6 +622,10 @@ public:
 	void StopFrameProduction();
 	// Requires GPU idle. Releases frame ownership after CPU production stopped.
 	void ShutdownTaskWorkers();
+	// Owner thread, after ShutdownTaskWorkers: gives back the alias placements the graph made and its requirements in the
+	// shared alias arena, as its destruction would. Then the graph may be destroyed on another thread (GraphHost::Desc::
+	// destroyRetiredGraphsDetached): nothing else it holds is placed into, or used, by the graphs still running.
+	void ReleaseAliasPlacements();
 	// The runtime's services for those this graph has none of (never set, or dropped by a rebuild).
 	void UseRuntimeServices();
 	void ClearExtensions();
@@ -705,6 +709,9 @@ public:
 	// The resource registered under rid (RegisterResource), or null. Unlike RequestResourcePtr it asks no provider and is not
 	// a lookup (WasLookedUp), so a host can check a registration before it adds its own. The building thread only.
 	std::shared_ptr<Resource> RegisteredResource(ResourceIdentifier const& rid) const { return _registry.RequestShared(rid); }
+	// The graph's registry: what its passes' registry handles resolve in. A host of several graphs points the shared upload
+	// service at the registry of the graph it prepares (GraphHost::ExecuteFrame).
+	ResourceRegistry& GetResourceRegistry() noexcept { return _registry; }
 	std::shared_ptr<Resource> RequestResourcePtr(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(ResourceIdentifier const& rid, bool allowFailure = false);
 	ResourceRegistry::RegistryHandle RequestResourceHandle(Resource* const& pResource, bool allowFailure = false);
@@ -770,6 +777,10 @@ public:
 	}
 	// The builder of a pass built since the last reset, for settings applied after the fact (placement). Null if none.
 	RenderPassBuilder* FindPassBuilder(std::string const& name);
+	// The passes built since the last reset, in build order: how many, and the names of those from `first` on. A host
+	// that labels the passes a declaration builds (its own epoch tags, say) reads the count before it and the names after.
+	size_t PassBuilderCount() const noexcept { return m_passBuilderOrder.size(); }
+	std::vector<std::string> PassBuilderNamesFrom(size_t first) const;
 
 	/// Create a new queue of the given kind and register it with the render graph.
 	/// Must be called after Setup() and before the first Execute().
@@ -848,6 +859,10 @@ private:
 	// and those resource objects are shared with the graph the epoch still runs (and with any other build of it in flight), whose
 	// next preparation would then find its bindings moved under it.
 	void PrepareFirstPersistentBuild();
+	// The alias placement PrepareFirstPersistentBuild left to the first preparation, run now. Owner thread, once the graph is
+	// attached and before its first preparation. Nothing when the graph has placed already. GraphHost calls it at a synchronous
+	// host's attach, so the graphs attached together place in epoch order before any of them records.
+	void PlaceDeferredAliasesNow();
 	// Before CompileStructural, on a graph built detached: the context its passes' resolvers are captured with and its first
 	// publication binds versions with. Each preparation replaces it with its own (UpdateExecutionContext::resolverCaptureContext).
 	// GraphHost::BuildEpochGraph gives one that names each texture's reshaped version (array-size versions, VersionedResource).

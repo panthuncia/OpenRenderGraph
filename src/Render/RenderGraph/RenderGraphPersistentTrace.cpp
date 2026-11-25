@@ -177,7 +177,26 @@ std::shared_ptr<const ScheduleTrace> RenderGraph::TraceSelectedSchedule(uint32_t
 	const auto selected = state.program.Select();
 	if (!selected || !selected->executable) return {};
 	const auto& executable = *selected->executable;
-	const auto names = ScheduleTraceNamesOf(state, *selected, m_queueRegistry);
+	auto names = ScheduleTraceNamesOf(state, *selected, m_queueRegistry);
+	// Identity and size, so a host can match the resources of its epochs' traces (the same object in several graphs).
+	names.resourceFacts = [this, &state](uint32_t slot) {
+		ScheduleTraceNames::ResourceFacts facts;
+		if (slot >= state.entries.size() || state.entries[slot].retired || !state.entries[slot].resource) return facts;
+		auto* concrete = UnwrapDynamic(state.entries[slot].resource);
+		if (!concrete) return facts;
+		facts.objectId = concrete->GetGlobalResourceID();
+		facts.aliasCandidate = IsPersistentAliasCandidate(concrete);
+		uint64_t bytes = 0;
+		if (concrete->TryGetBufferByteSize(bytes)) {
+			facts.bytes = bytes;
+		} else if (auto* texture = dynamic_cast<PixelBuffer*>(concrete)) {
+			const auto desc = alias::AliasTextureResourceDesc(texture->GetDescription());
+			rhi::ResourceAllocationInfo info{};
+			DeviceManager::GetInstance().GetDevice().GetResourceAllocationInfo(&desc, 1, &info);
+			facts.bytes = info.sizeInBytes;
+		}
+		return facts;
+	};
 	if (epoch == UINT32_MAX) return BuildScheduleTrace(executable, names, "frame", UINT32_MAX);
 	for (const auto& [owner, split] : executable.epochs)
 		if (owner == epoch && split) return BuildScheduleTrace(*split, names, ScheduleTraceEpochLabel(epoch), epoch);

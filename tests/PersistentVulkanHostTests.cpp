@@ -371,6 +371,28 @@ private:
 	org::QueueKind m_queue = org::QueueKind::Graphics;
 };
 
+// Where an extension instance was shut down and destroyed ("retired": GraphHost::Desc::destroyRetiredGraphsDetached).
+struct ExtensionEnds {
+	std::mutex mutex;
+	std::vector<std::thread::id> shutdownOn, destroyedOn;
+};
+
+class EndProbeExtension final : public org::RenderGraph::IRenderGraphExtension {
+public:
+	explicit EndProbeExtension(std::shared_ptr<ExtensionEnds> ends) : m_ends(std::move(ends)) {}
+	~EndProbeExtension() override {
+		std::scoped_lock lock(m_ends->mutex);
+		m_ends->destroyedOn.push_back(std::this_thread::get_id());
+	}
+	void Shutdown(org::RenderGraph&) override {
+		std::scoped_lock lock(m_ends->mutex);
+		m_ends->shutdownOn.push_back(std::this_thread::get_id());
+	}
+	void GatherStructuralPasses(org::RenderGraph&, std::vector<org::RenderGraph::ExternalPassDesc>&) override {}
+private:
+	std::shared_ptr<ExtensionEnds> m_ends;
+};
+
 class HostExtension final : public org::RenderGraph::IRenderGraphExtension {
 public:
 	HostExtension(std::shared_ptr<org::Buffer> input, std::shared_ptr<org::Buffer> scratch,
@@ -463,6 +485,40 @@ private:
 	std::shared_ptr<std::atomic<uint64_t>> m_outputRevision;
 };
 
+// "placement": writes into scratch buffers that the frame placement places, and their copies to host buffers. Every scratch
+// buffer has the same name and size, so only their ordinals tell their keys apart (PlacementUse::key).
+class PlacementExtension final : public org::RenderGraph::IRenderGraphExtension {
+public:
+	struct Pair {
+		std::shared_ptr<org::Buffer> scratch;
+		std::shared_ptr<org::ExternalBufferResource> output;
+	};
+	PlacementExtension(std::shared_ptr<org::Buffer> input, std::vector<Pair> pairs, std::shared_ptr<const ComputeProgram> program,
+		std::shared_ptr<std::atomic<uint64_t>> outputRevision)
+		: m_input(std::move(input)), m_pairs(std::move(pairs)), m_program(std::move(program)), m_outputRevision(std::move(outputRevision)) {}
+	void PrepareForBuild(org::RenderGraph& graph) override {
+		graph.RegisterResource(org::ResourceIdentifier("test.placement.input"), m_input);
+		for (size_t i = 0; i < m_pairs.size(); ++i) {
+			graph.RegisterResource(org::ResourceIdentifier("test.placement.scratch." + std::to_string(i)), m_pairs[i].scratch);
+			graph.RegisterResource(org::ResourceIdentifier("test.placement.output." + std::to_string(i)), m_pairs[i].output);
+		}
+	}
+	void GatherStructuralPasses(org::RenderGraph&, std::vector<org::RenderGraph::ExternalPassDesc>& out) override {
+		for (size_t i = 0; i < m_pairs.size(); ++i) {
+			const auto suffix = std::to_string(i);
+			out.push_back(org::RenderGraph::ExternalPassDesc::Compute("test.placement.write." + suffix,
+				std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_pairs[i].scratch, m_program))));
+			out.push_back(org::RenderGraph::ExternalPassDesc::Copy("test.placement.copy." + suffix,
+				std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_pairs[i].scratch, m_pairs[i].output, m_outputRevision))));
+		}
+	}
+private:
+	std::shared_ptr<org::Buffer> m_input;
+	std::vector<Pair> m_pairs;
+	std::shared_ptr<const ComputeProgram> m_program;
+	std::shared_ptr<std::atomic<uint64_t>> m_outputRevision;
+};
+
 // "built", staged sets: a write into a versioned buffer, in one epoch only. GraphHost::EpochsDeclaring finds that epoch for it.
 class VersionedWriteExtension final : public org::RenderGraph::IRenderGraphExtension {
 public:
@@ -541,6 +597,7 @@ bool Matches(const HostBuffer& buffer, uint32_t value) {
 
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime);
+int TestFramePlacementCompute();
 int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org::Resource>()>& importOutput, const uint32_t* mapped,
 	const char* spirvPath,
 	rhi::PipelineLayoutHandle layout);
@@ -568,9 +625,17 @@ static int Run(int argc, char** argv) {
 	// "arena": two epochs whose transient scratch buffers share the host's alias arena (the second's write on the compute queue
 	// when the family has a second queue), against two of their own.
 	const bool arena = argc > 1 && std::strcmp(argv[1], "arena") == 0;
+	// "placement": frame placement with one epoch (GraphHost::SetFramePlacement): two transients of one name and description
+	// are both placed from it, the first plan places from the first version, a rebuilt graph's new resources take their
+	// predecessors' entries, new versions are taken in place without a rebuild, and heaps grown with headroom are trimmed.
+	const bool placement = argc > 1 && std::strcmp(argv[1], "placement") == 0;
 	// "split": a host of two epochs, each its own graph: the write pass in the first and the copy to the host buffer in the
 	// second (SplitEpochsScenario).
 	const bool split = argc > 1 && std::strcmp(argv[1], "split") == 0;
+	// "retired": a synchronous host that destroys its retired graphs on the runtime's deleter thread
+	// (Desc::destroyRetiredGraphsDetached): a graph replaced by a rebuild is shut down on the owner thread and destroyed on
+	// another, while the new graph keeps running; DestroyGraph still destroys on the owner thread.
+	const bool retired = argc > 1 && std::strcmp(argv[1], "retired") == 0;
 	// "built": application-driven builds (GraphHost::BuildEpochGraph, AttachEpochGraph): a build on a worker thread while both
 	// epochs submit, attached between frames; a failed build; stale builds rejected; staged sets; BuildsOf read on other threads
 	// while the owner stages and attaches; and stale alias placements reported (Desc::reportStaleAliasPlacements) instead of rebuilt.
@@ -646,6 +711,69 @@ static int Run(int argc, char** argv) {
 			runtime.reset();
 			if (line) std::printf("FAIL: rebinding (line %d)\n", line);
 			REQUIRE(line == 0, "rebinding");
+		} else if (retired) {
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
+				.tasks = std::make_shared<org::test::TestTaskService>(2)});
+			{
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0},
+					.destroyRetiredGraphsDetached = true});
+				auto program = CreateProgram(device.Get());
+				REQUIRE(program, "compute program");
+				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
+				org::BufferBase::DescriptorRequirements requirements{};
+				requirements.createUAV = true;
+				requirements.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+				scratch->SetDescriptorRequirements(requirements);
+				scratch->SetName("test.scratch");
+				auto output = ImportHostBuffer(device.Get(), first, "test.host-output.first");
+				REQUIRE(output, "import host buffer");
+				auto input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+				org::BufferBase::DescriptorRequirements inputViews{};
+				inputViews.createSRV = true;
+				inputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+				input->SetDescriptorRequirements(inputViews);
+				input->SetName("test.input");
+				uint32_t value = 0;
+				const auto upload = [&](org::RenderGraph&) {
+					BUFFER_UPLOAD(&value, sizeof(value), org::runtime::UploadTarget::FromShared(input), 0);
+				};
+				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+				auto ends = std::make_shared<ExtensionEnds>();
+				host.AddExtension("test.host", [&] {
+					return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision);
+				});
+				host.AddExtension("test.end-probe", [ends] { return std::make_unique<EndProbeExtension>(ends); });
+				const auto owner = std::this_thread::get_id();
+				const auto ended = [&](size_t count) {
+					std::scoped_lock lock(ends->mutex);
+					return ends->destroyedOn.size() >= count;
+				};
+				for (uint32_t frame = 0; frame < 12; ++frame) {
+					if (frame == 3 || frame == 6) host.RequestRebuild(0);
+					value = 42000u + 10u * frame;
+					host.ExecuteFrame(nullptr, upload, 0);
+					host.SealSubmitted();
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "retired: the new graph runs while the old one is destroyed");
+				}
+				// The deleter thread runs on its own: wait for it a while.
+				for (int wait = 0; wait < 200 && !ended(2); ++wait) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+				{
+					std::scoped_lock lock(ends->mutex);
+					REQUIRE(ends->shutdownOn.size() == 2 && ends->destroyedOn.size() == 2, "retired: both replaced graphs were shut down and destroyed");
+					for (const auto id : ends->shutdownOn) REQUIRE(id == owner, "retired: a replaced graph's extensions are shut down on the owner thread");
+					for (const auto id : ends->destroyedOn) REQUIRE(id != owner, "retired: a replaced graph is destroyed on another thread");
+				}
+				host.DestroyGraph();
+				{
+					std::scoped_lock lock(ends->mutex);
+					REQUIRE(ends->destroyedOn.size() == 3 && ends->destroyedOn.back() == owner, "retired: DestroyGraph destroys on the owner thread");
+				}
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				std::puts("retired: replaced graphs destroyed on the deleter thread");
+			}
+			runtime.reset();
 		} else if (split) {
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
 				.tasks = std::make_shared<org::test::TestTaskService>(2)});
@@ -685,6 +813,63 @@ static int Run(int argc, char** argv) {
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "split epochs, synchronous: the second copies what the first wrote");
 				}
 				REQUIRE(host.GraphCount() == 2 && host.Graph(0) && host.Graph(1) && host.Graph(0) != host.Graph(1), "a graph per epoch");
+				// Staged sets without async epochs (GraphHost::StageEpochGraph, AttachStagedEpochGraphs): both epochs are built and
+				// staged, the attached graphs keep running, a refused set keeps both staged, a dropped graph leaves the set incomplete,
+				// and the set attaches in one step.
+				{
+					uint32_t frame = 0;
+					const auto run = [&](const char* what) -> int {
+						value = 40500u + 10u * frame++;
+						host.ExecuteFrame(nullptr, upload, 0);
+						host.ExecuteFrame(nullptr, {}, 1);
+						host.SealSubmitted();
+						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), what);
+						return 0;
+					};
+					const auto stage = [&](uint32_t epoch, const char* why) -> bool {
+						auto graph = host.BuildEpochGraph(epoch, why);
+						const auto staged = graph && graph->Built() ? host.StageEpochGraph(graph) : org::GraphHost::StageResult{};
+						return staged.staged && !staged.attached && !graph;
+					};
+					auto* graph0 = host.Graph(0);
+					auto* graph1 = host.Graph(1);
+					const auto builds0 = host.BuildGeneration(0), builds1 = host.BuildGeneration(1);
+					const auto before = host.AttachStatsTotal();
+					REQUIRE(stage(0, "test: a synchronous staged set") && stage(1, "test: a synchronous staged set"), "sync: both epochs staged");
+					const auto staged0 = host.StagedGeneration(0), staged1 = host.StagedGeneration(1);
+					REQUIRE(staged0 && staged1, "sync: both have a staged generation");
+					for (int i = 0; i < 2; ++i)
+						if (const int failed = run("sync staged: the attached graphs keep running")) return failed;
+					REQUIRE(host.Graph(0) == graph0 && host.Graph(1) == graph1 && host.BuildGeneration(0) == builds0 && host.BuildGeneration(1) == builds1,
+						"sync: staging attaches nothing");
+					const uint32_t both[] = {0, 1};
+					const uint32_t twice[] = {0, 1, 1};
+					const auto refused = host.AttachStagedEpochGraphs(twice);
+					REQUIRE(!refused.attached && refused.refusal == org::GraphHost::AttachRefusal::Duplicate, "sync: a set naming an epoch twice is refused");
+					REQUIRE(host.StagedGeneration(0) == staged0 && host.StagedGeneration(1) == staged1 && host.Graph(0) == graph0 && host.Graph(1) == graph1,
+						"sync: a refused set keeps both staged and attaches nothing");
+					// A staged graph dropped: the set is incomplete and refused as a whole; epoch 0 keeps its staged graph.
+					const uint32_t one[] = {1};
+					REQUIRE(host.DropStagedEpochGraphs(one) == 1 && host.StagedGeneration(1) == 0 && host.StagedGeneration(0) == staged0,
+						"sync: one staged graph dropped");
+					REQUIRE(host.AttachStagedEpochGraphs(both).refusal == org::GraphHost::AttachRefusal::NotStaged && host.Graph(0) == graph0,
+						"sync: a set missing an epoch's graph attaches nothing");
+					if (const int failed = run("sync staged: frames after a refusal")) return failed;
+					// Staged again: a second staging of epoch 0 replaces its first.
+					REQUIRE(stage(0, "test: staged again") && stage(1, "test: staged again"), "sync: both staged again");
+					REQUIRE(host.StagedGeneration(0) > staged0, "sync: the second staging replaced the first");
+					const auto next0 = host.StagedGeneration(0), next1 = host.StagedGeneration(1);
+					REQUIRE(host.AttachStagedEpochGraphs(both).attached, "sync: the set attaches");
+					REQUIRE(host.Graph(0) != graph0 && host.Graph(1) != graph1 && host.BuildGeneration(0) == next0 && host.BuildGeneration(1) == next1,
+						"sync: both epochs run their staged builds");
+					REQUIRE(host.StagedGeneration(0) == 0 && host.StagedGeneration(1) == 0, "sync: nothing is left staged");
+					for (int i = 0; i < 4; ++i)
+						if (const int failed = run("sync staged: the attached set runs")) return failed;
+					const auto after = host.AttachStatsTotal();
+					REQUIRE(after.setsAttached == before.setsAttached + 1 && after.staged == before.staged + 4, "sync: one set attached of four stagings");
+					std::puts("split: a synchronous staged set attached together");
+					(void)host.TakeAsyncStats();
+				}
 				// Async epochs, then one epoch built again: the other keeps its graph and its build.
 				host.SetAsyncEpochs({0, 1});
 				for (uint32_t frame = 0; frame < 8; ++frame) {
@@ -1085,6 +1270,138 @@ static int Run(int argc, char** argv) {
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				host.SetAsyncEpochs({});
 				host.DestroyGraph();
+			}
+			runtime.reset();
+		} else if (placement) {
+			REQUIRE(TestFramePlacementCompute() == 0, "frame placement without a device");
+			// Aggressive auto aliasing: the scratch buffers are candidates whatever their score.
+			auto aliasing = org::runtime::GetOpenRenderGraphSettings();
+			aliasing.autoAliasMode = 3;
+			org::runtime::SetOpenRenderGraphSettings(aliasing);
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
+				.tasks = std::make_shared<org::test::TestTaskService>(2)});
+			{
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0},
+					.reportStaleAliasPlacements = true});
+				host.SetFramePositions({{0, 0, false}});
+				org::GraphHost::FramePlacementSettings settings;
+				settings.enabled = true;
+				settings.settleMilliseconds = 20;
+				settings.heapTrimMilliseconds = 100;
+				host.SetFramePlacement(settings);
+				auto program = CreateProgram(device.Get());
+				REQUIRE(program, "compute program");
+				auto input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+				org::BufferBase::DescriptorRequirements inputViews{};
+				inputViews.createSRV = true;
+				inputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+				input->SetDescriptorRequirements(inputViews);
+				input->SetName("test.placement.input");
+				const std::array<std::shared_ptr<org::ExternalBufferResource>, 2> outputs{
+					ImportHostBuffer(device.Get(), first, "test.placement.output.0"), ImportHostBuffer(device.Get(), second, "test.placement.output.1")};
+				REQUIRE(outputs[0] && outputs[1], "import host buffers");
+				std::vector<PlacementExtension::Pair> pairs;
+				// Two scratch buffers of one name and size: new objects at each call.
+				const auto makePairs = [&](uint64_t bytes) {
+					pairs.clear();
+					for (const auto& output : outputs) {
+						auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, bytes, true);
+						org::BufferBase::DescriptorRequirements requirements{};
+						requirements.createUAV = true;
+						requirements.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+							.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+						scratch->SetDescriptorRequirements(requirements);
+						scratch->SetName("test.placement.scratch");
+						scratch->SetAllowAlias(true);
+						pairs.push_back({std::move(scratch), output});
+					}
+				};
+				constexpr uint64_t kMB = 1024ull * 1024ull;
+				makePairs(8 * kMB);
+				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+				host.AddExtension("test.placement", [&] { return std::make_unique<PlacementExtension>(input, pairs, program, outputRevision); });
+				uint32_t value = 0, frame = 0;
+				const auto upload = [&](org::RenderGraph&) {
+					BUFFER_UPLOAD(&value, sizeof(value), org::runtime::UploadTarget::FromShared(input), 0);
+				};
+				const auto run = [&]() -> int {
+					value = 50000u + 10u * frame++;
+					host.ExecuteFrame(nullptr, upload, 0);
+					host.SealSubmitted();
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value) && Matches(second, value),
+						"placement: each copy reads what its write wrote");
+					return 0;
+				};
+				const auto use = [&] { return host.FramePlacementInUse(0); };
+				// The current heap for buffers, and its capacity.
+				const auto bufferHeap = [&]() -> uint64_t {
+					for (const auto& heap : host.FramePlacementHeaps())
+						if (heap.current && heap.memoryClass == 1) return heap.capacity;
+					return 0;
+				};
+
+				// 1. The first plan places both from the first version, published at once, and its heap is the need.
+				if (const int failed = run()) return failed;
+				const auto firstVersion = host.LatestFramePlacement();
+				REQUIRE(firstVersion && use().version == firstVersion->Id(), "placement: the first plan places from the first version");
+				REQUIRE(use().placed == 2, "placement: both scratch buffers of one name and description are placed from it");
+				size_t placedEntries = 0;
+				for (const auto& entry : firstVersion->Entries()) placedEntries += entry.placed && entry.name == "test.placement.scratch";
+				REQUIRE(placedEntries == 2, "placement: the version has an entry for each");
+				REQUIRE(bufferHeap() == firstVersion->BytesOfClass(1), "placement: a first heap is the need");
+
+				// 2. A rebuild with new resources of the same names and sizes: their keys find their predecessors' entries.
+				const auto builds = host.BuildGeneration(0);
+				makePairs(8 * kMB);
+				host.RequestRebuild(0);
+				if (const int failed = run()) return failed;
+				REQUIRE(host.BuildGeneration(0) == builds + 1, "placement: rebuilt");
+				REQUIRE(use().version == firstVersion->Id() && use().placed == 2, "placement: a rebuilt graph's new resources take their entries");
+
+				// 2b. Smaller resources: new keys the version does not know, but they fit in the free bytes of its block, so the graph
+				// places them there instead of in pools of its own.
+				makePairs(4 * kMB);
+				host.RequestRebuild(0);
+				if (const int failed = run()) return failed;
+				REQUIRE(use().version == firstVersion->Id() && use().placed == 2, "placement: new resources that fit go in the version's block");
+				REQUIRE(bufferHeap() == firstVersion->BytesOfClass(1), "placement: the heap is unchanged");
+
+				// 3. Larger resources that do not fit: new keys the version does not know. The plan's summary reports them uncovered,
+				// so the host computes the next version at once and the plan places them from it. The heap grows to the need (more
+				// than headroom times its old size).
+				makePairs(24 * kMB);
+				host.RequestRebuild(0);
+				if (const int failed = run()) return failed;
+				const auto grown = host.LatestFramePlacement();
+				REQUIRE(grown && grown->Id() != firstVersion->Id() && use().version == grown->Id() && use().placed == 2,
+					"placement: resources that do not fit are placed from a version made for them at once");
+				REQUIRE(bufferHeap() == grown->BytesOfClass(1), "placement: a heap that grows past its headroom takes the need");
+
+				// 4. A little larger again: the heap grows with headroom (the larger of the need and 1.25 times its size), and once
+				// quiet the layout is published again on a heap of its need. Both are taken in place.
+				makePairs(25 * kMB);
+				host.RequestRebuild(0);
+				if (const int failed = run()) return failed;
+				const auto rebuilt = host.BuildGeneration(0);
+				bool headroom = false, trimmed = false;
+				for (int wait = 0; wait < 400 && !trimmed; ++wait) {
+					if (const int failed = run()) return failed;
+					const auto latest = host.LatestFramePlacement();
+					const auto heap = bufferHeap();
+					if (latest && heap > latest->BytesOfClass(1) + org::FramePlacementMemory::TrimSlack(latest->BytesOfClass(1))) headroom = true;
+					trimmed = latest && latest->ExactHeaps() && use().version == latest->Id() && use().placed == 2 && heap == latest->BytesOfClass(1);
+					std::this_thread::sleep_for(std::chrono::milliseconds(5));
+				}
+				std::printf("placement: first version %llu, now %llu, buffer heap %llu bytes\n", static_cast<unsigned long long>(firstVersion->Id()),
+					static_cast<unsigned long long>(use().version), static_cast<unsigned long long>(bufferHeap()));
+				REQUIRE(headroom, "placement: a heap that grows takes headroom");
+				REQUIRE(trimmed, "placement: once quiet, the heap is trimmed to the need and the graph places from that version");
+				REQUIRE(host.BuildGeneration(0) == rebuilt, "placement: new versions are taken in place, without a rebuild");
+				REQUIRE(host.StaleAliasPlacementEpochs().empty(), "placement: an older frame placement is not reported stale");
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.DestroyGraph();
+				std::puts("placement: one name, two resources, the first version at once, rebuilds, in-place versions and a trim");
 			}
 			runtime.reset();
 		} else if (arena) {

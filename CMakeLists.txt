@@ -516,7 +516,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
                 SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/PersistentHostWrite.hlsl"
                 ENTRY main PROFILE cs_6_6)
             add_executable(OpenRenderGraphPersistentVulkanHostTests tests/PersistentVulkanHostTests.cpp tests/FrameRetirementTests.cpp tests/BindingOwnershipTests.cpp
-                tests/ContributorHostTests.cpp tests/RebindingGpuTests.cpp "${_org_persistent_write_spv}")
+                tests/ContributorHostTests.cpp tests/RebindingGpuTests.cpp tests/FramePlacementTests.cpp "${_org_persistent_write_spv}")
             target_compile_features(OpenRenderGraphPersistentVulkanHostTests PRIVATE cxx_std_23)
             target_include_directories(OpenRenderGraphPersistentVulkanHostTests PRIVATE src/include)
             target_compile_definitions(OpenRenderGraphPersistentVulkanHostTests PRIVATE NOMINMAX
@@ -563,6 +563,7 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Built COMMAND OpenRenderGraphPersistentVulkanHostTests built)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.BuiltOpen COMMAND OpenRenderGraphPersistentVulkanHostTests built open)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Arena COMMAND OpenRenderGraphPersistentVulkanHostTests arena)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Placement COMMAND OpenRenderGraphPersistentVulkanHostTests placement)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Leases COMMAND OpenRenderGraphPersistentVulkanHostTests leases)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.LeasesOpen COMMAND OpenRenderGraphPersistentVulkanHostTests leases open)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.LeasesWide COMMAND OpenRenderGraphPersistentVulkanHostTests leases-wide)

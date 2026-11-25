@@ -7,6 +7,7 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -28,6 +29,15 @@ class PersistentAliasArena;
  * which runs at their first preparation after a build. A version is never changed once published: a new layout is a new
  * version, with blocks of its own.
  *
+ * The first summary with candidates computes the first version at once, on the publishing thread, from the summaries so far,
+ * so the plan that published it places from it (a graph publishes its summary before its first plan takes a version). The
+ * later epochs' first plans fit their candidates into its free bytes and report what it leaves uncovered, which computes the
+ * next version at once. The worker thread computes no version until every frame epoch (SetFrameEpochs) has a summary, so no
+ * version is made from no summary at all.
+ *
+ * Once the versions have been quiet for Settings::trimAfter, a version whose heaps are larger than its need (growth headroom,
+ * a class it no longer uses) is published again with exact heaps: the same layout under a new id, which graphs take in place.
+ *
  * Any thread.
  */
 class FramePlacement {
@@ -42,6 +52,8 @@ public:
 		FramePlacementMemory::Sizing sizing;
 		// The period of the memory breakdown (LogMemory) while logLifetimes is set. Zero: never.
 		std::chrono::seconds memoryLogPeriod{10};
+		// How long the summaries and versions stay quiet before heaps larger than their need are trimmed. Zero: never.
+		std::chrono::milliseconds trimAfter{2000};
 	};
 
 	explicit FramePlacement(std::vector<uint32_t> epochOrder);
@@ -53,6 +65,11 @@ public:
 	Settings GetSettings() const;
 	/** @brief The frame alias arena, for its bytes in the diagnostic. */
 	void SetFrameArena(std::weak_ptr<FrameAliasArena> arena);
+	/**
+	 * @brief The epochs the first version waits for: none is computed until each has a summary. Empty: the epoch order. While an
+	 * epoch's graph is not built, no version is computed, so graphs place on their own.
+	 */
+	void SetFrameEpochs(std::vector<uint32_t> epochs);
 	/** @brief An epoch graph's latest summary. Starts the worker on the first call. */
 	void Publish(PlacementSummary summary);
 	/** @brief The version graphs place from: null while disabled or before the first one. */
@@ -61,6 +78,8 @@ public:
 	uint64_t CurrentId() const noexcept { return m_currentId.load(std::memory_order_acquire); }
 	/** @brief Settings::enabled. Lock-free, for each graph preparation. True before the first version too. */
 	bool Enabled() const noexcept { return m_enabled.load(std::memory_order_acquire); }
+	/** @brief The block memory's heaps (FramePlacementMemory::Heaps). */
+	std::vector<FramePlacementMemory::HeapInfo> Heaps() const { return m_memory->Heaps(); }
 	/** @brief The last layout computed, enabled or not. Null before the first one. */
 	std::shared_ptr<const FramePlacementVersion> Latest() const;
 	/** @brief The latest summary of each epoch, in ascending epoch order. */
@@ -81,6 +100,12 @@ public:
 
 private:
 	void Run();
+	// Under m_mutex: whether every frame epoch has a summary.
+	bool SummariesCompleteLocked() const;
+	// Under m_mutex: the inputs of a computation from the latest summaries, which summaries receives.
+	FramePlacementInputs InputsLocked(std::vector<std::shared_ptr<const PlacementSummary>>& summaries) const;
+	// Under m_mutex: when the current version's heaps are due for a trim check, if they are.
+	std::optional<std::chrono::steady_clock::time_point> TrimDueLocked() const;
 	void LogVersion(const FramePlacementVersion& version, const std::vector<std::shared_ptr<const PlacementSummary>>& summaries,
 		bool detailed) const;
 
@@ -93,6 +118,9 @@ private:
 	uint64_t m_changes = 0;    // summary or setting changes so far
 	uint64_t m_computed = 0;   // the changes the last computation saw
 	std::chrono::steady_clock::time_point m_lastChange{};
+	std::chrono::steady_clock::time_point m_lastPublish{};  // when the current version was published
+	std::vector<uint32_t> m_frameEpochs;                    // SetFrameEpochs
+	uint64_t m_trimChecked = 0;                             // the version the last trim check ran for
 	uint64_t m_nextId = 1;
 	std::shared_ptr<const FramePlacementVersion> m_latest, m_current;
 	// Block memory every version shares (FramePlacementMemory).

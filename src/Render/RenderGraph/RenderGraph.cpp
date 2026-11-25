@@ -1389,6 +1389,18 @@ RenderPassBuilder* RenderGraph::FindPassBuilder(std::string const& name) {
 	return static_cast<RenderPassBuilder*>(it->second.get());
 }
 
+std::vector<std::string> RenderGraph::PassBuilderNamesFrom(size_t first) const {
+	std::vector<std::string> names;
+	for (size_t index = first; index < m_passBuilderOrder.size(); ++index) {
+		for (const auto& [name, builder] : m_passBuildersByName) {
+			if (builder.get() != m_passBuilderOrder[index]) continue;
+			names.push_back(name);
+			break;
+		}
+	}
+	return names;
+}
+
 RenderPassBuilder& RenderGraph::GetOrCreateRenderPassBuilder(std::string const& name) {
 	if (auto it = m_passBuildersByName.find(name); it != m_passBuildersByName.end()) {
 		if (m_passNamesSeenThisReset.contains(name)) {

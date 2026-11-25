@@ -63,10 +63,40 @@ void FramePlacement::SetFrameArena(std::weak_ptr<FrameAliasArena> arena) {
 	m_frameArena = std::move(arena);
 }
 
-void FramePlacement::Publish(PlacementSummary summary) {
-	auto published = std::make_shared<const PlacementSummary>(std::move(summary));
+void FramePlacement::SetFrameEpochs(std::vector<uint32_t> epochs) {
 	{
 		std::lock_guard lock(m_mutex);
+		m_frameEpochs = std::move(epochs);
+		++m_changes;
+		m_lastChange = std::chrono::steady_clock::now();
+	}
+	m_wake.notify_all();
+}
+
+bool FramePlacement::SummariesCompleteLocked() const {
+	const auto& epochs = m_frameEpochs.empty() ? m_epochOrder : m_frameEpochs;
+	return std::ranges::all_of(epochs, [&](uint32_t epoch) { return m_summaries.contains(epoch); });
+}
+
+FramePlacementInputs FramePlacement::InputsLocked(std::vector<std::shared_ptr<const PlacementSummary>>& summaries) const {
+	FramePlacementInputs inputs;
+	inputs.epochOrder = m_epochOrder;
+	inputs.repeatedEpochs = m_settings.repeatedEpochs;
+	inputs.beamSearch = m_settings.beamSearch;
+	summaries.clear();
+	for (const auto& [epoch, summary] : m_summaries) summaries.push_back(summary);
+	inputs.summaries = summaries;
+	return inputs;
+}
+
+void FramePlacement::Publish(PlacementSummary summary) {
+	auto published = std::make_shared<const PlacementSummary>(std::move(summary));
+	std::shared_ptr<const FramePlacementVersion> first;
+	bool firstEver = false;
+	std::vector<std::shared_ptr<const PlacementSummary>> summaries;
+	bool detailed = false;
+	{
+		std::unique_lock lock(m_mutex);
 		auto& kept = m_summaries[published->epoch];
 		const bool changed = !kept || kept->hash != published->hash;
 		// The same uses give the same placement. The new summary is kept for its pooled bytes alone.
@@ -75,8 +105,49 @@ void FramePlacement::Publish(PlacementSummary summary) {
 		++m_changes;
 		m_lastChange = std::chrono::steady_clock::now();
 		if (!m_thread.joinable() && !m_stopping) m_thread = std::thread([this] { Run(); });
+		// The first summary with candidates makes the first version now, from the summaries so far, so the plan that published
+		// it places from it instead of on its own path. With several frame epochs the later epochs' first plans then fit their
+		// candidates into the version's free bytes, and report what it leaves uncovered (a resource the earlier epoch shares
+		// with them: its span in the version ends in the earlier epoch). One with candidates the current version left uncovered
+		// (PlacementSummary::uncovered) makes the next version now, and its plan places from it at once. (Waiting for every
+		// epoch's summary instead put the first epochs' transients in pools beside the version's heaps for 120 frames.)
+		const bool uncovered = m_current && kept->uncovered != 0;
+		const bool firstVersion = !m_current && !kept->uses.empty();
+		if (m_settings.enabled && (firstVersion || uncovered)) {
+			const auto replacing = m_current;
+			const auto inputs = InputsLocked(summaries);
+			const auto changes = m_changes;
+			const auto id = m_nextId++;
+			detailed = m_settings.logLifetimes;
+			lock.unlock();
+			std::shared_ptr<FramePlacementVersion> computed;
+			try {
+				computed = FramePlacementVersion::Compute(inputs, id);
+				if (computed) computed->SetMemory(m_memory);
+			} catch (const std::exception& error) {
+				spdlog::error("Frame placement: the computation failed: {}", error.what());
+			}
+			lock.lock();
+			// Another thread may have published one meanwhile: that one stands.
+			if (computed && m_settings.enabled && m_current == replacing) {
+				if (m_computed < changes) m_computed = changes;
+				m_latest = computed;
+				m_current = computed;
+				m_currentId.store(computed->Id(), std::memory_order_release);
+				m_lastPublish = std::chrono::steady_clock::now();
+				firstEver = !replacing;
+				first = computed;
+			}
+		}
 	}
 	m_wake.notify_all();
+	if (first) {
+		std::string epochs;
+		for (const auto& summary : summaries) epochs += (epochs.empty() ? "" : ",") + std::to_string(summary->epoch);
+		spdlog::info("Frame placement {}: published at once, {} (summaries of epochs {})", first->Id(),
+			firstEver ? "the first" : "for a graph's uncovered candidates", epochs);
+		LogVersion(*first, summaries, detailed);
+	}
 }
 
 std::shared_ptr<const FramePlacementVersion> FramePlacement::Current() const {
@@ -207,11 +278,62 @@ void FramePlacement::LogMemory(PersistentAliasArena* pools, const std::string& g
 	if (!poolList.empty()) spdlog::info("Frame placement memory: shared arena pools: {}", poolList);
 }
 
+std::optional<std::chrono::steady_clock::time_point> FramePlacement::TrimDueLocked() const {
+	if (!m_settings.enabled || !m_current || m_settings.trimAfter.count() <= 0 || m_trimChecked == m_current->Id()) return std::nullopt;
+	return (std::max)(m_lastChange, m_lastPublish) + m_settings.trimAfter;
+}
+
 void FramePlacement::Run() {
 	std::unique_lock lock(m_mutex);
 	while (!m_stopping) {
 		if (m_changes == m_computed) {
-			m_wake.wait(lock);
+			// Quiet. Once the current version has been quiet for the trim time, heaps larger than its need (growth headroom, a
+			// class it no longer uses) are trimmed.
+			const auto trimDue = TrimDueLocked();
+			if (!trimDue) {
+				m_wake.wait(lock);
+				continue;
+			}
+			if (std::chrono::steady_clock::now() < *trimDue) {
+				m_wake.wait_until(lock, *trimDue);
+				continue;
+			}
+			const auto current = m_current;
+			m_trimChecked = current->Id();
+			// The latest layout (the current one, or a newer one the current version served in place of) on exact heaps, when
+			// that trims a heap or is a newer layout.
+			const auto latest = m_latest ? m_latest : current;
+			const auto needs = latest->BlockNeeds();
+			if (!m_memory->WouldTrim(needs) && latest->LayoutHash() == current->LayoutHash()) continue;
+			// The same layout under a new id, its blocks on exact heaps. Graphs take it in place at their next preparation, as
+			// any new version. The heaps no block uses go now: their placements keep them alive until they move.
+			std::vector<std::shared_ptr<const PlacementSummary>> summaries;
+			const auto inputs = InputsLocked(summaries);
+			const auto id = m_nextId++;
+			lock.unlock();
+			std::shared_ptr<FramePlacementVersion> trimmed;
+			try {
+				trimmed = FramePlacementVersion::Compute(inputs, id);
+			} catch (const std::exception& error) {
+				spdlog::error("Frame placement: the trim's computation failed: {}", error.what());
+			}
+			lock.lock();
+			// Only while nothing changed meanwhile; otherwise a new computation is due. The trim takes the latest layout, which the
+			// current version may have served in its place (Run's serves).
+			if (!trimmed || m_changes != m_computed || m_current != current) continue;
+			trimmed->SetMemory(m_memory);
+			trimmed->SetExactHeaps(true);
+			m_memory->ReleaseUnused(needs);
+			m_latest = trimmed;
+			m_current = trimmed;
+			m_currentId.store(trimmed->Id(), std::memory_order_release);
+			m_lastPublish = std::chrono::steady_clock::now();
+			m_trimChecked = trimmed->Id();
+			lock.unlock();
+			spdlog::info("Frame placement {}: published once quiet, on heaps of its need ({:.2f} MB; the current version was {}); graphs "
+						 "place from it at their next preparation",
+				trimmed->Id(), MB(trimmed->Bytes()), current->Id());
+			lock.lock();
 			continue;
 		}
 		// Wait until the summaries have been quiet for the settle time, so a burst of builds gives one computation.
@@ -220,13 +342,14 @@ void FramePlacement::Run() {
 			m_wake.wait_until(lock, due);
 			continue;
 		}
-		FramePlacementInputs inputs;
-		inputs.epochOrder = m_epochOrder;
-		inputs.repeatedEpochs = m_settings.repeatedEpochs;
-		inputs.beamSearch = m_settings.beamSearch;
+		// Without a plan's summary that made one at once, the first version waits for a summary of every frame epoch
+		// (SetFrameEpochs), so no version comes from no summary at all.
+		if (!m_current && !SummariesCompleteLocked()) {
+			m_computed = m_changes;
+			continue;
+		}
 		std::vector<std::shared_ptr<const PlacementSummary>> summaries;
-		for (const auto& [epoch, summary] : m_summaries) summaries.push_back(summary);
-		inputs.summaries = summaries;
+		const auto inputs = InputsLocked(summaries);
 		const auto changes = m_changes;
 		const bool detailed = m_settings.logLifetimes;
 		const auto id = m_nextId++;
@@ -245,10 +368,17 @@ void FramePlacement::Run() {
 		// An unchanged layout keeps the version already published, so graphs see no change.
 		const bool newLayout = !m_latest || m_latest->LayoutHash() != version->LayoutHash();
 		if (newLayout) m_latest = version;
+		// Each new version makes every graph place again (a structural edit at its next preparation). While the current one still
+		// places every candidate of every graph (each rebuilt graph found its entries or fitted its new transients into free
+		// bytes), a new layout is taken only when it needs clearly less memory. The trim publishes the settled layout later.
+		const bool uncovered = std::ranges::any_of(summaries, [](const auto& summary) { return summary->uncovered != 0; });
+		const bool smaller = m_current && m_latest->Bytes() + FramePlacementMemory::TrimSlack(m_current->Bytes()) < m_current->Bytes();
+		const bool serves = m_current && m_current->Slots().size() == m_latest->Slots().size() && !uncovered && !smaller;
 		bool published = false;
-		if (m_settings.enabled && (!m_current || m_current->LayoutHash() != m_latest->LayoutHash())) {
+		if (m_settings.enabled && (!m_current || m_current->LayoutHash() != m_latest->LayoutHash()) && !serves) {
 			m_current = m_latest;
 			m_currentId.store(m_current->Id(), std::memory_order_release);
+			m_lastPublish = std::chrono::steady_clock::now();
 			published = true;
 		}
 		if (!newLayout && !published) continue;

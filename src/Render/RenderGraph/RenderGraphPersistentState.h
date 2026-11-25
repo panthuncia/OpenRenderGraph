@@ -458,13 +458,22 @@ struct RenderGraph::PersistentInstanceState {
 	PersistentInstanceState() = default;
 	PersistentInstanceState(const PersistentInstanceState&) = delete;
 	PersistentInstanceState& operator=(const PersistentInstanceState&) = delete;
-	~PersistentInstanceState() {
+	~PersistentInstanceState() { ReleaseAliasPlacements(); }
+	// Gives back what this state holds in what other graphs place into: the placements it made (ReleaseOwnAliasPlacements),
+	// its frame regions, and its requirements in the arena's pools. Its end does it otherwise; a graph destroyed on another
+	// thread does it first on the owner thread (RenderGraph::ReleaseAliasPlacements), since a resource it gives back may be
+	// placed again by another graph at once. Once.
+	void ReleaseAliasPlacements() noexcept {
+		if (aliasPlacementsReleased) return;
+		aliasPlacementsReleased = true;
 		ReleaseOwnAliasPlacements(aliasPlacementOwners, this);
+		frameRegions.clear();
 		if (!aliasArena) return;
 		std::lock_guard lock(aliasArena->mutex);
 		for (auto& [id, pool] : aliasArena->pools) pool.required.erase(this);
 		aliasArena->stale.erase(this);
 	}
+	bool aliasPlacementsReleased = false;
 	struct AliasPlacementRecord {
 		uint64_t poolID = 0, offset = 0, sizeBytes = 0;
 		const AliasHeapGeneration* heap = nullptr;
@@ -478,6 +487,10 @@ struct RenderGraph::PersistentInstanceState {
 	// epochs use, or a resource that keeps its contents across runs. Bindings of these enter without a discard.
 	std::unordered_set<Resource*> aliasContinues;
 	std::unordered_map<Resource*, AliasPlacementOwner> aliasPlacementOwners; // The same, for this state's end (ReleaseOwnAliasPlacements).
+	// Resources several epochs use that the latest plan bound where another epoch's graph placed them (keepBacking), with their
+	// backing generation then. When that graph re-places one (its own re-placement for a newer frame placement), this graph's
+	// executable no longer admits the backing: the next preparation re-places this graph too (BindPersistentFrame).
+	std::unordered_map<Resource*, AliasPlacementOwner> adoptedBackings;
 	// With a frame alias arena (RenderGraph::SetFrameAliasRegion): the range reserved for each pool's transients, by pool id. Each
 	// plan reserves its ranges again and gives back the previous ones. The state's end gives back the last ones.
 	std::unordered_map<uint64_t, std::shared_ptr<FrameAliasArena::Reservation>> frameRegions;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <map>
 #include <cstdint>
@@ -19,9 +20,13 @@ namespace org {
  * A host uses these to place transients across the whole frame (FramePlacementVersion).
  */
 struct PlacementUse {
-	// Stable across builds: a hash of the resource's name and its memory description (size, alignment, memory class,
-	// backends). Two graphs that use one resource give it the same key.
+	// Stable across builds of the epoch's graph: a hash of the resource's name, its memory description (size, alignment,
+	// memory class, backends) and its ordinal among the graph's candidates with the same name and description, in first-use
+	// order. A new build makes new resources, so their identities change, but their keys do not. Unique in the summary.
 	uint64_t key = 0;
+	// The resource's identity (Resource::GetGlobalResourceID plus one; 0 for none). Graphs of several epochs that use one
+	// resource give the same identity, so it is matched across epochs by identity, never by name.
+	uint64_t objectId = 0;
 	std::string name;
 	// Pass ranks within the epoch's schedule, inclusive.
 	uint32_t firstRank = 0, lastRank = 0;
@@ -74,14 +79,17 @@ struct PlacementSummary {
 	// Passes in the epoch's schedule. Ranks run from 0 to rankCount - 1.
 	uint32_t rankCount = 0;
 	PlacementMemory memory = PlacementMemory::PrivatePools;
-	// One per candidate, sorted by key. Each key appears once.
+	// One per candidate, sorted by key. Each key appears once (Finish merges repeated keys and makes them ineligible).
 	std::vector<PlacementUse> uses;
 	// What this graph's own pools needed in its plan, by memory class (index 1 to 3), and in total.
 	std::array<uint64_t, 4> pooledBytesByClass{};
 	uint64_t pooledBytes = 0;
 	// The bytes this graph placed from a frame placement (FramePlacementVersion) in its plan.
 	uint64_t framePlacedBytes = 0;
-	// A hash of the epoch, the ranks and the uses. Two summaries with the same hash lead to the same frame placement.
+	// Candidates the graph would pool that the version it placed from did not place: on its own path, or held back. While no
+	// summary has any, the version still serves every graph, and the host publishes a new one only when it is smaller.
+	uint32_t uncovered = 0;
+	// A hash of the epoch, the ranks, the uses and uncovered. Two summaries with the same hash lead to the same frame placement.
 	uint64_t hash = 0;
 
 	/** @brief Sorts the uses, merges repeated keys and sets hash. Call it once the summary is filled in. */
@@ -122,13 +130,18 @@ struct FramePlacementInputs {
  * any placed resource. A heap too small, or too big (more than shrinkFactor times what it needs with headroom), is replaced.
  * The replaced memory stays alive through the placements made in it. Heaps lists the replaced ones that are still alive.
  *
+ * A heap is made at its need. Only a heap that grows gets headroom (the larger of its need and headroom times its old size), so a burst of versions that grow a little reuses it. Once
+ * the versions settle, the host trims the heaps to the need (FramePlacement::Settings::trimAfter): a version whose blocks take
+ * exact heaps (Acquire's exact).
+ *
  * Any thread.
  */
 class FramePlacementMemory {
 public:
 	/** @brief How heaps are sized. */
 	struct Sizing {
-		// A new heap is this much larger than its first need, so small growth between versions reuses it.
+		// A heap that grows takes the larger of its need and this many times its old capacity (as the planner's pools), so
+		// small growth between versions reuses it. A heap's first size is its need.
 		double headroom = 1.25;
 		// A heap more than this many times its need with headroom is replaced by a smaller one.
 		double shrinkFactor = 2.0;
@@ -152,9 +165,21 @@ public:
 	~FramePlacementMemory();
 	FramePlacementMemory(const FramePlacementMemory&) = delete;
 	FramePlacementMemory& operator=(const FramePlacementMemory&) = delete;
-	/** @brief A heap of at least capacity bytes. poolID and versionID are for memory statistics and the log. Throws on failure. */
+	/**
+	 * @brief A heap of at least capacity bytes. poolID and versionID are for memory statistics and the log. exact: a heap larger
+	 * than capacity (beyond TrimSlack) is replaced by one of capacity, and a new heap gets no headroom. Throws on failure.
+	 */
 	std::shared_ptr<const AliasHeapGeneration> Acquire(uint8_t memoryClass, uint64_t backendMask, uint64_t capacity, uint64_t alignment,
-		uint64_t poolID, uint64_t versionID);
+		uint64_t poolID, uint64_t versionID, bool exact = false);
+	/**
+	 * @brief Whether a version with these blocks would trim a heap: a current heap is larger than its blocks' need by more than
+	 * TrimSlack, or no block of the version uses its class and backends.
+	 */
+	bool WouldTrim(const std::vector<std::pair<std::pair<uint8_t, uint64_t>, uint64_t>>& needs) const;
+	/** @brief Drops the current heaps of the classes and backends no block in needs uses. Their placements keep them alive. */
+	void ReleaseUnused(const std::vector<std::pair<std::pair<uint8_t, uint64_t>, uint64_t>>& needs);
+	// What a heap may exceed its need by before a trim replaces it: the larger of 4 MB and 1/64 of the need.
+	static uint64_t TrimSlack(uint64_t need) noexcept { return (std::max)(uint64_t{4} << 20, need / 64); }
 	/** @brief The current heaps' capacities, in bytes. Replaced heaps still alive are not counted (Heaps lists them). */
 	uint64_t Bytes() const;
 	/** @brief The current heaps, then the replaced heaps that are still alive. Drops the records of replaced heaps that are gone. */
@@ -203,10 +228,15 @@ public:
 		uint32_t epoch = 0;
 		uint32_t firstRank = 0, lastRank = 0;
 		bool firstUseWrites = false;
+		uint64_t key = 0;  // its key in that epoch's summary
 	};
-	/** @brief One resource key and where it goes. */
+	/**
+	 * @brief One resource and where it goes. Uses of several epochs are one entry when they name the same resource (its
+	 * identity), never by name: two epochs' resources with the same key but different identities are two entries.
+	 */
 	struct Entry {
-		uint64_t key = 0;
+		uint64_t key = 0;  // its key in its first epoch's summary
+		uint64_t objectId = 0;  // PlacementUse::objectId when the summaries were taken
 		std::string name;
 		uint64_t size = 0, alignment = 1;
 		uint8_t memoryClass = 0;
@@ -237,8 +267,15 @@ public:
 	const std::vector<Slot>& Slots() const noexcept { return m_slots; }
 	const std::vector<Block>& Blocks() const noexcept { return m_blocks; }
 	const std::vector<Entry>& Entries() const noexcept { return m_entries; }
-	/** @brief The entry for a key, or null. */
-	const Entry* Find(uint64_t key) const noexcept;
+	/** @brief The entry for an epoch's key (PlacementUse::key), or null. */
+	const Entry* Find(uint64_t key, uint32_t epoch) const noexcept;
+	/** @brief The entry for a resource identity (PlacementUse::objectId), or null. */
+	const Entry* FindObject(uint64_t objectId) const noexcept;
+	/** @brief Its blocks take heaps of exactly their need (FramePlacementMemory::Acquire's exact): a trim of the heaps. */
+	bool ExactHeaps() const noexcept { return m_exactHeaps; }
+	void SetExactHeaps(bool exact) noexcept { m_exactHeaps = exact; }
+	/** @brief Each block's class and backends with its capacity, summed per class and backends (FramePlacementMemory::WouldTrim). */
+	std::vector<std::pair<std::pair<uint8_t, uint64_t>, uint64_t>> BlockNeeds() const;
 	/** @brief Whether an epoch has a slot. */
 	bool HasEpoch(uint32_t epoch) const noexcept;
 	/** @brief A hash of the slots, blocks and entries. It leaves the id out, so two versions with one layout match. */
@@ -262,7 +299,9 @@ private:
 	std::vector<Slot> m_slots;
 	std::vector<Block> m_blocks;
 	std::vector<Entry> m_entries;
-	std::unordered_map<uint64_t, uint32_t> m_entryByKey;
+	std::map<std::pair<uint64_t, uint32_t>, uint32_t> m_entryByKey;  // by key and epoch
+	std::unordered_map<uint64_t, uint32_t> m_entryByObject;
+	bool m_exactHeaps = false;
 	// Block memory, made by AcquireBlock. Without shared memory (SetMemory) the version owns its blocks' memory. With it, the
 	// version only remembers the heaps its blocks took, weakly: the placements made in a heap keep it alive, and a version a
 	// graph still holds keeps no heap alive by itself. A block whose heap went takes one again at its next AcquireBlock.

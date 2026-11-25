@@ -740,6 +740,10 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint32_t frameIndex
 	state.prepared = PreparePersistentExecution(device, frameIndex, hostData, deltaTime, options);
 }
 
+void RenderGraph::ReleaseAliasPlacements() {
+	if (m_compilerState && m_compilerState->persistent) m_compilerState->persistent->ReleaseAliasPlacements();
+}
+
 bool RenderGraph::DeclaredVersions::Declares(const void* key) const noexcept {
 	const auto keys = Keys();
 	return keys && std::binary_search(keys->begin(), keys->end(), key);
@@ -795,6 +799,14 @@ void RenderGraph::PrepareFirstPersistentBuild() {
 	m_deferFirstAliasPlacement = false;
 	// A staged graph is asked what it declares before it is ever prepared.
 	PublishDeclaredVersions();
+}
+
+void RenderGraph::PlaceDeferredAliasesNow() {
+	if (!m_compilerState || m_compilerState->frameProductionStopped) return;
+	if (!m_compilerState->persistent || !m_compilerState->persistent->aliasPlacementDeferred) return;
+	// The services the first preparation would make current: the placement re-materializes resources and rebinds their views.
+	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
+	PlaceDeferredPersistentAliases();
 }
 
 void RenderGraph::PlaceDeferredPersistentAliases() {
@@ -1116,7 +1128,18 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 		// Alias re-placement when the host published a new frame placement since this graph's plan took one.
 		const bool framePlacementChanged = m_framePlacementProbe && state.framePlacementTaken
 			&& m_framePlacementProbe() != (state.framePlacement ? state.framePlacement->Id() : 0);
-		if ((packingChanged || framePlacementChanged) && !state.pending) {
+		// A resource several epochs share that this graph bound at another graph's placement, moved by that graph since (its
+		// re-placement for a newer version): this graph's executable must admit the new backing, which only a structural edit does.
+		bool adoptedMoved = false;
+		for (const auto& [concrete, adopted] : state.adoptedBackings) {
+			const auto resource = adopted.resource.lock();
+			const auto* backed = resource ? dynamic_cast<const BackedResource*>(resource.get()) : nullptr;
+			if (backed && backed->GetBackingGeneration() != adopted.generation) {
+				adoptedMoved = true;
+				break;
+			}
+		}
+		if ((packingChanged || framePlacementChanged || adoptedMoved) && !state.pending) {
 			BT_ZONE_SCOPE("ORG.Persistent.ForcedRealias");
 			auto forced = state.program.BeginEdit();
 			// Re-placement is only valid in a structural edit (the executable must
@@ -1136,7 +1159,8 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 			if (!ready || !state.program.Install(forced, ready)) throw std::runtime_error("Persistent forced alias re-placement failed to install");
 			++state.structuralBuilds;
 			spdlog::info("Persistent alias re-placement ({}): frame={}",
-				packingChanged ? "packing strategy changed" : framePlacementChanged ? "new frame placement" : "forced", state.frameNumber);
+				packingChanged ? "packing strategy changed" : framePlacementChanged ? "new frame placement"
+				: adoptedMoved ? "a shared resource another epoch placed moved" : "forced", state.frameNumber);
 		} else if (!state.pending && state.framePlacementTaken && m_framePlacementEnabled && m_framePlacementEnabled()) {
 			// A versioned candidate whose current version changed since the latest plan (a new extent, a new version). The new
 			// version has a key of its own, so the graph plans again to publish it in its usage summary. It keeps the memory its

@@ -60,8 +60,12 @@ void PlacementSummary::Finish() {
 	hasher.Mix(epoch);
 	hasher.Mix(rankCount);
 	hasher.Mix(static_cast<uint64_t>(memory));
+	hasher.Mix(uncovered);
 	for (const auto& use : uses) {
 		hasher.Mix(use.key);
+		// A new resource under a key changes the summary, so the host computes again: the version matches uses of several
+		// epochs by identity.
+		hasher.Mix(use.objectId);
 		hasher.Mix(use.firstRank);
 		hasher.Mix(use.lastRank);
 		hasher.Mix((use.firstUseWrites ? 1u : 0u) | (use.writeGuaranteed ? 2u : 0u) | (use.loopCrossing ? 4u : 0u) | (use.eligible ? 8u : 0u));
@@ -108,21 +112,27 @@ std::shared_ptr<FramePlacementVersion> FramePlacementVersion::Compute(const Fram
 		base += (std::max)(summary.rankCount, 1u) + 1;
 	}
 
-	// One entry per key, its uses in frame order. A key is the resource's name and memory description, so a key seen in two
-	// epochs is the same resource, or two resources that are never live together.
+	// One entry per resource, its uses in frame order. Uses of several epochs are one resource when they have one identity
+	// (PlacementUse::objectId): resources several epochs' graphs share are the same objects. A key is unique within an epoch
+	// only, and two epochs' resources with one name are two resources. A use without an identity is a resource of its epoch.
 	struct Pending {
 		Entry entry;
 		std::string ineligible;
 		bool firstWriteGuaranteed = false;
 		bool loopCrossing = false;
+		size_t firstSlot = 0;
 	};
-	std::map<uint64_t, Pending> byKey;
+	// (identity, key, epoch): (identity, 0, 0) for a use with an identity, (0, key, epoch) otherwise.
+	std::map<std::tuple<uint64_t, uint64_t, uint32_t>, Pending> byKey;
 	for (const auto epoch : order) {
 		for (const auto& use : byEpoch.at(epoch)->uses) {
-			auto [found, inserted] = byKey.try_emplace(use.key);
+			const auto group = use.objectId ? std::tuple(use.objectId, uint64_t{0}, 0u) : std::tuple(uint64_t{0}, use.key, epoch);
+			auto [found, inserted] = byKey.try_emplace(group);
 			auto& pending = found->second;
 			if (inserted) {
 				pending.entry.key = use.key;
+				pending.entry.objectId = use.objectId;
+				pending.firstSlot = slotOf.at(epoch);
 				pending.entry.name = use.name;
 				pending.entry.size = use.size;
 				pending.entry.alignment = (std::max<uint64_t>)(use.alignment, 1);
@@ -130,7 +140,7 @@ std::shared_ptr<FramePlacementVersion> FramePlacementVersion::Compute(const Fram
 				pending.entry.backendMask = use.backendMask;
 				pending.firstWriteGuaranteed = use.writeGuaranteed;
 			}
-			pending.entry.uses.push_back({epoch, use.firstRank, use.lastRank, use.firstUseWrites});
+			pending.entry.uses.push_back({epoch, use.firstRank, use.lastRank, use.firstUseWrites, use.key});
 			pending.loopCrossing = pending.loopCrossing || use.loopCrossing;
 			if (!use.eligible && pending.ineligible.empty())
 				pending.ineligible = "epoch " + std::to_string(epoch) + ": " + (use.exclusion.empty() ? std::string("not eligible") : use.exclusion);
@@ -162,10 +172,19 @@ std::shared_ptr<FramePlacementVersion> FramePlacementVersion::Compute(const Fram
 		else entry.placed = true;
 	}
 
+	// The entries in an order that does not depend on identities: by their first epoch in frame order, then by key (unique in an
+	// epoch). So a rebuild that makes new resources under the same keys gives the same layout.
+	std::vector<Pending*> sorted;
+	sorted.reserve(byKey.size());
+	for (auto& [group, pending] : byKey) sorted.push_back(&pending);
+	std::sort(sorted.begin(), sorted.end(), [](const Pending* a, const Pending* b) {
+		return std::tuple(a->firstSlot, a->entry.key) < std::tuple(b->firstSlot, b->entry.key);
+	});
+
 	// Pack per memory class and backend set, as the planner's pools are kept apart.
 	std::map<std::pair<uint64_t, uint8_t>, std::vector<Entry*>> groups;
-	for (auto& [key, pending] : byKey) {
-		if (pending.entry.placed) groups[{pending.entry.backendMask, pending.entry.memoryClass}].push_back(&pending.entry);
+	for (auto* pending : sorted) {
+		if (pending->entry.placed) groups[{pending->entry.backendMask, pending->entry.memoryClass}].push_back(&pending->entry);
 	}
 	for (auto& [group, members] : groups) {
 		std::sort(members.begin(), members.end(), [](const Entry* a, const Entry* b) {
@@ -218,10 +237,12 @@ std::shared_ptr<FramePlacementVersion> FramePlacementVersion::Compute(const Fram
 			pending.entry.reason = "no bytes";
 		}
 
-	version->m_entries.reserve(byKey.size());
-	for (auto& [key, pending] : byKey) {
-		version->m_entryByKey.emplace(key, static_cast<uint32_t>(version->m_entries.size()));
-		version->m_entries.push_back(std::move(pending.entry));
+	version->m_entries.reserve(sorted.size());
+	for (auto* pending : sorted) {
+		const auto index = static_cast<uint32_t>(version->m_entries.size());
+		for (const auto& use : pending->entry.uses) version->m_entryByKey.emplace(std::pair(use.key, use.epoch), index);
+		if (pending->entry.objectId) version->m_entryByObject.emplace(pending->entry.objectId, index);
+		version->m_entries.push_back(std::move(pending->entry));
 	}
 	version->m_allocations.resize(version->m_blocks.size());
 	version->m_heaps.resize(version->m_blocks.size());
@@ -242,6 +263,9 @@ std::shared_ptr<FramePlacementVersion> FramePlacementVersion::Compute(const Fram
 	}
 	for (const auto& entry : version->m_entries) {
 		hasher.Mix(entry.key);
+		// The identity only where it decides what the version does: a resource several epochs share. A rebuild that makes an
+		// epoch's own resources again keeps the layout.
+		if (entry.MultiEpoch()) hasher.Mix(entry.objectId);
 		hasher.Mix((entry.placed ? 1 : 0) | (entry.acrossRuns ? 2 : 0));
 		hasher.Mix(entry.block);
 		hasher.Mix(entry.offset);
@@ -268,9 +292,21 @@ FramePlacementVersion::~FramePlacementVersion() {
 	}
 }
 
-const FramePlacementVersion::Entry* FramePlacementVersion::Find(uint64_t key) const noexcept {
-	const auto found = m_entryByKey.find(key);
+const FramePlacementVersion::Entry* FramePlacementVersion::Find(uint64_t key, uint32_t epoch) const noexcept {
+	const auto found = m_entryByKey.find(std::pair(key, epoch));
 	return found == m_entryByKey.end() ? nullptr : &m_entries[found->second];
+}
+
+const FramePlacementVersion::Entry* FramePlacementVersion::FindObject(uint64_t objectId) const noexcept {
+	if (!objectId) return nullptr;
+	const auto found = m_entryByObject.find(objectId);
+	return found == m_entryByObject.end() ? nullptr : &m_entries[found->second];
+}
+
+std::vector<std::pair<std::pair<uint8_t, uint64_t>, uint64_t>> FramePlacementVersion::BlockNeeds() const {
+	std::map<std::pair<uint8_t, uint64_t>, uint64_t> needs;
+	for (const auto& block : m_blocks) needs[{block.memoryClass, block.backendMask}] += block.capacity;
+	return {needs.begin(), needs.end()};
 }
 
 bool FramePlacementVersion::HasEpoch(uint32_t epoch) const noexcept {
@@ -298,7 +334,7 @@ std::shared_ptr<const AliasHeapGeneration> FramePlacementVersion::AcquireBlock(u
 		// The heap the block took before, while a placement still holds it. So every graph that places from this version at the
 		// same time places in the same heap.
 		if (auto heap = m_sharedHeaps[blockIndex].lock()) return heap;
-		auto heap = m_memory->Acquire(block.memoryClass, block.backendMask, block.capacity, block.alignment, block.poolID, m_id);
+		auto heap = m_memory->Acquire(block.memoryClass, block.backendMask, block.capacity, block.alignment, block.poolID, m_id, m_exactHeaps);
 		m_sharedHeaps[blockIndex] = heap;
 		return heap;
 	}
@@ -339,7 +375,7 @@ FramePlacementMemory::~FramePlacementMemory() {
 }
 
 std::shared_ptr<const AliasHeapGeneration> FramePlacementMemory::Acquire(uint8_t memoryClass, uint64_t backendMask, uint64_t capacity,
-	uint64_t alignment, uint64_t poolID, uint64_t versionID) {
+	uint64_t alignment, uint64_t poolID, uint64_t versionID, bool exact) {
 	std::lock_guard lock(m_mutex);
 	auto& cached = m_heaps[{memoryClass, backendMask}];
 	// Room to grow a little, so small changes between versions reuse the heap.
@@ -347,13 +383,18 @@ std::shared_ptr<const AliasHeapGeneration> FramePlacementMemory::Acquire(uint8_t
 	const double shrinkFactor = (std::max)(m_sizing.shrinkFactor, 1.0);
 	const bool fits = cached.heap && cached.capacity >= capacity && cached.alignment >= alignment;
 	const bool tooBig = cached.heap
-		&& static_cast<double>(cached.capacity) > shrinkFactor * static_cast<double>(capacity) * headroom;
+		&& (exact ? cached.capacity > AlignUp(capacity, kBlockGranularity) + TrimSlack(capacity)
+				  : static_cast<double>(cached.capacity) > shrinkFactor * static_cast<double>(capacity) * headroom);
 	if (fits && !tooBig) {
 		cached.needed = capacity;
 		cached.neededBy = versionID;
 		return cached.heap;
 	}
-	const auto size = static_cast<uint64_t>(static_cast<double>(capacity) * headroom + 65535.0) / 65536ull * 65536ull;
+	// A first heap and a trim take the need. A heap that grows takes the larger of the need and headroom times its old capacity,
+	// as the planner's pools do, so a burst of small growths reuses it; the trim once the versions settle gives the rest back.
+	const bool grow = cached.heap && !fits;
+	const double grown = grow && !exact ? static_cast<double>(cached.capacity) * headroom : 0.0;
+	const auto size = static_cast<uint64_t>((std::max)(static_cast<double>(capacity), grown) + 65535.0) / 65536ull * 65536ull;
 	rhi::ma::AllocationDesc allocDesc{};
 	allocDesc.heapType = rhi::HeapType::DeviceLocal;
 	allocDesc.flags = rhi::ma::AllocationFlagCanAlias;
@@ -384,8 +425,40 @@ std::shared_ptr<const AliasHeapGeneration> FramePlacementMemory::Acquire(uint8_t
 	++cached.generation;
 	cached.heap = AliasHeapGeneration::Capture(cached.allocation, cached.generation);
 	spdlog::info("Frame placement {}: heap for class {} {}: capacity={} (needed {}) generation={}", versionID, memoryClass,
-		fits ? "shrank" : cached.generation == 1 ? "allocated" : "grew", size, capacity, cached.generation);
+		fits ? (exact ? "trimmed" : "shrank") : cached.generation == 1 ? "allocated" : "grew", size, capacity, cached.generation);
 	return cached.heap;
+}
+
+bool FramePlacementMemory::WouldTrim(const std::vector<std::pair<std::pair<uint8_t, uint64_t>, uint64_t>>& needs) const {
+	std::lock_guard lock(m_mutex);
+	for (const auto& [key, heap] : m_heaps) {
+		if (!heap.heap) continue;
+		const auto found = std::ranges::find_if(needs, [&](const auto& need) { return need.first == key; });
+		if (found == needs.end()) return true;
+		// A heap smaller than the need grows when a graph places into it: nothing to trim.
+		if (heap.capacity > AlignUp(found->second, kBlockGranularity) + TrimSlack(found->second)) return true;
+	}
+	return false;
+}
+
+void FramePlacementMemory::ReleaseUnused(const std::vector<std::pair<std::pair<uint8_t, uint64_t>, uint64_t>>& needs) {
+	std::lock_guard lock(m_mutex);
+	for (auto it = m_heaps.begin(); it != m_heaps.end();) {
+		const auto& key = it->first;
+		if (std::ranges::any_of(needs, [&](const auto& need) { return need.first == key; })) {
+			++it;
+			continue;
+		}
+		auto& heap = it->second;
+		if (heap.heap) {
+			spdlog::info("Frame placement: heap for class {} released: capacity={} generation={} (no block uses it)", key.first, heap.capacity,
+				heap.generation);
+			m_replaced.push_back({key.first, key.second, heap.capacity, heap.generation, heap.heap});
+		}
+		if (heap.allocation.GetAllocation())
+			DeletionManager::GetInstance().MarkForDelete(std::move(heap.allocation), "RenderGraph frame placement block (unused)");
+		it = m_heaps.erase(it);
+	}
 }
 
 uint64_t FramePlacementMemory::Bytes() const {

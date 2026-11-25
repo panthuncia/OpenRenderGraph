@@ -271,6 +271,12 @@ std::shared_ptr<const ScheduleTrace> BuildScheduleTrace(const persistent::Execut
         traced.id = structure.resourceIDs[resource];
         traced.hasLayout = resource < structure.resourceShapes.size() && structure.resourceShapes[resource].hasLayout;
         if (names.resource && resource < executable.resourceSlots.size()) traced.name = names.resource(executable.resourceSlots[resource].index);
+        if (names.resourceFacts && resource < executable.resourceSlots.size()) {
+            const auto facts = names.resourceFacts(executable.resourceSlots[resource].index);
+            traced.objectId = facts.objectId;
+            traced.aliasCandidate = facts.aliasCandidate;
+            traced.bytes = facts.bytes;
+        }
         if (traced.name.empty()) traced.name = "<resource " + std::to_string(resource) + ">";
     }
 

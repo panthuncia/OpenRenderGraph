@@ -4,6 +4,8 @@
 #include <array>
 #include <bit>
 #include <functional>
+#include <map>
+#include <tuple>
 #include <unordered_set>
 
 namespace org {
@@ -530,17 +532,25 @@ namespace {
 // planner counts them as ORG transients, not as materialized by someone else: a later build of the same epoch (a staged graph) places
 // them again rather than keep the placement of the graph it replaces, whose pools go with it.
 std::mutex g_aliasPlacedMutex;
-std::unordered_set<const void*> g_aliasPlaced;
+// By resource: the epoch whose graph placed it last (RenderGraph pass epoch filter).
+std::unordered_map<const void*, uint32_t> g_aliasPlaced;
 
 bool AliasPlacedAnywhere(const void* resource) {
 	std::lock_guard lock(g_aliasPlacedMutex);
 	return g_aliasPlaced.contains(resource);
 }
 
-// Placed: recorded. Not placed: forgotten; returns whether it was recorded.
-bool NoteAliasPlaced(const void* resource, bool placed) {
+// Whether a graph of another epoch placed it: then it is that graph's too, and a plan of this epoch must not move it.
+bool AliasPlacedByOtherEpoch(const void* resource, uint32_t epoch) {
 	std::lock_guard lock(g_aliasPlacedMutex);
-	if (placed) return g_aliasPlaced.insert(resource).second;
+	const auto found = g_aliasPlaced.find(resource);
+	return found != g_aliasPlaced.end() && found->second != epoch;
+}
+
+// Placed: recorded, with the epoch that placed it. Not placed: forgotten; returns whether it was recorded.
+bool NoteAliasPlaced(const void* resource, bool placed, uint32_t epoch = UINT32_MAX) {
+	std::lock_guard lock(g_aliasPlacedMutex);
+	if (placed) return g_aliasPlaced.insert_or_assign(resource, epoch).second;
 	return g_aliasPlaced.erase(resource) != 0;
 }
 
@@ -746,6 +756,15 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		// this is not the first epoch of the frame that uses it, or it keeps its contents across runs. It then enters without a
 		// discard (PreparedBackingState::aliasContinues).
 		bool continues = false;
+		// Its key in usage summaries and frame placements (PlacementUse::key).
+		uint64_t key = 0;
+		// Placed from a frame placement: its lifetime in this graph's ranks, as the version's bytes see it. Its uses, from rank 0
+		// when its contents come from an earlier epoch, to the last rank when they go on to a later one (or across runs).
+		uint32_t frameFirst = 0, frameLast = 0;
+		// Its own path, as planned before the frame placement step. Restored when the frame placement does not take it.
+		bool ownPooled = false;
+		uint64_t ownPoolID = 0;
+		const char* ownExclusion = nullptr;
 	};
 	std::vector<Candidate> candidates;
 	std::unordered_map<Resource*, uint32_t> candidateByConcrete;
@@ -900,51 +919,161 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		if (c.exclusion) ++excludedCount;
 	}
 
-	// Frame placement (SetFramePlacementSource). The graph's first plan takes the host's current version, and every later plan of the
-	// graph keeps it. So a new version reaches the epoch through a new build. A candidate the version covers takes the version's
-	// offset in its block instead of a place in this graph's pools. Covered means:
+	// Keys (PlacementUse::key): the name and memory description, and the ordinal among this graph's candidates with the same
+	// ones, in first-use order (then in the order the passes first touch them). A rebuild of the same graph makes new resources,
+	// and they get the keys their predecessors had. A version's key also holds its number, so a new version is a new entry.
+	{
+		std::vector<uint32_t> order(candidates.size());
+		for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+		std::stable_sort(order.begin(), order.end(), [&](uint32_t l, uint32_t r) {
+			return std::tuple(candidates[l].firstUse, candidates[l].lastUse) < std::tuple(candidates[r].firstUse, candidates[r].lastUse);
+		});
+		std::unordered_map<uint64_t, uint64_t> ordinals;
+		for (const auto index : order) {
+			auto& c = candidates[index];
+			auto key = PlacementKey(c.concrete->GetName(), c.sizeBytes, c.alignment, c.resourceClass, c.backendMask);
+			if (const auto ordinal = ordinals[key]++) boost::hash_combine(key, ordinal);
+			if (c.version) boost::hash_combine(key, c.version->number);
+			c.key = key;
+		}
+	}
+	// A resource's identity in usage summaries (PlacementUse::objectId).
+	const auto objectOf = [](const Candidate& c) { return c.concrete->GetGlobalResourceID() + 1; };
+	uint64_t framePlacedBytes = 0, framePlacedCount = 0, frameWithheld = 0, frameOwnPath = 0, frameMoved = 0, frameFitted = 0;
+	uint64_t requiredBytes = 0;
+	std::array<uint64_t, 4> requiredByClass{};
+	// The usage summary: every used candidate with its ranks, for the host's frame-wide placement.
+	// Candidates the plan would pool but did not place from its version (PlacementSummary::uncovered).
+	const auto uncoveredCount = [&] {
+		uint32_t count = 0;
+		for (const auto& c : candidates)
+			if (c.eligible && !c.framePlaced && (c.pooled || c.keepBacking)) ++count;
+		return count;
+	};
+	// countUncovered false: the first summary, before any version placed anything.
+	const auto publishSummary = [&](bool countUncovered) {
+		if (!m_placementSummaryObserver) return;
+		PlacementSummary summary;
+		summary.epoch = m_passEpochFilter;
+		summary.rankCount = nextRank;
+		summary.pooledBytesByClass = requiredByClass;
+		summary.pooledBytes = requiredBytes;
+		summary.framePlacedBytes = framePlacedBytes;
+		if (countUncovered) summary.uncovered = uncoveredCount();
+		summary.uses.reserve(candidates.size());
+		for (const auto& c : candidates) {
+			if (c.firstUse == UINT32_MAX || !c.direct) continue;
+			PlacementUse use;
+			use.name = c.concrete->GetName();
+			use.key = c.key;
+			use.objectId = objectOf(c);
+			use.firstRank = c.firstUse;
+			use.lastRank = c.lastUse;
+			use.firstUseWrites = c.firstUseIsWrite;
+			use.writeGuaranteed = c.writeGuaranteed;
+			use.loopCrossing = c.acrossRuns;
+			use.eligible = c.eligible;
+			if (c.ineligible) use.exclusion = c.ineligible;
+			else if (c.exclusion) use.exclusion = c.exclusion;
+			use.size = c.sizeBytes;
+			use.alignment = c.alignment;
+			use.memoryClass = c.resourceClass;
+			use.backendMask = c.backendMask;
+			summary.uses.push_back(std::move(use));
+		}
+		summary.Finish();
+		try {
+			m_placementSummaryObserver(std::move(summary));
+		} catch (const std::exception& error) {
+			spdlog::warn("Persistent alias plan: the usage summary of epoch {} was not published: {}", m_passEpochFilter, error.what());
+		}
+	};
+
+	// Frame placement (SetFramePlacementSource). The graph's first plan takes the host's current version, and keeps it until the
+	// host publishes a newer one: the graph then places again from that, in place (BindPersistentFrame). A candidate the version
+	// covers takes the version's offset in its block instead of a place in this graph's pools. Covered means:
 	// - the planner would pool it on one backend if its first use wrote (eligible),
-	// - the version placed its key,
-	// - its ranks here lie inside the ranks the version reserved for this epoch,
+	// - the version has its entry, found by its identity, or else by its key in this epoch (a rebuilt graph's new resource),
+	// - the version placed it,
 	// - in the frame's first epoch that uses it, its first use here is a guaranteed write.
-	// Byte overlaps between epochs are ordered by the alias ledger, as for any placed resource.
+	// Its ranks here may differ from the version's (a rebuild that added passes). That is safe for the bytes the version shares
+	// with other epochs: they hold it over whole slots of the epochs in between, and other epochs' resources lie in other
+	// slots. Only this graph's own candidates in its bytes may now overlap in time: those pairs are checked below, and one of each
+	// goes back to its own path. Byte overlaps between epochs are ordered by the alias ledger, as for any placed resource.
+	// A plan for any other reason (a structural build at a preparation) while the host has a newer version takes that one: placing
+	// from the older version would move the resources several epochs share back to its offsets, under the other epochs' graphs,
+	// which placed them from the newer one.
+	if (state.framePlacementTaken && m_framePlacementProbe && m_framePlacementProbe() != (state.framePlacement ? state.framePlacement->Id() : 0))
+		state.framePlacementTaken = false;
 	if (!state.framePlacementTaken) {
 		state.framePlacementTaken = true;
+		// The summary goes first, and again at the end with the bytes this plan placed (the same uses, so no new computation).
+		// The summary that completes the frame's epochs makes the first version at once (GraphHost), so the plan that completes
+		// it places from it instead of on its own path.
+		if (m_framePlacementEnabled && m_framePlacementEnabled()) publishSummary(false);
 		state.framePlacement = m_framePlacementSource ? m_framePlacementSource() : nullptr;
 		if (state.framePlacement)
 			spdlog::info("Persistent alias plan: epoch {} places from frame placement {}", m_passEpochFilter, state.framePlacement->Id());
 	}
-	const auto framePlacement = state.framePlacement;
-	// A candidate's key in usage summaries and frame placements. A version's key holds its number, so a new version is a new
-	// entry, placed by the next frame placement.
-	const auto keyOf = [](const Candidate& c) {
-		auto key = PlacementKey(c.concrete->GetName(), c.sizeBytes, c.alignment, c.resourceClass, c.backendMask);
-		if (c.version) boost::hash_combine(key, c.version->number);
-		return key;
+	for (auto& c : candidates) {
+		c.ownPooled = c.pooled;
+		c.ownPoolID = c.poolID;
+		c.ownExclusion = c.exclusion;
+	}
+	// Not placed from the frame placement after all: another epoch may hold it, or its own path takes it.
+	const auto withhold = [&](Candidate& c) {
+		c.pooled = false;
+		c.keepBacking = true;
+		c.exclusion = "frame placement does not cover it (used by several epochs)";
+		++frameWithheld;
 	};
-	uint64_t framePlacedBytes = 0, framePlacedCount = 0, frameWithheld = 0;
-	if (framePlacement) {
+	// The frame placement step: places the candidates from a version, starting from their own paths.
+	const auto placeFrom = [&](const std::shared_ptr<const FramePlacementVersion>& framePlacement) {
+		for (auto& c : candidates) {
+			c.pooled = c.ownPooled;
+			c.poolID = c.ownPoolID;
+			c.exclusion = c.ownExclusion;
+			c.framePlaced = c.frameShared = c.keepBacking = c.continues = false;
+			c.frameBlock = UINT32_MAX;
+			c.offset = 0;
+		}
+		framePlacedBytes = framePlacedCount = frameWithheld = frameOwnPath = frameMoved = frameFitted = 0;
+		if (!framePlacement) return;
+		const auto epoch = m_passEpochFilter;
+		const auto slot = std::ranges::find_if(framePlacement->Slots(), [&](const auto& s) { return s.epoch == epoch; });
+		const bool repeatedSlot = slot != framePlacement->Slots().end() && slot->repeated;
+		const uint32_t lastRank = nextRank ? nextRank - 1 : 0;
 		for (auto& c : candidates) {
 			if (!c.eligible) continue;
-			const auto* entry = framePlacement->Find(keyOf(c));
-			// A resource the version does not know (new since it was computed) is not pooled here: the graph cannot tell whether
-			// other epochs use it, and a graph that pooled it would disagree with one that gave it memory of its own. It keeps
-			// memory of its own until a version covers it.
+			// The resource itself when the version knows it (an object several epochs' graphs share, or this graph's own).
+			// Otherwise its key in this epoch: a rebuilt graph's new resource takes its predecessor's entry. An entry several
+			// epochs share is the object they shared, so another object under its key is a new resource.
+			const auto* entry = framePlacement->FindObject(objectOf(c));
 			if (!entry) {
-				if (!c.exclusion) ++excludedCount;
-				c.pooled = false;
-				c.exclusion = "the frame placement does not know it yet";
-				++frameWithheld;
+				entry = framePlacement->Find(c.key, epoch);
+				if (entry && entry->MultiEpoch()) entry = nullptr;
+			}
+			if (!entry) {
+				// New since the version was computed. If another epoch's graph placed it, that backing stays: moving it would
+				// break that graph's executable. Otherwise it goes on this graph's own path until a version covers it.
+				if (AliasPlacedByOtherEpoch(c.concrete, epoch)) withhold(c);
+				else ++frameOwnPath;
 				continue;
 			}
-			const auto* use = entry->UseIn(m_passEpochFilter);
-			const bool firstInFrame = use && entry->uses.front().epoch == m_passEpochFilter;
+			const auto* use = entry->UseIn(epoch);
+			if (!use) {
+				// The version knows it from other epochs only (it was computed before this build). This graph's own pools see
+				// only its own uses, so they could hand its bytes to something live in another epoch. A later version covers it.
+				withhold(c);
+				continue;
+			}
+			const bool firstInFrame = entry->uses.front().epoch == epoch;
+			const bool lastInFrame = entry->uses.back().epoch == epoch;
 			// A resource that keeps its contents across runs needs a version that gave it one lifetime over every run. A version
 			// computed before it was marked did not.
-			const bool covered = entry->placed && use && use->firstRank <= c.firstUse && c.lastUse <= use->lastRank
-				&& (!firstInFrame || (c.firstUseIsWrite && c.writeGuaranteed)) && (!c.acrossRuns || entry->acrossRuns);
+			const bool covered = entry->placed && (!firstInFrame || (c.firstUseIsWrite && c.writeGuaranteed))
+				&& (!c.acrossRuns || entry->acrossRuns);
 			if (covered) {
-				if (c.exclusion) --excludedCount;
 				c.exclusion = nullptr;
 				c.pooled = true;
 				c.framePlaced = true;
@@ -953,23 +1082,147 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				// Its lifetime in the version covers everything between its earlier use and this one, so no other occupant of its
 				// bytes runs in this graph before it.
 				c.continues = !firstInFrame || entry->acrossRuns;
+				const bool wholeSlot = entry->acrossRuns || (entry->MultiEpoch() && repeatedSlot);
+				c.frameFirst = firstInFrame && !wholeSlot ? c.firstUse : 0;
+				c.frameLast = lastInFrame && !wholeSlot ? c.lastUse : lastRank;
 				c.poolID = framePlacement->Blocks().at(entry->block).poolID;
 				c.offset = entry->offset;
 				framePlacedBytes += c.sizeBytes;
 				++framePlacedCount;
-			} else if (entry->MultiEpoch() || !use) {
-				// Other epochs use it too, or the version knows it only from other epochs (it was computed before this build).
-				// This graph's own pools see only its own uses, so they could hand its bytes to something live in another
-				// epoch. It is not pooled here. If another graph already gave it a backing, that backing stays: moving it would
-				// break that graph's executable. A later version covers it.
-				if (!c.exclusion) ++excludedCount;
-				c.pooled = false;
-				c.keepBacking = true;
-				c.exclusion = "frame placement does not cover it (used by several epochs)";
-				++frameWithheld;
+			} else if (entry->MultiEpoch()) {
+				// Other epochs use it too, but the version does not place it (a first use that reads, a gated first write).
+				withhold(c);
+			} else {
+				++frameOwnPath;
 			}
 		}
+		// The version kept this graph's candidates apart over the ranks it saw. A rebuilt graph's ranks may differ, so two that
+		// share bytes and are live together here cannot both take their offsets. One goes back: a resource of this epoch alone
+		// to its own path, one several epochs share to the backing it has.
+		std::map<uint32_t, std::vector<uint32_t>> byBlock;
+		for (uint32_t i = 0; i < candidates.size(); ++i)
+			if (candidates[i].framePlaced) byBlock[candidates[i].frameBlock].push_back(i);
+		for (auto& [block, members] : byBlock) {
+			std::sort(members.begin(), members.end(), [&](uint32_t l, uint32_t r) { return candidates[l].offset < candidates[r].offset; });
+			for (size_t i = 0; i < members.size(); ++i) {
+				for (size_t j = i + 1; j < members.size(); ++j) {
+					auto& a = candidates[members[i]];
+					auto& b = candidates[members[j]];
+					if (b.offset >= a.offset + a.sizeBytes) break;
+					if (!a.framePlaced) break;
+					if (!b.framePlaced || a.frameLast < b.frameFirst || b.frameLast < a.frameFirst) continue;
+					auto& moved = a.frameShared && !b.frameShared ? b : !a.frameShared && b.frameShared ? a : b;
+					moved.framePlaced = false;
+					framePlacedBytes -= moved.sizeBytes;
+					--framePlacedCount;
+					++frameMoved;
+					if (moved.frameShared) {
+						moved.frameShared = false;
+						moved.continues = false;
+						withhold(moved);
+					} else {
+						moved.continues = false;
+						moved.pooled = moved.ownPooled;
+						moved.poolID = moved.ownPoolID;
+						moved.exclusion = moved.ownExclusion;
+						moved.offset = 0;
+						++frameOwnPath;
+					}
+				}
+			}
+		}
+		// Resources the version does not know yet, or does not place here, that this graph alone uses: into the free bytes of the
+		// version's blocks, where this graph's own pools would have put them, so a rebuild with new transients does not allocate
+		// pools beside the blocks. Free means: no candidate this graph placed from the block is live then (its lifetime here),
+		// and no entry the version gives another epoch holds the bytes through this epoch's slot. An entry of this epoch alone
+		// that no candidate took is free: its resource is gone. Those that do not fit take their own path.
+		std::vector<uint32_t> unplaced;
+		for (uint32_t i = 0; i < candidates.size(); ++i) {
+			const auto& c = candidates[i];
+			if (c.framePlaced || !c.ownPooled || c.shared || c.manualPool || c.acrossRuns || c.keepBacking || c.version || c.firstUse == UINT32_MAX) continue;
+			unplaced.push_back(i);
+		}
+		std::stable_sort(unplaced.begin(), unplaced.end(), [&](uint32_t l, uint32_t r) {
+			const auto& a = candidates[l];
+			const auto& b = candidates[r];
+			return std::tuple(a.firstUse, ~a.sizeBytes) < std::tuple(b.firstUse, ~b.sizeBytes);
+		});
+		if (!unplaced.empty()) {
+			struct Occupant {
+				uint64_t begin = 0, end = 0;
+				uint32_t first = 0, last = 0;
+			};
+			std::map<uint32_t, std::vector<Occupant>> occupants;
+			const auto& slots = framePlacement->Slots();
+			const uint32_t slotBase = slot != slots.end() ? slot->base : 0;
+			const uint32_t slotEnd = slot != slots.end() ? slot->base + (std::max)(slot->rankCount, 1u) - 1 : 0;
+			std::unordered_set<const FramePlacementVersion::Entry*> taken;
+			for (const auto& c : candidates) {
+				if (!c.framePlaced) continue;
+				occupants[c.frameBlock].push_back({c.offset, c.offset + c.sizeBytes, c.frameFirst, c.frameLast});
+				if (const auto* entry = framePlacement->FindObject(objectOf(c))) taken.insert(entry);
+				else if (const auto* byKey = framePlacement->Find(c.key, epoch)) taken.insert(byKey);
+			}
+			for (const auto& entry : framePlacement->Entries()) {
+				if (!entry.placed || taken.contains(&entry)) continue;
+				// Another epoch's resource whose lifetime reaches into this slot: its bytes are held through the whole slot here.
+				const bool ownEpochOnly = !entry.MultiEpoch() && entry.uses.front().epoch == epoch;
+				if (ownEpochOnly || slot == slots.end() || entry.frameLast < slotBase || entry.frameFirst > slotEnd) continue;
+				occupants[entry.block].push_back({entry.offset, entry.offset + entry.size, 0, lastRank});
+			}
+			for (const auto index : unplaced) {
+				auto& c = candidates[index];
+				for (uint32_t b = 0; b < framePlacement->Blocks().size(); ++b) {
+					const auto& block = framePlacement->Blocks()[b];
+					if (block.memoryClass != c.resourceClass || block.backendMask != c.backendMask) continue;
+					auto& held = occupants[b];
+					std::vector<std::pair<uint64_t, uint64_t>> busy;
+					for (const auto& o : held)
+						if (!(o.last < c.firstUse || c.lastUse < o.first)) busy.emplace_back(o.begin, o.end);
+					std::sort(busy.begin(), busy.end());
+					uint64_t offset = 0;
+					const uint64_t alignment = (std::max<uint64_t>)(c.alignment, 1);
+					for (const auto& [begin, end] : busy) {
+						if (offset + c.sizeBytes <= begin) break;
+						if (end > offset) offset = (end + alignment - 1) / alignment * alignment;
+					}
+					if (offset + c.sizeBytes > block.capacity) continue;
+					held.push_back({offset, offset + c.sizeBytes, c.firstUse, c.lastUse});
+					c.exclusion = nullptr;
+					c.pooled = true;
+					c.framePlaced = true;
+					c.frameBlock = b;
+					c.frameShared = false;
+					c.continues = false;
+					c.frameFirst = c.firstUse;
+					c.frameLast = c.lastUse;
+					c.poolID = block.poolID;
+					c.offset = offset;
+					framePlacedBytes += c.sizeBytes;
+					++framePlacedCount;
+					++frameFitted;
+					--frameOwnPath;
+					break;
+				}
+			}
+		}
+	};
+	placeFrom(state.framePlacement);
+	// Candidates the version leaves on this graph's own path or held back (new transients that did not fit, new resources other
+	// epochs share): the summary that says so makes the host compute the next version at once (FramePlacement::Publish), and
+	// this plan places from that one. So a rebuild that brings new transients neither allocates pools beside the blocks nor
+	// places again a settle time later.
+	if (state.framePlacement && uncoveredCount() > 0 && m_framePlacementSource) {
+		publishSummary(true);
+		if (auto newer = m_framePlacementSource(); newer && newer != state.framePlacement) {
+			spdlog::info("Persistent alias plan: epoch {} places from frame placement {}, made for its {} uncovered candidates", m_passEpochFilter,
+				newer->Id(), uncoveredCount());
+			state.framePlacement = std::move(newer);
+			placeFrom(state.framePlacement);
+		}
 	}
+	const auto framePlacement = state.framePlacement;
+
 	// A version goes only where a frame placement puts it. Other graphs may bind it, and this graph's pools see only its own
 	// uses. Otherwise it keeps the backing it has: memory of its own from whoever made it, or the frame placement another
 	// epoch's graph gave it.
@@ -984,6 +1237,10 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		c.pooled = false;
 		c.keepBacking = true;
 	}
+
+	excludedCount = 0;
+	for (const auto& c : candidates)
+		if (c.exclusion) ++excludedCount;
 
 	// The resources whose bindings continue from an earlier execution of the frame. Bindings made from here on read it.
 	state.aliasContinues.clear();
@@ -1011,8 +1268,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		else byPool[candidates[i].poolID].push_back(i);
 	}
 	std::vector<std::pair<uint32_t, uint32_t>> edges; // (logical slot, logical slot)
-	uint64_t independentBytes = 0, requiredBytes = 0, reservedBytes = 0;
-	std::array<uint64_t, 4> requiredByClass{};
+	uint64_t independentBytes = 0, reservedBytes = 0;
 	size_t overlapPairs = 0;
 	// Placement orderings between byte-overlapping occupants of one pool or block.
 	auto orderOverlaps = [&](const std::vector<uint32_t>& members) {
@@ -1220,6 +1476,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		}
 		changed = true;
 	};
+	state.adoptedBackings.clear();
 	for (auto& c : candidates) {
 		auto* backed = dynamic_cast<BackedResource*>(c.concrete);
 		if (!backed) continue;
@@ -1252,7 +1509,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				// change, which the executable refuses.
 				const bool movedSincePlan = previous == state.aliasPlaced.end() || !(previous->second == record);
 				state.aliasPlaced[c.concrete] = record;
-				NoteAliasPlaced(c.concrete, true);
+				NoteAliasPlaced(c.concrete, true, m_passEpochFilter);
 				// A version outlives the graph, so the graph's end never gives it back.
 				if (c.frameShared || c.version) state.aliasPlacementOwners.erase(c.concrete);
 				else {
@@ -1278,7 +1535,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			}
 			TrackTransientFrameResource(c.concrete);
 			state.aliasPlaced[c.concrete] = record;
-			NoteAliasPlaced(c.concrete, true);
+			NoteAliasPlaced(c.concrete, true, m_passEpochFilter);
 			if (c.framePlaced)
 				NoteFramePlaced(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration(), &state, c.sizeBytes, m_passEpochFilter);
 			// A resource several epochs use is not this graph's alone: the graph's end leaves its placement to the others. A version
@@ -1298,9 +1555,10 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			}
 		} else if (c.keepBacking && backed->IsMaterialized() && !state.aliasPlaced.contains(c.concrete)) {
 			// Placed by another graph and shared with it: bound as it is, in this structural edit, so the executable admits its
-			// current placement.
+			// current placement. If that graph moves it, this one re-places (adoptedBackings).
 			state.aliasPlacementOwners.erase(c.concrete);
 			rebind(c.concrete);
+			state.adoptedBackings[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
 		} else {
 			state.aliasPlacementOwners.erase(c.concrete);
 			if (state.aliasPlaced.erase(c.concrete) && backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
@@ -1319,41 +1577,8 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	m_framePlacementPlanned.store(true, std::memory_order_release);
 	// The previous plan's ranges go. Its placements that this plan did not replace keep their memory through their leases.
 	state.frameRegions = std::move(newFrameRegions);
-	// The usage summary: every used candidate with its ranks, for the host's frame-wide placement.
-	if (m_placementSummaryObserver) {
-		PlacementSummary summary;
-		summary.epoch = m_passEpochFilter;
-		summary.rankCount = nextRank;
-		summary.pooledBytesByClass = requiredByClass;
-		summary.pooledBytes = requiredBytes;
-		summary.framePlacedBytes = framePlacedBytes;
-		summary.uses.reserve(candidates.size());
-		for (const auto& c : candidates) {
-			if (c.firstUse == UINT32_MAX || !c.direct) continue;
-			PlacementUse use;
-			use.name = c.concrete->GetName();
-			use.key = keyOf(c);
-			use.firstRank = c.firstUse;
-			use.lastRank = c.lastUse;
-			use.firstUseWrites = c.firstUseIsWrite;
-			use.writeGuaranteed = c.writeGuaranteed;
-			use.loopCrossing = c.acrossRuns;
-			use.eligible = c.eligible;
-			if (c.ineligible) use.exclusion = c.ineligible;
-			else if (c.exclusion) use.exclusion = c.exclusion;
-			use.size = c.sizeBytes;
-			use.alignment = c.alignment;
-			use.memoryClass = c.resourceClass;
-			use.backendMask = c.backendMask;
-			summary.uses.push_back(std::move(use));
-		}
-		summary.Finish();
-		try {
-			m_placementSummaryObserver(std::move(summary));
-		} catch (const std::exception& error) {
-			spdlog::warn("Persistent alias plan: the usage summary of epoch {} was not published: {}", m_passEpochFilter, error.what());
-		}
-	}
+	// The usage summary, with the bytes this plan placed.
+	publishSummary(true);
 	BT_PLOT("ORG.Persistent.AliasPlacements", static_cast<int64_t>(placed));
 	BT_PLOT("ORG.Persistent.AliasRequiredBytes", static_cast<int64_t>(requiredBytes));
 	BT_PLOT("ORG.Persistent.AliasReservedBytes", static_cast<int64_t>(reservedBytes));
@@ -1414,11 +1639,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	if (logging || state.aliasPlans <= 2 || rematerialized)
 		spdlog::info("Persistent alias plan #{}: epoch={} inHostStream={} candidates={} placed={} excluded={} pools={} overlapPairs={} "
 			"orderings={} rematerialized={} standalone={} independentMB={:.2f} requiredMB={:.2f} reservedMB={:.2f} rebuild={} "
-			"framePlacement={} framePlaced={} framePlacedMB={:.2f} frameWithheld={}",
+			"framePlacement={} framePlaced={} framePlacedMB={:.2f} frameWithheld={} frameOwnPath={} frameMoved={} frameFitted={}",
 			state.aliasPlans, m_passEpochFilter, PassEpochInHostStream(), candidates.size(), placed, excludedCount, byPool.size(),
 			overlapPairs, edges.size(), rematerialized, standalone, independentBytes / (1024.0 * 1024.0), requiredBytes / (1024.0 * 1024.0),
 			reservedBytes / (1024.0 * 1024.0), changed, framePlacement ? framePlacement->Id() : 0, framePlacedCount,
-			framePlacedBytes / (1024.0 * 1024.0), frameWithheld);
+			framePlacedBytes / (1024.0 * 1024.0), frameWithheld, frameOwnPath, frameMoved, frameFitted);
 	// Which queue slots this epoch's batches use, once per plan under logging: with inHostStream, which of them are in the host's stream.
 	if (logging) {
 		std::vector<uint32_t> queues;

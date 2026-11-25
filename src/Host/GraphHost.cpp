@@ -628,9 +628,14 @@ void GraphHost::RetireLease(RunLease& lease, Async* state) {
 	// (a graph's own pointer may be in the middle of a rebuild).
 	if (!lease.external && lease.submission)
 		if (const auto& stats = m_desc.runtime->Statistics()) {
-			rhi::Queue queue = m_device.GetQueue(rhi::QueueKind::Graphics);
-			stats->OnFrameComplete(lease.index, queue);
-			if (m_completedFrame) m_completedFrame(lease.hostFrame, *stats);
+			// Every queue's: a run's async compute passes resolve into the compute queue's range of the run's index. With several
+			// epochs a frame (several runs), only the run's retirement knows its index. The callback sees each queue's read.
+			for (const auto kind : { rhi::QueueKind::Compute, rhi::QueueKind::Graphics }) {
+				rhi::Queue queue = m_device.GetQueue(kind);
+				if (!queue) continue;
+				stats->OnFrameComplete(lease.index, queue);
+				if (m_completedFrame) m_completedFrame(lease.hostFrame, *stats);
+			}
 		}
 	ReleaseLease(lease, state);
 }
@@ -1056,7 +1061,17 @@ void GraphHost::ReleaseRetiredGraphs(bool all) {
 			BT_ZONE_SCOPE("ORG.Host.ReleaseRetiredGraph");
 			retired.graph->ShutdownExtensions();
 			retired.graph->ShutdownTaskWorkers();
-			retired.graph.reset();
+			// Everything else the graph holds is its own, or shared through services that other threads use too (the runtime's
+			// registries and ledgers, deferred deletion and descriptor release, the upload policy and backing resize registries,
+			// the ECS entity hooks, which defer to their thread). So the rest of its destruction (about 10 ms for a large graph:
+			// its external client's and queues' timelines, its passes and resources, its compiled state) can run on the runtime's
+			// deleter thread. Not with async epochs, whose host thread holds still for it (HoldAsync), nor at a release of all.
+			const bool detached = m_desc.destroyRetiredGraphsDetached && !all && !m_async && m_desc.runtime;
+			if (detached) {
+				// What other graphs place into goes back here, on the owner thread: they may place it again at once.
+				retired.graph->ReleaseAliasPlacements();
+				m_desc.runtime->DestroyDetached(std::shared_ptr<RenderGraph>(std::move(retired.graph)), "a retired epoch graph");
+			} else retired.graph.reset();
 			return true;
 		});
 	};
@@ -1419,6 +1434,7 @@ GraphHost::AttachResult GraphHost::AttachEpochGraph(std::unique_ptr<EpochGraph>&
 	if (m_async && !m_async->holding) ReplaceAsyncInstances({&index, 1}, replace);
 	else (void)replace(index);
 	if (!failure.empty()) return Refuse(AttachRefusal::SharedSetupFailed, instance.epoch, std::move(failure));
+	PlaceAttachedAliases(index);
 	m_attachCount.fetch_add(1, std::memory_order_relaxed);
 	spdlog::info("GraphHost: epoch {}'s graph {} (build {}): built in {:.2f} ms off the host, attached in {:.3f} ms; why: {}", epochName,
 		replacing ? "replaced" : "attached", instance.buildGeneration, built->m_buildMs,
@@ -1430,12 +1446,11 @@ GraphHost::AttachResult GraphHost::AttachEpochGraph(std::unique_ptr<EpochGraph>&
 std::vector<uint32_t> GraphHost::StaleAliasPlacementEpochs() const {
 	CheckOwner("StaleAliasPlacementEpochs");
 	std::vector<uint32_t> stale;
-	// An epoch with a staged graph is not stale: the staged graph's placement grew the pool, or took the current frame placement,
-	// and it replaces the attached one.
+	// An epoch with a staged graph is not stale: the staged graph's placement grew the pool, and it replaces the attached one.
+	// A graph placed from an older frame placement is not stale either: it places again from the current one in place, at its
+	// next preparation, before it records (RenderGraph::SetFramePlacementProbe).
 	for (const auto& instance : m_instances)
-		if (instance.graph && !instance.staged
-			&& (!instance.graph->PersistentAliasPlacementsCurrent() || FramePlacementStale(*instance.graph, instance.epoch)))
-			stale.push_back(instance.epoch);
+		if (instance.graph && !instance.staged && !instance.graph->PersistentAliasPlacementsCurrent()) stale.push_back(instance.epoch);
 	return stale;
 }
 
@@ -1476,7 +1491,7 @@ GraphHost::StageResult GraphHost::StageEpochGraph(std::unique_ptr<EpochGraph>& b
 	const auto index = built->m_index;
 	auto& instance = m_instances[index];
 	// Nothing runs that a staging would keep: attached at once.
-	if (!m_async || m_async->holding || !instance.graph) {
+	if ((m_async && m_async->holding) || !instance.graph) {
 		const auto attached = AttachEpochGraph(built);
 		result.attached = attached.attached;
 		result.reason = attached.reason;
@@ -1496,8 +1511,7 @@ GraphHost::StageResult GraphHost::StageEpochGraph(std::unique_ptr<EpochGraph>& b
 	const auto begin = std::chrono::steady_clock::now();
 	const auto generation = (std::max)(instance.buildGeneration, instance.lastGeneration) + 1;
 	std::string failure;
-	// The host's thread holds still while its view of the epoch changes. Nothing is detached: the attached graph keeps its tickets.
-	HoldAsync({}, [&] {
+	const auto stage = [&] {
 		auto& graph = *built->m_graph;
 		// The shared setup steps but the upload service's registry, which the attach points at the new graph: the running graphs'
 		// uploads keep resolving as before until then.
@@ -1510,26 +1524,33 @@ GraphHost::StageResult GraphHost::StageEpochGraph(std::unique_ptr<EpochGraph>& b
 		graph.SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
 		graph.SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
 		RetireStaged(index);
-		// The staged graph's first recording places its transients, which may move ones the attached graph binds: from here the
-		// attached graph keeps what it bound, and records nothing new.
-		instance.graph->FreezeAliasedBindings();
 		auto* raw = built->m_graph.get();
 		instance.staged = std::move(built);
 		instance.stagedGeneration = generation;
 		instance.lastGeneration = generation;
-		for (uint32_t i = 0; i < m_async->epochs.size(); ++i) {
-			if (m_async->instanceOf[i] != index) continue;
-			m_async->stagedGraph[i] = raw;
-			m_async->stagedGeneration[i] = generation;
-			m_async->stagedRecordings[i].clear();
-		}
-		// Requests made before the build started are answered by it. A later one stays.
-		if (instance.requests->load(std::memory_order_acquire) == instance.staged->m_requests) {
-			instance.rebuildRequested = false;
-			instance.rebuildReasons.clear();
+		if (m_async) {
+			// The staged graph's first recording places its transients, which may move ones the attached graph binds. From here the
+			// attached graph keeps what it bound, and records nothing new.
+			instance.graph->FreezeAliasedBindings();
+			for (uint32_t i = 0; i < m_async->epochs.size(); ++i) {
+				if (m_async->instanceOf[i] != index) continue;
+				m_async->stagedGraph[i] = raw;
+				m_async->stagedGeneration[i] = generation;
+				m_async->stagedRecordings[i].clear();
+			}
+			// Requests made before the build started are answered by it. A later one stays. Without async epochs the attach
+			// answers them (SwapStagedIn): a staged graph dropped before its attach answers nothing.
+			if (instance.requests->load(std::memory_order_acquire) == instance.staged->m_requests) {
+				instance.rebuildRequested = false;
+				instance.rebuildReasons.clear();
+			}
 		}
 		PublishDeclared(index);
-	});
+	};
+	// With async epochs the host's thread holds still while its view of the epoch changes. Nothing is detached: the attached graph
+	// keeps its tickets. Without them nothing else runs now.
+	if (m_async) HoldAsync({}, stage);
+	else stage();
 	if (!failure.empty()) return refuse(AttachRefusal::SharedSetupFailed, std::move(failure));
 	m_stageCount.fetch_add(1, std::memory_order_relaxed);
 	result.staged = true;
@@ -1555,6 +1576,11 @@ bool GraphHost::SwapStagedIn(size_t index) {
 			m_async->stagedGeneration[i] = 0;
 		}
 	InstallGraph(index, std::move(built->m_graph), built->m_serial, generation);
+	// Without async epochs the requests made before the build started are answered here (with them, at the staging).
+	if (!m_async && instance.requests->load(std::memory_order_acquire) == built->m_requests) {
+		instance.rebuildRequested = false;
+		instance.rebuildReasons.clear();
+	}
 	// The recordings made on it are its tickets' candidates from now on.
 	if (m_async)
 		for (uint32_t i = 0; i < m_async->epochs.size(); ++i)
@@ -1605,6 +1631,12 @@ GraphHost::AttachResult GraphHost::AttachStagedEpochGraphs(std::span<const uint3
 	if (m_async && !m_async->holding) ReplaceAsyncInstances(indices, [&](size_t i) { return SwapStagedIn(i); });
 	else
 		for (const auto index : indices) (void)SwapStagedIn(index);
+	// Without async epochs: the set's graphs place in the host's epoch order (instances are in that order), before any prepares.
+	if (!m_async) {
+		auto ordered = indices;
+		std::ranges::sort(ordered);
+		for (const auto index : ordered) PlaceAttachedAliases(index);
+	}
 	m_attachCount.fetch_add(indices.size(), std::memory_order_relaxed);
 	m_setAttachCount.fetch_add(1, std::memory_order_relaxed);
 	spdlog::info("GraphHost: staged graphs of epochs {} attached together in {:.3f} ms", names,
@@ -1650,6 +1682,41 @@ std::vector<uint32_t> GraphHost::EpochsAwaitingSlices(const IVersionedResource& 
 		if (next && next->DeclaresOtherSlices(key, slices)) epochs.push_back(m_instances[index].epoch);
 	}
 	return epochs;
+}
+
+size_t GraphHost::DropStagedEpochGraphs(std::span<const uint32_t> epochs) {
+	BT_ZONE_SCOPE("ORG.Host.DropStagedEpochGraphs");
+	CheckOwner("DropStagedEpochGraphs");
+	std::vector<size_t> indices;
+	for (const auto epoch : epochs) {
+		const auto index = InstanceOf(epoch);
+		if (index == kNoInstance || !m_instances[index].staged || std::ranges::find(indices, index) != indices.end()) continue;
+		indices.push_back(index);
+	}
+	if (indices.empty()) return 0;
+	const auto drop = [&] {
+		for (const auto index : indices) RetireStaged(index);
+	};
+	// RetireStaged changes the host thread's view of the epochs: it holds still meanwhile.
+	if (m_async && !m_async->holding) HoldAsync({}, drop);
+	else drop();
+	spdlog::info("GraphHost: {} staged graph(s) dropped before their attach", indices.size());
+	return indices.size();
+}
+
+void GraphHost::PlaceAttachedAliases(size_t index) {
+	auto& instance = m_instances[index];
+	if (m_async || !instance.graph) return;
+	try {
+		instance.graph->PlaceDeferredAliasesNow();
+	} catch (const std::exception& e) {
+		instance.failed = true;
+		instance.failure = std::string("its alias placement at the attach failed: ") + e.what();
+		spdlog::error("GraphHost: epoch {}'s graph failed to place its transients at its attach (build {}); it runs nothing until it is built "
+			"again: {}", instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch), instance.buildGeneration,
+			e.what());
+		ReportEpochFailure({instance.epoch, instance.buildGeneration, false, instance.failure});
+	}
 }
 
 GraphHost::AttachStats GraphHost::AttachStatsTotal() const noexcept {
@@ -1716,11 +1783,6 @@ bool GraphHost::BuildDueInstances(bool all) {
 			&& !instance.graph->PersistentAliasPlacementsCurrent()) {
 			MarkRebuild(instance, "its alias placements are in a pool another epoch's build grew");
 			basic_telemetry::AddCounter("ORG.Host.AliasArenaRebuilds");
-		}
-		if (!m_desc.reportStaleAliasPlacements && instance.graph && !instance.rebuildRequested && !instance.staged
-			&& FramePlacementStale(*instance.graph, instance.epoch)) {
-			MarkRebuild(instance, "it placed from a frame placement that is no longer current");
-			basic_telemetry::AddCounter("ORG.Host.FramePlacementRebuilds");
 		}
 		// A failed build waits for a rebuild request (BuildDue).
 		if (all ? (!instance.graph && !instance.failed) || instance.rebuildRequested : BuildDue(index)) due.push_back(index);
@@ -2119,13 +2181,27 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 		return EpochFailedError(instance.epoch, error);
 	};
 	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
-	// Frame pacing: this position's run of framesInFlight frames back (a frame: each epoch of the order once) is waited for and
-	// retired. It was submitted to the device by its own Execute, so the wait always ends. Every other run whose GPU work is done
+	// Frame pacing: this epoch's run of framesInFlight of its executions back is waited for and retired. It was submitted to the device by its own Execute, so the wait always ends. Every other run whose GPU work is done
 	// retires too (their statistics are read, their memory freed).
 	{
-		const size_t positions = size_t{(std::max)(m_desc.framesInFlight, 1u)} * (std::max<size_t>)(m_desc.epochOrder.size(), 1);
-		if (m_syncLeases.size() != positions) m_syncLeases.assign(positions, nullptr);
-		if (auto* previous = std::exchange(m_syncLeases[m_frameNumber % positions], nullptr); previous && previous->state == RunLease::State::Submitted) {
+		// Per epoch: its run framesInFlight of its own executions back, so no epoch's graph has more runs in flight than its
+		// admission holds, however often each epoch executes in a frame.
+		const size_t inFlight = (std::max)(m_desc.framesInFlight, 1u);
+		const size_t positions = inFlight * (std::max<size_t>)(m_instances.size(), 1);
+		if (m_syncLeases.size() != positions) {
+			m_syncLeases.assign(positions, nullptr);
+			m_syncSubmissions.assign(positions, 0);
+			m_syncExecutions.assign(m_instances.size(), 0);
+		}
+		m_syncPosition = index * inFlight + m_syncExecutions[index]++ % inFlight;
+		// The run at a position, if its lease still holds it and it is not complete.
+		const auto pending = [&](size_t position) -> RunLease* {
+			auto* run = m_syncLeases[position];
+			return run && run->state == RunLease::State::Submitted && run->submission == m_syncSubmissions[position] ? run : nullptr;
+		};
+		auto* previous = pending(m_syncPosition);
+		m_syncLeases[m_syncPosition] = nullptr;
+		if (previous) {
 			BT_ZONE_SCOPE("ORG.Host.WaitFramePacing");
 			for (const auto& [timeline, value] : previous->points) (void)(*timeline)->HostWait(value);
 		}
@@ -2150,6 +2226,12 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	lap(m_lastTimings.releaseUs);
 	graph.SetPersistentEpoch(epoch);
 	graph.SetFrameWaitValue(m_frameWaitValue);
+	// The shared upload service resolves registry handles in one registry. A pass queues an upload by a handle of its own graph's
+	// registry in its Update, and this graph's upload pass records it in Execute below, so the service resolves in this graph's
+	// registry while the graph is prepared and executed. Otherwise a host of several graphs resolves every handle in the registry
+	// of the graph attached last, which names another resource (or none) at that index.
+	if (m_instances.size() > 1)
+		if (auto* uploads = graph.GetUploadService()) uploads->SetUploadResolveContext({&graph.GetResourceRegistry(), 0});
 	if (beforePrepare) {
 		BT_ZONE_SCOPE("ORG.Host.CommitInputs");
 		beforePrepare(graph);
@@ -2233,8 +2315,8 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 			lease.state = RunLease::State::Submitted;
 			m_submittedLeases.push_back(&lease);
 		}
-		const size_t positions = m_syncLeases.size();
-		m_syncLeases[m_frameNumber % positions] = &lease;
+		m_syncLeases[m_syncPosition] = &lease;
+		m_syncSubmissions[m_syncPosition] = lease.submission;
 	}
 	lap(m_lastTimings.signalUs);
 	m_lastHostFrame = m_frameNumber;
@@ -2307,6 +2389,11 @@ void GraphHost::SetFramePositions(std::vector<FramePosition> positions) {
 	}
 	m_framePositions = std::move(positions);
 	m_framePlacement->SetFrameArena(m_frameAliasArena);
+	// The frame placement's worker makes no version until each epoch with a position has a summary (the first plan with
+	// candidates makes one at once).
+	std::vector<uint32_t> epochs;
+	for (const auto& entry : m_framePositions) epochs.push_back(entry.epoch);
+	m_framePlacement->SetFrameEpochs(std::move(epochs));
 }
 
 std::shared_ptr<FrameAliasArena> GraphHost::FrameArena() const {
@@ -2500,22 +2587,11 @@ void GraphHost::ApplyFramePlacementSettings() {
 		applied.sizing.headroom = m_framePlacementSettings.heapHeadroom;
 		applied.sizing.shrinkFactor = m_framePlacementSettings.heapShrinkFactor;
 		applied.memoryLogPeriod = std::chrono::seconds(m_framePlacementSettings.memoryLogSeconds);
+		applied.trimAfter = std::chrono::milliseconds(m_framePlacementSettings.heapTrimMilliseconds);
 	}
 	for (const auto& [epoch, most] : m_ticketsAhead)
 		if (std::ranges::find(applied.repeatedEpochs, epoch) == applied.repeatedEpochs.end()) applied.repeatedEpochs.push_back(epoch);
 	m_framePlacement->SetSettings(std::move(applied));
-}
-
-bool GraphHost::FramePlacementStale(const RenderGraph& graph, uint32_t epoch) const {
-	const auto use = graph.FramePlacementInUse();
-	if (!use.planned || !m_framePlacement) return false;
-	const auto current = m_framePlacement->Current();
-	if (!current) return use.placed != 0;
-	if (use.version == current->Id()) return false;
-	if (use.placed != 0) return true;
-	return std::ranges::any_of(current->Entries(), [&](const FramePlacementVersion::Entry& entry) {
-		return entry.placed && entry.UseIn(epoch) != nullptr;
-	});
 }
 
 void GraphHost::LogFramePlacement(bool detailed) const {
@@ -2528,6 +2604,20 @@ std::vector<std::shared_ptr<const PlacementSummary>> GraphHost::PlacementSummari
 
 std::shared_ptr<const FramePlacementVersion> GraphHost::LatestFramePlacement() const {
 	return m_framePlacement ? m_framePlacement->Latest() : nullptr;
+}
+
+GraphHost::FramePlacementUse GraphHost::FramePlacementInUse(uint32_t epoch) const {
+	CheckOwner("FramePlacementInUse");
+	for (const auto& instance : m_instances) {
+		if (instance.epoch != epoch || !instance.graph) continue;
+		const auto use = instance.graph->FramePlacementInUse();
+		return {use.planned, use.version, use.placed};
+	}
+	return {};
+}
+
+std::vector<FramePlacementMemory::HeapInfo> GraphHost::FramePlacementHeaps() const {
+	return m_framePlacement ? m_framePlacement->Heaps() : std::vector<FramePlacementMemory::HeapInfo>{};
 }
 
 void GraphHost::SetExternalEpochs(std::vector<uint32_t> epochs) {
