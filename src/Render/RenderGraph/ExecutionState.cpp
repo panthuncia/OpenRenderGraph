@@ -54,10 +54,11 @@ bool BackingAccessAdmissionLedger::RetireCompleted(rhi::ResourceHandle resource,
     const auto* grid = m_accesses.Find(key);
     if (!grid) return true;
     for (const auto& cell : grid->cells) {
-        if (!PointCompleted(PointOf(cell.writer), completed)) return false;
+        for (const auto& writer : cell.writers) if (!PointCompleted(PointOf(writer), completed)) return false;
         for (const auto& reader : cell.readers) if (!PointCompleted(PointOf(reader), completed)) return false;
     }
     m_accesses.Erase(key);
+    ++m_changes;
     return true;
 }
 bool AliasAccessAdmissionLedger::RetireCompleted(const AliasHeapGeneration* heap,
@@ -93,12 +94,22 @@ void Visit(const CompileResourceShape& shape, CompileRange range, auto&& fn) {
             fn(mip, slice);
 }
 
+// A state grid's fingerprint is the XOR of its cells' hashes, so a commit updates it for the cells it changes alone.
+uint64_t MixBits(uint64_t value) {
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
+    return value ^ (value >> 31);
+}
+uint64_t CellHash(size_t cell, const CompileResourceState& state, uint32_t queue) {
+    uint64_t hash = MixBits(cell * 0x9E3779B97F4A7C15ull + state.access);
+    hash = MixBits(hash ^ state.layout);
+    hash = MixBits(hash ^ state.sync);
+    return MixBits(hash ^ ((uint64_t{state.write} << 32) | queue));
+}
 template<class Grid>
 uint64_t Fingerprint(const Grid& grid) {
-    uint64_t hash = 1469598103934665603ull;
-    const auto mix = [&](uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
-    for (const auto& cell : grid.cells) { mix(cell.access); mix(cell.layout); mix(cell.sync); mix(cell.write); }
-    for (const auto queue : grid.queues) mix(queue);
+    uint64_t hash = 0;
+    for (size_t cell = 0; cell < grid.cells.size(); ++cell) hash ^= CellHash(cell, grid.cells[cell], grid.queues[cell]);
     return hash;
 }
 
@@ -866,6 +877,32 @@ PreparedExecutionBarrierPlan BackingStateAdmissionLedger::Prepare(
         output.committedStates.resize(next);
         output.committedQueues.resize(next);
     }
+    // Across batches: per resource and cell, the nearest later batch that commits it (from the last batch back). A commit is
+    // superseded from the latest of those over its cells on.
+    std::vector<std::vector<uint32_t>> nextCommit(ordered.size());
+    for (size_t batch = result.batches.size(); batch-- > 0;) {
+        auto& output = result.batches[batch];
+        const auto count = output.committedStates.size();
+        output.committedSupersededAt.assign(count, UINT32_MAX);
+        for (size_t i = 0; i < count; ++i) {
+            const auto resource = output.committedIndices[i];
+            if (resource >= ordered.size() || nextCommit[resource].empty()) continue;
+            const auto& shape = ordered[resource].shape;
+            uint32_t at = 0;
+            Visit(shape, output.committedStates[i].range,
+                [&](uint32_t mip, uint32_t slice) { at = (std::max)(at, nextCommit[resource][CellIndex(shape, mip, slice)]); });
+            output.committedSupersededAt[i] = at;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const auto resource = output.committedIndices[i];
+            if (resource >= ordered.size()) continue;
+            const auto& shape = ordered[resource].shape;
+            auto& cells = nextCommit[resource];
+            if (cells.empty()) cells.assign(size_t{shape.mips} * shape.slices, UINT32_MAX);
+            Visit(shape, output.committedStates[i].range,
+                [&](uint32_t mip, uint32_t slice) { cells[CellIndex(shape, mip, slice)] = static_cast<uint32_t>(batch); });
+        }
+    }
     BT_PLOT("ORG.Execution.StateBarrierSteps", static_cast<int64_t>(entrySteps));
     BT_PLOT("ORG.Execution.IntraBatchStateBarrierSteps", static_cast<int64_t>(intraBatchSteps));
     BT_PLOT("ORG.Execution.CrossQueueStateBarrierSteps", static_cast<int64_t>(crossQueueSteps));
@@ -883,6 +920,7 @@ void BackingStateAdmissionLedger::SeedBatch(const PreparedBatchBarriers& batch) 
         if (m_states.Contains(key) && !authoritative) continue;
         auto& grid = m_states.Emplace(key);
         grid = StateGrid{};
+        grid.changedIn = ++m_changes;
         grid.shape = seed.shape;
         grid.cells.resize(size_t{grid.shape.mips} * grid.shape.slices);
         grid.queues.assign(grid.cells.size(), UINT32_MAX);
@@ -904,6 +942,7 @@ void BackingStateAdmissionLedger::SeedUniform(rhi::ResourceHandle resource, cons
     if (m_states.Contains(key)) throw std::logic_error("A backing the ledger holds cannot be seeded again");
     auto& grid = m_states.Emplace(key);
     grid = StateGrid{};
+    grid.changedIn = ++m_changes;
     grid.shape = shape;
     grid.cells.assign(size_t{shape.mips} * shape.slices, state);
     grid.queues.assign(grid.cells.size(), queue);
@@ -920,14 +959,23 @@ void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch
         auto* grid = m_states.Find(key);
         if (!grid)
             throw std::logic_error("Backing state was not seeded before commit");
-        const auto& update = batch.committedStates[i];
-        Visit(grid->shape, update.range, [&](uint32_t mip, uint32_t slice) {
-            const auto cellIndex = CellIndex(grid->shape, mip, slice);
-            grid->cells[cellIndex] = update.state;
-            grid->queues[cellIndex] = batch.committedQueues[i];
-        });
-        grid->fingerprint = Fingerprint(*grid);
+        if (CommitCells(*grid, batch.committedStates[i], batch.committedQueues[i])) grid->changedIn = ++m_changes;
     }
+}
+
+bool BackingStateAdmissionLedger::CommitCells(StateGrid& grid, const PreparedStateRegion& update, uint32_t queue) {
+    // A commit that leaves the cells as they were (an execution that returns what it touches to where it found it, a closed one's
+    // home states) writes nothing, and the fingerprint stands.
+    bool changed = false;
+    Visit(grid.shape, update.range, [&](uint32_t mip, uint32_t slice) {
+        const auto cell = CellIndex(grid.shape, mip, slice);
+        if (grid.cells[cell] == update.state && grid.queues[cell] == queue) return;
+        grid.fingerprint ^= CellHash(cell, grid.cells[cell], grid.queues[cell]) ^ CellHash(cell, update.state, queue);
+        grid.cells[cell] = update.state;
+        grid.queues[cell] = queue;
+        changed = true;
+    });
+    return changed;
 }
 
 UntouchedResources FindUntouched(const Schedule& graph, std::span<const PreparedBackingState> backings,
@@ -977,7 +1025,7 @@ UntouchedResources FindUntouched(const Schedule& graph, std::span<const Prepared
 }
 
 void BackingStateAdmissionLedger::Invalidate(std::span<const rhi::ResourceHandle> resources) {
-    for (const auto resource : resources) if (resource.valid()) m_states.Erase(Key(resource));
+    for (const auto resource : resources) if (resource.valid() && m_states.Erase(Key(resource))) ++m_changes;
 }
 
 void BackingStateAdmissionLedger::Capture(StatePrediction& prediction, const Schedule& graph,
@@ -1016,44 +1064,63 @@ bool BackingStateAdmissionLedger::Predicts(const StatePrediction& prediction, st
     return true;
 }
 
-void BackingStateAdmissionLedger::CommitBatch(const PreparedBatchBarriers& batch, std::span<const PreparedBackingState> backings,
-    uint64_t backingSet, std::span<const uint32_t> unmoved) {
+void BackingStateAdmissionLedger::CommitBatches(std::span<const PreparedBatchBarriers> batches,
+    std::span<const PreparedBackingState> backings, uint64_t backingSet, std::span<const uint32_t> unmoved) {
     BT_ZONE_SCOPE("ORG.Execution.CommitStates");
-    if (batch.committedResources.size() != batch.committedStates.size()
-        || batch.committedQueues.size() != batch.committedStates.size()
-        || batch.committedIndices.size() != batch.committedStates.size())
-        throw std::invalid_argument("Invalid backing-state commit");
-    // Seeds first: the first executions of a backing, and the aliased backings that enter from Undefined, whose grids are made
-    // again. Making a grid moves no address (the table's entries stay put), so the commits below still find them by index.
-    if (!batch.seeds.empty() && batch.committedIndices.size() != batch.committedStates.size()) {
-        CommitBatch(batch);
-        return;
-    }
-    SeedBatch(batch);
-    auto& resolved = m_states.Resolve(backings, backingSet);
-    for (size_t i = 0; i < batch.committedStates.size(); ++i) {
-        const auto index = batch.committedIndices[i];
-        // No running pass touched it: it stays as the execution found it.
-        if (!unmoved.empty() && std::binary_search(unmoved.begin(), unmoved.end(), index)) continue;
-        StateGrid* grid = index < resolved.size() ? resolved[index] : nullptr;
-        if (!grid) {
-            grid = m_states.Find(Key(batch.committedResources[i]));
-            if (!grid) throw std::logic_error("Backing state was not seeded before commit");
-            if (index < resolved.size()) resolved[index] = grid;
+    // What a batch's commit depends on besides the batch: how many batches commit with it (superseded commits), and the
+    // unmoved resources.
+    uint64_t key = (1469598103934665603ull ^ batches.size()) * 1099511628211ull;
+    for (const auto index : unmoved) key = (key ^ index) * 1099511628211ull;
+    // The same call as the last one to commit these batches (backings, key): a grid that has not changed since is as that call
+    // left it, so its commits write nothing there. A grid is skipped or committed as a whole (in batch order): its commits from
+    // one batch redone without a later batch's could leave a cell they share in the earlier state. Commits to different grids
+    // are independent.
+    uint64_t since = 0;
+    if (!batches.empty() && std::ranges::all_of(batches, [&](const PreparedBatchBarriers& batch) {
+            const auto& last = batch.lastCommit;
+            return last.ledger == this && last.changes == batches.front().lastCommit.changes && last.backingSet == backingSet
+                && last.key == key;
+        }))
+        since = batches.front().lastCommit.changes;
+    // Nothing in the ledger changed since.
+    if (since == m_changes) return;
+    {
+        BT_ZONE_SCOPE("ORG.Execution.CommitStateCells");
+        basic_telemetry::AddCounter("ORG.Execution.StateCommitVisits");
+        // Found once: a seed makes a grid without moving another's address (the table's entries stay put), and a grid the set had
+        // none of when resolved is found by key below and kept.
+        auto& resolved = m_states.Resolve(backings, backingSet);
+        for (const auto& batch : batches) {
+            if (batch.committedResources.size() != batch.committedStates.size()
+                || batch.committedQueues.size() != batch.committedStates.size()
+                || batch.committedIndices.size() != batch.committedStates.size()
+                || (!batch.committedSupersededAt.empty() && batch.committedSupersededAt.size() != batch.committedStates.size()))
+                throw std::invalid_argument("Invalid backing-state commit");
+            const bool superseding = !batch.committedSupersededAt.empty();
+            // Seeds first: the first executions of a backing, and the aliased backings that enter from Undefined, whose grids are made
+            // again.
+            if (!batch.seeds.empty()) SeedBatch(batch);
+            for (size_t i = 0; i < batch.committedStates.size(); ++i) {
+                // A later batch committed here commits its cells again.
+                if (superseding && batch.committedSupersededAt[i] < batches.size()) continue;
+                const auto index = batch.committedIndices[i];
+                // No running pass touched it: it stays as the execution found it.
+                if (!unmoved.empty() && std::binary_search(unmoved.begin(), unmoved.end(), index)) continue;
+                StateGrid* grid = index < resolved.size() ? resolved[index] : nullptr;
+                if (!grid) {
+                    grid = m_states.Find(Key(batch.committedResources[i]));
+                    if (!grid) throw std::logic_error("Backing state was not seeded before commit");
+                    if (index < resolved.size()) resolved[index] = grid;
+                }
+                // Unchanged since this call last left it. A grid this call changes keeps a stamp after `since`, so its later
+                // commits in this call are made too.
+                if (grid->changedIn <= since) continue;
+                if (CommitCells(*grid, batch.committedStates[i], batch.committedQueues[i])) grid->changedIn = ++m_changes;
+            }
         }
-        const auto& update = batch.committedStates[i];
-        // A commit that leaves the cells as they were (an execution that returns what it touches to where it found it, a closed
-        // one's home states) writes nothing, and the fingerprint stands.
-        bool changed = false;
-        Visit(grid->shape, update.range, [&](uint32_t mip, uint32_t slice) {
-            const auto cellIndex = CellIndex(grid->shape, mip, slice);
-            if (grid->cells[cellIndex] == update.state && grid->queues[cellIndex] == batch.committedQueues[i]) return;
-            grid->cells[cellIndex] = update.state;
-            grid->queues[cellIndex] = batch.committedQueues[i];
-            changed = true;
-        });
-        if (changed) grid->fingerprint = Fingerprint(*grid);
     }
+    // The ledger as this call leaves it.
+    for (const auto& batch : batches) batch.lastCommit = {this, m_changes, backingSet, key};
 }
 
 namespace {
@@ -1121,33 +1188,37 @@ void BackingAccessAdmissionLedger::CloseStream(uint64_t stream) {
     if (m_closedProducers >= 1024) FixClosedProducers();
 }
 
-void BackingAccessAdmissionLedger::FixClosedProducers() {
-    const uint64_t change = ++m_commits;
-    m_accesses.ForEach([&](uint64_t, AccessGrid& grid) {
-        bool changed = false;
-        const auto fix = [&](AccessRef& ref) {
-            if (!ref.producer || !m_producers[ref.producer].closed) return;
-            ref = {0, m_producers[ref.producer].signal};
-            changed = true;
-        };
-        for (auto& cell : grid.cells) {
-            fix(cell.writer);
-            for (auto& reader : cell.readers) fix(reader);
-            // Fixed points keep one reader per timeline, the latest.
-            auto& readers = cell.readers;
-            for (size_t i = 0; i < readers.size(); ++i) {
-                if (readers[i].producer) continue;
-                for (size_t j = readers.size(); j-- > i + 1;)
-                    if (!readers[j].producer && readers[j].point.timeline == readers[i].point.timeline) {
-                        readers[i].point.value = (std::max)(readers[i].point.value, readers[j].point.value);
-                        readers.erase(readers.begin() + static_cast<std::ptrdiff_t>(j));
-                    }
+bool BackingAccessAdmissionLedger::FoldClosed(std::vector<AccessRef>& refs) const {
+    bool fixed = false;
+    for (auto& ref : refs) {
+        if (!ref.producer || !m_producers[ref.producer].closed) continue;
+        ref = {0, m_producers[ref.producer].signal};
+        fixed = true;
+    }
+    if (!fixed) return false;
+    for (size_t i = 0; i < refs.size(); ++i) {
+        if (refs[i].producer) continue;
+        for (size_t j = refs.size(); j-- > i + 1;)
+            if (!refs[j].producer && refs[j].point.timeline == refs[i].point.timeline) {
+                refs[i].point.value = (std::max)(refs[i].point.value, refs[j].point.value);
+                refs.erase(refs.begin() + static_cast<std::ptrdiff_t>(j));
             }
+    }
+    return true;
+}
+
+void BackingAccessAdmissionLedger::FixClosedProducers() {
+    uint64_t change = 0;
+    m_accesses.ForEach([&](uint64_t, AccessGrid& grid) {
+        bool changed = false, writersChanged = false;
+        for (auto& cell : grid.cells) {
+            if (FoldClosed(cell.writers)) changed = writersChanged = true;
+            if (FoldClosed(cell.readers)) changed = true;
         }
-        if (changed) {
-            Fingerprint(grid);
-            grid.changedIn = change;
-        }
+        if (!changed) return;
+        if (!change) change = ++m_changes;
+        grid.changedIn = change;
+        if (writersChanged) grid.writersChangedIn = change;
     });
     for (uint32_t id = 1; id < m_producers.size(); ++id)
         if (m_producers[id].closed) {
@@ -1157,21 +1228,25 @@ void BackingAccessAdmissionLedger::FixClosedProducers() {
     m_closedProducers = 0;
 }
 
-void BackingAccessAdmissionLedger::Fingerprint(AccessGrid& grid) {
-    uint64_t all = 1469598103934665603ull, writers = all;
-    const auto mix = [](uint64_t& hash, uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
-    const auto mixRef = [&](uint64_t& hash, const AccessRef& ref) {
-        if (ref.producer) mix(hash, 0x8000000000000000ull | ref.producer);
-        else { mix(hash, ref.point.timeline); mix(hash, ref.point.value); }
-    };
-    for (const auto& cell : grid.cells) {
-        mixRef(all, cell.writer);
-        mixRef(writers, cell.writer);
-        mix(all, cell.readers.size());
-        for (const auto& reader : cell.readers) mixRef(all, reader);
+namespace {
+// Adds an access to a cell's writers or readers: a producer once, a fixed point as the latest of its timeline. True when it
+// changed them.
+bool AddAccess(std::vector<AccessRef>& refs, const AccessRef& ref) {
+    if (ref.producer) {
+        if (std::ranges::find(refs, ref) != refs.end()) return false;
+        refs.push_back(ref);
+        return true;
     }
-    grid.fingerprint = all;
-    grid.writersFingerprint = writers;
+    const auto found = std::ranges::find_if(refs,
+        [&](const AccessRef& other) { return !other.producer && other.point.timeline == ref.point.timeline; });
+    if (found == refs.end()) {
+        refs.push_back(ref);
+        return true;
+    }
+    if (found->point.value >= ref.point.value) return false;
+    found->point = ref.point;
+    return true;
+}
 }
 
 void BackingAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
@@ -1185,36 +1260,36 @@ void BackingAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
     if (graph.incomingBoundaryAccessesByBatch.size() != graph.batches.size())
         throw std::invalid_argument("Compiled graph has no boundary access stream");
     auto& resolved = m_accesses.Resolve(resources, backingSet);
-    // A capture lists each resource once (taken: 1 listed, 2 also written), and each batch's sources once. A producer is found
+    // A capture lists each resource once (taken: 1 listed, 3 also written), and each batch's sources once. A producer is found
     // listed by its mark, a fixed point by a search among the batch's fixed points (there are few).
     std::vector<uint8_t> taken;
     if (capture) {
         capture->valid = false;
+        capture->generation = m_changes;
         capture->entries.clear();
+        capture->consumers.resize(graph.batches.size());
         capture->waits.assign(graph.batches.size(), {});
         taken.assign(ordered.size(), 0);
-        if (m_producerMarks.size() < m_producers.size()) m_producerMarks.resize(m_producers.size(), 0);
     }
+    if (m_producerMarks.size() < m_producers.size()) m_producerMarks.resize(m_producers.size(), 0);
     uint64_t waitsAdded = 0;
     for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
         const auto& batch = graph.batches[batchIndex];
         const auto consumerTimeline = queues[batch.queue].timeline;
         const auto before = incoming[batchIndex].size();
-        const uint64_t mark = capture ? ++m_mark : 0;
-        // Neighbouring cells mostly name the same access: one added just before adds nothing new.
-        AccessRef last{};
+        const uint64_t mark = ++m_mark;
+        if (capture) capture->consumers[batchIndex] = consumerTimeline;
+        // Each producer once per batch; fixed points merge in AppendWait (the latest per timeline).
         const auto add = [&](const AccessRef& ref) {
-            if (ref == last) return;
-            last = ref;
-            AppendWait(incoming[batchIndex], PointOf(ref), consumerTimeline);
-            if (!capture || (!ref.producer && !ref.point.value)) return;
-            auto& sources = capture->waits[batchIndex];
             if (ref.producer) {
                 if (m_producerMarks[ref.producer] == mark) return;
                 m_producerMarks[ref.producer] = mark;
-            } else if (std::ranges::find(sources, ref) != sources.end()) {
-                return;
             }
+            const auto point = PointOf(ref);
+            AppendWait(incoming[batchIndex], point, consumerTimeline);
+            if (!capture || !point.timeline || !point.value || point.timeline == consumerTimeline) return;
+            auto& sources = capture->waits[batchIndex];
+            if (!ref.producer && std::ranges::find(sources, ref) != sources.end()) return;
             sources.push_back(ref);
         };
         for (const auto& access : graph.incomingBoundaryAccessesByBatch[batchIndex]) {
@@ -1224,7 +1299,7 @@ void BackingAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
             auto*& grid = resolved[resourceIndex];
             if (!grid) grid = const_cast<AccessGrid*>(m_accesses.Find(Key(ordered[resourceIndex].resource)));
             if (capture) {
-                if (!taken[resourceIndex]) capture->entries.push_back({resourceIndex, grid != nullptr, false, 0});
+                if (!taken[resourceIndex]) capture->entries.push_back({resourceIndex, grid != nullptr, false});
                 taken[resourceIndex] |= write ? 3 : 1;
             }
             if (!grid) continue;
@@ -1232,19 +1307,14 @@ void BackingAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
                 throw std::invalid_argument("Backing access shape changed without identity change");
             Visit(grid->shape, access.range, [&](uint32_t mip, uint32_t slice) {
                 const auto& cell = grid->cells[CellIndex(grid->shape, mip, slice)];
-                add(cell.writer);
+                for (const auto& writer : cell.writers) add(writer);
                 if (write) for (const auto& reader : cell.readers) add(reader);
             });
         }
         waitsAdded += incoming[batchIndex].size() - before;
     }
     if (capture) {
-        // The fingerprints the waits depend on: a written resource's whole grid, a read one's writers.
-        for (auto& entry : capture->entries) {
-            entry.readers = taken[entry.resource] == 3;
-            if (const auto* grid = resolved[entry.resource])
-                entry.fingerprint = entry.readers ? grid->fingerprint : grid->writersFingerprint;
-        }
+        for (auto& entry : capture->entries) entry.readers = taken[entry.resource] == 3;
         capture->valid = true;
     }
     BT_PLOT("ORG.Execution.CrossFrameHazardWaits", static_cast<int64_t>(waitsAdded));
@@ -1252,7 +1322,7 @@ void BackingAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
         "ORG.Execution.CrossFrameHazardWaits", static_cast<int64_t>(waitsAdded));
 }
 
-bool BackingAccessAdmissionLedger::PredictedWaits(const AccessPrediction& prediction, const Schedule& graph,
+bool BackingAccessAdmissionLedger::PredictedWaits(AccessPrediction& prediction, const Schedule& graph,
     std::span<const PreparedBackingState> resources,
     std::span<const ExecutionTimelinePoint> queues,
     std::vector<std::vector<ExecutionTimelinePoint>>& incoming, uint64_t backingSet) const {
@@ -1260,16 +1330,22 @@ bool BackingAccessAdmissionLedger::PredictedWaits(const AccessPrediction& predic
     if (!prediction.valid || prediction.waits.size() != graph.batches.size() || incoming.size() != graph.batches.size()
         || queues.size() != graph.structure->queues.size())
         return false;
-    auto& resolved = m_accesses.Resolve(resources, backingSet);
-    for (const auto& entry : prediction.entries) {
-        if (entry.resource >= resolved.size()) return false;
-        auto*& grid = resolved[entry.resource];
-        if (!grid) grid = const_cast<AccessGrid*>(m_accesses.Find(Key(resources[entry.resource].resource)));
-        if (!grid) {
-            if (entry.present) return false;
-            continue;
+    for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex)
+        if (prediction.consumers[batchIndex] != queues[graph.batches[batchIndex].queue].timeline) return false;
+    // Something changed since the capture was last checked: it holds while none of its grids did (a grid made or gone counts).
+    if (prediction.generation != m_changes) {
+        auto& resolved = m_accesses.Resolve(resources, backingSet);
+        for (const auto& entry : prediction.entries) {
+            if (entry.resource >= resolved.size()) return false;
+            auto*& grid = resolved[entry.resource];
+            if (!grid) grid = const_cast<AccessGrid*>(m_accesses.Find(Key(resources[entry.resource].resource)));
+            if (!grid) {
+                if (entry.present) return false;
+                continue;
+            }
+            if (!entry.present || (entry.readers ? grid->changedIn : grid->writersChangedIn) > prediction.generation) return false;
         }
-        if (!entry.present || (entry.readers ? grid->fingerprint : grid->writersFingerprint) != entry.fingerprint) return false;
+        prediction.generation = m_changes;
     }
     uint64_t waitsAdded = 0;
     for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
@@ -1292,6 +1368,7 @@ void BackingAccessAdmissionLedger::AppendBoundaryAccessWaits(const Schedule& gra
         || selected.size() != ordered.size())
         throw std::invalid_argument("Invalid boundary access wait dimensions");
     auto& resolved = m_accesses.Resolve(resources, backingSet);
+    if (m_producerMarks.size() < m_producers.size()) m_producerMarks.resize(m_producers.size(), 0);
     for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
         auto& waits = out[batchIndex];
         for (const auto& access : graph.incomingBoundaryAccessesByBatch[batchIndex]) {
@@ -1303,11 +1380,12 @@ void BackingAccessAdmissionLedger::AppendBoundaryAccessWaits(const Schedule& gra
             // One entry per timeline among this access's own: another access of the resource may add the same timeline again, which
             // the reader merges (the latest value per timeline). Searching every earlier entry would cost the batch's accesses squared.
             const size_t first = waits.size();
-            // Neighbouring cells mostly name the same access: one appended just before adds nothing new.
-            AccessRef last{};
+            const uint64_t mark = ++m_mark;
             const auto append = [&](const AccessRef& ref) {
-                if (ref == last) return;
-                last = ref;
+                if (ref.producer) {
+                    if (m_producerMarks[ref.producer] == mark) return;
+                    m_producerMarks[ref.producer] = mark;
+                }
                 const auto point = PointOf(ref);
                 if (!point.timeline || !point.value) return;
                 for (size_t i = first; i < waits.size(); ++i)
@@ -1319,7 +1397,7 @@ void BackingAccessAdmissionLedger::AppendBoundaryAccessWaits(const Schedule& gra
             };
             Visit(grid->shape, access.range, [&](uint32_t mip, uint32_t slice) {
                 const auto& cell = grid->cells[CellIndex(grid->shape, mip, slice)];
-                append(cell.writer);
+                for (const auto& writer : cell.writers) append(writer);
                 for (const auto& reader : cell.readers) append(reader);
             });
         }
@@ -1343,8 +1421,7 @@ void BackingAccessAdmissionLedger::Commit(const Schedule& graph,
         open = &found->second;
     }
     batchCount = (std::min)(batchCount, static_cast<uint32_t>(graph.batches.size()));
-    // A stream's batch moves its producer's latest signal, which every cell the stream touched names. The same stream touches
-    // the same cells every time, so no cell is left naming a later signal than its own.
+    // A stream's batch moves its producer's latest signal, which every cell the stream touched names.
     const auto moveProducer = [&](uint32_t batchIndex) {
         const auto signal = execution.batches[batchIndex].signal;
         if (!signal.timeline || !signal.value) throw std::invalid_argument("Unsubmitted hazard point");
@@ -1356,80 +1433,62 @@ void BackingAccessAdmissionLedger::Commit(const Schedule& graph,
         producer.signal = signal;
         return ref;
     };
-    auto& resolved = m_accesses.Resolve(resources, backingSet);
-    // The grids this commit changes, each hashed once at the end: a grid's fingerprint covers all its cells, and a resource
-    // has several accesses a frame.
-    const uint64_t commit = ++m_commits;
-    thread_local std::vector<AccessGrid*> changedGrids;
-    changedGrids.clear();
-    // The same stream on the same graph, backings and batches as its last commit: a grid that commit left as it found it, and that
-    // nothing changed since, needs no walk (Stream).
-    const uint64_t quietBefore = open && open->lastCommit && open->graph == &graph && open->backingSet == backingSet && backingSet
-        && open->batchCount == batchCount ? open->lastCommit : 0;
-    uint64_t skipped = 0;
-    for (uint32_t batchIndex = 0; batchIndex < batchCount; ++batchIndex) {
-        const auto ref = moveProducer(batchIndex);
-        const auto signal = execution.batches[batchIndex].signal;
-        for (const auto& access : graph.boundaryAccessesByBatch[batchIndex]) {
-            const auto resourceIndex = access.resource;
-            const bool write = access.state.write;
-            const auto& backing = ordered[resourceIndex];
-            if (!backing.resource.valid()) continue;
-            bool inserted = false;
-            auto*& entry = resolved[resourceIndex];
-            if (!entry) entry = &m_accesses.Emplace(Key(backing.resource), &inserted);
-            auto& grid = *entry;
-            if (inserted) {
-                grid.shape = backing.shape;
-                grid.cells.resize(size_t{grid.shape.mips} * grid.shape.slices);
-            } else if (grid.shape != backing.shape) {
-                throw std::invalid_argument("Backing access shape changed without identity change");
-            }
-            if (!inserted && grid.changedIn < quietBefore) {
-                ++skipped;
-                continue;
-            }
-            // A cell is written only when who touched it changes, so a frame that repeats leaves it (and the grid's fingerprint) as it
-            // was. Its readers are those since its writer last changed, one per producer (a stream's batch) and one per timeline
-            // among fixed points (the latest): the same writer again keeps them. A read from before that write is complete when the
-            // write is, so the next writer's wait on it is redundant, never wrong.
-            bool changed = inserted;
-            Visit(grid.shape, access.range, [&](uint32_t mip, uint32_t slice) {
-                auto& cell = grid.cells[CellIndex(grid.shape, mip, slice)];
-                if (write) {
-                    if (cell.writer == ref) return;
-                    cell.writer = ref;
-                    cell.readers.clear();
-                    changed = true;
-                    return;
+    // The stream's last walk covers this commit (Stream): its cells name its producers already, so only their signals move.
+    const bool sameWalk = open && backingSet && open->graph == &graph && open->backingSet == backingSet
+        && open->tableGeneration == m_accesses.Generation();
+    if (sameWalk && batchCount <= open->batchCount) {
+        for (uint32_t batchIndex = 0; batchIndex < batchCount; ++batchIndex) moveProducer(batchIndex);
+        return;
+    }
+    // The walk: each access's cells take the commit's references.
+    {
+        BT_ZONE_SCOPE("ORG.Execution.CommitCrossFrameWalk");
+        basic_telemetry::AddCounter("ORG.Execution.CrossFrameCommitWalks");
+        auto& resolved = m_accesses.Resolve(resources, backingSet);
+        uint64_t change = 0;  // this commit's change count, taken at its first change
+        const auto changed = [&](AccessGrid& grid, bool writers) {
+            if (!change) change = ++m_changes;
+            grid.changedIn = change;
+            if (writers) grid.writersChangedIn = change;
+        };
+        for (uint32_t batchIndex = 0; batchIndex < batchCount; ++batchIndex) {
+            const auto ref = moveProducer(batchIndex);
+            for (const auto& access : graph.boundaryAccessesByBatch[batchIndex]) {
+                const auto resourceIndex = access.resource;
+                const bool write = access.state.write;
+                const auto& backing = ordered[resourceIndex];
+                if (!backing.resource.valid()) continue;
+                bool inserted = false;
+                auto*& entry = resolved[resourceIndex];
+                if (!entry) entry = &m_accesses.Emplace(Key(backing.resource), &inserted);
+                auto& grid = *entry;
+                if (inserted) {
+                    grid.shape = backing.shape;
+                    grid.cells.resize(size_t{grid.shape.mips} * grid.shape.slices);
+                    changed(grid, true);
+                } else if (grid.shape != backing.shape) {
+                    throw std::invalid_argument("Backing access shape changed without identity change");
                 }
-                if (std::ranges::find(cell.readers, ref) != cell.readers.end()) return;
-                if (ref.producer) {
-                    cell.readers.push_back(ref);
-                    changed = true;
-                    return;
-                }
-                auto reader = std::ranges::find_if(cell.readers,
-                    [&](const AccessRef& other) { return !other.producer && other.point.timeline == signal.timeline; });
-                if (reader == cell.readers.end()) cell.readers.push_back(ref);
-                else if (reader->point.value < signal.value) *reader = ref;
-                else return;
-                changed = true;
-            });
-            if (changed && grid.changedIn != commit) {
-                grid.changedIn = commit;
-                changedGrids.push_back(&grid);
+                bool grew = false;
+                Visit(grid.shape, access.range, [&](uint32_t mip, uint32_t slice) {
+                    auto& cell = grid.cells[CellIndex(grid.shape, mip, slice)];
+                    auto& refs = write ? cell.writers : cell.readers;
+                    if (!AddAccess(refs, ref)) return;
+                    // A new reference (a stream's first walk, after a rebuild): closed producers' references become points, so
+                    // a cell holds the open producers and a point per timeline, however many streams came and went.
+                    FoldClosed(refs);
+                    grew = true;
+                });
+                if (grew) changed(grid, write);
             }
         }
+        if (open) {
+            open->batchCount = sameWalk ? (std::max)(open->batchCount, batchCount) : batchCount;
+            open->graph = &graph;
+            open->backingSet = backingSet;
+            open->tableGeneration = m_accesses.Generation();
+        }
     }
-    for (auto* grid : changedGrids) Fingerprint(*grid);
-    if (open) {
-        open->lastCommit = commit;
-        open->graph = &graph;
-        open->backingSet = backingSet;
-        open->batchCount = batchCount;
-    }
-    if (skipped) basic_telemetry::AddCounter("ORG.Execution.QuietCrossFrameAccesses", static_cast<int64_t>(skipped));
 }
 
 namespace {
@@ -1465,28 +1524,7 @@ void AliasAccessAdmissionLedger::ForEachConflict(const PreparedBackingState& res
     }
 }
 
-std::vector<rhi::ResourceHandle> AliasAccessAdmissionLedger::ApplyInitialStates(
-    const Schedule& graph,
-    std::span<const PreparedBackingState> resources) const {
-    BT_ZONE_SCOPE("ORG.Execution.ResolveAliasActivations");
-    const auto ordered = OrderBackings(graph, resources);
-    if (graph.aliasFinalResourcesByBatch.size() != graph.batches.size())
-        throw std::invalid_argument("Compiled graph has no alias final-use stream");
-    std::vector<rhi::ResourceHandle> activated;
-    for (const auto& resource : ordered) {
-        if (!resource.aliasHeapIdentity || !resource.aliasSize) continue;
-        bool replacesOccupant = false;
-        ForEachConflict(resource, [&](const Occupant&) { replacesOccupant = true; });
-        if (!replacesOccupant) continue;
-        activated.push_back(resource.resource);
-    }
-    BT_PLOT("ORG.Execution.AliasActivations", static_cast<int64_t>(activated.size()));
-    if (!activated.empty()) basic_telemetry::AddCounter(
-        "ORG.Execution.AliasActivations", static_cast<int64_t>(activated.size()));
-    return activated;
-}
-
-void AliasAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
+std::vector<rhi::ResourceHandle> AliasAccessAdmissionLedger::Resolve(const Schedule& graph,
     std::span<const PreparedBackingState> resources,
     std::span<const ExecutionTimelinePoint> queues,
     std::vector<std::vector<ExecutionTimelinePoint>>& incoming) const {
@@ -1494,27 +1532,44 @@ void AliasAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
     if (incoming.size() != graph.batches.size() || queues.size() != graph.structure->queues.size())
         throw std::invalid_argument("Invalid alias hazard dimensions");
     const auto ordered = OrderBackings(graph, resources);
-    if (graph.aliasFirstResourcesByBatch.size() != graph.batches.size())
-        throw std::invalid_argument("Compiled graph has no alias entry stream");
+    if (graph.aliasFirstResourcesByBatch.size() != graph.batches.size()
+        || graph.aliasFinalResourcesByBatch.size() != graph.batches.size())
+        throw std::invalid_argument("Compiled graph has no alias use streams");
+    // One conflict scan per resource gives both its waits and its activation.
+    enum : uint8_t { kUnseen, kClear, kConflicts };
+    std::vector<uint8_t> seen(ordered.size(), kUnseen);
     uint64_t waitsAdded = 0, overlapsFound = 0;
     for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
-        const auto& batch = graph.batches[batchIndex];
-        const auto consumerTimeline = queues[batch.queue].timeline;
+        const auto consumerTimeline = queues[graph.batches[batchIndex].queue].timeline;
         const auto before = incoming[batchIndex].size();
         for (const auto resourceIndex : graph.aliasFirstResourcesByBatch[batchIndex]) {
-            const auto& resource = ordered[resourceIndex];
-            ForEachConflict(resource, [&](const Occupant& occupant) {
+            bool conflicts = false;
+            ForEachConflict(ordered[resourceIndex], [&](const Occupant& occupant) {
+                conflicts = true;
                 ++overlapsFound;
                 for (const auto point : occupant.accesses)
                     AppendWait(incoming[batchIndex], point, consumerTimeline);
             });
+            seen[resourceIndex] = conflicts ? kConflicts : kClear;
         }
         waitsAdded += incoming[batchIndex].size() - before;
     }
+    std::vector<rhi::ResourceHandle> activated;
+    for (size_t index = 0; index < ordered.size(); ++index) {
+        const auto& resource = ordered[index];
+        if (!resource.aliasHeapIdentity || !resource.aliasSize) continue;
+        // A resource no batch uses first still activates when it replaces an occupant.
+        if (seen[index] == kUnseen) ForEachConflict(resource, [&](const Occupant&) { seen[index] = kConflicts; });
+        if (seen[index] == kConflicts) activated.push_back(resource.resource);
+    }
     BT_PLOT("ORG.Execution.AliasHazardWaits", static_cast<int64_t>(waitsAdded));
     BT_PLOT("ORG.Execution.AliasOverlaps", static_cast<int64_t>(overlapsFound));
+    BT_PLOT("ORG.Execution.AliasActivations", static_cast<int64_t>(activated.size()));
     if (waitsAdded) basic_telemetry::AddCounter(
         "ORG.Execution.AliasHazardWaits", static_cast<int64_t>(waitsAdded));
+    if (!activated.empty()) basic_telemetry::AddCounter(
+        "ORG.Execution.AliasActivations", static_cast<int64_t>(activated.size()));
+    return activated;
 }
 
 void AliasAccessAdmissionLedger::Commit(const Schedule& graph,
@@ -1555,30 +1610,6 @@ void AliasAccessAdmissionLedger::Commit(const Schedule& graph,
             else if (point->value < signal.value) *point = signal;
         }
     }
-}
-
-void BackingAccessAdmissionLedger::ResolvePlannedPoints(
-    const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points) {
-    auto resolve = [&](ExecutionTimelinePoint& point) {
-        if (const auto found = points.find(point.value); found != points.end()) point = found->second;
-    };
-    for (auto& producer : m_producers) resolve(producer.signal);
-    const uint64_t change = ++m_commits;
-    m_accesses.ForEach([&](uint64_t, AccessGrid& grid) {
-        for (auto& cell : grid.cells) {
-            if (!cell.writer.producer) resolve(cell.writer.point);
-            for (auto& reader : cell.readers) if (!reader.producer) resolve(reader.point);
-        }
-        Fingerprint(grid);
-        grid.changedIn = change;
-    });
-}
-
-void AliasAccessAdmissionLedger::ResolvePlannedPoints(
-    const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points) {
-    for (auto& [_, heap] : m_heaps) for (auto& occupant : heap.occupants)
-        for (auto& point : occupant.accesses)
-            if (const auto found = points.find(point.value); found != points.end()) point = found->second;
 }
 
 } // namespace org::compiler

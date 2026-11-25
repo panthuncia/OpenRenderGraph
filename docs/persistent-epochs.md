@@ -208,9 +208,10 @@ from there through the ledgers.
 -   **Predicted admission.** The ledger's view of an executable's entry resources repeats from frame to frame. Each
     executable keeps the last entry-only plan it was admitted with and the ledger's fingerprint of each entry resource
     (`StatePrediction`). While the fingerprints hold, the admission takes that plan as it is (`FrameAdmission::
-    sharedBarriers`). The access ledger predicts the waits the same way (`AccessPrediction`). The handoff lists a ticket
-    recorded from a predicted plan are kept per run lease index and submitted again by the index's next ticket that takes
-    the same plan.
+    sharedBarriers`). The access ledger's cells keep every producer that wrote or read them, so they stop changing once a
+    frame repeats: the waits' capture (`AccessPrediction`) then holds without a check, and a stream's commit only moves its
+    producers' signals. The handoff lists a ticket recorded from a predicted plan are kept per run lease index and
+    submitted again by the index's next ticket that takes the same plan.
 -   **Cost.** In steady state, admission plus commit is a few microseconds per epoch on the submitting thread.
 
 ## Async epochs: tickets

@@ -1845,7 +1845,7 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
     const auto& graph = *frame.publication->executable->graph;
     frame.incomingWaits = frame.ownWaits;
     frame.boundaryAccessWaits.clear();
-    const auto invalidated = m_sequencer->aliases.ApplyInitialStates(graph, frame.backings);
+    const auto invalidated = m_sequencer->aliases.Resolve(graph, frame.backings, frame.queuePoints, frame.incomingWaits);
     frame.aliasActivations = invalidated;
     frame.sharedBarriers.reset();
     frame.prediction.reset();
@@ -1943,31 +1943,13 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         frame.barriers = m_sequencer->states.Prepare(graph, frame.backings, invalidated, frame.entryOnly, frame.backings.Validated(),
             frame.backings.Id(), m_externalHome);
     }
-    // The access waits: an access stream's, from a capture while the ledger holds what that one found (a frame repeats). The
-    // capture that held moves to the front. Otherwise the waits are resolved in full and captured in place of the oldest.
-    bool predictedWaits = false;
-    if (frame.stream) {
-        auto& captures = predictionSlot->access;
-        for (size_t i = 0; i < captures.size() && !predictedWaits; ++i) {
-            if (!m_sequencer->accesses.PredictedWaits(captures[i], graph, frame.backings, frame.queuePoints, frame.incomingWaits,
-                    frame.backings.Id())) continue;
-            const auto hit = captures.begin() + static_cast<std::ptrdiff_t>(i);
-            std::rotate(captures.begin(), hit, hit + 1);
-            predictedWaits = true;
-        }
-    }
-    if (!predictedWaits) {
-        compiler::AccessPrediction* capture = nullptr;
-        if (frame.stream) {
-            auto& captures = predictionSlot->access;
-            if (captures.size() < PredictionSlot::kAccessCaptures) captures.emplace_back();
-            std::rotate(captures.begin(), captures.end() - 1, captures.end());
-            capture = &captures.front();
-        }
+    // The access waits: an access stream's, from its capture while none of the grids it depends on changed (a frame repeats).
+    // Otherwise they are resolved in full and captured again.
+    const bool predictedWaits = frame.stream && m_sequencer->accesses.PredictedWaits(predictionSlot->access, graph, frame.backings,
+        frame.queuePoints, frame.incomingWaits, frame.backings.Id());
+    if (!predictedWaits)
         m_sequencer->accesses.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, frame.incomingWaits, frame.backings.Id(),
-            capture);
-    }
-    m_sequencer->aliases.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, frame.incomingWaits);
+            frame.stream ? &predictionSlot->access : nullptr);
     // Points already reached (a retired timeline's among them: another graph's, destroyed since) need no wait.
     for (auto& waits : frame.incomingWaits)
         std::erase_if(waits, [&](compiler::ExecutionTimelinePoint point) { return m_sequencer->Reached(point); });
@@ -2067,7 +2049,7 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const compiler::G
     // Allocate retention before mutating submission-backed ledgers.
     if (!retained.completions.empty()) m_retained.push_back(std::move(retained));
     const auto& barriers = frame.Barriers();
-    for (uint32_t i = 0; i < count; ++i) m_sequencer->states.CommitBatch(barriers.batches[i], frame.backings, frame.backings.Id(), frame.unmoved);
+    m_sequencer->states.CommitBatches(std::span(barriers.batches).first(count), frame.backings, frame.backings.Id(), frame.unmoved);
     for (const auto& effect : frame.incomingEffects) if (effect.firstBatch < count)
         m_sequencer->incomingRevisions.insert_or_assign((uint64_t{effect.resource.generation} << 32) | effect.resource.index,
             ResourceSequencer::IncomingRevision{effect.revision,effect.completion});
