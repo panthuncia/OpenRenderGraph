@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -55,6 +56,25 @@ struct FramePlacedResident {
 	std::string name;
 	uint64_t offset = 0, size = 0;
 	uint32_t epoch = UINT32_MAX;  // the epoch whose graph placed it
+	uint64_t objectId = 0;        // its identity, as PlacementUse::objectId
+};
+
+/**
+ * @brief A resource that a new frame placement version must keep where it is (FramePlacementVersion::Keeping): a graph that runs
+ * now binds it there.
+ */
+struct FramePlacementPin {
+	uint64_t objectId = 0;
+	const AliasHeapGeneration* heap = nullptr;
+	uint64_t offset = 0, size = 0;
+};
+
+/** @brief The bytes a version's blocks of one memory class, backend set and heap lane need (FramePlacementVersion::BlockNeeds). */
+struct FramePlacementBlockNeed {
+	uint8_t memoryClass = 0;
+	uint64_t backendMask = 0;
+	uint32_t lane = 0;
+	uint64_t capacity = 0;
 };
 
 /**
@@ -134,6 +154,10 @@ struct FramePlacementInputs {
  * the versions settle, the host trims the heaps to the need (FramePlacement::Settings::trimAfter): a version whose blocks take
  * exact heaps (Acquire's exact).
  *
+ * Heaps are kept per memory class, backend set and lane. A version that keeps the running graphs' resources where they are
+ * (FramePlacementVersion::Keeping) cannot grow a heap they lie in, so what does not fit goes to a block of a new lane, with a
+ * heap of its own. A version packed from scratch uses lane 0 only, and the trim drops the heaps of the lanes it no longer uses.
+ *
  * Any thread.
  */
 class FramePlacementMemory {
@@ -150,6 +174,7 @@ public:
 	struct HeapInfo {
 		uint8_t memoryClass = 0;
 		uint64_t backendMask = 0;
+		uint32_t lane = 0;
 		uint64_t capacity = 0, generation = 0;
 		// The capacity the latest version asked for when it took the heap (its block's packed bytes). 0 for a replaced heap.
 		uint64_t needed = 0;
@@ -170,14 +195,17 @@ public:
 	 * than capacity (beyond TrimSlack) is replaced by one of capacity, and a new heap gets no headroom. Throws on failure.
 	 */
 	std::shared_ptr<const AliasHeapGeneration> Acquire(uint8_t memoryClass, uint64_t backendMask, uint64_t capacity, uint64_t alignment,
-		uint64_t poolID, uint64_t versionID, bool exact = false);
+		uint64_t poolID, uint64_t versionID, bool exact = false, uint32_t lane = 0);
 	/**
 	 * @brief Whether a version with these blocks would trim a heap: a current heap is larger than its blocks' need by more than
-	 * TrimSlack, or no block of the version uses its class and backends.
+	 * TrimSlack, or no block of the version uses its class, backends and lane.
 	 */
-	bool WouldTrim(const std::vector<std::pair<std::pair<uint8_t, uint64_t>, uint64_t>>& needs) const;
-	/** @brief Drops the current heaps of the classes and backends no block in needs uses. Their placements keep them alive. */
-	void ReleaseUnused(const std::vector<std::pair<std::pair<uint8_t, uint64_t>, uint64_t>>& needs);
+	bool WouldTrim(const std::vector<FramePlacementBlockNeed>& needs) const;
+	/** @brief The heap Acquire would return without allocating, or null when it would allocate one. */
+	std::shared_ptr<const AliasHeapGeneration> Peek(uint8_t memoryClass, uint64_t backendMask, uint64_t capacity, uint64_t alignment,
+		bool exact = false, uint32_t lane = 0) const;
+	/** @brief Drops the current heaps of the classes, backends and lanes no block in needs uses. Their placements keep them alive. */
+	void ReleaseUnused(const std::vector<FramePlacementBlockNeed>& needs);
 	// What a heap may exceed its need by before a trim replaces it: the larger of 4 MB and 1/64 of the need.
 	static uint64_t TrimSlack(uint64_t need) noexcept { return (std::max)(uint64_t{4} << 20, need / 64); }
 	/** @brief The current heaps' capacities, in bytes. Replaced heaps still alive are not counted (Heaps lists them). */
@@ -197,11 +225,13 @@ private:
 	struct Replaced {
 		uint8_t memoryClass = 0;
 		uint64_t backendMask = 0, capacity = 0, generation = 0;
+		uint32_t lane = 0;
 		std::weak_ptr<const AliasHeapGeneration> heap;
 	};
+	using HeapKey = std::tuple<uint8_t, uint64_t, uint32_t>;  // memory class, backend mask, lane
 	mutable std::mutex m_mutex;
 	Sizing m_sizing;
-	std::map<std::pair<uint8_t, uint64_t>, Heap> m_heaps;  // by memory class and backend mask
+	std::map<HeapKey, Heap> m_heaps;
 	mutable std::vector<Replaced> m_replaced;
 };
 
@@ -222,6 +252,9 @@ public:
 		uint64_t capacity = 0, alignment = 1;
 		uint64_t poolID = 0;  // for memory statistics and the alias ledger's records
 		uint32_t members = 0;
+		// Its heap's lane (FramePlacementMemory). 0, except for a block a version that keeps the running graphs' resources added
+		// for what did not fit in the blocks it kept (Keeping).
+		uint32_t lane = 0;
 	};
 	/** @brief A resource's ranks in one epoch. */
 	struct Use {
@@ -257,6 +290,36 @@ public:
 
 	/** @brief Computes the placement. id: the version's number, which names its blocks' pool ids. */
 	static std::shared_ptr<FramePlacementVersion> Compute(const FramePlacementInputs& inputs, uint64_t id);
+	/**
+	 * @brief A version with fresh's entries and lifetimes that keeps every pinned resource where it is, so the graphs that bind
+	 * them need not place again. fresh is Compute's result for the new summaries; base is the version the pinned resources were
+	 * placed from. Its blocks keep base's heaps:
+	 * - an entry of fresh whose identity is pinned keeps the pin's heap and offset. If fresh does not place it (its first use now
+	 *   reads), it stays unplaced and its bytes are held over the whole frame, as graphs keep such a resource where it is,
+	 * - an entry of a kept epoch (a graph that keeps running) that is not pinned is left unplaced: that graph has it elsewhere,
+	 * - every other entry goes into the free bytes of base's blocks, where no entry with an overlapping lifetime lies,
+	 * - what does not fit goes to a new block of the same class and backends, in a new heap lane, so no heap a pin lies in grows.
+	 * pinEpochs (null: every epoch): a pin holds only for an entry with a use in one of them. A staged set's graphs that have not
+	 * placed yet replace their running graphs at the set's attach, so what only those running graphs use need not stay.
+	 * Returns null, with why, when it cannot: a pin in a heap base has no block for, or one whose memory description changed. Two
+	 * pinned entries that share bytes and are now live together keep one where it is and move the other (KeptMoved): the one
+	 * several epochs use stays first, then the larger.
+	 */
+	static std::shared_ptr<FramePlacementVersion> Keeping(const FramePlacementVersion& fresh, const FramePlacementVersion& base,
+		const std::vector<FramePlacementPin>& pins, const std::vector<uint32_t>& keptEpochs, uint64_t id, std::string* why = nullptr,
+		const std::vector<uint32_t>* pinEpochs = nullptr);
+	/** @brief The same layout under a new id, its heaps not taken yet (the trim of a kept layout: SetExactHeaps after). */
+	static std::shared_ptr<FramePlacementVersion> Relabel(const FramePlacementVersion& from, uint64_t id);
+	/** @brief The id of the version Keeping kept from, 0 for a version packed from scratch. */
+	uint64_t KeptFrom() const noexcept { return m_keptFrom; }
+	/**
+	 * @brief Keeping: how many pinned resources it moved after all (two pinned ones that share bytes and are now live together),
+	 * and the first few names. The graphs that bind them place again.
+	 */
+	size_t KeptMovedCount() const noexcept { return m_keptMovedCount; }
+	const std::vector<std::string>& KeptMoved() const noexcept { return m_keptMoved; }
+	/** @brief Whether a pool id names a frame placement block (Block::poolID), not one of a graph's own pools. */
+	static constexpr bool IsBlockPoolID(uint64_t poolID) noexcept { return (poolID & 0xFFFFFF0000000000ull) == 0xF9A0000000000000ull; }
 
 	FramePlacementVersion() = default;
 	~FramePlacementVersion();
@@ -274,8 +337,8 @@ public:
 	/** @brief Its blocks take heaps of exactly their need (FramePlacementMemory::Acquire's exact): a trim of the heaps. */
 	bool ExactHeaps() const noexcept { return m_exactHeaps; }
 	void SetExactHeaps(bool exact) noexcept { m_exactHeaps = exact; }
-	/** @brief Each block's class and backends with its capacity, summed per class and backends (FramePlacementMemory::WouldTrim). */
-	std::vector<std::pair<std::pair<uint8_t, uint64_t>, uint64_t>> BlockNeeds() const;
+	/** @brief Each block's class, backends and lane with its capacity, summed per class, backends and lane (FramePlacementMemory::WouldTrim). */
+	std::vector<FramePlacementBlockNeed> BlockNeeds() const;
 	/** @brief Whether an epoch has a slot. */
 	bool HasEpoch(uint32_t epoch) const noexcept;
 	/** @brief A hash of the slots, blocks and entries. It leaves the id out, so two versions with one layout match. */
@@ -288,14 +351,21 @@ public:
 	 * block the version does not have.
 	 */
 	std::shared_ptr<const AliasHeapGeneration> AcquireBlock(uint32_t block) const;
+	/** @brief The heap AcquireBlock would return now without allocating one, or null when it would allocate. Any thread. */
+	std::shared_ptr<const AliasHeapGeneration> PeekBlock(uint32_t block) const;
 	/** @brief Whether any block's memory is allocated now. */
 	bool Allocated() const;
 	/** @brief Takes block memory from memory (shared with the host's other versions) instead of allocating its own. Before any AcquireBlock. */
 	void SetMemory(std::shared_ptr<FramePlacementMemory> memory) { m_memory = std::move(memory); }
 
 private:
+	// The layout hash, the entry indices and the block memory slots, from the slots, blocks and entries (Compute, Keeping).
+	void Finish();
 	uint64_t m_id = 0;
 	uint64_t m_layoutHash = 0;
+	uint64_t m_keptFrom = 0;  // Keeping
+	size_t m_keptMovedCount = 0;
+	std::vector<std::string> m_keptMoved;
 	std::vector<Slot> m_slots;
 	std::vector<Block> m_blocks;
 	std::vector<Entry> m_entries;

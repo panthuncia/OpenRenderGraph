@@ -17,7 +17,9 @@ namespace org {
 namespace {
     // Idle lists kept beyond the high water of one generation's demand. The rest of the capacity grows on demand, to
     // cover the lists still in flight.
-    constexpr size_t kWarmSlackCommandLists = 2;
+    // Above the largest request: a frame's first recordings (a new graph's, whose lists the retiring graph's still hold) take more
+    // than the steady ones at once. Two left a new graph's first frame waiting for resets (M4 step 8).
+    constexpr size_t kWarmSlackCommandLists = 4;
 
     const char* QueueKindDebugName(rhi::QueueKind type) noexcept {
         switch (type) {

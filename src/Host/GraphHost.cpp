@@ -33,6 +33,7 @@
 #include "Interfaces/IResourceResolver.h"
 #include "HostUploadExtension.h"
 #include "FramePlacement.h"
+#include "OpenRenderGraph/ExternalClient.h"
 #include "Resources/PixelBuffer.h"
 #include "Resources/Defragmenter.h"
 #include "Resources/Relocation.h"
@@ -51,6 +52,26 @@
 #endif
 
 namespace org {
+
+namespace detail {
+// The frame placement view a graph's alias plans read: a staged set's (GraphHost::PlaceEpochGraphs) until the set attaches or the
+// staging closes, then the host's. The flag keeps the attached graphs' per-preparation probe lock-free.
+struct PlacementLink {
+	std::mutex mutex;
+	std::shared_ptr<FramePlacement::Staging> staging;
+	std::atomic<bool> staged{false};
+	std::shared_ptr<FramePlacement::Staging> Get() {
+		if (!staged.load(std::memory_order_acquire)) return nullptr;
+		std::lock_guard lock(mutex);
+		return staging && !staging->Closed() ? staging : nullptr;
+	}
+	void Set(std::shared_ptr<FramePlacement::Staging> value) {
+		std::lock_guard lock(mutex);
+		staging = std::move(value);
+		staged.store(static_cast<bool>(staging), std::memory_order_release);
+	}
+};
+}  // namespace detail
 
 namespace {
 
@@ -498,6 +519,7 @@ GraphHost::GraphHost(Desc desc)
 	}
 	m_declared.resize(m_instances.size());
 	m_builds = std::make_unique<BuildsCell[]>(m_instances.size());
+	m_externalSlots = std::make_unique<std::atomic<uint32_t>[]>(m_instances.size());
 	m_framePlacement = std::make_shared<FramePlacement>(m_desc.epochOrder);
 	// Made with the host, so the queue's pointer never changes while another thread drains it.
 	if (m_desc.submissionThread) {
@@ -1187,7 +1209,10 @@ std::shared_ptr<const ResolverCaptureContext> ReshapedCaptureContext() {
 }
 } // namespace
 
-std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, bool detached, detail::HostUploadExtension** uploads) {
+std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, bool detached, detail::HostUploadExtension** uploads,
+	std::shared_ptr<detail::PlacementLink>* placementLink) {
+	auto link = std::make_shared<detail::PlacementLink>();
+	if (placementLink) *placementLink = link;
 	auto graph = std::make_unique<RenderGraph>(m_desc.runtime);
 	try {
 		// A detached build may be staged ahead of a new slice count, so it lowers for the pending version.
@@ -1226,19 +1251,32 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 		{
 			const auto memory = inputs.frameArena ? PlacementMemory::FrameArena
 				: inputs.aliasArena ? PlacementMemory::SharedArena : PlacementMemory::PrivatePools;
-			graph->SetPlacementSummaryObserver([placement = std::weak_ptr<FramePlacement>(m_framePlacement), memory](PlacementSummary summary) {
+			// A staged set's graphs publish to its staging (PlaceEpochGraphs) until it attaches.
+			graph->SetPlacementSummaryObserver([placement = std::weak_ptr<FramePlacement>(m_framePlacement), memory, link](PlacementSummary summary) {
 				summary.memory = memory;
 				summary.Finish();
-				if (const auto locked = placement.lock()) locked->Publish(std::move(summary));
+				const auto locked = placement.lock();
+				if (!locked) return;
+				if (const auto staging = link->Get()) locked->PublishStaged(*staging, std::move(summary));
+				else locked->Publish(std::move(summary));
 			});
 			// The version the graph's first plan takes: null while the frame placement is off.
-			graph->SetFramePlacementSource([placement = std::weak_ptr<FramePlacement>(m_framePlacement)]() -> std::shared_ptr<const FramePlacementVersion> {
+			graph->SetFramePlacementSource([placement = std::weak_ptr<FramePlacement>(m_framePlacement), link]() -> std::shared_ptr<const FramePlacementVersion> {
 				const auto locked = placement.lock();
-				return locked ? locked->Current() : nullptr;
+				if (!locked) return nullptr;
+				if (const auto staging = link->Get()) return locked->StagedCurrent(*staging);
+				return locked->Current();
 			});
-			graph->SetFramePlacementProbe([placement = std::weak_ptr<FramePlacement>(m_framePlacement)]() -> uint64_t {
+			graph->SetFramePlacementDecline([placement = std::weak_ptr<FramePlacement>(m_framePlacement), link]() -> bool {
 				const auto locked = placement.lock();
-				return locked ? locked->CurrentId() : 0;
+				const auto staging = link->Get();
+				return locked && staging && locked->DeclineStaged(*staging);
+			});
+			graph->SetFramePlacementProbe([placement = std::weak_ptr<FramePlacement>(m_framePlacement), link]() -> uint64_t {
+				const auto locked = placement.lock();
+				if (!locked) return 0;
+				if (const auto staging = link->Get()) return staging->CurrentId();
+				return locked->CurrentId();
 			});
 			// Versioned slots are candidates only while the frame placement is on.
 			graph->SetFramePlacementEnabled([placement = std::weak_ptr<FramePlacement>(m_framePlacement)]() -> bool {
@@ -1376,7 +1414,7 @@ std::unique_ptr<GraphHost::EpochGraph> GraphHost::BuildEpochGraph(uint32_t epoch
 		result->m_epochConfiguration = inputs.epochConfiguration;
 		result->m_requests = inputs.requests;
 		result->m_serial = inputs.serial;
-		result->m_graph = MakeGraph(inputs, true, &result->m_uploads);
+		result->m_graph = MakeGraph(inputs, true, &result->m_uploads, &result->m_placementLink);
 	} catch (const std::exception& e) {
 		result->m_error = e.what();
 	} catch (...) {
@@ -1421,6 +1459,8 @@ GraphHost::AttachResult GraphHost::AttachEpochGraph(std::unique_ptr<EpochGraph>&
 		graph.SetGpuPassRangeCallbacks(m_gpuPassRangeBegin, m_gpuPassRangeEnd);
 		graph.SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
 		built->m_uploads = nullptr;
+		// The frame placement version and summaries it placed from at its build go live with it.
+		CommitPlacementStaging(*built);
 		// A graph staged for the epoch is older than this attach's (or would have been rejected below): it goes.
 		RetireStaged(index);
 		InstallGraph(index, std::move(built->m_graph), built->m_serial);
@@ -1431,6 +1471,11 @@ GraphHost::AttachResult GraphHost::AttachEpochGraph(std::unique_ptr<EpochGraph>&
 		}
 		return true;
 	};
+	// An attach is a frame boundary: the next frame takes the current version.
+	if (m_framePlacementFrozen) {
+		m_framePlacement->Thaw();
+		m_framePlacementFrozen = false;
+	}
 	if (m_async && !m_async->holding) ReplaceAsyncInstances({&index, 1}, replace);
 	else (void)replace(index);
 	if (!failure.empty()) return Refuse(AttachRefusal::SharedSetupFailed, instance.epoch, std::move(failure));
@@ -1463,6 +1508,9 @@ void GraphHost::RetireStaged(size_t index) {
 			m_async->stagedGeneration[i] = 0;
 			m_async->stagedRecordings[i].clear();
 		}
+	// Its staging, if it placed from one, publishes nothing now. (A set's other graphs keep it, closed, until they go too.)
+	if (instance.staged && instance.staged->m_placementLink && m_framePlacement)
+		if (const auto staging = instance.staged->m_placementLink->Get()) m_framePlacement->DropStaging(*staging);
 	if (instance.staged && instance.staged->m_graph) {
 		// Never submitted: it is released once the work submitted so far is done, like a replaced graph.
 		instance.staged->m_uploads = nullptr;
@@ -1628,6 +1676,14 @@ GraphHost::AttachResult GraphHost::AttachStagedEpochGraphs(std::span<const uint3
 			+ (instance.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(instance.epoch)) + " (build "
 			+ std::to_string(instance.stagedGeneration) + ")";
 	}
+	// The frame placement stagings the set's graphs placed from at their build (PlaceEpochGraphs) go live, before any of them
+	// prepares. An attach is a frame boundary: the next frame takes the current version.
+	if (m_framePlacementFrozen) {
+		m_framePlacement->Thaw();
+		m_framePlacementFrozen = false;
+	}
+	for (const auto index : indices)
+		if (m_instances[index].staged) CommitPlacementStaging(*m_instances[index].staged);
 	if (m_async && !m_async->holding) ReplaceAsyncInstances(indices, [&](size_t i) { return SwapStagedIn(i); });
 	else
 		for (const auto index : indices) (void)SwapStagedIn(index);
@@ -1702,6 +1758,78 @@ size_t GraphHost::DropStagedEpochGraphs(std::span<const uint32_t> epochs) {
 	else drop();
 	spdlog::info("GraphHost: {} staged graph(s) dropped before their attach", indices.size());
 	return indices.size();
+}
+
+void GraphHost::CommitPlacementStaging(EpochGraph& graph) {
+	if (!graph.m_placementLink) return;
+	if (const auto staging = graph.m_placementLink->Get(); staging && m_framePlacement) m_framePlacement->CommitStaging(*staging);
+	graph.m_placementLink->Set(nullptr);
+}
+
+size_t GraphHost::PlaceEpochGraphs(std::span<EpochGraph* const> graphs) {
+	BT_ZONE_SCOPE("ORG.Host.PlaceEpochGraphs");
+	if (m_async || !m_framePlacement || !m_framePlacement->Enabled()) return 0;
+	std::vector<EpochGraph*> ordered;
+	for (auto* graph : graphs)
+		if (graph && graph->m_graph && graph->m_placementLink && !graph->m_placementLink->Get()) ordered.push_back(graph);
+	if (ordered.empty()) return 0;
+	// In the host's epoch order (instances are in it): a version a later epoch's graph needs then exists before the earlier
+	// graphs' next plan, as at an attach.
+	std::ranges::stable_sort(ordered, {}, [](const EpochGraph* graph) { return graph->m_index; });
+	std::vector<uint32_t> epochs;
+	for (const auto* graph : ordered) epochs.push_back(graph->m_epoch);
+	const auto begin = std::chrono::steady_clock::now();
+	const auto staging = m_framePlacement->BeginStaging(epochs);
+	size_t placed = 0;
+	std::string outcomes;
+	for (auto* graph : ordered) {
+		graph->m_placementLink->Set(staging);
+		const auto graphBegin = std::chrono::steady_clock::now();
+		std::string why;
+		bool ok = false;
+		try {
+			ok = graph->m_graph->PlaceDeferredAliasesAtBuild(&why);
+		} catch (const std::exception& e) {
+			// Half placed: the graph cannot be attached. It never ran, so dropping it touches nothing the running graphs use.
+			graph->m_error = std::string("its alias placement at the build failed: ") + e.what();
+			graph->m_uploads = nullptr;
+			graph->m_graph.reset();
+			why = graph->m_error;
+		}
+		if (ok) ++placed;
+		// The version it placed from, or the staging's when it left its placement to the attach (it places from that one there): the
+		// set keeps it, and a later graph of the set cannot decline it.
+		if (graph->m_graph) {
+			const auto version = graph->m_graph->PersistentFramePlacement();
+			m_framePlacement->NoteStagedPlacement(*staging, ok && version ? version->Id() : staging->CurrentId(), graph->m_epoch, ok);
+		}
+		const auto epochName = graph->m_epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(graph->m_epoch);
+		outcomes += (outcomes.empty() ? "" : "; ") + epochName + (ok ? " placed" : " left for its attach (" + why + ")")
+			+ fmt::format(" in {:.2f} ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - graphBegin).count());
+	}
+	// Each graph's external client (readbacks, streaming uploads, copies after the frame) makes a queue slot at its first submission
+	// on it, and that submission waits for the slot's first command list. The slots the epoch's graphs used are made ready now.
+	for (auto* graph : ordered) {
+		if (!graph->m_graph || !m_externalSlots || graph->m_index >= m_instances.size()) continue;
+		if (const auto slots = m_externalSlots[graph->m_index].load(std::memory_order_acquire)) {
+			try {
+				graph->m_graph->GetExternalClient().Prewarm(slots);
+			} catch (const std::exception& e) {
+				spdlog::warn("GraphHost: epoch {}'s external client was not made ready at its build: {}", graph->m_epoch, e.what());
+			}
+		}
+	}
+	// A version the set made: its heaps now, on this thread, so neither the attach nor a graph left for it allocates them.
+	const auto acquireBegin = std::chrono::steady_clock::now();
+	try {
+		m_framePlacement->AcquireStagedBlocks(*staging);
+	} catch (const std::exception& e) {
+		spdlog::warn("GraphHost: a staged frame placement's memory was not allocated at the build ({}); its attach allocates it", e.what());
+	}
+	spdlog::info("GraphHost: transients of {} of {} built graphs placed at the build in {:.2f} ms (from frame placement {}; heaps {:.2f} ms): {}",
+		placed, ordered.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), staging->CurrentId(),
+		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acquireBegin).count(), outcomes);
+	return placed;
 }
 
 void GraphHost::PlaceAttachedAliases(size_t index) {
@@ -1916,6 +2044,11 @@ void GraphHost::SealSubmitted() {
 		DrainSubmissions("a seal (the frame's end)");
 		m_sealsPushed.fetch_add(1, std::memory_order_seq_cst);
 		PassSeal(nullptr);
+	}
+	// The frame's end: the next frame takes the current frame placement version.
+	if (m_framePlacementFrozen) {
+		m_framePlacement->Thaw();
+		m_framePlacementFrozen = false;
 	}
 	// Once a frame: chunks the runs in flight have not needed for a while go.
 	if (const auto& arena = m_desc.runtime->Arena()) arena->Trim();
@@ -2163,6 +2296,10 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	const auto index = epoch == persistent::AllEpochs ? 0 : InstanceOf(epoch);
 	if (index == kNoInstance) throw std::invalid_argument("ExecuteFrame: epoch " + std::to_string(epoch) + " is not one of the host's");
 	ReleaseRetiredGraphs(false);
+	// The external client slots the epoch's graph used by now (the renderer's work after the last frame included).
+	if (m_externalSlots && m_instances[index].graph)
+		if (const auto used = m_instances[index].graph->ExternalClientSlots())
+			m_externalSlots[index].fetch_or(used, std::memory_order_acq_rel);
 	if (BuildDue(index)) (void)BuildInstance(index);
 	lap(m_lastTimings.buildUs);
 	// An epoch whose graph failed runs nothing; the others are not affected.
@@ -2285,6 +2422,13 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 		throw failEpoch(e.what());
 	}
 	lap(m_lastTimings.executeUs);
+	// The frame's frame placement version: the one this graph recorded with. The later epochs of the frame place from it, whatever
+	// is published meanwhile (the worker's settled or trimmed versions), so none moves a resource this graph wrote this frame.
+	if (m_framePlacement && !m_framePlacementFrozen)
+		if (auto version = graph.PersistentFramePlacement()) {
+			m_framePlacement->Freeze(std::move(version));
+			m_framePlacementFrozen = true;
+		}
 	m_lastTimings.execute = graph.LastPersistentExecuteTimings();
 	// Execute submitted the frame: every batch signalled its queue's timeline, so the value each queue
 	// has reached is the run's completion on it.
@@ -2588,6 +2732,7 @@ void GraphHost::ApplyFramePlacementSettings() {
 		applied.sizing.shrinkFactor = m_framePlacementSettings.heapShrinkFactor;
 		applied.memoryLogPeriod = std::chrono::seconds(m_framePlacementSettings.memoryLogSeconds);
 		applied.trimAfter = std::chrono::milliseconds(m_framePlacementSettings.heapTrimMilliseconds);
+		applied.keepRunning = m_framePlacementSettings.keepRunning;
 	}
 	for (const auto& [epoch, most] : m_ticketsAhead)
 		if (std::ranges::find(applied.repeatedEpochs, epoch) == applied.repeatedEpochs.end()) applied.repeatedEpochs.push_back(epoch);

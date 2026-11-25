@@ -34,6 +34,8 @@ class ResourceCleanupQueue;
 
 namespace org::detail {
 class HostUploadExtension;
+// A graph's link to the frame placement view it places from: a staged set's until its attach (GraphHost::PlaceEpochGraphs).
+struct PlacementLink;
 }
 
 namespace org::relocation {
@@ -263,6 +265,8 @@ public:
 		size_t m_index = 0;
 		std::unique_ptr<RenderGraph> m_graph;
 		detail::HostUploadExtension* m_uploads = nullptr;  // owned by m_graph
+		// Where its alias plans take their frame placement from: the staging PlaceEpochGraphs placed it in, until its attach.
+		std::shared_ptr<detail::PlacementLink> m_placementLink;
 		// The host's state the build saw. AttachEpochGraph compares it with the state at the attach.
 		uint64_t m_hostConfiguration = 0, m_epochConfiguration = 0, m_requests = 0, m_serial = 0;
 		std::string m_reason, m_error;
@@ -365,6 +369,20 @@ public:
 		AttachRefusal refusal = AttachRefusal::None;
 	};
 	StageResult StageEpochGraph(std::unique_ptr<EpochGraph>& graph);
+	/**
+	 * @brief The calling thread (the one that built them), before they are staged or attached: places the transients of graphs
+	 * BuildEpochGraph made, in the host's epoch order, so their attach only swaps them in. Without async epochs, with the frame
+	 * placement on.
+	 *
+	 * The graphs place from one staging of the frame placement (FramePlacement::BeginStaging): their usage summaries, and a version
+	 * their new transients need, stay the staging's until the set attaches (AttachStagedEpochGraphs, AttachEpochGraph), which
+	 * publishes them. Nothing the running graphs bind moves: a graph whose placement would move a resource another graph placed or
+	 * made (a resource several epochs share, at another offset in a new version) is left to its attach, as before (its alias plan
+	 * at the attach, PlaceAttachedAliases). The heaps of a version the set made are allocated here either way.
+	 *
+	 * Returns how many graphs were placed. A graph whose placement throws is left failed (not Built()).
+	 */
+	size_t PlaceEpochGraphs(std::span<EpochGraph* const> graphs);
 	/** @brief An epoch's attached and staged build generations, read together (BuildsOf). 0 means none. */
 	struct Builds {
 		uint64_t attached = 0;  // the build its graph runs (0 with no graph)
@@ -656,6 +674,12 @@ public:
 		uint32_t heapTrimMilliseconds = 2000;
 		// The memory breakdown's period while logLifetimes is set, in seconds. 0: never.
 		uint32_t memoryLogSeconds = 10;
+		// A version made at once for a plan's uncovered candidates (a rebuilt graph's new transients, at its build or its attach)
+		// keeps every resource the running graphs bind where it is (FramePlacementVersion::Keeping). What does not fit in the
+		// version's heaps goes to heaps of its own, so no heap the running graphs use grows. Those graphs then take the new
+		// version as it is, without placing again. False, or when it cannot be done: the version is packed from scratch and every
+		// graph places again from it.
+		bool keepRunning = true;
 	};
 	/** @brief Owner thread. Kept across rebuilds. */
 	void SetFramePlacement(FramePlacementSettings settings);
@@ -1160,6 +1184,15 @@ private:
 	// Owner thread, without async epochs: the attached graph places the transients its detached build left to its first
 	// preparation (RenderGraph::PlaceDeferredAliasesNow). A failure marks the epoch failed, as a failed preparation does.
 	void PlaceAttachedAliases(size_t index);
+	// Owner thread, at an attach: publishes the frame placement staging the graph placed from (PlaceEpochGraphs) and links the
+	// graph to the host's frame placement. Once per staging: the set's other graphs only change their link.
+	void CommitPlacementStaging(EpochGraph& graph);
+	// A frame runs one frame placement version (FramePlacement::Freeze): set once a graph that placed from one has recorded in
+	// the frame, cleared at the seal and at an attach. Owner thread.
+	bool m_framePlacementFrozen = false;
+	// Per instance (index as m_instances): the external client slots its attached graphs have used, so a new build of the epoch
+	// makes them ready ahead (PlaceEpochGraphs). Written on the owner thread, read by builds.
+	std::unique_ptr<std::atomic<uint32_t>[]> m_externalSlots;
 	// Owner thread: publishes what the instance's attached and staged graphs declare, for EpochsDeclaring, and their build
 	// generations, for BuildsOf. Every change of either graph calls it.
 	void PublishDeclared(size_t index);
@@ -1214,7 +1247,8 @@ private:
 	BuildInputs SnapshotBuildInputs(size_t index);
 	// Any thread: makes the instance's graph from a snapshot, through Setup. With detached it also runs the first build
 	// (RenderGraph::PrepareFirstPersistentBuild) and defers the shared setup steps. Throws on failure.
-	std::unique_ptr<RenderGraph> MakeGraph(const BuildInputs& inputs, bool detached, detail::HostUploadExtension** uploads);
+	std::unique_ptr<RenderGraph> MakeGraph(const BuildInputs& inputs, bool detached, detail::HostUploadExtension** uploads,
+		std::shared_ptr<detail::PlacementLink>* placementLink = nullptr);
 	// Owner thread, the instance not in the host's thread's hands: the graph replaces the instance's. The old one is retired by
 	// the work submitted so far.
 	void InstallGraph(size_t index, std::unique_ptr<RenderGraph> graph, uint64_t serial, uint64_t generation = 0);

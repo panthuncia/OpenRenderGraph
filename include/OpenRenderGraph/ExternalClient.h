@@ -99,6 +99,11 @@ public:
 	void Retire();
 	// Stops the background work of its command-list pools. Call it before the task service shuts down.
 	void ShutdownTaskWorkers();
+	// The queue slots it has submitted on (or made ready), as a bit mask.
+	uint32_t UsedSlots();
+	// Makes these slots (a bit mask) ready ahead of their first submission: their timelines, and command lists made in the
+	// background. A slot is made at its first submission otherwise, and that submission waits for its first list.
+	void Prewarm(uint32_t slots);
 
 private:
 	struct SlotState;

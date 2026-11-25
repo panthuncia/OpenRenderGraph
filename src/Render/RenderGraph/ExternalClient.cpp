@@ -78,6 +78,25 @@ ExternalClient::SlotState& ExternalClient::Slot(uint32_t slot) {
 	return *state;
 }
 
+uint32_t ExternalClient::UsedSlots() {
+	std::lock_guard lock(m_mutex);
+	uint32_t mask = 0;
+	for (size_t slot = 0; slot < m_slots.size() && slot < 32; ++slot)
+		if (m_slots[slot]) mask |= 1u << slot;
+	return mask;
+}
+
+void ExternalClient::Prewarm(uint32_t slots) {
+	std::lock_guard lock(m_mutex);
+	for (size_t slot = 0; slot < m_slots.size() && slot < 32; ++slot) {
+		if (!(slots & (1u << slot))) continue;
+		auto& state = Slot(static_cast<uint32_t>(slot));
+		// Each submission takes a list for its work and one for its barriers, and a frame submits several (readbacks, streaming
+		// uploads): enough for one frame stand ready, made in the background.
+		if (state.pool) state.pool->PublishDemand(6, 0);
+	}
+}
+
 void ExternalClient::ShutdownTaskWorkers() {
 	std::lock_guard lock(m_mutex);
 	for (auto& slot : m_slots)

@@ -720,9 +720,42 @@ bool persistent_impl::LoweringAddsDeclarations(const State::MainPass& main, cons
 	return false;
 }
 
+namespace {
+// Where a slow preparation's time went (a graph's first ones, a re-placement): the phases that took 0.1 ms or more, and the passes
+// whose PrepareFrame took longest. Logged for a graph's first two preparations and any over 3 ms.
+struct PreparationLaps {
+	using Clock = std::chrono::steady_clock;
+	Clock::time_point begin = Clock::now(), last = begin;
+	std::string phases;
+	std::vector<std::pair<double, std::string>> passes;
+	void Mark(const char* name) {
+		const auto now = Clock::now();
+		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+		last = now;
+		if (ms >= 0.1) phases += fmt::format("{}{} {:.2f}", phases.empty() ? "" : ", ", name, ms);
+	}
+	void Pass(double ms, const std::string& name) {
+		if (ms < 0.05) return;
+		passes.emplace_back(ms, name);
+		std::sort(passes.begin(), passes.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+		if (passes.size() > 4) passes.pop_back();
+	}
+};
+thread_local PreparationLaps* t_preparationLaps = nullptr;
+void PreparationLap(const char* name) {
+	if (t_preparationLaps) t_preparationLaps->Mark(name);
+}
+}  // namespace
+
 void RenderGraph::PreparePersistentFrame(rhi::Device device, uint32_t frameIndex, const IHostExecutionData* hostData, float deltaTime,
 	const PersistentExecutionOptions& options) {
 	BT_ZONE_SCOPE("ORG.Persistent.PrepareFrame");
+	PreparationLaps laps;
+	struct LapsScope {
+		PreparationLaps* previous;
+		explicit LapsScope(PreparationLaps* laps) : previous(t_preparationLaps) { t_preparationLaps = laps; }
+		~LapsScope() { t_preparationLaps = previous; }
+	} lapsScope(&laps);
 	if (m_compilerState->frameProductionStopped) throw std::logic_error("Frame production has stopped");
 	// Persistent structural builds, preparation and ownership retirement run on the task service; there is no inline fallback.
 	if (!m_taskService) throw std::logic_error("Persistent execution requires a task service");
@@ -734,10 +767,21 @@ void RenderGraph::PreparePersistentFrame(rhi::Device device, uint32_t frameIndex
 	state.frameNumber = ++compiler.asyncPreparationFrameNumber;
 	RetireIdlePersistentAliasPools(state);
 	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
+	PreparationLap(bootstrap ? "bootstrap" : "begin");
 	PlaceDeferredPersistentAliases();
+	PreparationLap("deferred placement");
 	BindPersistentFrame(bootstrap);
 	PublishDeclaredVersions();
+	PreparationLap("publish versions");
 	state.prepared = PreparePersistentExecution(device, frameIndex, hostData, deltaTime, options);
+	PreparationLap("prepare execution");
+	const double total = std::chrono::duration<double, std::milli>(PreparationLaps::Clock::now() - laps.begin).count();
+	if (state.frameNumber <= 2 || total > 3.0) {
+		std::string passes;
+		for (const auto& [ms, name] : laps.passes) passes += fmt::format("{}{} {:.2f}", passes.empty() ? "" : ", ", name, ms);
+		spdlog::info("Persistent preparation timing: epoch {} preparation {} total {:.2f} ms: {}; slowest passes: {}", m_passEpochFilter,
+			state.frameNumber, total, laps.phases, passes.empty() ? "none" : passes);
+	}
 }
 
 void RenderGraph::ReleaseAliasPlacements() {
@@ -809,6 +853,66 @@ void RenderGraph::PlaceDeferredAliasesNow() {
 	PlaceDeferredPersistentAliases();
 }
 
+bool RenderGraph::PlaceDeferredAliasesAtBuild(std::string* why) {
+	if (!m_compilerState || m_compilerState->frameProductionStopped) {
+		if (why) *why = "frame production stopped";
+		return false;
+	}
+	if (!m_compilerState->persistent || !m_compilerState->persistent->aliasPlacementDeferred) return true;
+	auto& state = *m_compilerState->persistent;
+	// As the attach's (PlaceDeferredAliasesNow), on the building thread, which owns the graph alone.
+	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
+	state.placingAtBuild = true;
+	state.atBuildOwnPools = false;
+	state.atBuildRefusal.clear();
+	struct Reset {
+		bool& flag;
+		~Reset() { flag = false; }
+	} reset{state.placingAtBuild};
+	PlaceDeferredPersistentAliases();
+	if (state.atBuildRefusal.empty()) return true;
+	state.aliasPlacementDeferred = true;
+	if (why) *why = state.atBuildRefusal;
+	return false;
+}
+
+std::shared_ptr<const FramePlacementVersion> RenderGraph::PersistentFramePlacement() const {
+	if (!m_compilerState || !m_compilerState->persistent || !m_compilerState->persistent->framePlacementTaken) return nullptr;
+	return m_compilerState->persistent->framePlacement;
+}
+
+bool RenderGraph::TakeFramePlacementInPlace() {
+	if (!m_compilerState || !m_compilerState->persistent || !m_framePlacementSource) return false;
+	auto& state = *m_compilerState->persistent;
+	if (!state.framePlacementTaken || !state.framePlacement) return false;
+	const auto next = m_framePlacementSource();
+	if (!next || next == state.framePlacement || !next->HasEpoch(m_passEpochFilter)) return false;
+	size_t kept = 0;
+	for (const auto& [concrete, record] : state.aliasPlaced) {
+		const auto* entry = next->FindObject(concrete->GetGlobalResourceID() + 1);
+		if (!FramePlacementVersion::IsBlockPoolID(record.poolID)) {
+			// In this graph's own pools. A version that places it should be taken by a plan, which moves it there.
+			if (entry && entry->placed) return false;
+			continue;
+		}
+		if (!entry || !entry->placed) return false;
+		const auto heap = next->PeekBlock(entry->block);
+		if (!heap || heap.get() != record.heap || entry->offset != record.offset || entry->size != record.sizeBytes) return false;
+		// Its contents come from an earlier epoch (or across runs) exactly as before, so its bindings enter it the same way.
+		const bool firstInFrame = !entry->uses.empty() && entry->uses.front().epoch == m_passEpochFilter;
+		if ((!firstInFrame || entry->acrossRuns) != record.continues) return false;
+		// This graph's own placement exactly when no other epoch uses it, so its end gives back the same ones.
+		if (entry->MultiEpoch() == state.aliasPlacementOwners.contains(concrete)) return false;
+		++kept;
+	}
+	const auto previous = state.framePlacement->Id();
+	state.framePlacement = next;
+	m_framePlacementVersion.store(next->Id(), std::memory_order_release);
+	spdlog::info("Persistent alias placement: epoch {} takes frame placement {} as it is (from {}; its {} frame placements stay): frame={}",
+		m_passEpochFilter, next->Id(), previous, kept, state.frameNumber);
+	return true;
+}
+
 void RenderGraph::PlaceDeferredPersistentAliases() {
 	auto& compiler = *m_compilerState;
 	if (!compiler.persistent || !compiler.persistent->aliasPlacementDeferred) return;
@@ -820,11 +924,17 @@ void RenderGraph::PlaceDeferredPersistentAliases() {
 	// replaces may carry another graph's placement, which only a structural edit may change). There are no orderings yet.
 	edit.ClearPlacementOrderings();
 	state.aliasEdges.clear();
+	const auto begin = std::chrono::steady_clock::now();
 	const auto live = state.program.Select();
 	if (!live || !PlanPersistentAliasPlacement(edit, *live)) return;
+	const auto planned = std::chrono::steady_clock::now();
 	std::atomic_bool cancelled{false};
 	auto ready = edit.Build(compiler.synchronousCompileWorkspace, cancelled);
+	const auto built = std::chrono::steady_clock::now();
 	if (!ready || !state.program.Install(edit, ready)) throw std::runtime_error("Persistent deferred alias placement failed to install");
+	const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+	spdlog::info("Persistent deferred alias placement timing: epoch {} plan {:.2f} ms, validated build {:.2f} ms, install {:.2f} ms", m_passEpochFilter,
+		ms(begin, planned), ms(planned, built), ms(built, std::chrono::steady_clock::now()));
 	++state.structuralBuilds;
 	basic_telemetry::AddCounter("ORG.Persistent.DeferredAliasPlacements");
 }
@@ -1123,11 +1233,14 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 		// Declarations of replaced versions move to the current ones. A pending build lowered the old declarations, so
 		// this waits until it installs.
 		if (!bootstrap && !state.pending) ReleaseReplacedVersionDeclarations();
+		PreparationLap("structural build and replaced versions");
 		// Alias re-placement when the packing strategy changed since the latest plan (plans run only on structural builds).
 		const bool packingChanged = m_getAutoAliasPackingStrategy && m_getAutoAliasPackingStrategy() != state.aliasPackingStrategy;
 		// Alias re-placement when the host published a new frame placement since this graph's plan took one.
-		const bool framePlacementChanged = m_framePlacementProbe && state.framePlacementTaken
+		bool framePlacementChanged = m_framePlacementProbe && state.framePlacementTaken
 			&& m_framePlacementProbe() != (state.framePlacement ? state.framePlacement->Id() : 0);
+		// A version that leaves this graph's placements where they are is taken as it is: no plan, no build.
+		if (framePlacementChanged && !state.pending && TakeFramePlacementInPlace()) framePlacementChanged = false;
 		// A resource several epochs share that this graph bound at another graph's placement, moved by that graph since (its
 		// re-placement for a newer version): this graph's executable must admit the new backing, which only a structural edit does.
 		bool adoptedMoved = false;
@@ -1141,6 +1254,7 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 		}
 		if ((packingChanged || framePlacementChanged || adoptedMoved) && !state.pending) {
 			BT_ZONE_SCOPE("ORG.Persistent.ForcedRealias");
+			const auto forcedBegin = std::chrono::steady_clock::now();
 			auto forced = state.program.BeginEdit();
 			// Re-placement is only valid in a structural edit (the executable must
 			// re-validate the new overlaps). Dropping the orderings makes it one;
@@ -1154,13 +1268,29 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 			state.forceNewAliasHeaps = packingChanged;
 			// The plan takes the host's current version again.
 			if (framePlacementChanged) state.framePlacementTaken = false;
-			auto ready = BuildPersistentStructural(forced);
-			state.forceNewAliasHeaps = false;
-			if (!ready || !state.program.Install(forced, ready)) throw std::runtime_error("Persistent forced alias re-placement failed to install");
-			++state.structuralBuilds;
-			spdlog::info("Persistent alias re-placement ({}): frame={}",
+			if (packingChanged) {
+				auto ready = BuildPersistentStructural(forced);
+				state.forceNewAliasHeaps = false;
+				if (!ready || !state.program.Install(forced, ready)) throw std::runtime_error("Persistent forced alias re-placement failed to install");
+				++state.structuralBuilds;
+			} else {
+				// A new frame placement or a moved shared backing changes placements only: planned against the live publication's
+				// ranks (as the deferred placement), so one validated build instead of a schedule build and a placed one. The
+				// orderings the plan derives follow those ranks, so the live order stays valid under them.
+				state.forceNewAliasHeaps = false;
+				const auto live = state.program.Select();
+				if (live && PlanPersistentAliasPlacement(forced, *live)) {
+					std::atomic_bool cancelled{false};
+					auto ready = forced.Build(compiler.synchronousCompileWorkspace, cancelled);
+					if (!ready || !state.program.Install(forced, ready)) throw std::runtime_error("Persistent forced alias re-placement failed to install");
+					++state.structuralBuilds;
+				}
+			}
+			PreparationLap("re-placement");
+			spdlog::info("Persistent alias re-placement ({}): frame={} in {:.2f} ms",
 				packingChanged ? "packing strategy changed" : framePlacementChanged ? "new frame placement"
-				: adoptedMoved ? "a shared resource another epoch placed moved" : "forced", state.frameNumber);
+				: adoptedMoved ? "a shared resource another epoch placed moved" : "forced", state.frameNumber,
+				std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - forcedBegin).count());
 		} else if (!state.pending && state.framePlacementTaken && m_framePlacementEnabled && m_framePlacementEnabled()) {
 			// A versioned candidate whose current version changed since the latest plan (a new extent, a new version). The new
 			// version has a key of its own, so the graph plans again to publish it in its usage summary. It keeps the memory its
@@ -1199,6 +1329,7 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 		// Set when a relower cannot wait for a worker build: the frame would prepare the pass against a publication that does
 		// not have its declarations.
 		bool inlineStructural = false;
+		PreparationLap("versions moved");
 		{ BT_ZONE_SCOPE("ORG.Persistent.PollDynamicDeclared");
 		for (uint32_t mainIndex = 0; mainIndex < state.mainPasses.size(); ++mainIndex) {
 			auto& main = state.mainPasses[mainIndex];
@@ -1278,6 +1409,7 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 		}
 		BT_PLOT("ORG.Persistent.RefreshedDeclarations", static_cast<int64_t>(refreshed));
 		// Resolver membership: within reserved capacity this is a binding edit.
+		PreparationLap("poll declarations");
 		{ BT_ZONE_SCOPE("ORG.Persistent.PollGroups");
 		for (uint32_t groupIndex = 0; groupIndex < state.groups.size(); ++groupIndex) {
 			auto& group = state.groups[groupIndex];
@@ -1350,6 +1482,7 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 		// edits (structural).
 		size_t rotated = 0;
 		{
+			PreparationLap("poll groups");
 			BT_ZONE_SCOPE("ORG.Persistent.PollBackings");
 			for (uint32_t index = 0; index < state.entries.size(); ++index) {
 				auto& entry = state.entries[index];
@@ -1409,6 +1542,7 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 			BT_PLOT("ORG.Persistent.RotatedBindings", static_cast<int64_t>(rotated));
 		}
 		if (!remapCandidates.empty()) {
+			PreparationLap("poll backings");
 			BT_ZONE_SCOPE("ORG.Persistent.RemapDeclarations");
 			const auto live = state.program.Select();
 			for (auto& candidate : remapCandidates) {
@@ -1430,6 +1564,7 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 			structural.erase(std::unique(structural.begin(), structural.end()), structural.end());
 		}
 		if (edit) {
+			PreparationLap("remap declarations");
 			BT_ZONE_SCOPE("ORG.Persistent.InlineEditBuild");
 			if (m_sharingChangePolicy == SharingChangePolicy::Deferred) DeferSharingChanges(state, *edit);
 			std::atomic_bool cancelled{false};
@@ -1463,6 +1598,7 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 		// Direct declarations of a resolver bind the set it resolved to when the pass was lowered. A preparation that resolves
 		// another set would record against resources it does not name - read past a grown buffer's old backing, say. A change
 		// is relowered inline above, so by here every pass must match; never silently.
+		PreparationLap("edit build");
 		{ BT_ZONE_SCOPE("ORG.Persistent.CheckDirectResolvers");
 		for (const auto& main : state.mainPasses) {
 			for (const auto& [resolver, identity] : main.directResolvers) {
@@ -1499,6 +1635,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 		m_scheduleSnapshot.store(nullptr, std::memory_order_release);
 	}
 	if (state.bindingsFor != selected.get()) {
+		PreparationLap("select");
 		BT_ZONE_SCOPE("ORG.Persistent.BuildBindingTable");
 		std::vector<FrozenExecutionBindings::ResourceBinding> table(selected->bindings.Size());
 		for (uint32_t index = 0; index < selected->bindings.Size(); ++index) {
@@ -1545,6 +1682,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 	std::vector<std::pair<std::shared_ptr<const IVersionedResource>, uint64_t>> versionStamps;
 	bool perFrame = false;
 	if (executing) {
+		PreparationLap("binding table and setup");
 		BT_ZONE_SCOPE("ORG.Persistent.BindVersions");
 		const auto& compiled = executing->executable->resourceIndexBySlot;
 		std::vector<std::pair<uint32_t, FrozenExecutionBindings::ResourceBinding>> overlay;
@@ -1606,6 +1744,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 	main.bindings = preparation.bindings;
 	main.invocations.resize(selected->logical->passSlots.size());
 	{
+		PreparationLap("bind versions and setup");
 		BT_ZONE_SCOPE("ORG.Persistent.PrepareInvocations");
 		auto passPreparation = preparation;
 		state.prepareCostByMain.resize(state.mainPasses.size());
@@ -1765,8 +1904,10 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 			if (!packet) throw std::runtime_error("Pass '" + any.name + "' has no owned preparation; persistent execution requires PrepareFrame");
 			{
 				auto& cost = state.prepareCostByMain[mainIndex];
-				cost.first += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prepareStarted).count());
+				const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - prepareStarted).count();
+				cost.first += static_cast<uint64_t>(ns);
 				++cost.second;
+				if (t_preparationLaps) t_preparationLaps->Pass(static_cast<double>(ns) / 1e6, any.name);
 			}
 			packet.SetDebugName(any.name);
 			// A pass the host turned off for this execution by its host data (RenderGraphPass::SetSkipWhen) records only its barriers.
@@ -1811,6 +1952,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 		}
 	}
 	if (executing) execution.main = std::move(main);
+	PreparationLap("prepare invocations");
 	// 4. Uploads.
 	// Tickets have none: the host records its uploads itself when it submits the ticket, and tickets don't
 	// support any other upload pass.

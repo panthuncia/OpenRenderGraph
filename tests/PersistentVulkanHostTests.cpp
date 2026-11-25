@@ -519,6 +519,41 @@ private:
 	std::shared_ptr<std::atomic<uint64_t>> m_outputRevision;
 };
 
+// "staged-placement": two epochs with frame placement. Epoch 0 writes a scratch buffer that epoch 1 copies to a host buffer (one
+// object both epochs' graphs use), and epoch 1 writes and copies a scratch buffer of its own.
+class StagedPlacementExtension final : public org::RenderGraph::IRenderGraphExtension {
+public:
+	StagedPlacementExtension(std::shared_ptr<org::Buffer> input, std::shared_ptr<org::Buffer> shared, std::shared_ptr<org::ExternalBufferResource> sharedOutput,
+		std::shared_ptr<org::Buffer> own, std::shared_ptr<org::ExternalBufferResource> ownOutput, std::shared_ptr<const ComputeProgram> program,
+		std::shared_ptr<std::atomic<uint64_t>> outputRevision)
+		: m_input(std::move(input)), m_shared(std::move(shared)), m_sharedOutput(std::move(sharedOutput)), m_own(std::move(own)),
+		m_ownOutput(std::move(ownOutput)), m_program(std::move(program)), m_outputRevision(std::move(outputRevision)) {}
+	void PrepareForBuild(org::RenderGraph& graph) override {
+		graph.RegisterResource(org::ResourceIdentifier("test.staged.input"), m_input);
+		graph.RegisterResource(org::ResourceIdentifier("test.staged.shared"), m_shared);
+		graph.RegisterResource(org::ResourceIdentifier("test.staged.shared-output"), m_sharedOutput);
+		graph.RegisterResource(org::ResourceIdentifier("test.staged.own"), m_own);
+		graph.RegisterResource(org::ResourceIdentifier("test.staged.own-output"), m_ownOutput);
+	}
+	void GatherStructuralPasses(org::RenderGraph&, std::vector<org::RenderGraph::ExternalPassDesc>& out) override {
+		out.push_back(org::RenderGraph::ExternalPassDesc::Compute("test.staged.write-shared",
+			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_shared, m_program))).Epoch(0));
+		out.push_back(org::RenderGraph::ExternalPassDesc::Copy("test.staged.copy-shared",
+			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_shared, m_sharedOutput, m_outputRevision))).Epoch(1));
+		out.push_back(org::RenderGraph::ExternalPassDesc::Compute("test.staged.write-own",
+			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_own, m_program))).Epoch(1));
+		out.push_back(org::RenderGraph::ExternalPassDesc::Copy("test.staged.copy-own",
+			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_own, m_ownOutput, m_outputRevision))).Epoch(1));
+	}
+private:
+	std::shared_ptr<org::Buffer> m_input, m_shared;
+	std::shared_ptr<org::ExternalBufferResource> m_sharedOutput;
+	std::shared_ptr<org::Buffer> m_own;
+	std::shared_ptr<org::ExternalBufferResource> m_ownOutput;
+	std::shared_ptr<const ComputeProgram> m_program;
+	std::shared_ptr<std::atomic<uint64_t>> m_outputRevision;
+};
+
 // "built", staged sets: a write into a versioned buffer, in one epoch only. GraphHost::EpochsDeclaring finds that epoch for it.
 class VersionedWriteExtension final : public org::RenderGraph::IRenderGraphExtension {
 public:
@@ -598,6 +633,8 @@ bool Matches(const HostBuffer& buffer, uint32_t value) {
 int TestFrameRetirement(rhi::Device device, rhi::Backend backend);
 int TestRebindingGpu(rhi::Device device, const std::shared_ptr<org::Runtime>& runtime);
 int TestFramePlacementCompute();
+int TestFramePlacementStaging();
+int TestFramePlacementKeeping();
 int TestContributors(rhi::Device device, const std::function<std::shared_ptr<org::Resource>()>& importOutput, const uint32_t* mapped,
 	const char* spirvPath,
 	rhi::PipelineLayoutHandle layout);
@@ -629,6 +666,11 @@ static int Run(int argc, char** argv) {
 	// are both placed from it, the first plan places from the first version, a rebuilt graph's new resources take their
 	// predecessors' entries, new versions are taken in place without a rebuild, and heaps grown with headroom are trimmed.
 	const bool placement = argc > 1 && std::strcmp(argv[1], "placement") == 0;
+	// "staged-placement": frame placement with two epochs and staged sets (GraphHost::PlaceEpochGraphs): a set placed on the thread
+	// that built it while the attached graphs keep rendering, a version that keeps the running graphs' resources (taken by them as
+	// it is), a dropped set that publishes nothing, and one version a frame while the worker publishes. Also the deviceless staging
+	// and freeze checks, and versions that keep resources on real heaps (FramePlacementTests.cpp).
+	const bool stagedPlacement = argc > 1 && std::strcmp(argv[1], "staged-placement") == 0;
 	// "split": a host of two epochs, each its own graph: the write pass in the first and the copy to the host buffer in the
 	// second (SplitEpochsScenario).
 	const bool split = argc > 1 && std::strcmp(argv[1], "split") == 0;
@@ -1274,6 +1316,7 @@ static int Run(int argc, char** argv) {
 			runtime.reset();
 		} else if (placement) {
 			REQUIRE(TestFramePlacementCompute() == 0, "frame placement without a device");
+			REQUIRE(TestFramePlacementStaging() == 0, "frame placement staging without a device");
 			// Aggressive auto aliasing: the scratch buffers are candidates whatever their score.
 			auto aliasing = org::runtime::GetOpenRenderGraphSettings();
 			aliasing.autoAliasMode = 3;
@@ -1402,6 +1445,136 @@ static int Run(int argc, char** argv) {
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				host.DestroyGraph();
 				std::puts("placement: one name, two resources, the first version at once, rebuilds, in-place versions and a trim");
+			}
+			runtime.reset();
+		} else if (stagedPlacement) {
+			REQUIRE(TestFramePlacementStaging() == 0, "frame placement staging without a device");
+			auto aliasing = org::runtime::GetOpenRenderGraphSettings();
+			aliasing.autoAliasMode = 3;
+			org::runtime::SetOpenRenderGraphSettings(aliasing);
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
+				.tasks = std::make_shared<org::test::TestTaskService>(2)});
+			REQUIRE(TestFramePlacementKeeping() == 0, "frame placement versions that keep resources");
+			{
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1}});
+				host.SetFramePositions({{0, 0, false}, {1, 1, false}});
+				org::GraphHost::FramePlacementSettings settings;
+				settings.enabled = true;
+				settings.settleMilliseconds = 20;
+				settings.heapTrimMilliseconds = 60;
+				host.SetFramePlacement(settings);
+				auto program = CreateProgram(device.Get());
+				REQUIRE(program, "compute program");
+				auto input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+				org::BufferBase::DescriptorRequirements inputViews{};
+				inputViews.createSRV = true;
+				inputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+				input->SetDescriptorRequirements(inputViews);
+				input->SetName("test.staged.input");
+				const auto scratch = [&](uint64_t bytes, const char* name) {
+					auto buffer = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, bytes, true);
+					org::BufferBase::DescriptorRequirements requirements{};
+					requirements.createUAV = true;
+					requirements.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+						.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+					buffer->SetDescriptorRequirements(requirements);
+					buffer->SetName(name);
+					buffer->SetAllowAlias(true);
+					return buffer;
+				};
+				constexpr uint64_t kMB = 1024ull * 1024ull;
+				auto shared = scratch(8 * kMB, "test.staged.shared");
+				auto own = scratch(4 * kMB, "test.staged.own");
+				auto sharedOutput = ImportHostBuffer(device.Get(), first, "test.staged.shared-output");
+				auto ownOutput = ImportHostBuffer(device.Get(), second, "test.staged.own-output");
+				REQUIRE(sharedOutput && ownOutput, "import host buffers");
+				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+				host.AddExtension("test.staged", [&] {
+					return std::make_unique<StagedPlacementExtension>(input, shared, sharedOutput, own, ownOutput, program, outputRevision);
+				});
+				uint32_t value = 0, frame = 0;
+				const auto upload = [&](org::RenderGraph&) {
+					BUFFER_UPLOAD(&value, sizeof(value), org::runtime::UploadTarget::FromShared(input), 0);
+				};
+				// One version a frame: every epoch's graph prepared from the version the first one recorded with.
+				size_t mixedVersions = 0;
+				const auto run = [&](const char* what) -> int {
+					value = 60000u + 10u * frame++;
+					host.ExecuteFrame(nullptr, upload, 0);
+					host.ExecuteFrame(nullptr, {}, 1);
+					if (host.FramePlacementInUse(0).version != host.FramePlacementInUse(1).version) ++mixedVersions;
+					host.SealSubmitted();
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value) && Matches(second, value), what);
+					return 0;
+				};
+				const auto generation = [](const std::shared_ptr<org::Buffer>& buffer) { return buffer->GetBackingGeneration(); };
+				for (int i = 0; i < 60; ++i) {
+					if (const int failed = run("staged placement: frames before any set")) return failed;
+					std::this_thread::sleep_for(std::chrono::milliseconds(2));
+				}
+				const auto settled = host.FramePlacementInUse(0).version;
+				REQUIRE(settled && host.FramePlacementInUse(1).version == settled, "staged placement: both epochs place from one version");
+				const auto stage = [&](std::unique_ptr<org::GraphHost::EpochGraph>& graph) {
+					const auto staged = host.StageEpochGraph(graph);
+					return staged.staged && !staged.attached;
+				};
+
+				// 1. Epoch 1 rebuilt with a larger scratch buffer of its own: a new version is needed. Its transients are placed on this
+				// thread, from a staging the attached graphs do not see: they keep running on their version and backings until the set
+				// attaches. The version keeps the shared buffer where it is, so epoch 0 takes it without placing again.
+				{
+					own = scratch(24 * kMB, "test.staged.own");
+					const auto sharedBacking = generation(shared);
+					const auto graph0 = host.Graph(0);
+					const auto builds0 = host.BuildGeneration(0);
+					auto graph = host.BuildEpochGraph(1, "test: a staged set that needs a new version");
+					REQUIRE(graph && graph->Built(), "staged placement: built");
+					org::GraphHost::EpochGraph* const graphs[] = {graph.get()};
+					REQUIRE(host.PlaceEpochGraphs(graphs) == 1 && graph->Built(), "staged placement: placed at the build");
+					REQUIRE(own->IsMaterialized() && generation(shared) == sharedBacking, "staged placement: the new transient is placed, the shared one stays");
+					for (int i = 0; i < 3; ++i)
+						if (const int failed = run("staged placement: the attached graphs keep running while a set is placed")) return failed;
+					REQUIRE(host.FramePlacementInUse(0).version == settled && host.FramePlacementInUse(1).version == settled,
+						"staged placement: nothing is published before the attach");
+					REQUIRE(stage(graph), "staged placement: staged");
+					const uint32_t one[] = {1};
+					REQUIRE(host.AttachStagedEpochGraphs(one).attached, "staged placement: the set attaches");
+					for (int i = 0; i < 3; ++i)
+						if (const int failed = run("staged placement: after the attach")) return failed;
+					const auto next = host.FramePlacementInUse(1).version;
+					REQUIRE(next != settled && host.FramePlacementInUse(0).version == next, "staged placement: the set's version is every epoch's");
+					REQUIRE(host.Graph(0) == graph0 && host.BuildGeneration(0) == builds0 && generation(shared) == sharedBacking,
+						"staged placement: epoch 0 keeps its graph, and the shared buffer its backing");
+				}
+				// 2. A dropped set: placed at its build, staged, then dropped. Its staging publishes nothing.
+				{
+					const auto before = host.FramePlacementInUse(0).version;
+					own = scratch(48 * kMB, "test.staged.own");
+					auto graph = host.BuildEpochGraph(1, "test: a dropped set");
+					org::GraphHost::EpochGraph* const graphs[] = {graph.get()};
+					REQUIRE(graph && graph->Built() && host.PlaceEpochGraphs(graphs) == 1 && stage(graph), "dropped set: placed and staged");
+					const uint32_t one[] = {1};
+					REQUIRE(host.DropStagedEpochGraphs(one) == 1, "dropped set: dropped");
+					own = scratch(24 * kMB, "test.staged.own");
+					for (int i = 0; i < 3; ++i)
+						if (const int failed = run("dropped set: frames after")) return failed;
+					REQUIRE(host.FramePlacementInUse(0).version == before && host.FramePlacementInUse(1).version == before,
+						"dropped set: its version was never published");
+				}
+				// 3. Versions the worker publishes while frames run (the settle and the trim of the heaps): each frame's epochs place
+				// from one version.
+				// (Earlier frames may differ by design: a later epoch's plan that needs a version at once for its uncovered candidates
+				// makes it the frame's version, the first frame and an attach of epoch 1 alone among them.)
+				mixedVersions = 0;
+				for (int i = 0; i < 80; ++i) {
+					if (const int failed = run("staged placement: frames while versions are published")) return failed;
+					std::this_thread::sleep_for(std::chrono::milliseconds(3));
+				}
+				REQUIRE(mixedVersions == 0, "staged placement: no frame's epochs placed from different versions");
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.DestroyGraph();
+				std::puts("staged placement: a set placed at its build, a kept version, a dropped set, one version a frame");
 			}
 			runtime.reset();
 		} else if (arena) {

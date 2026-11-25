@@ -331,6 +331,15 @@ void RenderGraph::SetSwapchainResource(std::shared_ptr<Resource> resource) {
 	m_swapchain = std::move(resource);
 }
 
+uint32_t RenderGraph::ExternalClientSlots() {
+	ExternalClient* client = nullptr;
+	{
+		std::lock_guard lock(m_externalClientMutex);
+		client = m_externalClient.get();
+	}
+	return client ? client->UsedSlots() : 0;
+}
+
 ExternalClient& RenderGraph::GetExternalClient() {
 	std::lock_guard lock(m_externalClientMutex);
 	if (!m_externalClient) {
@@ -1004,6 +1013,15 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 	auto toMilliseconds = [](auto duration) {
 		return std::chrono::duration<double, std::milli>(duration).count();
 	};
+	// Where a slow update's time went outside the preparation (a new graph's first ones): its passes' Update calls.
+	const auto updateBegin = std::chrono::steady_clock::now();
+	std::vector<std::pair<double, std::string>> slowestUpdates;
+	const auto noteUpdate = [&](double ms, const std::string& name) {
+		if (ms < 0.05) return;
+		slowestUpdates.emplace_back(ms, name);
+		std::sort(slowestUpdates.begin(), slowestUpdates.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+		if (slowestUpdates.size() > 4) slowestUpdates.pop_back();
+	};
 
 	{
 		BT_ZONE_SCOPE("RenderGraph::Update::PassUpdates");
@@ -1037,6 +1055,7 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 
 					const auto start = std::chrono::steady_clock::now();
 					obj.pass->Update(context);
+					noteUpdate(toMilliseconds(std::chrono::steady_clock::now() - start), obj.name);
 					if (traceLifecycle) {
 						spdlog::info("RG frame {} pass update '{}' complete", context.frameIndex, obj.name);
 					}
@@ -1055,14 +1074,26 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 			m_statisticsService->SetupQueryHeap();
 	}
 
+	const auto passUpdatesEnd = std::chrono::steady_clock::now();
 	if (context.beforeCompileFrame) {
 		BT_ZONE_SCOPE("RenderGraph::Update::BeforeCompileFrame");
 		context.beforeCompileFrame();
 	}
+	const auto beforeCompileEnd = std::chrono::steady_clock::now();
 
 	{
 		BT_ZONE_SCOPE("RenderGraph::Update::CompileFrame");
 		PreparePersistentFrame(device, static_cast<uint32_t>(context.preparationSlot), context.hostData, 0.0f, options);
+	}
+	const double passUpdatesMs = toMilliseconds(passUpdatesEnd - updateBegin);
+	const double beforeCompileMs = toMilliseconds(beforeCompileEnd - passUpdatesEnd);
+	const auto preparations = m_compilerState ? m_compilerState->asyncPreparationFrameNumber : 0;
+	if (preparations <= 2 || passUpdatesMs + beforeCompileMs > 1.5) {
+		std::string slowest;
+		for (const auto& [ms, name] : slowestUpdates) slowest += fmt::format("{}{} {:.2f}", slowest.empty() ? "" : ", ", name, ms);
+		spdlog::info("Graph update timing: epoch {} preparation {}: pass updates {:.2f} ms (slowest: {}), before compile {:.2f} ms, preparation {:.2f} ms",
+			m_passEpochFilter, preparations, passUpdatesMs, slowest.empty() ? "none" : slowest, beforeCompileMs,
+			toMilliseconds(std::chrono::steady_clock::now() - beforeCompileEnd));
 	}
 }
 

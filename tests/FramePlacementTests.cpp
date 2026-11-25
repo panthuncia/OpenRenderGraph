@@ -1,12 +1,14 @@
 // Frame placement without a device: how a version matches uses across epochs (FramePlacementVersion::Compute), and when the
 // host publishes its first version (FramePlacement, GraphHost's frame-wide placement). No block memory is acquired here.
-// Run by PersistentVulkanHostTests' "placement" mode, before its device part.
+// Run by PersistentVulkanHostTests' "placement" mode, before its device part; TestFramePlacementKeeping needs its device.
 #include "Render/RenderGraph/FramePlacement.h"
 #include "../src/Host/FramePlacement.h"
 #include "TestSupport.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <string>
 #include <thread>
 
 namespace {
@@ -162,5 +164,223 @@ int TestFramePlacementCompute() {
 		ENSURE(placement.Current());
 	}
 	std::puts("frame placement: identities, keys and the first version");
+	return 0;
+}
+
+namespace {
+org::FramePlacement::Settings StagingSettings() {
+	org::FramePlacement::Settings settings;
+	settings.enabled = true;
+	settings.settle = std::chrono::milliseconds(10);
+	settings.trimAfter = std::chrono::milliseconds(0);
+	// Without a device no heap is allocated, so no version can keep resources where they are: every version is packed from scratch.
+	settings.keepRunning = false;
+	return settings;
+}
+
+// Waits for the worker to publish a version other than id.
+bool WaitForNewCurrent(const org::FramePlacement& placement, uint64_t id) {
+	for (int wait = 0; wait < 200 && placement.CurrentId() == id; ++wait) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	return placement.CurrentId() != id;
+}
+}  // namespace
+
+// Staged sets (FramePlacement::BeginStaging, GraphHost::PlaceEpochGraphs) and the per-frame freeze, without a device.
+int TestFramePlacementStaging() {
+	// Shared, as the host owns it: a staging closes through a weak reference to it when its last reference goes.
+	const auto owner = std::make_shared<org::FramePlacement>(std::vector<uint32_t>{0, 1, 2});
+	auto& placement = *owner;
+	placement.SetSettings(StagingSettings());
+	placement.SetFrameEpochs({1, 2});
+	placement.Publish(*Summary(1, 4, {Use(7, 100, 0, 3)}));
+	placement.Publish(*Summary(2, 4, {Use(9, 200, 0, 3)}));
+	std::this_thread::sleep_for(std::chrono::milliseconds(60));
+	const auto base = placement.Current();
+	ENSURE(base && base->HasEpoch(1));
+	const auto withUncovered = [](uint32_t epoch, std::vector<org::PlacementUse> uses) {
+		org::PlacementSummary summary = *Summary(epoch, 4, std::move(uses));
+		summary.uncovered = 1;
+		summary.Finish();
+		return summary;
+	};
+
+	// 1. A staged graph's uncovered candidates make a version for its set only. The running graphs keep the current one, and the
+	// worker publishes nothing while the staging is open. The set's attach publishes it.
+	{
+		const auto staging = placement.BeginStaging({2});
+		ENSURE(!staging->Closed() && staging->CurrentId() == base->Id());
+		placement.PublishStaged(*staging, withUncovered(2, {Use(9, 201, 0, 3), Use(10, 202, 0, 1, 16 * kMB)}));
+		const auto pending = placement.StagedCurrent(*staging);
+		ENSURE(pending && pending != base && pending->FindObject(202) && staging->CurrentId() == pending->Id());
+		ENSURE(placement.Current() == base && placement.CurrentId() == base->Id());
+		// A summary that would make the worker publish (a new epoch's slot) waits while the staging is open.
+		placement.Publish(*Summary(0, 2, {Use(11, 300, 0, 1)}));
+		std::this_thread::sleep_for(std::chrono::milliseconds(60));
+		ENSURE(placement.CurrentId() == base->Id());
+		ENSURE(placement.CommitStaging(*staging) && staging->Closed());
+		ENSURE(placement.Current() == pending);
+		const auto summaries = placement.Summaries();
+		ENSURE(std::ranges::any_of(summaries, [](const auto& summary) { return summary->epoch == 2 && std::ranges::any_of(summary->uses,
+			[](const auto& use) { return use.objectId == 202; }); }));
+		// Closed now: the worker publishes what waited.
+		ENSURE(WaitForNewCurrent(placement, pending->Id()));
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(60));
+	const auto current = placement.Current();
+
+	// 2. A dropped set (its staging closed without its attach, or its last reference gone) publishes nothing.
+	{
+		const auto staging = placement.BeginStaging({1});
+		placement.PublishStaged(*staging, withUncovered(1, {Use(7, 101, 0, 3), Use(12, 102, 0, 1, 32 * kMB)}));
+		ENSURE(placement.StagedCurrent(*staging) != current);
+		placement.DropStaging(*staging);
+		ENSURE(staging->Closed() && placement.Current() == current);
+		ENSURE(!placement.CommitStaging(*staging) && placement.Current() == current);
+	}
+	{
+		auto staging = placement.BeginStaging({1});
+		placement.PublishStaged(*staging, withUncovered(1, {Use(7, 103, 0, 3), Use(12, 104, 0, 1, 32 * kMB)}));
+		staging.reset();
+		ENSURE(placement.Current() == current);
+		const auto summaries = placement.Summaries();
+		ENSURE(std::ranges::none_of(summaries, [](const auto& summary) { return std::ranges::any_of(summary->uses,
+			[](const auto& use) { return use.objectId == 104; }); }));
+	}
+
+	// 3. Declining: a set may keep the version it had while none of its graphs placed from the pending one. It then computes no
+	// other version. Once a graph placed from the pending version, the set keeps it.
+	{
+		const auto staging = placement.BeginStaging({2});
+		placement.PublishStaged(*staging, withUncovered(2, {Use(9, 205, 0, 3), Use(13, 206, 0, 1, 16 * kMB)}));
+		ENSURE(placement.StagedCurrent(*staging) != current);
+		ENSURE(placement.DeclineStaged(*staging));
+		ENSURE(placement.StagedCurrent(*staging) == current && staging->CurrentId() == current->Id());
+		placement.PublishStaged(*staging, withUncovered(2, {Use(9, 205, 0, 3), Use(13, 206, 0, 1, 24 * kMB)}));
+		ENSURE(placement.StagedCurrent(*staging) == current);
+		ENSURE(placement.DeclineStaged(*staging));
+		ENSURE(!placement.CommitStaging(*staging) && placement.Current() == current);
+	}
+	{
+		const auto staging = placement.BeginStaging({2});
+		placement.PublishStaged(*staging, withUncovered(2, {Use(9, 207, 0, 3), Use(13, 208, 0, 1, 16 * kMB)}));
+		const auto pending = placement.StagedCurrent(*staging);
+		placement.NoteStagedPlacement(*staging, pending->Id(), 2, true);
+		ENSURE(!placement.DeclineStaged(*staging) && placement.StagedCurrent(*staging) == pending);
+		ENSURE(placement.CommitStaging(*staging) && placement.Current() == pending);
+	}
+	std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+	// 4. The freeze: a frame runs one version. One the worker publishes meanwhile is the next frame's; one a plan of the frame needs
+	// at once (its uncovered candidates) is the frame's version at once.
+	{
+		const auto frame = placement.Current();
+		placement.Freeze(frame);
+		// A new epoch's slot: the worker publishes the next layout (the current one cannot serve it).
+		placement.Publish(*Summary(3, 3, {Use(15, 400, 0, 2)}));
+		std::this_thread::sleep_for(std::chrono::milliseconds(60));
+		ENSURE(placement.CurrentId() == frame->Id() && placement.Current() == frame);
+		placement.Thaw();
+		ENSURE(WaitForNewCurrent(placement, frame->Id()));
+		const auto next = placement.Current();
+		placement.Freeze(next);
+		placement.Publish(withUncovered(1, {Use(7, 105, 0, 3), Use(14, 106, 0, 1, 64 * kMB)}));
+		ENSURE(placement.CurrentId() != next->Id() && placement.Current()->FindObject(106));
+		placement.Thaw();
+	}
+	std::puts("frame placement: staged sets (commit, drop, decline) and the per-frame freeze");
+	return 0;
+}
+
+// Versions that keep the running graphs' resources where they are (FramePlacementVersion::Keeping). Needs a device: the kept heaps
+// are real ones (FramePlacementMemory).
+int TestFramePlacementKeeping() {
+	auto memory = std::make_shared<org::FramePlacementMemory>();
+	const auto compute = [&](std::vector<std::shared_ptr<const org::PlacementSummary>> summaries, uint64_t id) {
+		auto version = org::FramePlacementVersion::Compute(Inputs(std::move(summaries)), id);
+		version->SetMemory(memory);
+		return version;
+	};
+	// Epoch 1: A (100) then B (101), which share bytes. Epoch 2: C (200).
+	const auto epochOne = Summary(1, 4, {Use(1, 100, 0, 1), Use(2, 101, 2, 3)});
+	const auto base = compute({epochOne, Summary(2, 4, {Use(3, 200, 0, 3)})}, 1);
+	ENSURE(base->Blocks().size() == 1);
+	const auto heap = base->AcquireBlock(0);
+	const auto* a = base->FindObject(100);
+	const auto* b = base->FindObject(101);
+	ENSURE(a && b && a->placed && b->placed && a->offset == b->offset);
+	// The running graphs' resources, where base put them.
+	std::vector<org::FramePlacementPin> pins;
+	for (const auto& entry : base->Entries()) pins.push_back({entry.objectId, heap.get(), entry.offset, entry.size});
+	const std::vector<uint32_t> keptOne{1};
+
+	// 1. Epoch 2 rebuilt with a larger resource D (201). A and B stay where they are, in base's heap. D does not fit in it, so it
+	// goes to a block of a new lane: no heap a pin lies in grows. C (the old graph's) holds no bytes.
+	{
+		const auto fresh = compute({epochOne, Summary(2, 4, {Use(4, 201, 0, 3, 16 * kMB)})}, 2);
+		std::string why;
+		const auto kept = org::FramePlacementVersion::Keeping(*fresh, *base, pins, keptOne, 2, &why);
+		ENSURE(kept && why.empty() && kept->KeptFrom() == base->Id() && kept->KeptMovedCount() == 0);
+		kept->SetMemory(memory);
+		const auto* keptA = kept->FindObject(100);
+		const auto* keptB = kept->FindObject(101);
+		const auto* d = kept->FindObject(201);
+		ENSURE(keptA && keptB && d && keptA->placed && keptB->placed && d->placed);
+		ENSURE(kept->AcquireBlock(keptA->block) == heap && keptA->offset == a->offset && keptB->offset == b->offset);
+		ENSURE(kept->Blocks()[d->block].lane == 1 && kept->AcquireBlock(d->block) != heap);
+		ENSURE(!kept->FindObject(200));
+	}
+	// 2. Epoch 2 now uses A too: A lives until epoch 2, so it is live with B and C in their shared bytes. A, which several epochs
+	// use, stays; B and C move (their graphs place again).
+	{
+		const auto fresh = compute({epochOne, Summary(2, 4, {Use(3, 200, 0, 3), Use(5, 100, 0, 1)})}, 3);
+		const auto kept = org::FramePlacementVersion::Keeping(*fresh, *base, pins, keptOne, 3);
+		// C (epoch 2, in the same bytes) is live with A now too.
+		ENSURE(kept && kept->KeptMovedCount() == 2 && kept->KeptMoved().front() == "test.resource");
+		kept->SetMemory(memory);
+		const auto* keptA = kept->FindObject(100);
+		const auto* keptB = kept->FindObject(101);
+		ENSURE(keptA->MultiEpoch() && kept->AcquireBlock(keptA->block) == heap && keptA->offset == a->offset);
+		ENSURE(keptB->placed && (keptB->block != keptA->block || keptB->offset != keptA->offset));
+	}
+	// 3. A pinned resource the new layout does not place (its first use in frame order now reads) stays unplaced, and its bytes are
+	// held over the whole frame: nothing else is put there.
+	{
+		auto read = Use(1, 100, 0, 1);
+		read.firstUseWrites = false;
+		const auto fresh = compute({Summary(1, 4, {read, Use(2, 101, 2, 3)}), Summary(2, 4, {Use(3, 200, 0, 3), Use(5, 100, 2, 3)})}, 4);
+		std::string why;
+		const auto kept = org::FramePlacementVersion::Keeping(*fresh, *base, pins, keptOne, 4, &why);
+		ENSURE(kept);
+		kept->SetMemory(memory);
+		const auto* keptA = kept->FindObject(100);
+		ENSURE(keptA && !keptA->placed);
+		for (const auto& entry : kept->Entries())
+			if (entry.placed && kept->AcquireBlock(entry.block) == heap)
+				ENSURE(entry.offset >= a->offset + a->size || entry.offset + entry.size <= a->offset);
+	}
+	// 4. A pin in a heap the base has no block for cannot be kept: the caller packs from scratch.
+	{
+		const auto fresh = compute({epochOne, Summary(2, 4, {Use(3, 200, 0, 3)})}, 5);
+		auto stray = pins;
+		const auto other = org::FramePlacementVersion::Compute(Inputs({Summary(1, 4, {Use(1, 100, 0, 3, 8 * kMB)})}), 6);
+		other->SetMemory(std::make_shared<org::FramePlacementMemory>());
+		const auto otherHeap = other->AcquireBlock(0);
+		stray[0].heap = otherHeap.get();
+		std::string why;
+		ENSURE(!org::FramePlacementVersion::Keeping(*fresh, *base, stray, keptOne, 5, &why) && !why.empty());
+	}
+	// 5. Lanes: the trim of a version whose lane-1 block went drops that heap; lane 0 stays.
+	{
+		const auto fresh = compute({epochOne, Summary(2, 4, {Use(4, 201, 0, 3, 16 * kMB)})}, 7);
+		const auto kept = org::FramePlacementVersion::Keeping(*fresh, *base, pins, keptOne, 7);
+		kept->SetMemory(memory);
+		for (uint32_t block = 0; block < kept->Blocks().size(); ++block) (void)kept->AcquireBlock(block);
+		ENSURE(std::ranges::count_if(memory->Heaps(), [](const auto& info) { return info.current && info.lane == 1; }) == 1);
+		ENSURE(memory->WouldTrim(base->BlockNeeds()));
+		memory->ReleaseUnused(base->BlockNeeds());
+		ENSURE(std::ranges::none_of(memory->Heaps(), [](const auto& info) { return info.current && info.lane == 1; }));
+		ENSURE(std::ranges::any_of(memory->Heaps(), [&](const auto& info) { return info.current && info.identity == heap.get(); }));
+	}
+	std::puts("frame placement: versions that keep the running graphs' resources (pins, moved pins, held bytes, lanes)");
 	return 0;
 }

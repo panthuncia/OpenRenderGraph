@@ -95,6 +95,7 @@ void FramePlacement::Publish(PlacementSummary summary) {
 	bool firstEver = false;
 	std::vector<std::shared_ptr<const PlacementSummary>> summaries;
 	bool detailed = false;
+	double computeMs = 0.0;
 	{
 		std::unique_lock lock(m_mutex);
 		auto& kept = m_summaries[published->epoch];
@@ -119,14 +120,27 @@ void FramePlacement::Publish(PlacementSummary summary) {
 			const auto changes = m_changes;
 			const auto id = m_nextId++;
 			detailed = m_settings.logLifetimes;
+			// Every other epoch's graph keeps running: the plan that published this summary is the only one placing now. With no
+			// other epoch that has transients, nothing is kept and the version is packed from scratch.
+			std::vector<uint32_t> keptEpochs;
+			bool othersPlace = false;
+			for (const auto& [epoch, summary] : m_summaries)
+				if (epoch != kept->epoch) {
+					keptEpochs.push_back(epoch);
+					othersPlace = othersPlace || !summary->uses.empty();
+				}
+			const bool keep = m_settings.keepRunning && othersPlace;
 			lock.unlock();
 			std::shared_ptr<FramePlacementVersion> computed;
+			const auto computeBegin = std::chrono::steady_clock::now();
 			try {
 				computed = FramePlacementVersion::Compute(inputs, id);
+				if (computed && replacing) computed = KeepRunning(std::move(computed), replacing, std::move(keptEpochs), keep, "a graph's uncovered candidates");
 				if (computed) computed->SetMemory(m_memory);
 			} catch (const std::exception& error) {
 				spdlog::error("Frame placement: the computation failed: {}", error.what());
 			}
+			computeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - computeBegin).count();
 			lock.lock();
 			// Another thread may have published one meanwhile: that one stands.
 			if (computed && m_settings.enabled && m_current == replacing) {
@@ -135,6 +149,12 @@ void FramePlacement::Publish(PlacementSummary summary) {
 				m_current = computed;
 				m_currentId.store(computed->Id(), std::memory_order_release);
 				m_lastPublish = std::chrono::steady_clock::now();
+				// A plan of this frame needs it now (its candidates are uncovered by the frame's version, which may give it no valid
+				// layout at all), so it is the frame's version from here on. Only the worker's versions wait for the frame's end.
+				if (m_frozen.load(std::memory_order_relaxed)) {
+					m_frozenVersion = computed;
+					m_frozenId.store(computed->Id(), std::memory_order_release);
+				}
 				firstEver = !replacing;
 				first = computed;
 			}
@@ -144,15 +164,251 @@ void FramePlacement::Publish(PlacementSummary summary) {
 	if (first) {
 		std::string epochs;
 		for (const auto& summary : summaries) epochs += (epochs.empty() ? "" : ",") + std::to_string(summary->epoch);
-		spdlog::info("Frame placement {}: published at once, {} (summaries of epochs {})", first->Id(),
-			firstEver ? "the first" : "for a graph's uncovered candidates", epochs);
+		spdlog::info("Frame placement {}: published at once, {} (summaries of epochs {}), computed in {:.2f} ms{}", first->Id(),
+			firstEver ? "the first" : "for a graph's uncovered candidates", epochs, computeMs,
+			first->KeptFrom() ? "; it keeps the running graphs' resources where version " + std::to_string(first->KeptFrom()) + " has them"
+							  : std::string());
 		LogVersion(*first, summaries, detailed);
 	}
 }
 
 std::shared_ptr<const FramePlacementVersion> FramePlacement::Current() const {
 	std::lock_guard lock(m_mutex);
-	return m_current;
+	return m_frozen.load(std::memory_order_relaxed) ? m_frozenVersion : m_current;
+}
+
+void FramePlacement::Freeze(std::shared_ptr<const FramePlacementVersion> version) {
+	std::lock_guard lock(m_mutex);
+	m_frozenVersion = std::move(version);
+	m_frozenId.store(m_frozenVersion ? m_frozenVersion->Id() : 0, std::memory_order_release);
+	m_frozen.store(true, std::memory_order_release);
+}
+
+void FramePlacement::Thaw() {
+	std::lock_guard lock(m_mutex);
+	m_frozen.store(false, std::memory_order_release);
+	m_frozenVersion.reset();
+}
+
+FramePlacement::Staging::~Staging() {
+	if (m_closed.load(std::memory_order_acquire)) return;
+	if (const auto owner = m_owner.lock()) {
+		{
+			std::lock_guard lock(owner->m_mutex);
+			owner->CloseStagingLocked(*this);
+		}
+		owner->m_wake.notify_all();
+	}
+}
+
+void FramePlacement::CloseStagingLocked(Staging& staging) {
+	if (staging.m_closed.exchange(true, std::memory_order_acq_rel)) return;
+	if (m_openStagings) --m_openStagings;
+}
+
+std::shared_ptr<FramePlacement::Staging> FramePlacement::BeginStaging(std::vector<uint32_t> epochs) {
+	std::shared_ptr<Staging> staging(new Staging());
+	staging->m_owner = weak_from_this();
+	staging->m_epochs = std::move(epochs);
+	std::lock_guard lock(m_mutex);
+	staging->m_base = m_current;
+	// A set that rebuilds every epoch with transients (a recipe swap, a resize) leaves no graph running beside it: its versions
+	// are packed from scratch, as they cost no running graph a placement.
+	staging->m_keep = m_settings.keepRunning && std::ranges::any_of(m_summaries, [&](const auto& entry) {
+		return !entry.second->uses.empty() && std::ranges::find(staging->m_epochs, entry.first) == staging->m_epochs.end();
+	});
+	staging->m_currentId.store(m_current ? m_current->Id() : 0, std::memory_order_release);
+	++m_openStagings;
+	return staging;
+}
+
+void FramePlacement::PublishStaged(Staging& staging, PlacementSummary summary) {
+	auto published = std::make_shared<const PlacementSummary>(std::move(summary));
+	std::unique_lock lock(m_mutex);
+	if (staging.Closed()) return;
+	auto& kept = staging.m_summaries[published->epoch];
+	const bool changed = !kept || kept->hash != published->hash;
+	kept = published;
+	if (!changed || !m_settings.enabled || staging.m_declined) return;
+	// As Publish: the first version, or one for the candidates the staging's version leaves uncovered, computed at once. Here it
+	// stays the staging's (pending) until its set attaches, so the running graphs keep the current version and their backings.
+	const auto versionNow = staging.m_pending ? staging.m_pending : staging.m_base;
+	const bool firstVersion = !versionNow && !kept->uses.empty();
+	const bool uncovered = versionNow && kept->uncovered != 0;
+	// A layout that kept the running graphs' resources in place may need clearly more than one packed from scratch (a heap lane
+	// added for a graph whose resources were larger then). The set's graphs place anyway, so a version that keeps the running
+	// graphs' resources and packs the set's own again (a lane nothing lies in any more goes) is made for them now, if it is
+	// clearly smaller. Otherwise only the trim packs again, once quiet, and every graph places again then.
+	const bool compact = !firstVersion && !uncovered && !staging.m_pending && versionNow && versionNow->KeptFrom() && staging.m_keep
+		&& !kept->uses.empty();
+	if (!firstVersion && !uncovered && !compact) return;
+	// The host's summaries, with the staged epochs' in their place.
+	auto merged = m_summaries;
+	for (const auto& [epoch, staged] : staging.m_summaries) merged[epoch] = staged;
+	FramePlacementInputs inputs;
+	inputs.epochOrder = m_epochOrder;
+	inputs.repeatedEpochs = m_settings.repeatedEpochs;
+	inputs.beamSearch = m_settings.beamSearch;
+	std::vector<std::shared_ptr<const PlacementSummary>> summaries;
+	for (const auto& [epoch, s] : merged) summaries.push_back(s);
+	inputs.summaries = summaries;
+	const auto id = m_nextId++;
+	const bool detailed = m_settings.logLifetimes;
+	const bool keep = staging.m_keep;
+	// The graphs that keep running: every epoch the set does not rebuild, and the set's graphs that placed already.
+	std::vector<uint32_t> keptEpochs = staging.m_placedEpochs;
+	for (const auto& [epoch, s] : merged)
+		if (std::ranges::find(staging.m_epochs, epoch) == staging.m_epochs.end()) keptEpochs.push_back(epoch);
+	// What stays where it is: what the graphs that keep running use, and what the set's new graphs that published use (their running
+	// graphs bind it until the attach). What only the running graphs of the set's other epochs use goes with them at the attach.
+	std::vector<uint32_t> pinEpochs = keptEpochs;
+	for (const auto& [epoch, s] : staging.m_summaries) pinEpochs.push_back(epoch);
+	lock.unlock();
+	std::shared_ptr<FramePlacementVersion> computed;
+	const auto computeBegin = std::chrono::steady_clock::now();
+	try {
+		computed = FramePlacementVersion::Compute(inputs, id);
+		// A compaction that would not save memory, or could not keep the running graphs' resources, is not made.
+		if (compact && computed && versionNow->Bytes() <= computed->Bytes() + FramePlacementMemory::TrimSlack(computed->Bytes())) computed.reset();
+		if (computed && versionNow)
+			computed = KeepRunning(std::move(computed), versionNow, std::move(keptEpochs), keep, compact ? "a staged set, to pack it again" : "a staged set",
+				&pinEpochs);
+		if (compact && computed
+			&& (!computed->KeptFrom() || computed->Bytes() + FramePlacementMemory::TrimSlack(versionNow->Bytes()) >= versionNow->Bytes()))
+			computed.reset();
+		if (computed) computed->SetMemory(m_memory);
+	} catch (const std::exception& error) {
+		spdlog::error("Frame placement: the staged computation failed: {}", error.what());
+	}
+	const double computeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - computeBegin).count();
+	if (!computed) return;
+	lock.lock();
+	if (staging.Closed()) return;
+	staging.m_pending = computed;
+	staging.m_currentId.store(computed->Id(), std::memory_order_release);
+	lock.unlock();
+	std::string epochs;
+	for (const auto& s : summaries) epochs += (epochs.empty() ? "" : ",") + std::to_string(s->epoch);
+	spdlog::info("Frame placement {}: computed for a staged set, {} (summaries of epochs {}), in {:.2f} ms; published at the set's attach{}",
+		computed->Id(), firstVersion ? "the first" : compact ? "to pack its graphs' transients again" : "for a graph's uncovered candidates", epochs, computeMs,
+		computed->KeptFrom() ? "; it keeps the running graphs' resources where version " + std::to_string(computed->KeptFrom()) + " has them"
+							 : std::string());
+	LogVersion(*computed, summaries, detailed);
+}
+
+std::shared_ptr<const FramePlacementVersion> FramePlacement::StagedCurrent(const Staging& staging) const {
+	std::lock_guard lock(m_mutex);
+	return staging.m_pending ? staging.m_pending : staging.m_base;
+}
+
+bool FramePlacement::DeclineStaged(Staging& staging) {
+	uint64_t declined = 0;
+	{
+		std::lock_guard lock(m_mutex);
+		// Declined already: the set's later graphs place from the base too.
+		if (staging.m_declined) return !staging.Closed();
+		if (staging.Closed() || staging.m_pendingUsed || !staging.m_pending) return false;
+		declined = staging.m_pending->Id();
+		staging.m_declined = true;
+		staging.m_pending.reset();
+		staging.m_currentId.store(staging.m_base ? staging.m_base->Id() : 0, std::memory_order_release);
+	}
+	// Its heaps stay this memory's current ones: the worker's next version, which places the set's new transients, takes them.
+	spdlog::info("Frame placement {}: declined by its staged set (it would move resources the running graphs bind); the set places from {}",
+		declined, staging.m_currentId.load(std::memory_order_acquire));
+	return true;
+}
+
+void FramePlacement::NoteStagedPlacement(Staging& staging, uint64_t versionId, uint32_t epoch, bool placed) {
+	std::lock_guard lock(m_mutex);
+	if (staging.m_pending && staging.m_pending->Id() == versionId) staging.m_pendingUsed = true;
+	if (placed && epoch != UINT32_MAX && std::ranges::find(staging.m_placedEpochs, epoch) == staging.m_placedEpochs.end())
+		staging.m_placedEpochs.push_back(epoch);
+}
+
+std::shared_ptr<FramePlacementVersion> FramePlacement::KeepRunning(std::shared_ptr<FramePlacementVersion> fresh,
+	const std::shared_ptr<const FramePlacementVersion>& base, std::vector<uint32_t> keptEpochs, bool keep, const char* what,
+	const std::vector<uint32_t>* pinEpochs) const {
+	if (!keep || !fresh || !base) return fresh;
+	// What the graphs bind now: every resource still where a frame placement put it.
+	std::vector<FramePlacementPin> pins;
+	for (const auto& resident : FramePlacedResidents())
+		if (resident.objectId) pins.push_back({resident.objectId, resident.heap, resident.offset, resident.size});
+	std::string why;
+	auto keeping = FramePlacementVersion::Keeping(*fresh, *base, pins, keptEpochs, fresh->Id(), &why, pinEpochs);
+	if (!keeping) {
+		spdlog::info("Frame placement {}: for {}, packed from scratch: it cannot keep the running graphs' resources where version {} has "
+					 "them ({}); every graph places again from it",
+			fresh->Id(), what, base->Id(), why);
+		return fresh;
+	}
+	uint64_t laneBytes = 0;
+	for (const auto& block : keeping->Blocks())
+		if (block.lane) laneBytes += block.capacity;
+	std::string moved;
+	for (const auto& name : keeping->KeptMoved()) moved += (moved.empty() ? "'" : ", '") + name + "'";
+	spdlog::info("Frame placement {}: for {}, keeps the running graphs' resources where version {} has them{}: {:.2f} MB in {} blocks "
+				 "({:.2f} MB in added heap lanes) against {:.2f} MB packed from scratch",
+		keeping->Id(), what, base->Id(),
+		keeping->KeptMovedCount() ? fmt::format(" but {} that are now live with another in their bytes ({}{})", keeping->KeptMovedCount(), moved,
+										keeping->KeptMovedCount() > keeping->KeptMoved().size() ? ", ..." : "")
+								  : std::string(),
+		MB(keeping->Bytes()), keeping->Blocks().size(), MB(laneBytes), MB(fresh->Bytes()));
+	return keeping;
+}
+
+void FramePlacement::AcquireStagedBlocks(const Staging& staging) {
+	std::shared_ptr<const FramePlacementVersion> pending;
+	{
+		std::lock_guard lock(m_mutex);
+		pending = staging.m_pending;
+	}
+	if (!pending) return;
+	// The memory keeps each class's current heap, so a block no graph placed into yet stays allocated until the attach takes it.
+	for (uint32_t block = 0; block < pending->Blocks().size(); ++block) (void)pending->AcquireBlock(block);
+}
+
+bool FramePlacement::CommitStaging(Staging& staging) {
+	std::shared_ptr<const FramePlacementVersion> published;
+	std::string epochs;
+	{
+		std::lock_guard lock(m_mutex);
+		if (staging.Closed()) return false;
+		const auto now = std::chrono::steady_clock::now();
+		for (const auto& [epoch, summary] : staging.m_summaries) {
+			auto& kept = m_summaries[epoch];
+			if (!kept || kept->hash != summary->hash) {
+				++m_changes;
+				m_lastChange = now;
+			}
+			kept = summary;
+			epochs += (epochs.empty() ? "" : ",") + std::to_string(epoch);
+		}
+		// The set's graphs placed from it. The worker computes again from the summaries once they settle; the same inputs give the
+		// same layout, which it does not publish again.
+		if (staging.m_pending && m_settings.enabled) {
+			m_latest = staging.m_pending;
+			m_current = staging.m_pending;
+			m_currentId.store(m_current->Id(), std::memory_order_release);
+			m_lastPublish = now;
+			published = m_current;
+		}
+		if (!m_thread.joinable() && !m_stopping && !m_summaries.empty()) m_thread = std::thread([this] { Run(); });
+		CloseStagingLocked(staging);
+	}
+	m_wake.notify_all();
+	if (published)
+		spdlog::info("Frame placement {}: published at the attach of the staged set that placed from it (summaries of epochs {})", published->Id(),
+			epochs);
+	return static_cast<bool>(published);
+}
+
+void FramePlacement::DropStaging(Staging& staging) {
+	{
+		std::lock_guard lock(m_mutex);
+		CloseStagingLocked(staging);
+	}
+	m_wake.notify_all();
 }
 
 std::shared_ptr<const FramePlacementVersion> FramePlacement::Latest() const {
@@ -268,10 +524,10 @@ void FramePlacement::LogMemory(PersistentAliasArena* pools, const std::string& g
 		uint64_t packed = 0;
 		if (current)
 			for (const auto& block : current->Blocks())
-				if (block.memoryClass == heap.memoryClass && block.backendMask == heap.backendMask) packed += block.capacity;
-		spdlog::info("Frame placement memory: heap class {} backends {:#x} generation {} {}: reserved {:.2f} MB, current version packs "
+				if (block.memoryClass == heap.memoryClass && block.backendMask == heap.backendMask && block.lane == heap.lane) packed += block.capacity;
+		spdlog::info("Frame placement memory: heap class {} backends {:#x} lane {} generation {} {}: reserved {:.2f} MB, current version packs "
 					 "{:.2f} MB{}; held by {} (references {})",
-			heap.memoryClass, heap.backendMask, heap.generation, heap.current ? "current" : "replaced", MB(heap.capacity), MB(packed),
+			heap.memoryClass, heap.backendMask, heap.lane, heap.generation, heap.current ? "current" : "replaced", MB(heap.capacity), MB(packed),
 			heap.current && heap.needed ? fmt::format(", last taken by version {} for {:.2f} MB", heap.neededBy, MB(heap.needed)) : std::string(),
 			held, heap.references);
 	}
@@ -286,6 +542,11 @@ std::optional<std::chrono::steady_clock::time_point> FramePlacement::TrimDueLock
 void FramePlacement::Run() {
 	std::unique_lock lock(m_mutex);
 	while (!m_stopping) {
+		// A staged set places from the current version (or its own pending one): nothing is published until it attaches or goes.
+		if (m_openStagings) {
+			m_wake.wait(lock);
+			continue;
+		}
 		if (m_changes == m_computed) {
 			// Quiet. Once the current version has been quiet for the trim time, heaps larger than its need (growth headroom, a
 			// class it no longer uses) are trimmed.
@@ -302,7 +563,12 @@ void FramePlacement::Run() {
 			m_trimChecked = current->Id();
 			// The latest layout (the current one, or a newer one the current version served in place of) on exact heaps, when
 			// that trims a heap or is a newer layout.
-			const auto latest = m_latest ? m_latest : current;
+			auto latest = m_latest ? m_latest : current;
+			// A layout that kept the running graphs' resources in place (Keeping) stays while it needs no more than the layout
+			// packed from scratch: packing again would make every graph place again for nothing. Only its heaps are trimmed.
+			const bool keepCurrent = current->KeptFrom() && latest != current
+				&& current->Bytes() <= latest->Bytes() + FramePlacementMemory::TrimSlack(latest->Bytes());
+			if (keepCurrent) latest = current;
 			const auto needs = latest->BlockNeeds();
 			if (!m_memory->WouldTrim(needs) && latest->LayoutHash() == current->LayoutHash()) continue;
 			// The same layout under a new id, its blocks on exact heaps. Graphs take it in place at their next preparation, as
@@ -313,16 +579,28 @@ void FramePlacement::Run() {
 			lock.unlock();
 			std::shared_ptr<FramePlacementVersion> trimmed;
 			try {
-				trimmed = FramePlacementVersion::Compute(inputs, id);
+				trimmed = keepCurrent ? FramePlacementVersion::Relabel(*current, id) : FramePlacementVersion::Compute(inputs, id);
 			} catch (const std::exception& error) {
 				spdlog::error("Frame placement: the trim's computation failed: {}", error.what());
+			}
+			if (trimmed) {
+				trimmed->SetMemory(m_memory);
+				trimmed->SetExactHeaps(true);
+				// Its heaps are made here, on this thread: otherwise the first graph that places from it allocates them at its
+				// preparation, on the render thread (a heap of a GB took 20-40 ms there).
+				const auto acquireBegin = std::chrono::steady_clock::now();
+				try {
+					for (uint32_t block = 0; block < trimmed->Blocks().size(); ++block) (void)trimmed->AcquireBlock(block);
+				} catch (const std::exception& error) {
+					spdlog::warn("Frame placement {}: its heaps were not allocated ahead ({}); the graphs allocate them", trimmed->Id(), error.what());
+				}
+				const double acquireMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acquireBegin).count();
+				if (acquireMs > 1.0) spdlog::info("Frame placement {}: heaps allocated ahead of its publication in {:.2f} ms", trimmed->Id(), acquireMs);
 			}
 			lock.lock();
 			// Only while nothing changed meanwhile; otherwise a new computation is due. The trim takes the latest layout, which the
 			// current version may have served in its place (Run's serves).
 			if (!trimmed || m_changes != m_computed || m_current != current) continue;
-			trimmed->SetMemory(m_memory);
-			trimmed->SetExactHeaps(true);
 			m_memory->ReleaseUnused(needs);
 			m_latest = trimmed;
 			m_current = trimmed;
@@ -372,7 +650,10 @@ void FramePlacement::Run() {
 		// places every candidate of every graph (each rebuilt graph found its entries or fitted its new transients into free
 		// bytes), a new layout is taken only when it needs clearly less memory. The trim publishes the settled layout later.
 		const bool uncovered = std::ranges::any_of(summaries, [](const auto& summary) { return summary->uncovered != 0; });
-		const bool smaller = m_current && m_latest->Bytes() + FramePlacementMemory::TrimSlack(m_current->Bytes()) < m_current->Bytes();
+		// A layout that kept the running graphs' resources in place (Keeping) is packed again only by the trim, once quiet: every
+		// graph places again for it, and while settings are toggled the next kept layout often needs less anyway.
+		const bool smaller = m_current && !m_current->KeptFrom()
+			&& m_latest->Bytes() + FramePlacementMemory::TrimSlack(m_current->Bytes()) < m_current->Bytes();
 		const bool serves = m_current && m_current->Slots().size() == m_latest->Slots().size() && !uncovered && !smaller;
 		bool published = false;
 		if (m_settings.enabled && (!m_current || m_current->LayoutHash() != m_latest->LayoutHash()) && !serves) {

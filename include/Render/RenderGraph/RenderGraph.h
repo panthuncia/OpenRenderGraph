@@ -311,6 +311,11 @@ private:
 	// graph as a plain binding change. It must be cheap: it runs once per preparation.
 	using FramePlacementProbe = std::function<uint64_t()>;
 	void SetFramePlacementProbe(FramePlacementProbe probe) { m_framePlacementProbe = std::move(probe); }
+	// A plan before the graph is attached (PlaceDeferredAliasesAtBuild) whose new version would move resources the running graphs
+	// bind asks this to keep the version it had instead. True: it does (its new transients go to its own pool until a later version
+	// takes them). Unset, or false: the placement is left to the attach.
+	using FramePlacementDecline = std::function<bool()>;
+	void SetFramePlacementDecline(FramePlacementDecline decline) { m_framePlacementDecline = std::move(decline); }
 	// Whether the host places transients across the frame (GraphHost::FramePlacementSettings::enabled), even before its first
 	// version. Only then are the current versions of versioned slots alias candidates. A versioned resource is often used by
 	// several graphs, and a graph's own pools see only its own uses. So a version is placed only at a frame placement's offset,
@@ -830,6 +835,8 @@ public:
 	/// executions in submission order. The graph's own uploads go through it too.
 	/// Created on first use. Call it after Setup. Any thread.
 	ExternalClient& GetExternalClient();
+	// The queue slots its external client has used (ExternalClient::UsedSlots), 0 when it has none yet. Does not make one.
+	uint32_t ExternalClientSlots();
 
 private:
 	// Driving the graph is GraphHost's: its declared-graph calls (Build, PrepareFrame, ExecuteFrame)
@@ -863,6 +870,18 @@ private:
 	// attached and before its first preparation. Nothing when the graph has placed already. GraphHost calls it at a synchronous
 	// host's attach, so the graphs attached together place in epoch order before any of them records.
 	void PlaceDeferredAliasesNow();
+	// The same placement on the thread that built the graph, before it is staged or attached (GraphHost::PlaceEpochGraphs). It
+	// places only when that moves nothing another graph binds: every resource it would place or bind that is materialized by
+	// someone else must already be where the plan puts it, and nothing may go to the arena's shared pools. Otherwise it changes
+	// nothing, leaves the placement to the attach and returns false with why. True when it placed (or had nothing to place).
+	bool PlaceDeferredAliasesAtBuild(std::string* why = nullptr);
+	// The frame placement version the graph's latest alias plan placed from, null for none. Owner thread.
+	std::shared_ptr<const FramePlacementVersion> PersistentFramePlacement() const;
+	// Owner thread, at a preparation that finds a new frame placement version: takes it without a plan when it leaves every
+	// resource this graph placed from a frame placement where it is, with the same contents flow (whether it continues from an
+	// earlier epoch, and whether it is this graph's own), and places nothing of this graph's own pools. A version that kept the
+	// running graphs' resources (FramePlacementVersion::Keeping) is one. True when it took it.
+	bool TakeFramePlacementInPlace();
 	// Before CompileStructural, on a graph built detached: the context its passes' resolvers are captured with and its first
 	// publication binds versions with. Each preparation replaces it with its own (UpdateExecutionContext::resolverCaptureContext).
 	// GraphHost::BuildEpochGraph gives one that names each texture's reshaped version (array-size versions, VersionedResource).
@@ -1001,6 +1020,7 @@ private:
 	FrameTransientObserver m_frameTransientObserver;  // SetFrameTransientObserver
 	PlacementSummaryObserver m_placementSummaryObserver;  // SetPlacementSummaryObserver
 	FramePlacementProbe m_framePlacementProbe;            // SetFramePlacementProbe
+	FramePlacementDecline m_framePlacementDecline;        // SetFramePlacementDecline
 	FramePlacementSource m_framePlacementSource;          // SetFramePlacementSource
 	FramePlacementEnabled m_framePlacementEnabled;        // SetFramePlacementEnabled
 	// FramePlacementInUse, written by each alias plan.

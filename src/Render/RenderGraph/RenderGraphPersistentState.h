@@ -509,6 +509,15 @@ struct RenderGraph::PersistentInstanceState {
 	// Built off the owner thread (PrepareFirstPersistentBuild) without its alias placement: the first preparation places.
 	bool deferAliasPlacement = false;
 	bool aliasPlacementDeferred = false;
+	// RenderGraph::PlaceDeferredAliasesAtBuild: the plan runs before the graph is attached, so it must move nothing another graph
+	// binds. A plan that would sets atBuildRefusal and changes nothing.
+	bool placingAtBuild = false;
+	std::string atBuildRefusal;
+	// The plan at the build declined a new version (RenderGraph::SetFramePlacementDecline): its new transients may go to its pool.
+	bool atBuildOwnPools = false;
+	// Resources this graph materialized standalone itself (MaterializePersistentStandalone). Any other materialized candidate
+	// may be bound by another graph.
+	std::unordered_set<Resource*> ownMaterialized;
 	// RenderGraph::FreezeAliasedBindings: the graph keeps the backings it bound for the transients it placed, whatever they point at
 	// now (a staged build of the same epoch placed them elsewhere).
 	std::atomic<bool> freezeAliased{false};

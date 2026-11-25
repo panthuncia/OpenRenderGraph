@@ -207,6 +207,7 @@ void RenderGraph::MaterializePersistentStandalone(std::span<Resource* const> res
 		if (auto* texture = dynamic_cast<PixelBuffer*>(concrete)) texture->Materialize();
 		else if (auto* buffer = dynamic_cast<BufferBase*>(concrete)) buffer->Materialize();
 		else continue;
+		if (m_compilerState && m_compilerState->persistent) m_compilerState->persistent->ownMaterialized.insert(concrete);
 		TrackTransientFrameResource(concrete);
 		basic_telemetry::AddCounter("ORG.Persistent.StandaloneMaterializations");
 	}
@@ -512,7 +513,10 @@ void RenderGraph::DrainPersistentStructuralBuild(std::vector<uint32_t>& structur
 void RenderGraph::RetireIdlePersistentAliasPools(PersistentExecutionState& state) {
 	const uint64_t retireFrames = m_getAutoAliasPoolRetireIdleFrames ? (std::max)(1u, m_getAutoAliasPoolRetireIdleFrames()) : 120u;
 	if (!state.aliasArena) return;
-	std::lock_guard arenaLock(state.aliasArena->mutex);
+	// Each preparation retires what idled long enough; one that finds the arena busy (another graph's plan holds it, which may be
+	// allocating a pool on its own thread) leaves it to the next. Waiting here put that allocation on the render thread.
+	std::unique_lock arenaLock(state.aliasArena->mutex, std::try_to_lock);
+	if (!arenaLock.owns_lock()) return;
 	auto& pools = state.aliasArena->pools;
 	for (auto it = pools.begin(); it != pools.end();) {
 		auto& pool = it->second;
@@ -586,6 +590,21 @@ void NoteFramePlaced(Resource* concrete, const AliasHeapGeneration* heap, uint64
 	g_framePlaced[concrete] = {concrete->weak_from_this(), heap, offset, generation, owner, size, epoch};
 }
 
+// Where concrete is placed from a frame placement now (its heap, offset and bytes), if it still is.
+bool FramePlacedWhere(Resource* concrete, const AliasHeapGeneration*& heap, uint64_t& offset, uint64_t& size) {
+	std::lock_guard lock(g_framePlacedMutex);
+	const auto found = g_framePlaced.find(concrete);
+	if (found == g_framePlaced.end()) return false;
+	const auto& record = found->second;
+	const auto resource = record.resource.lock();
+	auto* backed = resource.get() == concrete ? dynamic_cast<BackedResource*>(concrete) : nullptr;
+	if (!backed || !backed->IsMaterialized() || backed->GetBackingGeneration() != record.generation) return false;
+	heap = record.heap;
+	offset = record.offset;
+	size = record.size;
+	return true;
+}
+
 // Makes owner the graph state that gives the frame placement of concrete back.
 void ClaimFramePlaced(const void* concrete, const void* owner) {
 	std::lock_guard lock(g_framePlacedMutex);
@@ -619,7 +638,7 @@ std::vector<FramePlacedResident> FramePlacedResidents() {
 		auto* backed = resource ? dynamic_cast<BackedResource*>(resource.get()) : nullptr;
 		// Only resources still at the placement the record names. A resource placed again elsewhere left that heap.
 		if (!backed || !backed->IsMaterialized() || backed->GetBackingGeneration() != record.generation) continue;
-		out.push_back({record.heap, resource->GetName(), record.offset, record.size, record.epoch});
+		out.push_back({record.heap, resource->GetName(), record.offset, record.size, record.epoch, resource->GetGlobalResourceID() + 1});
 	}
 	return out;
 }
@@ -681,6 +700,10 @@ void RenderGraph::ReportFrameTransientUses(const persistent::SelectedPublication
 
 bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction& edit, const persistent::SelectedPublication& scheduled) {
 	BT_ZONE_SCOPE("ORG.Persistent.PlanAliases");
+	using PlanClock = std::chrono::steady_clock;
+	const auto planBegin = PlanClock::now();
+	double acquireMs = 0.0;
+	size_t materializedCount = 0;
 	auto& state = *m_compilerState->persistent;
 	const auto& executable = *scheduled.executable;
 	const auto& graph = *executable.graph;
@@ -989,6 +1012,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		}
 	};
 
+	const auto planGathered = PlanClock::now();
 	// Frame placement (SetFramePlacementSource). The graph's first plan takes the host's current version, and keeps it until the
 	// host publishes a newer one: the graph then places again from that, in place (BindPersistentFrame). A candidate the version
 	// covers takes the version's offset in its block instead of a place in this graph's pools. Covered means:
@@ -1131,6 +1155,31 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				}
 			}
 		}
+		// A resource this graph keeps where another epoch's graph placed it (withheld) holds those bytes from this graph's start
+		// (its contents come from that epoch) to its last use here. The version may give the same bytes to one of this graph's own
+		// candidates (it did not know this graph uses it): that candidate goes back to its own path.
+		for (const auto& k : candidates) {
+			if (!k.keepBacking) continue;
+			const AliasHeapGeneration* heldHeap = nullptr;
+			uint64_t heldOffset = 0, heldSize = 0;
+			if (!FramePlacedWhere(k.concrete, heldHeap, heldOffset, heldSize)) continue;
+			for (auto& c : candidates) {
+				if (&c == &k || !c.framePlaced || c.frameShared) continue;
+				if (framePlacement->PeekBlock(c.frameBlock).get() != heldHeap) continue;
+				if (c.offset >= heldOffset + heldSize || heldOffset >= c.offset + c.sizeBytes) continue;
+				if (c.frameFirst > k.lastUse) continue;
+				c.framePlaced = false;
+				framePlacedBytes -= c.sizeBytes;
+				--framePlacedCount;
+				++frameMoved;
+				c.continues = false;
+				c.pooled = c.ownPooled;
+				c.poolID = c.ownPoolID;
+				c.exclusion = c.ownExclusion;
+				c.offset = 0;
+				++frameOwnPath;
+			}
+		}
 		// Resources the version does not know yet, or does not place here, that this graph alone uses: into the free bytes of the
 		// version's blocks, where this graph's own pools would have put them, so a rebuild with new transients does not allocate
 		// pools beside the blocks. Free means: no candidate this graph placed from the block is live then (its lifetime here),
@@ -1162,6 +1211,19 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				occupants[c.frameBlock].push_back({c.offset, c.offset + c.sizeBytes, c.frameFirst, c.frameLast});
 				if (const auto* entry = framePlacement->FindObject(objectOf(c))) taken.insert(entry);
 				else if (const auto* byKey = framePlacement->Find(c.key, epoch)) taken.insert(byKey);
+			}
+			// A resource another epoch's graph placed in this version's blocks that this graph keeps where it is (withheld: the version
+			// does not give this epoch its use, or that graph fitted it into free bytes) holds its bytes through this graph's whole
+			// slot. Its place is where it is now, which the version may not know.
+			for (const auto& c : candidates) {
+				if (!c.keepBacking) continue;
+				const AliasHeapGeneration* heldHeap = nullptr;
+				uint64_t heldOffset = 0, heldSize = 0;
+				if (!FramePlacedWhere(c.concrete, heldHeap, heldOffset, heldSize)) continue;
+				for (uint32_t b = 0; b < framePlacement->Blocks().size(); ++b)
+					if (framePlacement->PeekBlock(b).get() == heldHeap)
+						occupants[b].push_back({heldOffset, heldOffset + heldSize, 0, lastRank});
+				if (const auto* entry = framePlacement->FindObject(objectOf(c))) taken.insert(entry);
 			}
 			for (const auto& entry : framePlacement->Entries()) {
 				if (!entry.placed || taken.contains(&entry)) continue;
@@ -1212,6 +1274,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	// epochs share): the summary that says so makes the host compute the next version at once (FramePlacement::Publish), and
 	// this plan places from that one. So a rebuild that brings new transients neither allocates pools beside the blocks nor
 	// places again a settle time later.
+	const auto baseVersion = state.framePlacement;
 	if (state.framePlacement && uncoveredCount() > 0 && m_framePlacementSource) {
 		publishSummary(true);
 		if (auto newer = m_framePlacementSource(); newer && newer != state.framePlacement) {
@@ -1221,7 +1284,53 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			placeFrom(state.framePlacement);
 		}
 	}
+	// Placed before the graph is attached: resources the running graphs bind (materialized by someone else) must stay where they
+	// are. The first offender under a version, or null.
+	const auto movesForeign = [&](const std::shared_ptr<const FramePlacementVersion>& version) -> const Candidate* {
+		for (const auto& c : candidates) {
+			auto* backed = dynamic_cast<BackedResource*>(c.concrete);
+			if (!backed || !backed->IsMaterialized() || state.ownMaterialized.contains(c.concrete) || state.aliasPlaced.contains(c.concrete))
+				continue;
+			if (c.pooled && c.framePlaced) {
+				if (c.shared) return &c;
+				// Without allocating: a version the set may decline allocates nothing (a heap it would need is a move anyway).
+				const auto heap = version->PeekBlock(c.frameBlock);
+				if (!heap || !AtFramePlacement(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration())) return &c;
+			} else if (c.pooled) {
+				return &c;
+			} else if (!c.version && !c.keepBacking && AliasPlacedAnywhere(c.concrete)) {
+				return &c;
+			}
+		}
+		return nullptr;
+	};
+	// A new version made for this graph's uncovered candidates may pack the frame anew, moving resources the running graphs bind.
+	// Before the attach the set may decline it (no graph of the set placed from it yet): this graph keeps the version it had, and
+	// its new transients go to its own pool until a later version takes them in place. Only when the old version withholds nothing:
+	// a resource this graph newly shares with another epoch needs the new version, or the other epoch's graph reuses its bytes
+	// while this one still reads it (wrong contents until the new version comes). Then the placement waits for the attach.
+	if (state.placingAtBuild && baseVersion && state.framePlacement != baseVersion && m_framePlacementDecline) {
+		if (const auto* offender = movesForeign(state.framePlacement)) {
+			const auto pending = state.framePlacement;
+			const auto offenderName = offender->concrete->GetName();
+			placeFrom(baseVersion);
+			if (frameWithheld == 0 && m_framePlacementDecline()) {
+				spdlog::info("Persistent alias plan: epoch {} keeps frame placement {} (frame placement {} would move '{}', which running graphs "
+					"bind); its new transients go to its own pool for now", m_passEpochFilter, baseVersion->Id(), pending->Id(), offenderName);
+				state.framePlacement = baseVersion;
+				state.atBuildOwnPools = true;
+			} else {
+				placeFrom(pending);
+			}
+		}
+	} else if (state.placingAtBuild && baseVersion && state.framePlacement == baseVersion && m_framePlacementDecline && uncoveredCount() > 0
+		&& frameWithheld == 0 && m_framePlacementDecline()) {
+		// An earlier graph of the set declined the version these candidates would need: the set stays on its base, and this
+		// graph's new transients go to its own pool too.
+		state.atBuildOwnPools = true;
+	}
 	const auto framePlacement = state.framePlacement;
+	const auto planFramed = PlanClock::now();
 
 	// A version goes only where a frame placement puts it. Other graphs may bind it, and this graph's pools see only its own
 	// uses. Otherwise it keeps the backing it has: memory of its own from whoever made it, or the frame placement another
@@ -1247,6 +1356,52 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	for (const auto& c : candidates)
 		if (c.framePlaced && c.continues) state.aliasContinues.insert(c.concrete);
 
+	// Placed before the graph is attached (PlaceDeferredAliasesAtBuild): the running graphs bind what is materialized by others,
+	// so the plan goes on only if it moves none of it, and allocates nothing in the arena's pools, which the running graphs share.
+	// Otherwise nothing has changed yet: the placement is left to the attach.
+	if (state.placingAtBuild) {
+		const char* refusal = nullptr;
+		const Candidate* refused = nullptr;
+		for (const auto& c : candidates) {
+			auto* backed = dynamic_cast<BackedResource*>(c.concrete);
+			if (!backed) continue;
+			const bool foreign = backed->IsMaterialized() && !state.ownMaterialized.contains(c.concrete) && !state.aliasPlaced.contains(c.concrete);
+			// The graph's own pool: only after it declined a new version, and only a pool no other graph places into (growing it
+			// would leave their placements in an old generation).
+			if (c.pooled && !c.framePlaced) {
+				// A resource another graph binds (an older build of this epoch) cannot move to this graph's pool before the attach.
+				if (foreign) refusal = "it would move a resource another graph binds into the graph's own pool";
+				else if (!state.atBuildOwnPools || c.manualPool || c.shared || m_frameAliasArena) refusal = "a transient goes to the graph's own pools";
+				else if (state.aliasArena) {
+					std::lock_guard arenaLock(state.aliasArena->mutex);
+					const auto found = state.aliasArena->pools.find(c.poolID);
+					if (found != state.aliasArena->pools.end())
+						for (const auto& [owner, bytes] : found->second.required)
+							if (owner != &state && bytes) refusal = "a transient goes to a pool other graphs place into";
+				}
+			}
+			else if (!foreign) continue;
+			else if (c.shared && c.pooled) refusal = "a resource shared between devices is placed";
+			else if (c.pooled) {
+				const auto heap = framePlacement->AcquireBlock(c.frameBlock);
+				if (!AtFramePlacement(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration()))
+					refusal = "it would move a resource another graph binds";
+			} else if (!c.version && !c.keepBacking && AliasPlacedAnywhere(c.concrete))
+				refusal = "it would take a resource another graph placed off its placement";
+			if (refusal) {
+				refused = &c;
+				break;
+			}
+		}
+		if (refusal) {
+			state.atBuildRefusal = std::string(refusal) + " ('" + refused->concrete->GetName() + "')";
+			// The plan at the attach takes the host's version then.
+			state.framePlacementTaken = false;
+			state.framePlacement.reset();
+			state.aliasContinues.clear();
+			return false;
+		}
+	}
 	// Pack per pool, into the arena's pools (shared with the other graphs of a host): each graph from offset 0.
 	if (!state.aliasArena) state.aliasArena = PersistentAliasArena::Create();
 	std::lock_guard arenaLock(state.aliasArena->mutex);
@@ -1449,6 +1604,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		if (pool.required.empty() && !pool.idleSinceFrame) pool.idleSinceFrame = (std::max)(state.frameNumber, uint64_t{1});
 	}
 
+	const auto planPacked = PlanClock::now();
 	// Apply: orderings, then bindings.
 	bool changed = false;
 	if (edges != state.aliasEdges) {
@@ -1483,7 +1639,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		if (c.pooled) {
 			++placed;
 			// A frame placement's block is allocated by the first graph that places into it.
+			const auto acquireBegin = PlanClock::now();
 			const std::shared_ptr<const AliasHeapGeneration> frameHeap = c.framePlaced ? framePlacement->AcquireBlock(c.frameBlock) : nullptr;
+			acquireMs += std::chrono::duration<double, std::milli>(PlanClock::now() - acquireBegin).count();
 			const auto& heap = c.framePlaced ? frameHeap : heapOf(c.poolID);
 			const State::AliasPlacementRecord record{c.poolID, c.offset, c.sizeBytes, heap.get(), c.framePlaced && c.continues};
 			const auto previous = state.aliasPlaced.find(c.concrete);
@@ -1501,7 +1659,15 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			const bool atFramePlacement = c.framePlaced && backed->IsMaterialized()
 				&& AtFramePlacement(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration());
 			if (previous != state.aliasPlaced.end() && previous->second == record && backed->IsMaterialized()
-				&& (!c.framePlaced || atFramePlacement)) continue;
+				&& (!c.framePlaced || atFramePlacement)) {
+				// Where it was. Whether it is this graph's own can still change: a new version may share it with another epoch now
+				// (or no longer). A shared one is left at the graph's end; giving it back then would take it from the other epochs.
+				if (c.framePlaced) {
+					if (c.frameShared || c.version) state.aliasPlacementOwners.erase(c.concrete);
+					else state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
+				}
+				continue;
+			}
 			if (atFramePlacement) {
 				// Already at its frame placement, by another epoch's graph. Its backing stays, so that graph's bindings stay valid.
 				// This graph's bindings may still name the backing it had before that graph placed it. Then they are bound again
@@ -1512,10 +1678,10 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				NoteAliasPlaced(c.concrete, true, m_passEpochFilter);
 				// A version outlives the graph, so the graph's end never gives it back.
 				if (c.frameShared || c.version) state.aliasPlacementOwners.erase(c.concrete);
-				else {
-					state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
-					ClaimFramePlaced(c.concrete, &state);
-				}
+				else state.aliasPlacementOwners[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
+				// Claimed either way: the graph that placed it (an older build of an epoch that used it alone, under a version that
+				// kept it where it is) must not give it back at its end, since this graph binds it now.
+				ClaimFramePlaced(c.concrete, &state);
 				// A version's slot is bound by each preparation (BindVersion), never by the publication.
 				if (c.version) continue;
 				bool unbound = false;
@@ -1533,6 +1699,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				options.aliasPlacement = BufferAliasPlacement{heap, c.offset, c.poolID};
 				static_cast<BufferBase*>(c.concrete)->Materialize(&options);
 			}
+			++materializedCount;
 			TrackTransientFrameResource(c.concrete);
 			state.aliasPlaced[c.concrete] = record;
 			NoteAliasPlaced(c.concrete, true, m_passEpochFilter);
@@ -1572,6 +1739,15 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		}
 	}
 	state.aliasRematerializations += rematerialized;
+	{
+		const auto ms = [](PlanClock::time_point a, PlanClock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+		const auto planApplied = PlanClock::now();
+		// Where a slow plan's time went (a plan at a build or an attach, a re-placement on a preparation).
+		if (ms(planBegin, planApplied) > 2.0)
+		spdlog::info("Persistent alias plan timing: epoch {} total {:.2f} ms: gather {:.2f}, frame placement {:.2f}, pack {:.2f}, apply {:.2f} "
+			"(acquire {:.2f}, {} materialized)", m_passEpochFilter, ms(planBegin, planApplied), ms(planBegin, planGathered),
+			ms(planGathered, planFramed), ms(planFramed, planPacked), ms(planPacked, planApplied), acquireMs, materializedCount);
+	}
 	m_framePlacementVersion.store(framePlacement ? framePlacement->Id() : 0, std::memory_order_release);
 	m_framePlacementPlaced.store(framePlacedCount, std::memory_order_release);
 	m_framePlacementPlanned.store(true, std::memory_order_release);
