@@ -683,8 +683,9 @@ public:
 	 * before each submission with the slot. The copy's LatchBlock regions then belong to that slot, so the host can write them
 	 * by slot (EpochCopyRun) and a slot's recording always reads the same place.
 	 *
-	 * - The ticket prepared ahead takes the copy after the one submitted last. When the caller names another copy, the ready
-	 *   ticket is given back and one for the named copy is prepared, and SubmitEpoch waits for it (AsyncStats::copyRepins).
+	 * - The ticket prepared ahead takes the copy as far past the one submitted last as that one was past the one before (the
+	 *   next copy at first). When the caller names another copy, the ready ticket is given back and one for the named copy is
+	 *   prepared, and SubmitEpoch waits for it (AsyncStats::copyRepins).
 	 * - Taking a copy waits for its last run as for any copy: a run behind a seal is waited for on the host's thread, and a
 	 *   run neither sealed nor done makes SubmitEpoch throw EpochCopiesBusyError.
 	 * Throws std::invalid_argument for an epoch that is not a revision-driven async epoch. Nothing before async epochs start.

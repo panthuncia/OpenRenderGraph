@@ -2153,6 +2153,22 @@ static int Run(int argc, char** argv) {
 					std::printf("segment: %llu copy re-pins over %u slotted frames, %llu after a skipped slot\n",
 						static_cast<unsigned long long>(before.copyRepins), 3 * copies, static_cast<unsigned long long>(repinned.copyRepins));
 					REQUIRE(before.copyRepins <= 1 && repinned.copyRepins <= 1, "only the first pin and the skipped slot may give a ticket back");
+					// An epoch that runs every other frame: from its second run on, the ticket prepared ahead is for the copy two past.
+					uint32_t slot = 1;
+					for (uint32_t run = 0; run < 2 * copies; ++run) {
+						slot = (slot + 2) % copies;
+						value = 72000u + 10u * run;
+						host.SetEpochCopy(0, slot);
+						host.SubmitEpoch(0, [&](org::RenderGraph& graph) {
+							upload(graph);
+							seen = host.CurrentRun();
+						}, {}, slotted);
+						REQUIRE(seen == host.EpochCopyRun(0, slot), "a stepped run is its frame slot's copy");
+						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a stepped copy's recording writes every element");
+					}
+					const auto stepped = host.TakeAsyncStats();
+					std::printf("segment: %llu copy re-pins over %u runs two slots apart\n", static_cast<unsigned long long>(stepped.copyRepins), 2 * copies);
+					REQUIRE(stepped.copyRepins <= 1, "only the first step of two may give a ticket back");
 					// A revision that turns the write pass off: the copy runs, the write records only its barriers, so the host buffer
 					// keeps what the last write made.
 					auto skipped = record(kCount, current, true);

@@ -466,6 +466,7 @@ public:
     void RecordDeferred(rhi::CommandList a_list) const;
     uint32_t QueueSlot() const noexcept override { return m_queueSlot; }
     bool Replayable() const noexcept override { return m_replayable; }
+    const PreparedRhiExecutionBatch* AsRhi() const noexcept override { return this; }
     // Whether a timeline identity resolves through this packet's bindings. Only such an identity can be a wait for
     // SubmitLeading.
     bool BindsTimeline(uint64_t identity) const noexcept {

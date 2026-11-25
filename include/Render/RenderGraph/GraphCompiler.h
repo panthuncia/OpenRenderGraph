@@ -16,7 +16,7 @@
 #include "Render/Runtime/ITaskService.h"
 
 namespace rhi { class CommandList; }
-namespace org::compiler { struct PreparedTimelineBinding; struct UntouchedResources; }
+namespace org::compiler { struct PreparedTimelineBinding; struct UntouchedResources; class PreparedRhiExecutionBatch; }
 #include "Render/RenderGraph/CompilerAlgorithms.h"
 
 namespace org::compiler {
@@ -405,6 +405,8 @@ public:
     // Submittable again once the previous submission has completed (PreparedRhiExecutionBatch's replayable packets): a
     // submission commits nothing but its commands, and completion releases nothing; the owner's last reference does.
     virtual bool Replayable() const noexcept { return false; }
+    // The packet as an RHI batch, or null for another kind. A virtual call instead of a dynamic_cast on the submission path.
+    virtual const PreparedRhiExecutionBatch* AsRhi() const noexcept { return nullptr; }
 };
 class ExecutionTimelineAdmission {
 public:

@@ -216,6 +216,9 @@ struct RenderGraph::PersistentRecording {
 	mutable std::vector<uint8_t> untouchedSkips;
 	mutable uint64_t untouchedBackings = 0;
 	mutable compiler::UntouchedResources untouched;
+	// Likewise the batches that wait for the frame's values (persistent::FrameWaitReaders), and the backing set they were found for.
+	mutable std::vector<uint8_t> frameReaders;
+	mutable uint64_t frameReadersBackings = 0;
 	// The reuse key.
 	uint64_t hostTag = 0;
 	std::shared_ptr<const persistent::SelectedPublication> publication;
@@ -661,10 +664,27 @@ struct RenderGraph::PersistentExecutionsState {
 		std::vector<rhi::CommandList> handoff, streamHandoff;  // per batch
 		std::vector<uint32_t> targets;  // per batch, the batch whose handoff list holds its entry barriers
 		uint64_t untouched = 0;  // the untouched resources' signature (compiler::UntouchedResources): their entry barriers are left out
+		uint64_t leftOut = 0;    // how many entry barriers on untouched resources the lists leave out (diagnostics)
 		std::vector<std::shared_ptr<const void>> allocations;
 	};
 	static constexpr size_t kHandoffCacheEntries = 4;
 	std::vector<std::vector<HandoffCache>> handoffCache;
+	// SubmitPersistentTicket's per-batch vectors, kept across its calls: a steady ticket allocates none of them.
+	struct TicketScratch {
+		std::vector<std::vector<uint8_t>> skips;
+		std::vector<uint8_t> late, streamSlots, afterStream;
+		std::vector<compiler::ExecutionBatchTimeline> batches;
+		std::vector<std::vector<compiler::ExecutionTimelinePoint>> incoming;
+		std::vector<rhi::CommandList> handoff, streamHandoff, streamReleases;
+		std::vector<uint32_t> streamReleaseConsumers, targets;
+		std::vector<std::vector<compiler::PreparedTimelineBinding>> extra;
+		std::vector<std::vector<uint32_t>> producers;
+		bool busy = false;  // a call holds them
+	};
+	TicketScratch ticketScratch;
+	// Each queue slot's timeline identity (QueueTimelineIdentity), asked once: the queues' fences live as long as the graph.
+	std::vector<uint64_t> queueIdentities;
+	std::vector<compiler::ExecutionTimelinePoint> admittedQueues;  // AdmitPersistentTicket's, with the queues' values
 	std::vector<uint8_t> tracyFrameBegun;
 	// Diagnostic: preparation cost per main pass index (ns, calls).
 	std::vector<std::pair<uint64_t, uint64_t>> prepareCostByMain;

@@ -1242,6 +1242,8 @@ void UploadInstance::ProcessDeferredReleases(uint32_t frameIndex) {
 	}
 	FrameStaged(frameIndex).clear();  // the GPU is done with the run: producers may reuse these batches
 	auto& retiringPages = FramePages(frameIndex);
+	// Most runs upload nothing: no page to retire and none opened since the last release, so nothing changes.
+	if (retiringPages.empty() && m_openPages.empty()) return;
 	std::unordered_set<Resource*> pendingUploadBuffers;
 	pendingUploadBuffers.reserve(m_resourceUpdates.size() + m_textureUpdates.size());
 	for (const auto& update : m_resourceUpdates) {

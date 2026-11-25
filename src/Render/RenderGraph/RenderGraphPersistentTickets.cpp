@@ -140,6 +140,14 @@ uint64_t RenderGraph::PersistentTicketHostFrame(const PersistentTicket& ticket) 
 ExecutionHandle RenderGraph::PersistentTicketExecution(const PersistentTicket& ticket) noexcept { return ExecutionHandle(ticket.execution); }
 uint64_t RenderGraph::PersistentTicketHostTag(const PersistentTicket& ticket) noexcept { return ticket.hostTag; }
 void RenderGraph::SetPersistentTicketHostTag(PersistentTicket& ticket, uint64_t tag) noexcept { ticket.hostTag = tag; }
+bool RenderGraph::PersistentTicketOnQueue(const PersistentTicket& ticket, uint32_t queue) noexcept {
+	for (const auto& segment : ticket.segments) {
+		const auto& publication = segment.admission.publication;
+		if (!publication || !publication->executable || !publication->executable->graph) return false;
+		if (!std::ranges::all_of(publication->executable->graph->batches, [&](const auto& batch) { return batch.queue == queue; })) return false;
+	}
+	return true;
+}
 uint32_t RenderGraph::PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept {
 	return ticket.queueUploads.planned ? ticket.queueUploads.spared : 0;
 }
@@ -319,9 +327,14 @@ void RenderGraph::AdmitPersistentTicket(PersistentTicket& ticket, std::span<cons
 	if (queueValues.size() < slotCount) throw std::logic_error("A ticket admitted without every queue's submitted value");
 	// An admission commits before the next is prepared, and a ticket's segments are admitted together: it can have only one.
 	if (ticket.segments.size() > 1) throw std::logic_error("A ticket with several segments");
-	std::vector<compiler::ExecutionTimelinePoint> queues;
-	queues.reserve(slotCount);
-	for (size_t slot = 0; slot < slotCount; ++slot) queues.push_back({QueueTimelineIdentity(*m_runtime, m_queueRegistry, slot), queueValues[slot]});
+	if (state.queueIdentities.size() != slotCount) {
+		state.queueIdentities.resize(slotCount);
+		for (size_t slot = 0; slot < slotCount; ++slot) state.queueIdentities[slot] = QueueTimelineIdentity(*m_runtime, m_queueRegistry, slot);
+	}
+	// Kept: the caller holds the sequencer (HoldPersistentSequencer), as for every admission.
+	auto& queues = state.admittedQueues;
+	queues.resize(slotCount);
+	for (size_t slot = 0; slot < slotCount; ++slot) queues[slot] = {state.queueIdentities[slot], queueValues[slot]};
 	for (auto& segment : ticket.segments) {
 		if (segment.admitted) throw std::logic_error("A ticket admitted twice");
 		auto publication = segment.admission.publication;
@@ -387,11 +400,32 @@ bool RenderGraph::FlushSubmitCarry(SubmitCarry& carry, uint32_t* merged) {
 	return ok;
 }
 
+namespace {
+// A packet as an RHI batch, or null.
+const compiler::PreparedRhiExecutionBatch* RhiOf(const std::shared_ptr<const compiler::IPreparedExecutionBatch>& packet) noexcept {
+	return packet ? packet->AsRhi() : nullptr;
+}
+// `count` empty inner vectors, their storage kept.
+template <class T>
+void ResetInner(std::vector<std::vector<T>>& outer, size_t count) {
+	outer.resize(count);
+	for (auto& inner : outer) inner.clear();
+}
+}
+
 bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uint64_t> nextQueueValues, PersistentTicketSubmission& out,
 	std::pair<uint32_t, uint64_t> uploadsDone, uint64_t frameWait, bool streamUploads, SubmitCarry* carry, bool carryOut, TicketUploads* uploads) {
 	BT_ZONE_SCOPE("ORG.Persistent.SubmitTicket");
 	out = {};
 	auto& state = *m_compilerState->persistent;
+	// The graph's kept vectors; a call made while another of the graph's runs (a pass recorded at submission) uses its own.
+	PersistentExecutionsState::TicketScratch own;
+	auto& scratch = state.ticketScratch.busy ? own : state.ticketScratch;
+	scratch.busy = true;
+	struct ReleaseScratch {
+		PersistentExecutionsState::TicketScratch& scratch;
+		~ReleaseScratch() { scratch.busy = false; }
+	} releaseScratch{scratch};
 	// The admission (AdmitPersistentTicket), the handoff and the commit with nothing admitted in between.
 	auto hold = state.admission->HoldSequencer();
 	struct AbandonUncommitted {
@@ -416,7 +450,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			const auto& packets = segment.recording->packets;
 			ride = !graph.batches.empty() && packets.size() == graph.batches.size() && segment.admission.Barriers().releases.empty()
 				&& std::ranges::all_of(graph.batches, [&](const auto& batch) { return batch.queue == uploads->queueSlot; })
-				&& dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets.front().get()) != nullptr
+				&& RhiOf(packets.front()) != nullptr
 				&& !std::ranges::any_of(planned.leading, [](const auto& leading) { return leading.batch == 0 && leading.copies; });
 		}
 		if (!ride) {
@@ -436,17 +470,19 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 		// one skips the run, so it stays as the execution found it. Its entry barriers and releases are left out here, its body
 		// barriers by the lists (left out ahead when every use was skipped ahead, else at execution), and the commit leaves its
 		// ledger state as it was (FrameAdmission::unmoved). The late batches' answers are asked once, here, and passed on.
-		std::vector<std::vector<uint8_t>> skips(batchCount);
+		auto& skips = scratch.skips;
+		ResetInner(skips, batchCount);
 		compiler::UntouchedResources untouched;
 		if (!ticket.external && !state.admission->ExternalHomeStates()
 			&& !diagnostics::DiagnosticKeepSkippedPassBarriers().load(std::memory_order_relaxed)) {
 			BT_ZONE_SCOPE("ORG.Persistent.TicketUntouched");
 			const auto& packets = segment.recording->packets;
 			const auto* ahead = segment.recording->ahead.get();
-			std::vector<uint8_t> late(batchCount);
+			auto& late = scratch.late;
+			late.assign(batchCount, 0);
 			bool lateSkips = false;
 			for (uint32_t batch = 0; batch < batchCount; ++batch) {
-				const auto* packet = batch < packets.size() ? dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[batch].get()) : nullptr;
+				const auto* packet = batch < packets.size() ? RhiOf(packets[batch]) : nullptr;
 				if (packet && packet->Inline()) {
 					packet->AskSkips(skips[batch]);
 					late[batch] = 1;
@@ -486,7 +522,8 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			return releasedScratch;
 		};
 		// An external epoch's batches on the host's stream's queue (InHostStream) go to its host's stream; the rest are submitted here.
-		std::vector<uint8_t> streamSlots(m_queueRegistry.SlotCount());
+		auto& streamSlots = scratch.streamSlots;
+		streamSlots.assign(m_queueRegistry.SlotCount(), 0);
 		for (uint32_t slot = 0; slot < streamSlots.size(); ++slot) streamSlots[slot] = ticket.external && InHostStream(slot) ? 1 : 0;
 		const auto inStream = [&](uint32_t batch) {
 			const auto queue = graph.batches[batch].queue;
@@ -494,19 +531,33 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 		};
 		// The same timeline composition the owner's RecordSubmitted will derive from these values: the
 		// execution's incoming waits plus its batches' waits on each other.
-		std::vector<compiler::ExecutionBatchTimeline> batches(batchCount);
-		auto incoming = admission.incomingWaits;
+		auto& batches = scratch.batches;
+		batches.resize(batchCount);
+		for (auto& batch : batches) {
+			auto waits = std::move(batch.waits);
+			waits.clear();
+			batch = {};
+			batch.waits = std::move(waits);
+		}
+		auto& incoming = scratch.incoming;
+		ResetInner(incoming, admission.incomingWaits.size());
+		for (size_t batch = 0; batch < incoming.size(); ++batch)
+			incoming[batch].assign(admission.incomingWaits[batch].begin(), admission.incomingWaits[batch].end());
 		// An open execution's handoff, against the ledgers as admitted now: textures an earlier execution left on another
 		// queue are released there first (the consumers wait for it), and each batch's entry barriers go ahead of it: in a list
 		// submitted with it, or (in the host's stream) in a secondary its segment runs first. A resource's entry is its first use,
 		// so no earlier batch touches it.
-		std::vector<rhi::CommandList> handoff(batchCount);
-		std::vector<rhi::CommandList> streamHandoff(batchCount);
+		auto& handoff = scratch.handoff;
+		auto& streamHandoff = scratch.streamHandoff;
+		handoff.assign(batchCount, {});
+		streamHandoff.assign(batchCount, {});
 		// Releases on a queue the host's stream runs: in a secondary its first segment runs, with a value of its own on the graphics
 		// timeline that the consumers off the stream wait for.
-		std::vector<rhi::CommandList> streamReleases;
+		auto& streamReleases = scratch.streamReleases;
+		streamReleases.clear();
 		uint64_t streamReleasesSignal = 0;
-		std::vector<uint32_t> streamReleaseConsumers;
+		auto& streamReleaseConsumers = scratch.streamReleaseConsumers;
+		streamReleaseConsumers.clear();
 		const auto streamSecondary = [&](uint32_t slot, const char* name) {
 			auto allocation = std::make_shared<compiler::FrameCommandAllocation>();
 			allocation->pool = ExternalSecondaryPool(slot);
@@ -569,13 +620,14 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			// Merged handoffs: per batch, the first batch of the queue submission the coalescing below gives it. A batch submitted on
 			// its own (not a gatherable packet, or queue-scoped uploads ahead of it) keeps its own list, and the next batch starts a
 			// new submission.
-			std::vector<uint32_t> targets(batchCount);
+			auto& targets = scratch.targets;
+			targets.resize(batchCount);
 			for (uint32_t batch = 0; batch < batchCount; ++batch) targets[batch] = batch;
 			if (!ticket.external) {
 				const auto& packets = segment.recording->packets;
 				uint32_t first = UINT32_MAX, firstQueue = UINT32_MAX;
 				for (uint32_t batch = 0; batch < batchCount && batch < packets.size(); ++batch) {
-					const bool gatherable = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[batch].get()) != nullptr
+					const bool gatherable = RhiOf(packets[batch]) != nullptr
 						&& !std::ranges::any_of(planned.leading, [&](const auto& leading) { return leading.batch == batch && leading.copies; });
 					if (!gatherable) {
 						first = UINT32_MAX;
@@ -588,44 +640,6 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					targets[batch] = first;
 				}
 			}
-			// The barriers each handoff list records. A barrier that discards, starts from Undefined, or transfers a queue family stays
-			// with its own batch, and so does every barrier of a batch with acquired textures.
-			struct HandoffBarriers {
-				std::vector<rhi::TextureBarrier> textures;
-				std::vector<rhi::BufferBarrier> buffers;
-				std::vector<rhi::TextureBarrier> acquired;
-				bool Empty() const noexcept { return textures.empty() && buffers.empty() && acquired.empty(); }
-			};
-			std::vector<HandoffBarriers> lists(batchCount);
-			uint64_t leftOut = 0;  // entry barriers on untouched resources
-			for (uint32_t batch = 0; batch < batchCount; ++batch) {
-				const auto& entry = admission.Barriers().batches[batch];
-				const bool own = targets[batch] == batch || !entry.acquired.empty();
-				auto& local = lists[batch];
-				auto& merged = lists[own ? batch : targets[batch]];
-				for (const auto& texture : entry.textures) {
-					if (untouched.Holds(texture.texture)) {
-						++leftOut;
-						continue;
-					}
-					const bool movable = !texture.discard && texture.beforeLayout != rhi::ResourceLayout::Undefined
-						&& texture.queueOwnership == rhi::QueueOwnership::None && texture.externalOwnership == rhi::TextureBarrier::ExternalOwnership::None;
-					(movable ? merged : local).textures.push_back(texture);
-				}
-				for (const auto& buffer : entry.buffers) {
-					if (untouched.Holds(buffer.buffer)) {
-						++leftOut;
-						continue;
-					}
-					const bool movable = buffer.queueOwnership == rhi::QueueOwnership::None && buffer.externalOwnership == rhi::BufferBarrier::ExternalOwnership::None;
-					(movable ? merged : local).buffers.push_back(buffer);
-				}
-				for (const auto& texture : entry.acquired) {
-					if (!untouched.Holds(texture.texture)) local.acquired.push_back(texture);
-					else ++leftOut;
-				}
-			}
-			if (leftOut) diagnostics::UntouchedEntryBarriers().fetch_add(leftOut, std::memory_order_relaxed);
 			PersistentExecutionsState::HandoffCache* cache = nullptr;
 			if (admission.sharedBarriers && ticket.segments.size() == 1) {
 				if (state.handoffCache.size() <= ticket.slot) state.handoffCache.resize(size_t{ticket.slot} + 1);
@@ -647,56 +661,98 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					handoff = cache->handoff;
 					streamHandoff = cache->streamHandoff;
 					out.leases.insert(out.leases.end(), cache->allocations.begin(), cache->allocations.end());
+					if (cache->leftOut) diagnostics::UntouchedEntryBarriers().fetch_add(cache->leftOut, std::memory_order_relaxed);
 					basic_telemetry::AddCounter("ORG.Persistent.HandoffListsReused");
 				}
 			}
-			for (uint32_t batch = 0; batch < batchCount && !(cache && cache->plan); ++batch) {
-				const auto& entry = lists[batch];
-				if (entry.Empty()) continue;
-				std::shared_ptr<compiler::FrameCommandAllocation> allocation;
-				if (inStream(batch)) {
-					allocation = streamSecondary(graph.batches[batch].queue, "ORG external ticket handoff");
-				} else {
-					allocation = std::make_shared<compiler::FrameCommandAllocation>();
-					allocation->pool = m_queueRegistry.GetSharedPool(static_cast<QueueSlotIndex>(static_cast<uint8_t>(graph.batches[batch].queue)));
-					allocation->pair = allocation->pool->Request();
+			if (!(cache && cache->plan)) {
+				// Without kept lists: the barriers each handoff list records. A barrier that discards, starts from Undefined, or
+				// transfers a queue family stays with its own batch, and so does every barrier of a batch with acquired textures.
+				struct HandoffBarriers {
+					std::vector<rhi::TextureBarrier> textures;
+					std::vector<rhi::BufferBarrier> buffers;
+					std::vector<rhi::TextureBarrier> acquired;
+					bool Empty() const noexcept { return textures.empty() && buffers.empty() && acquired.empty(); }
+				};
+				std::vector<HandoffBarriers> lists(batchCount);
+				uint64_t leftOut = 0;  // entry barriers on untouched resources
+				for (uint32_t batch = 0; batch < batchCount; ++batch) {
+					const auto& entry = admission.Barriers().batches[batch];
+					const bool own = targets[batch] == batch || !entry.acquired.empty();
+					auto& local = lists[batch];
+					auto& merged = lists[own ? batch : targets[batch]];
+					for (const auto& texture : entry.textures) {
+						if (untouched.Holds(texture.texture)) {
+							++leftOut;
+							continue;
+						}
+						const bool movable = !texture.discard && texture.beforeLayout != rhi::ResourceLayout::Undefined
+							&& texture.queueOwnership == rhi::QueueOwnership::None && texture.externalOwnership == rhi::TextureBarrier::ExternalOwnership::None;
+						(movable ? merged : local).textures.push_back(texture);
+					}
+					for (const auto& buffer : entry.buffers) {
+						if (untouched.Holds(buffer.buffer)) {
+							++leftOut;
+							continue;
+						}
+						const bool movable = buffer.queueOwnership == rhi::QueueOwnership::None && buffer.externalOwnership == rhi::BufferBarrier::ExternalOwnership::None;
+						(movable ? merged : local).buffers.push_back(buffer);
+					}
+					for (const auto& texture : entry.acquired) {
+						if (!untouched.Holds(texture.texture)) local.acquired.push_back(texture);
+						else ++leftOut;
+					}
 				}
-				auto list = allocation->pair.list.Get();
-				// BasicRHI's command census names the list (diagnostics).
-				if (rhi::census::Enabled()) {
-					// Named after its batch's first pass, so a barrier's cost can be placed.
-					std::string label = "handoff";
-					const auto& passes = graph.batches[batch].passes;
-					const auto& names = graph.structure->diagnosticPassNames;
-					if (!passes.empty() && passes.front() < names.size() && !names[passes.front()].empty()) label += " > " + names[passes.front()];
-					rhi::census::SetLabel(label.c_str());
+				if (leftOut) diagnostics::UntouchedEntryBarriers().fetch_add(leftOut, std::memory_order_relaxed);
+				for (uint32_t batch = 0; batch < batchCount; ++batch) {
+					const auto& entry = lists[batch];
+					if (entry.Empty()) continue;
+					std::shared_ptr<compiler::FrameCommandAllocation> allocation;
+					if (inStream(batch)) {
+						allocation = streamSecondary(graph.batches[batch].queue, "ORG external ticket handoff");
+					} else {
+						allocation = std::make_shared<compiler::FrameCommandAllocation>();
+						allocation->pool = m_queueRegistry.GetSharedPool(static_cast<QueueSlotIndex>(static_cast<uint8_t>(graph.batches[batch].queue)));
+						allocation->pair = allocation->pool->Request();
+					}
+					auto list = allocation->pair.list.Get();
+					// BasicRHI's command census names the list (diagnostics).
+					if (rhi::census::Enabled()) {
+						// Named after its batch's first pass, so a barrier's cost can be placed.
+						std::string label = "handoff";
+						const auto& passes = graph.batches[batch].passes;
+						const auto& names = graph.structure->diagnosticPassNames;
+						if (!passes.empty() && passes.front() < names.size() && !names[passes.front()].empty()) label += " > " + names[passes.front()];
+						rhi::census::SetLabel(label.c_str());
+					}
+					rhi::BarrierBatch barriers{};
+					barriers.textures = {entry.textures.data(), static_cast<uint32_t>(entry.textures.size())};
+					barriers.buffers = {entry.buffers.data(), static_cast<uint32_t>(entry.buffers.size())};
+					list.Barriers(barriers);
+					if (!entry.acquired.empty()) {
+						rhi::BarrierBatch acquired{};
+						acquired.textures = {entry.acquired.data(), static_cast<uint32_t>(entry.acquired.size())};
+						list.Barriers(acquired);
+					}
+					const auto closed = [&] {
+						BT_ZONE_SCOPE("ORG.Persistent.TicketHandoff.End");
+						return list.EndChecked();
+					}();
+					if (closed != rhi::Result::Ok) throw std::runtime_error("A ticket's handoff list could not close");
+					allocation->Close();
+					(inStream(batch) ? streamHandoff : handoff)[batch] = list;
+					if (cache) cache->allocations.push_back(allocation);
+					out.leases.push_back(std::move(allocation));
 				}
-				rhi::BarrierBatch barriers{};
-				barriers.textures = {entry.textures.data(), static_cast<uint32_t>(entry.textures.size())};
-				barriers.buffers = {entry.buffers.data(), static_cast<uint32_t>(entry.buffers.size())};
-				list.Barriers(barriers);
-				if (!entry.acquired.empty()) {
-					rhi::BarrierBatch acquired{};
-					acquired.textures = {entry.acquired.data(), static_cast<uint32_t>(entry.acquired.size())};
-					list.Barriers(acquired);
+				if (cache && !cache->plan) {
+					cache->plan = admission.sharedBarriers;
+					cache->external = ticket.external;
+					cache->handoff = handoff;
+					cache->streamHandoff = streamHandoff;
+					cache->targets = targets;
+					cache->untouched = untouched.signature;
+					cache->leftOut = leftOut;
 				}
-				const auto closed = [&] {
-					BT_ZONE_SCOPE("ORG.Persistent.TicketHandoff.End");
-					return list.EndChecked();
-				}();
-				if (closed != rhi::Result::Ok) throw std::runtime_error("A ticket's handoff list could not close");
-				allocation->Close();
-				(inStream(batch) ? streamHandoff : handoff)[batch] = list;
-				if (cache) cache->allocations.push_back(allocation);
-				out.leases.push_back(std::move(allocation));
-			}
-			if (cache && !cache->plan) {
-				cache->plan = admission.sharedBarriers;
-				cache->external = ticket.external;
-				cache->handoff = handoff;
-				cache->streamHandoff = streamHandoff;
-				cache->targets = targets;
-				cache->untouched = untouched.signature;
 			}
 		}
 		if (planned.planned && planned.waitsForUploads.size() != batchCount)
@@ -718,8 +774,18 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					streamUploadsSignal = ++nextQueueValues[graphicsSlot];
 				}
 		// Scoped frame wait: only the batches that read the frame's values wait for it.
-		std::vector<uint8_t> frameReaders;
-		if (frameWait && m_scopedFrameWait) frameReaders = persistent::FrameWaitReaders(graph, admission.backings);
+		// The same backings find the same readers.
+		static const std::vector<uint8_t> kEveryBatch;
+		const std::vector<uint8_t>* readers = &kEveryBatch;
+		if (frameWait && m_scopedFrameWait) {
+			const auto& recording = *segment.recording;
+			if (recording.frameReadersBackings != admission.backings.Id()) {
+				recording.frameReaders = persistent::FrameWaitReaders(graph, admission.backings);
+				recording.frameReadersBackings = admission.backings.Id();
+			}
+			readers = &recording.frameReaders;
+		}
+		const auto& frameReaders = *readers;
 		uint32_t frameWaitsSpared = 0;
 		for (uint32_t batch = 0; batch < batchCount; ++batch) {
 			const auto queue = graph.batches[batch].queue;
@@ -761,10 +827,11 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 		// Submits a batch on its queue: waits on timelines it does not bind (another graph's, from the admission) bind through
 		// the runtime; its handoff goes ahead of it, and so do the uploads recorded on its queue (on the queue just ahead of
 		// it, so it needs no wait for them: the list ends with a full barrier), with the waits their destinations need.
-		std::vector<std::vector<compiler::PreparedTimelineBinding>> extra(packets.size());
+		auto& extra = scratch.extra;
+		ResetInner(extra, packets.size());
 		const auto submitPacket = [&](uint32_t i) -> bool {
 			if (carry && !FlushSubmitCarry(*carry)) return false;
-			const auto* packet = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[i].get());
+			const auto* packet = RhiOf(packets[i]);
 			for (const auto wait : batches[i].waits) {
 				if (!packet || packet->BindsTimeline(wait.timeline)) continue;
 				const auto handle = m_runtime->TimelineHandleOf(wait.timeline);
@@ -806,8 +873,10 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			}
 			// Per batch off the stream: whether it waits (through other batches) for a segment of the stream. The batches are in an
 			// order every wait follows, so a batch's producers come before it.
-			std::vector<uint8_t> afterStream(batchCount);
-			std::vector<std::vector<uint32_t>> producers(batchCount);
+			auto& afterStream = scratch.afterStream;
+			afterStream.assign(batchCount, 0);
+			auto& producers = scratch.producers;
+			ResetInner(producers, batchCount);
 			for (const auto wait : graph.relativeWaits)
 				if (wait.consumerBatch < batchCount && wait.producerBatch < batchCount) producers[wait.consumerBatch].push_back(wait.producerBatch);
 			for (uint32_t i = 0; i < batchCount; ++i) {
@@ -822,7 +891,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					if (!submitPacket(i)) return false;
 					continue;
 				}
-				auto packet = std::dynamic_pointer_cast<const compiler::PreparedRhiExecutionBatch>(packets[i]);
+				const auto* packet = RhiOf(packets[i]);
 				if (!packet) throw std::logic_error("An external epoch's packet the host cannot execute");
 				// A new segment where the batch waits for a batch off the stream; split from the ones before when that batch waits
 				// for one of them.
@@ -848,7 +917,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 					stream.waits.push_back({timeline, wait.value});
 				}
 				if (!packet->CommitExternal(batches[i].signal.value, stream.signals)) return false;
-				stream.items.push_back({packet, segment.resourceHeap, segment.samplerHeap});
+				stream.items.push_back({std::shared_ptr<const compiler::PreparedRhiExecutionBatch>(packets[i], packet), segment.resourceHeap, segment.samplerHeap});
 				const auto timeline = packet->ResolveTimeline(batches[i].signal.timeline);
 				if (!timeline.valid()) throw std::logic_error("An external epoch's signal on a timeline its packet does not bind");
 				stream.signals.push_back({timeline, batches[i].signal.value});
@@ -876,7 +945,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 				for (const auto producer : home.producers) {
 					if (producer >= batchCount || inStream(producer)) continue;
 					split = split || afterStream[producer];
-					const auto* prepared = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[producer].get());
+					const auto* prepared = RhiOf(packets[producer]);
 					auto timeline = prepared ? prepared->ResolveTimeline(batches[producer].signal.timeline) : rhi::TimelineHandle{};
 					if (!timeline.valid()) timeline = m_runtime->TimelineHandleOf(batches[producer].signal.timeline);
 					if (!timeline.valid()) throw std::logic_error("A ticket's home acquires wait on a timeline nothing binds");
@@ -1047,7 +1116,7 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 			return ok && committed;
 		};
 		for (uint32_t i = 0; i < batchCount; ++i) {
-			const auto* packet = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[i].get());
+			const auto* packet = RhiOf(packets[i]);
 			const bool leadingUploads = std::ranges::any_of(planned.leading, [&](const auto& leading) { return leading.batch == i && leading.copies; });
 			if (!packet || leadingUploads) {
 				if (!flush(false) || !submitPacket(i)) return false;
@@ -1303,7 +1372,7 @@ bool PlanTicketUploads(const RenderGraph::PersistentTicket& ticket, uint32_t gra
 		if (!destination.staged || destination.graphics || destination.aliased || destination.uses.empty() || !earlierUseKnown) continue;
 		const auto queue = graph.batches[destination.uses.front().first].queue;
 		if (queue == graphicsQueue || queue >= queueLists.size() || !queueLists[queue]) continue;
-		const auto* packet = dynamic_cast<const compiler::PreparedRhiExecutionBatch*>(packets[out.firstOnQueue[queue]].get());
+		const auto* packet = RhiOf(packets[out.firstOnQueue[queue]]);
 		if (!packet) continue;
 		const auto& ordered = orderedAfter(queue);
 		if (!std::ranges::all_of(destination.uses, [&](const auto& use) { return ordered[use.first] != 0; })) continue;
@@ -1393,7 +1462,8 @@ void Runtime::SeedFreshTextureUploads(std::span<const std::shared_ptr<runtime::S
 RenderGraph::TakenUploads RenderGraph::TakePendingUploads(rhi::Device device, uint32_t slot) {
 	BT_ZONE_SCOPE("ORG.Persistent.TakePendingUploads");
 	TakenUploads taken;
-	if (!m_uploadService) return taken;
+	// Most commits queue nothing: no list to drain and nothing staged.
+	if (!m_uploadService || !m_uploadService->HasPendingUploads()) return taken;
 	const auto pass = m_uploadService->GetUploadPass();
 	if (auto* immediate = dynamic_cast<IHasImmediateModeCommands*>(pass.get())) {
 		try {

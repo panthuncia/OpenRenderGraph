@@ -158,6 +158,8 @@ struct GraphHost::Async {
 	// Per epoch index: the published copy its next ticket takes (GraphHost::SetEpochCopy), or RunRef::kNoCopy to take any. The
 	// submitting thread writes it, the host's thread reads it when it prepares the epoch's ticket.
 	std::unique_ptr<std::atomic<uint32_t>[]> pinnedCopy;
+	// Submitting thread, per epoch index: the copy its last pinned submission took, or RunRef::kNoCopy.
+	std::vector<uint32_t> lastPinned;
 	// Recording requests taken from the host's queue (RecordingQueue), by the host's thread, in posting order.
 	struct RecordingRequest {
 		uint32_t epochIndex = 0;
@@ -2705,6 +2707,7 @@ void GraphHost::StartAsync() {
 	async->copiesBusyLogged.assign(async->epochs.size(), 0);
 	async->pinnedCopy = std::make_unique<std::atomic<uint32_t>[]>(async->epochs.size());
 	for (uint32_t index = 0; index < async->epochs.size(); ++index) async->pinnedCopy[index].store(RunRef::kNoCopy, std::memory_order_relaxed);
+	async->lastPinned.assign(async->epochs.size(), RunRef::kNoCopy);
 	async->queues = std::make_unique<Async::TicketQueue[]>(async->epochs.size());
 	async->inHand.assign(async->epochs.size(), 0);
 	async->mostAhead.assign(async->epochs.size(), 1);
@@ -3669,7 +3672,8 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 		ticket = async.WaitTicket(index);
 	}
 	// A pinned epoch (SetEpochCopy): a ticket of another copy goes back, and one for the named copy takes its place. Then the
-	// next ticket is prepared for the copy after it, which is what a caller that names its frame slots asks for next.
+	// next ticket is prepared for the copy the epoch's runs step to, which is what a caller that names its frame slots asks for
+	// next: the step between its last two runs. An epoch that runs every other frame steps two copies, not one.
 	if (async.revisionDriven[index]) {
 		const uint32_t pinned = async.pinnedCopy[index].load(std::memory_order_acquire);
 		if (pinned != RunRef::kNoCopy) {
@@ -3682,7 +3686,9 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 				if (!async.Post(discard)) async.ThrowIfFailed();
 				ticket = async.WaitTicket(index);
 			}
-			async.pinnedCopy[index].store((pinned + 1) % async.copyCount, std::memory_order_release);
+			const uint32_t last = std::exchange(async.lastPinned[index], pinned);
+			const uint32_t step = last == RunRef::kNoCopy ? 1 : (pinned + async.copyCount - last) % async.copyCount;
+			async.pinnedCopy[index].store((pinned + step) % async.copyCount, std::memory_order_release);
 		}
 	}
 	lap(m_lastTimings.ticketWaitUs);
@@ -4082,14 +4088,15 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	// An external epoch's uploads go into the slot's secondary, which its execution runs first: nothing is submitted here.
 	const bool external = commit.external;
 	// Taken at the commit: a ticket without uploads begins, records and closes no list (most have none). Its lists are begun
-	// here, external epochs' too.
+	// here, external epochs' too. The other queues' lists only for a ticket with batches on them: otherwise nothing is routed there.
 	const bool hasUploads = commit.uploads.Any() || !commit.uploads.supported;
 	if (hasUploads && !(external ? lease.uploadSecondary : lease.upload).Recording()) {
 		BT_ZONE_SCOPE("ORG.Host.BeginUploadLists");
 		if (external) async.uploadSecondaryPool->Begin(lease.uploadSecondary);
 		else async.uploadPool->Begin(lease.upload);
 		lease.queueUploads.resize(async.queueUploadKinds.size());
-		for (size_t queue = 0; queue < async.queueUploadKinds.size(); ++queue)
+		const bool otherQueues = m_desc.queueScopedUploads && !RenderGraph::PersistentTicketOnQueue(*ticket, async.graphicsSlot);
+		for (size_t queue = 0; queue < async.queueUploadKinds.size() && otherQueues; ++queue)
 			if (async.queueUploadKinds[queue] && !lease.queueUploads[queue].Recording())
 				async.queueUploadPools[static_cast<size_t>(*async.queueUploadKinds[queue])]->Begin(lease.queueUploads[queue]);
 	}
@@ -4152,7 +4159,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	auto& queueUploadLists = lease.queueUploads;
 	const bool queueScoped = m_desc.queueScopedUploads;
 	for (size_t queue = 0; queue < async.queueLists.size(); ++queue)
-		async.queueLists[queue] = queueScoped && queue < queueUploadLists.size() && queueUploadLists[queue].list
+		async.queueLists[queue] = queueScoped && queue < queueUploadLists.size() && queueUploadLists[queue].list && queueUploadLists[queue].Recording()
 			? queueUploadLists[queue].list.Get() : rhi::CommandList{};
 	size_t queueCopies = 0;
 	uploadLists.clear();
@@ -4165,7 +4172,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		(external ? secondary : list).list->End();
 		// Every one the host's thread began, used or not (they go back to their pools when the run retires).
 		for (auto& queueUploads : queueUploadLists)
-			if (queueUploads.list) queueUploads.list->End();
+			if (queueUploads.list && queueUploads.Recording()) queueUploads.list->End();
 		// Closed, so their allocators' claims go.
 		list.EndRecording();
 		secondary.EndRecording();
