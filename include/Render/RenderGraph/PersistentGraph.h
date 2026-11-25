@@ -695,10 +695,8 @@ private:
         // Earlier plans, most recent first: tried when the last one does not hold.
         static constexpr size_t kEarlier = 3;
         std::vector<std::shared_ptr<compiler::StatePrediction>> earlier;
-        // The access waits' captures, most recent first. A frame whose earlier accesses alternate (a stage that runs on some
-        // frames only) finds its capture again.
-        static constexpr size_t kAccessCaptures = 3;
-        std::vector<compiler::AccessPrediction> access;
+        // The access waits' capture (BackingAccessAdmissionLedger::PredictedWaits).
+        compiler::AccessPrediction access;
         uint64_t stream = 0;  // BackingAccessAdmissionLedger::OpenStream
         uint32_t uploadQueue = UINT32_MAX;  // the upload queue `offUploadQueue` was found for
         std::vector<uint8_t> offUploadQueue;  // per compiler resource; empty: none

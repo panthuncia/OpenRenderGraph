@@ -1943,30 +1943,13 @@ void SynchronousAdmission::AdmitLedger(FrameAdmission& frame, bool cacheEligible
         frame.barriers = m_sequencer->states.Prepare(graph, frame.backings, invalidated, frame.entryOnly, frame.backings.Validated(),
             frame.backings.Id(), m_externalHome);
     }
-    // The access waits: an access stream's, from a capture while the ledger holds what that one found (a frame repeats). The
-    // capture that held moves to the front. Otherwise the waits are resolved in full and captured in place of the oldest.
-    bool predictedWaits = false;
-    if (frame.stream) {
-        auto& captures = predictionSlot->access;
-        for (size_t i = 0; i < captures.size() && !predictedWaits; ++i) {
-            if (!m_sequencer->accesses.PredictedWaits(captures[i], graph, frame.backings, frame.queuePoints, frame.incomingWaits,
-                    frame.backings.Id())) continue;
-            const auto hit = captures.begin() + static_cast<std::ptrdiff_t>(i);
-            std::rotate(captures.begin(), hit, hit + 1);
-            predictedWaits = true;
-        }
-    }
-    if (!predictedWaits) {
-        compiler::AccessPrediction* capture = nullptr;
-        if (frame.stream) {
-            auto& captures = predictionSlot->access;
-            if (captures.size() < PredictionSlot::kAccessCaptures) captures.emplace_back();
-            std::rotate(captures.begin(), captures.end() - 1, captures.end());
-            capture = &captures.front();
-        }
+    // The access waits: an access stream's, from its capture while none of the grids it depends on changed (a frame repeats).
+    // Otherwise they are resolved in full and captured again.
+    const bool predictedWaits = frame.stream && m_sequencer->accesses.PredictedWaits(predictionSlot->access, graph, frame.backings,
+        frame.queuePoints, frame.incomingWaits, frame.backings.Id());
+    if (!predictedWaits)
         m_sequencer->accesses.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, frame.incomingWaits, frame.backings.Id(),
-            capture);
-    }
+            frame.stream ? &predictionSlot->access : nullptr);
     m_sequencer->aliases.AppendIncomingWaits(graph, frame.backings, frame.queuePoints, frame.incomingWaits);
     // Points already reached (a retired timeline's among them: another graph's, destroyed since) need no wait.
     for (auto& waits : frame.incomingWaits)

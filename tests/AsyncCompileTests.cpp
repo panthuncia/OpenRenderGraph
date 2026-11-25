@@ -201,112 +201,161 @@ int main() {
         ENSURE(admit(readMip0, readerCapture) == std::vector<ExecutionTimelinePoint>{{11, 200}});
         streams.CloseStream(reads);
 
-        // Quiet grids. Once a stream's commit leaves a grid as it found it, the next commit of the same graph and backings skips
-        // the grid and only moves its producers' signals. The waits still name the latest ones. A change the stream did not make
-        // (a fixed point, other backings, a grid made again) sends it through the walk again. Each frame returns the accesses its
-        // two commits skipped.
-        BackingAccessAdmissionLedger quiet;
+        // Fixed points. A cell keeps every writer and reader, producers once and fixed points as the latest per timeline. Three
+        // streams churn one cell every frame: W1 writes on queue 1, R reads on queue 0, W2 writes on queue 0 (a cell written by two
+        // producers in one frame, with a read between). From the second frame on the cell holds all three, so nothing changes:
+        // no commit walks the cells, the ledger's change count stands, and each admission's capture holds. A stage that reads on
+        // queue 1 on odd frames only converges the same way. The waits always equal a full resolution's, and equal an oracle that
+        // keeps only the latest writer and the reads since (the old rule): the extra references never order anything more.
+        BackingAccessAdmissionLedger churn;
         handle.index = 43;
-        PreparedBackingState backingA{.graphResourceID = 99, .resource = handle, .shape = {2, 1, false}};
-        handle.index = 44;
-        PreparedBackingState backingB{.graphResourceID = 99, .resource = handle, .shape = {2, 1, false}};
-        const auto writer = quiet.OpenStream(1), reader = quiet.OpenStream(1);
-        uint64_t value = 0;
-        // One frame: a write on queue 0 and a read on queue 1, both streams on backing set `set`. Returns how many commits were quiet.
-        auto frame = [&](PreparedBackingState& backing, uint64_t set) {
+        PreparedBackingState churned{.graphResourceID = 99, .resource = handle, .shape = {2, 1, false}};
+        const auto churnedOne = std::span{&churned, size_t{1}};
+        auto writeMip0Compute = makeGraph(true, 1, 0);
+        auto readMip0Graphics = makeGraph(false, 0, 0);
+        // The old rule, for one cell: the latest writer, and the latest read per timeline since.
+        struct Oracle {
+            ExecutionTimelinePoint writer{};
+            std::vector<ExecutionTimelinePoint> readers;
+            void Commit(bool write, ExecutionTimelinePoint signal) {
+                if (write) {
+                    writer = signal;
+                    readers.clear();
+                    return;
+                }
+                const auto found = std::ranges::find(readers, signal.timeline, &ExecutionTimelinePoint::timeline);
+                if (found == readers.end()) readers.push_back(signal);
+                else found->value = (std::max)(found->value, signal.value);
+            }
+            std::vector<ExecutionTimelinePoint> Waits(bool write, uint64_t consumer) const {
+                std::vector<ExecutionTimelinePoint> waits;
+                const auto add = [&](ExecutionTimelinePoint point) {
+                    if (!point.timeline || point.timeline == consumer) return;
+                    const auto found = std::ranges::find(waits, point.timeline, &ExecutionTimelinePoint::timeline);
+                    if (found == waits.end()) waits.push_back(point);
+                    else found->value = (std::max)(found->value, point.value);
+                };
+                add(writer);
+                if (write) for (const auto reader : readers) add(reader);
+                return waits;
+            }
+        } oracle;
+        const auto sorted = [](std::vector<ExecutionTimelinePoint> points) {
+            std::ranges::sort(points, {}, &ExecutionTimelinePoint::timeline);
+            return points;
+        };
+        struct Stage {
+            const Schedule* graph;
+            bool write;
+            uint32_t queue;
+            uint64_t stream = 0;
+            AccessPrediction capture{};
+        };
+        std::vector<Stage> stages{{&writeMip0Compute, true, 1}, {&readMip0Graphics, false, 0}, {&writeMip0, true, 0},
+            {&readMip0, false, 1}};
+        for (auto& stage : stages) stage.stream = churn.OpenStream(1);
+        uint64_t churnValue = 0;
+        uint32_t held = 0;
+        // One frame: each stage admitted (from its capture when it holds, checked against a full resolution and the oracle) and
+        // committed. `sometimes`: the last stage runs. Returns the frame's commit walks.
+        const auto churnFrame = [&](bool sometimes, bool checkOracle = true) {
             basic_telemetry::Session session({ .mode = basic_telemetry::CaptureMode::Trace,
                 .traceRootScopes = {"ORG.Execution.CommitCrossFrameHazards"} });
-            const auto one = std::span{&backing, size_t{1}};
-            GraphExecutionTimeline written;
-            written.batches = {{{11, ++value}, {}}};
-            quiet.Commit(writeMip0, one, written, UINT32_MAX, set, writer);
-            std::vector<std::vector<ExecutionTimelinePoint>> waits(1);
-            quiet.AppendIncomingWaits(readMip0, one, queues, waits);
-            ENSURE(waits[0] == std::vector<ExecutionTimelinePoint>{{11, value}});
-            GraphExecutionTimeline read;
-            read.batches = {{{22, ++value}, {}}};
-            quiet.Commit(readMip0, one, read, UINT32_MAX, set, reader);
-            waits.assign(1, {});
-            quiet.AppendIncomingWaits(writeMip0, one, queues, waits);
-            ENSURE(waits[0] == std::vector<ExecutionTimelinePoint>{{22, value}});
+            for (size_t i = 0; i < stages.size(); ++i) {
+                auto& stage = stages[i];
+                if (i == 3 && !sometimes) continue;
+                std::vector<std::vector<ExecutionTimelinePoint>> full(1), fromCapture(1);
+                churn.AppendIncomingWaits(*stage.graph, churnedOne, queues, full);
+                if (churn.PredictedWaits(stage.capture, *stage.graph, churnedOne, queues, fromCapture, 11)) ++held;
+                else churn.AppendIncomingWaits(*stage.graph, churnedOne, queues, fromCapture, 11, &stage.capture);
+                ENSURE(sorted(fromCapture[0]) == sorted(full[0]));
+                if (checkOracle) ENSURE(sorted(full[0]) == sorted(oracle.Waits(stage.write, queues[stage.queue].timeline)));
+                GraphExecutionTimeline done;
+                done.batches = {{{queues[stage.queue].timeline, ++churnValue}, {}}};
+                churn.Commit(*stage.graph, churnedOne, done, UINT32_MAX, 11, stage.stream);
+                oracle.Commit(stage.write, done.batches[0].signal);
+            }
             const auto snapshot = session.Snapshot();
             const auto metric = std::ranges::find_if(snapshot.metrics,
-                [](const auto& m) { return m.name == "ORG.Execution.QuietCrossFrameAccesses"; });
+                [](const auto& m) { return m.name == "ORG.Execution.CrossFrameCommitWalks"; });
             return metric == snapshot.metrics.end() ? 0 : static_cast<int>(metric->current);
         };
-        ENSURE(frame(backingA, 8) == 0);  // makes the cells
-        ENSURE(frame(backingA, 8) == 0);  // the same cells: the first walk that changes nothing
-        ENSURE(frame(backingA, 8) == 2);
-        ENSURE(frame(backingA, 8) == 2);
-        // A fixed point on the same backing: both streams walk again (the writer's cell changed, the reader's read is new).
+        ENSURE(churnFrame(true) == 4);   // each stream's first commit walks
+        ENSURE(churnFrame(false) == 0);  // the cell holds every producer: from here on only signals move
+        const auto steady = churn.Changes();
+        held = 0;
+        for (int frame = 3; frame <= 10; ++frame) ENSURE(churnFrame(frame % 2 != 0) == 0);
+        ENSURE(churn.Changes() == steady);
+        ENSURE(held == 4 * 3 + 4 * 4);  // every admission of frames 3 to 10 from its capture
+        // A fixed point (a commit outside a stream) changes the cell: every capture misses once, and no stream walks again. The
+        // cell keeps it as the latest write of its timeline, below W2's from then on, so the waits stay the oracle's.
         GraphExecutionTimeline outside;
-        outside.batches = {{{11, ++value}, {}}};
-        quiet.Commit(writeMip0, std::span{&backingA, size_t{1}}, outside);
-        ENSURE(frame(backingA, 8) == 0);
-        ENSURE(frame(backingA, 8) == 0);
-        ENSURE(frame(backingA, 8) == 2);
-        // Other backings under the same streams: never quiet on their first commits, and their cells are made.
-        ENSURE(frame(backingB, 9) == 0);
-        ENSURE(frame(backingB, 9) == 0);
-        ENSURE(frame(backingB, 9) == 2);
-        // Back to the first backings: the streams' last commits were of the other ones, so they walk again (and change nothing).
-        ENSURE(frame(backingA, 8) == 0);
-        ENSURE(frame(backingA, 8) == 2);
-        // A grid retired and made again: the walk makes its cells anew.
-        std::map<uint64_t, uint64_t> completed{{11, value}, {22, value}};
-        ENSURE(quiet.RetireCompleted(backingB.resource, completed));
-        ENSURE(frame(backingA, 8) == 2);  // another grid went: this one is still quiet
-        ENSURE(frame(backingB, 9) == 0);
-        ENSURE(frame(backingB, 9) == 0);
-        ENSURE(frame(backingB, 9) == 2);
-        // Boundary waits (a write ahead of the execution on any queue) name the writer and every reader at their latest signals.
-        ENSURE(frame(backingA, 8) == 0);
+        outside.batches = {{{11, ++churnValue}, {}}};
+        churn.Commit(writeMip0, churnedOne, outside);
+        oracle.Commit(true, outside.batches[0].signal);
+        ENSURE(churn.Changes() == steady + 1);
+        held = 0;
+        ENSURE(churnFrame(true) == 0);
+        ENSURE(held == 0);
+        ENSURE(churnFrame(false) == 0);
+        ENSURE(held == 3);
+        // A stream closed and opened again (a rebuild): the new stream walks once, and the captures miss once. Its walk folds the
+        // closed producer's reference into a point, so a cell does not grow with every rebuild.
+        churn.CloseStream(stages[2].stream);
+        stages[2].stream = churn.OpenStream(1);
+        held = 0;
+        ENSURE(churnFrame(true) == 1);
+        ENSURE(held == 3);  // the stages admitted before the new stream's first commit
+        held = 0;
+        ENSURE(churnFrame(false) == 0);
+        ENSURE(held == 0);  // the cell changed after their admissions
+        ENSURE(churnFrame(true) == 0);
+        ENSURE(held == 4);
+        // Enough closed producers are fixed into points. R's stream closes first, so the cell names a closed producer when the fix
+        // runs: its readers change, and the captures that depend on readers (the writes') miss. R's new stream walks once.
+        churn.CloseStream(stages[1].stream);
+        for (int i = 0; i < 1100; ++i) churn.CloseStream(churn.OpenStream(1));
+        stages[1].stream = churn.OpenStream(1);
+        held = 0;
+        ENSURE(churnFrame(true) == 1);
+        ENSURE(held == 2);  // the reads': they depend on the writers alone
+        held = 0;
+        ENSURE(churnFrame(false) == 0);
+        ENSURE(held == 2);  // W1 was admitted before R's new stream walked
+        held = 0;
+        ENSURE(churnFrame(true) == 0);
+        ENSURE(held == 4);
+        // A stream on other backings walks once, and walks again when it comes back (its last walk was elsewhere). Its producer's
+        // signal moved there, so the first admission back waits for that later point of the same timeline: more than needed, never
+        // less, and the oracle check is left out for that frame. (A host's stream keeps one backing set: SynchronousAdmission opens
+        // a new stream for new backings.)
+        handle.index = 44;
+        PreparedBackingState otherBacking{.graphResourceID = 99, .resource = handle, .shape = {2, 1, false}};
+        GraphExecutionTimeline elsewhere;
+        elsewhere.batches = {{{11, ++churnValue}, {}}};
+        {
+            basic_telemetry::Session session({ .mode = basic_telemetry::CaptureMode::Trace,
+                .traceRootScopes = {"ORG.Execution.CommitCrossFrameHazards"} });
+            churn.Commit(writeMip0, std::span{&otherBacking, size_t{1}}, elsewhere, UINT32_MAX, 12, stages[2].stream);
+            const auto snapshot = session.Snapshot();
+            ENSURE(std::ranges::any_of(snapshot.metrics,
+                [](const auto& m) { return m.name == "ORG.Execution.CrossFrameCommitWalks" && m.current == 1; }));
+        }
+        ENSURE(churnFrame(true, false) == 1);
+        ENSURE(churnFrame(false) == 0);
+        // A grid retired and made again: every stream walks once (a grid went), and its cells are made anew. The first admission
+        // after it finds no grid, where the oracle still names the completed accesses.
+        std::map<uint64_t, uint64_t> completed{{11, churnValue}, {22, churnValue}};
+        ENSURE(churn.RetireCompleted(churned.resource, completed));
+        ENSURE(churnFrame(true, false) == 4);
+        ENSURE(churnFrame(false) == 0);
+        // Boundary waits (a write ahead of the execution on any queue) name every writer and reader at their latest signals: the
+        // latest per timeline.
         BackingAccessAdmissionLedger::ResourceWaits boundary(1);
         const std::array<uint8_t, 1> selected{1};
-        quiet.AppendBoundaryAccessWaits(writeMip0, std::span{&backingA, size_t{1}}, selected, boundary, 8);
-        ENSURE((boundary[0] == std::vector<std::pair<uint32_t, ExecutionTimelinePoint>>{{0, {11, value - 1}}, {0, {22, value}}}));
-        quiet.CloseStream(writer);
-        quiet.CloseStream(reader);
-
-        // Alternating frames. A stage that reads only on odd frames leaves the cell with or without its read when the next frame's
-        // writer is admitted. Each state's capture holds again when that state comes back (an admission keeps several), and its
-        // waits are a full resolution's.
-        BackingAccessAdmissionLedger alternating;
-        handle.index = 45;
-        PreparedBackingState shared{.graphResourceID = 99, .resource = handle, .shape = {2, 1, false}};
-        const auto sharedOne = std::span{&shared, size_t{1}};
-        const auto consumer = alternating.OpenStream(1), producer = alternating.OpenStream(1), sometimes = alternating.OpenStream(1);
-        std::vector<AccessPrediction> captures;
-        uint32_t held = 0;
-        uint64_t point = 0;
-        for (uint64_t frame = 1; frame <= 8; ++frame) {
-            std::vector<std::vector<ExecutionTimelinePoint>> full(1), predictedWaits(1);
-            alternating.AppendIncomingWaits(writeMip0, sharedOne, queues, full);
-            bool hit = false;
-            for (auto& capture : captures)
-                if (alternating.PredictedWaits(capture, writeMip0, sharedOne, queues, predictedWaits, 10)) {
-                    hit = true;
-                    break;
-                }
-            if (hit) {
-                ++held;
-                ENSURE(predictedWaits == full);
-            } else {
-                captures.emplace_back();
-                alternating.AppendIncomingWaits(writeMip0, sharedOne, queues, predictedWaits, 10, &captures.back());
-                ENSURE(predictedWaits == full);
-            }
-            const auto commit = [&](const Schedule& graph, uint64_t timeline, uint64_t stream) {
-                GraphExecutionTimeline done;
-                done.batches = {{{timeline, ++point}, {}}};
-                alternating.Commit(graph, sharedOne, done, UINT32_MAX, 10, stream);
-            };
-            commit(writeMip0, 22, consumer);
-            commit(writeMip0, 11, producer);
-            if (frame % 2) commit(readMip0, 22, sometimes);
-        }
-        ENSURE(captures.size() == 3);  // the first frame's (no grid yet), then one per state
-        ENSURE(held == 5);
+        churn.AppendBoundaryAccessWaits(writeMip0, churnedOne, selected, boundary, 11);
+        ENSURE((boundary[0] == std::vector<std::pair<uint32_t, ExecutionTimelinePoint>>{{0, {22, churnValue - 2}}, {0, {11, churnValue}}}));
+        for (auto& stage : stages) churn.CloseStream(stage.stream);
     }
 
     // Physical aliases are ordered by the realized heap interval even when

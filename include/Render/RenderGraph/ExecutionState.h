@@ -132,21 +132,25 @@ struct AccessRef {
     bool operator==(const AccessRef& other) const { return producer == other.producer && (producer || point == other.point); }
 };
 
-// The same for the access ledger (BackingAccessAdmissionLedger::AppendIncomingWaits): what it held of each resource the batches use
-// first (its writers and readers, as references), and the earlier accesses each batch's waits came from. While the ledger holds the
-// same references, the waits are those accesses' points now.
+// The same for the access ledger (BackingAccessAdmissionLedger::AppendIncomingWaits): which resources the batches use first, and
+// the earlier accesses each batch's waits came from. While none of those resources' grids changed since, the waits are those
+// accesses' points now. The ledger's grids only grow (BackingAccessAdmissionLedger), so a capture that no longer holds never holds
+// again: an admission keeps one.
 struct AccessPrediction {
     struct Entry {
         uint32_t resource = 0;
         bool present = false;
-        // A batch writes the resource, so its readers are waited for too: the grid's whole fingerprint is compared. Otherwise
-        // only its writers can give waits, and only their fingerprint is.
+        // A batch writes the resource, so its readers are waited for too: any change to the grid counts. Otherwise only its
+        // writers can give waits, and only a change to them counts.
         bool readers = false;
-        uint64_t fingerprint = 0;
     };
     bool valid = false;
+    uint64_t generation = 0;  // the ledger's change count the capture was taken or last checked at
     std::vector<Entry> entries;
-    std::vector<std::vector<AccessRef>> waits;  // per batch, each once
+    // Per batch: its queue's timeline, and the accesses its waits come from, each once, without those on that timeline (queue
+    // order covers them; a reference's timeline is fixed once it is in a cell).
+    std::vector<uint64_t> consumers;
+    std::vector<std::vector<AccessRef>> waits;
 };
 
 namespace detail {
@@ -200,6 +204,8 @@ public:
         ++m_generation;
     }
     size_t Size() const noexcept { return m_index.size(); }
+    // Moves when an entry goes (Erase, Clear).
+    uint64_t Generation() const noexcept { return m_generation; }
     template<class Fn> void ForEach(Fn&& fn) { for (auto& [key, slot] : m_index) fn(key, m_entries[slot]); }
     // Per resource of the backing set, its entry (null: none when resolved; the caller finds it by key then, and keeps what it
     // finds here). backingSet 0: no set to remember, resolved for this call.
@@ -296,7 +302,6 @@ public:
     bool Predicts(const StatePrediction& prediction, std::span<const PreparedBackingState> initial, uint64_t backingSet = 0) const;
     void Invalidate(std::span<const rhi::ResourceHandle> resources);
     size_t BackingCount() const noexcept { return m_states.Size(); }
-    void Reset() { m_states.Clear(); }
 private:
     struct StateGrid {
         CompileResourceShape shape{};
@@ -311,12 +316,22 @@ private:
 // dependencies, these points refer only to work that was actually submitted.
 // The ledger is keyed by concrete backing identity and subresource cell so
 // unrelated resources/ranges and queues remain independent.
+//
+// A cell keeps every earlier access that wrote it and every one that read it: each producer once (a stream's batch, at its
+// latest signal), and fixed points as the latest per timeline. Nothing is taken out again, so once every producer that touches
+// a cell has touched it, the cell no longer changes: a frame that repeats changes nothing, and its commits only move their
+// producers' signals. A read waits for the cell's writers, a write for its writers and readers. Compared with keeping only the
+// latest writer and the reads since, the extra waits are on accesses the latest writer already waited for (an older write or
+// read: write-after-write, write-after-read), or on the same timeline (dropped), so they are redundant, never wrong, and order
+// nothing more on the GPU. A producer's latest signal is always one where it touched the cell: a stream touches the same cells
+// every time.
 class BackingAccessAdmissionLedger {
 public:
     // A stream: the executions of one executable with one backing set (the same accesses to the same backings each time). Each of
     // its batches is a producer: the cells it touches name the producer instead of a point, and its commit sets the producer's
-    // latest signal once, so a cell changes only when who touched it last changes. A closed stream's producers keep their last
-    // signals (fixed points from then on). Returns the stream's id (never 0).
+    // latest signal once. A stream commit that repeats the stream's last walk (same graph, backings and batches, no grid gone since)
+    // only moves the signals. A closed stream's producers keep their last signals (fixed points from then on). Returns the
+    // stream's id (never 0).
     uint64_t OpenStream(uint32_t batches);
     void CloseStream(uint64_t stream);
     // backingSet: as for BackingStateAdmissionLedger::Prepare. capture: filled with what the waits came from, for PredictedWaits.
@@ -325,18 +340,19 @@ public:
         std::span<const ExecutionTimelinePoint> queues,
         std::vector<std::vector<ExecutionTimelinePoint>>& incoming, uint64_t backingSet = 0,
         AccessPrediction* capture = nullptr) const;
-    // AppendIncomingWaits from a capture, when the ledger still holds what it was captured from: the same waits, at the points
-    // their producers have reached since. False (incoming untouched) when it does not.
-    bool PredictedWaits(const AccessPrediction& prediction, const Schedule& graph,
+    // AppendIncomingWaits from a capture, when none of the grids it depends on changed since it was taken: the same waits, at the
+    // points their producers have reached since. False (incoming untouched) when one did. A capture that holds is marked as
+    // checked at the ledger's current change count, so the next check while nothing changes is one comparison.
+    bool PredictedWaits(AccessPrediction& prediction, const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         std::span<const ExecutionTimelinePoint> queues,
         std::vector<std::vector<ExecutionTimelinePoint>>& incoming, uint64_t backingSet) const;
     // Per batch, (compiler resource index, wait).
     using ResourceWaits = std::vector<std::vector<std::pair<uint32_t, ExecutionTimelinePoint>>>;
     // For each boundary access (incomingBoundaryAccessesByBatch) to a selected resource (selected: one flag per compiler
-    // resource), every earlier access the ledger holds - its writer and all its readers, on every queue, the consumer's own
+    // resource), every earlier access the ledger holds - its writers and readers, on every queue, the consumer's own
     // included: what a write into the resource on any queue ahead of the execution must wait for (RenderGraph's queue-scoped
-    // ticket uploads), where AppendIncomingWaits gives a read only the writer, and nothing on its own queue. out: one list per batch.
+    // ticket uploads), where AppendIncomingWaits gives a read only the writers, and nothing on its own queue. out: one list per batch.
     void AppendBoundaryAccessWaits(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         std::span<const uint8_t> selected,
@@ -345,22 +361,21 @@ public:
     void Commit(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX, uint64_t backingSet = 0, uint64_t stream = 0);
-    void Reset() { m_accesses.Clear(); }
-    void ResolvePlannedPoints(const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points);
     bool RetireCompleted(rhi::ResourceHandle resource, const std::map<uint64_t, uint64_t>& completed);
     size_t BackingCount() const noexcept { return m_accesses.Size(); }
+    // Changes to the grids so far (a grid made, grown or gone, closed producers fixed). Steady frames leave it alone.
+    uint64_t Changes() const noexcept { return m_changes; }
 private:
     struct Cell {
-        AccessRef writer{};
-        std::vector<AccessRef> readers;  // at most one per timeline
+        std::vector<AccessRef> writers;
+        std::vector<AccessRef> readers;
     };
     struct AccessGrid {
         CompileResourceShape shape{};
         std::vector<Cell> cells;
-        // Of the cells' references, kept by every change (AccessPrediction): all of them, and the writers alone.
-        uint64_t fingerprint = 0;
-        uint64_t writersFingerprint = 0;
-        uint64_t changedIn = 0;  // the last change to its cells (m_commits). A Commit's end hashes each grid it changed once
+        // m_changes at the last change to any of its cells, and to any of their writers (AccessPrediction).
+        uint64_t changedIn = 0;
+        uint64_t writersChangedIn = 0;
     };
     struct Producer {
         ExecutionTimelinePoint signal{};  // the latest; its timeline is set by the first commit
@@ -369,29 +384,29 @@ private:
     ExecutionTimelinePoint PointOf(const AccessRef& ref) const noexcept {
         return ref.producer ? m_producers[ref.producer].signal : ref.point;
     }
-    uint64_t TimelineOf(const AccessRef& ref) const noexcept { return PointOf(ref).timeline; }
-    // Sets both fingerprints.
-    static void Fingerprint(AccessGrid& grid);
     // Closed producers' references become their points, and the producers are reused (after enough have closed).
     void FixClosedProducers();
+    // In one cell's writers or readers: closed producers' references become their points, and fixed points keep the latest per
+    // timeline. True when it changed them.
+    bool FoldClosed(std::vector<AccessRef>& refs) const;
     detail::BackingTable<AccessGrid> m_accesses;
     std::vector<Producer> m_producers{1};  // [0] unused: AccessRef::producer 0 is a point
     std::vector<uint32_t> m_freeProducers;
     size_t m_closedProducers = 0;
-    // An open stream. A grid its last commit left as it found it, and that nothing changed since, is left as it is again: the walk
-    // over its cells would find them naming these producers already (Commit skips it). That holds only for the same graph,
-    // backings and batches as that commit.
+    // An open stream, and what its last walk put in the grids: every cell its first `batchCount` batches touch on `graph` with
+    // `backingSet` names its producers. That holds until a grid goes (the table's generation moves): nothing else takes an open
+    // producer out of a cell.
     struct Stream {
         std::vector<uint32_t> producers;  // per batch
-        uint64_t lastCommit = 0;          // m_commits
         const Schedule* graph = nullptr;
         uint64_t backingSet = 0;
         uint32_t batchCount = 0;
+        uint64_t tableGeneration = 0;
     };
     std::unordered_map<uint64_t, Stream> m_streams;
     uint64_t m_nextStream = 1;
-    uint64_t m_commits = 0;  // Commit calls and other changes so far
-    // AppendIncomingWaits' capture lists each producer once per batch: the batch's mark per producer.
+    uint64_t m_changes = 1;
+    // AppendIncomingWaits lists each producer once per batch: the batch's mark per producer.
     mutable std::vector<uint64_t> m_producerMarks;
     mutable uint64_t m_mark = 0;
 };
@@ -419,8 +434,6 @@ public:
     void Commit(const Schedule& graph,
         std::span<const PreparedBackingState> resources,
         const GraphExecutionTimeline& execution, uint32_t batchCount = UINT32_MAX);
-    void Reset() { m_heaps.clear(); m_heapOwners.clear(); }
-    void ResolvePlannedPoints(const std::unordered_map<uint64_t, ExecutionTimelinePoint>& points);
     bool RetireCompleted(const AliasHeapGeneration* heap, const std::weak_ptr<const AliasHeapGeneration>& owner,
         const std::map<uint64_t, uint64_t>& completed);
     size_t HeapCount() const noexcept { return m_heaps.size(); }
