@@ -408,6 +408,9 @@ struct GraphHost::TicketCommit {
 	// so deferred deletions, descriptor releases and freed pinned regions made on the render thread wait for a settled frontier
 	// (Runtime::AssignmentScope).
 	std::unique_ptr<Runtime::AssignmentScope> assigned;
+	// An external ticket's: the execution FinishTicket adds its segments to, handed out at the commit (TakeExternalExecution).
+	std::shared_ptr<ExternalEpochExecution> execution;
+	std::shared_ptr<void> context;  // SetSubmissionContext's, as it was at the commit
 };
 
 // FinishTicket's completion messages, held until the group's last submission is on its queue (FinishTicket's posts).
@@ -3692,13 +3695,12 @@ void GraphHost::SubmitEpoch(uint32_t epoch, const FrameCallback& beforeSubmit, s
 		}
 	}
 	lap(m_lastTimings.ticketWaitUs);
-	if (m_submitQueue && !m_instances[instance].graph->IsExternalPersistentEpoch(epoch)) {
-		// The commit here; the rest on the submission thread, in order after the tickets before it.
+	if (m_submitQueue) {
+		// The commit here; the rest on the submission thread, in order after the tickets before it. An external epoch's execution
+		// is handed out now and filled in there.
 		auto commit = CommitTicket(async, index, std::move(ticket), beforeSubmit, std::move(resourceOwner), std::move(recording));
 		EnqueueTicket(async, std::move(commit));
 	} else {
-		// An external epoch's submission stays on this thread: it comes after every ticket the thread still holds.
-		DrainSubmissions("a submission on the calling thread");
 		SubmitTicket(async, index, std::move(ticket), beforeSubmit, std::move(resourceOwner), std::move(recording));
 	}
 }
@@ -3763,6 +3765,8 @@ void GraphHost::RunSubmitThread() {
 				auto& commit = *group[i].commit;
 				if (queue.failed.load(std::memory_order_acquire)) {
 					// After a failure nothing more is submitted. The ticket goes back to the host's thread unadmitted, which frees its lease.
+					// Its execution's reader stops waiting for it.
+					if (commit.execution) std::exchange(commit.execution, nullptr)->FinishTicket(false);
 					if (commit.ticket) {
 						Async::Message discard;
 						discard.kind = Async::Message::Kind::Discard;
@@ -3873,6 +3877,16 @@ void GraphHost::EnqueueTicket(Async& async, TicketCommit commit) {
 	entry.async = &async;
 	entry.commit.emplace(std::move(commit));
 	PushOrHold(*m_submitQueue, std::move(entry));
+}
+
+std::shared_ptr<void> GraphHost::SetSubmissionContext(std::shared_ptr<void> a_context) {
+	return std::exchange(m_submissionContext, std::move(a_context));
+}
+
+bool GraphHost::OnSubmissionThread() const noexcept {
+	if (!m_submitQueue) return false;
+	std::scoped_lock lock(m_submitQueue->mutex);
+	return m_submitQueue->threadId == std::this_thread::get_id();
 }
 
 void GraphHost::EnqueueOnSubmitThread(std::function<void()> a_closure) {
@@ -4059,6 +4073,13 @@ GraphHost::TicketCommit GraphHost::CommitTicket(Async& async, uint32_t index, st
 	// What the commit queued goes with this ticket, wherever it is finished.
 	commit.uploads = graph.TakePendingUploads(m_device, slot);
 	commit.assigned = std::make_unique<Runtime::AssignmentScope>(*m_desc.runtime);
+	if (commit.external) {
+		// The execution the caller takes now. FinishTicket adds this ticket's segments to it.
+		if (!m_externalExecution) m_externalExecution = std::make_shared<ExternalEpochExecution>();
+		++m_externalExecution->tickets;
+		commit.execution = m_externalExecution;
+	}
+	commit.context = m_submissionContext;
 	commit.ticket = std::move(ticket);
 	lap(m_lastTimings.checkUs);
 	return commit;
@@ -4071,6 +4092,18 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	BT_ZONE_VALUE(async.epochs[commit.index]);
 	const auto index = commit.index;
 	auto& ticket = commit.ticket;
+	// The ticket's context for the hooks its submission calls. Its execution's reader is told once the segments are added, or
+	// the finish failed.
+	struct Finishing {
+		GraphHost& host;
+		std::shared_ptr<ExternalEpochExecution> execution;
+		bool ok = false;
+		~Finishing() {
+			host.m_finishingContext = nullptr;
+			if (execution) execution->FinishTicket(ok);
+		}
+	} finishing{*this, std::move(commit.execution)};
+	m_finishingContext = commit.context.get();
 	// A submission's completion message wakes the host's thread lazily (wakesOnGpu); a discard always wakes it.
 	auto postControl = [&](Async::Message& message) {
 		const bool lazy = message.kind == Async::Message::Kind::Submitted;
@@ -4245,24 +4278,20 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	if (external && ok) {
 		// The caller's to execute (TakeExternalExecution): the uploads first, then the handoff into the execution.
 		auto execution = submitted.submission.external;
-		if (!execution) throw std::logic_error("An external epoch's ticket gave no execution");
+		if (!execution || !finishing.execution) throw std::logic_error("An external epoch's ticket gave no execution");
 		if (recorded) {
 			if (execution->segments.empty()) execution->segments.emplace_back();
 			auto& leading = execution->segments.front().leading;
 			leading.insert(leading.begin(), commands);
 		}
-		if (!m_externalExecution) {
-			m_externalExecution = std::move(execution);
-		} else {
-			// The caller has not taken the earlier tickets' execution (TakeExternalExecution): this ticket's segments run after
-			// theirs, in one execution. When a batch of that execution off the stream waits for one of its segments, its exit
-			// needed a host submission of its own (exitSplit): this ticket's segments, which may wait for that batch, start one.
-			auto& into = *m_externalExecution;
-			if (!execution->segments.empty() && into.exitSplit) execution->segments.front().split = true;
-			into.exitSplit = into.exitSplit || execution->exitSplit;
-			for (auto& segment : execution->segments) into.segments.push_back(std::move(segment));
-			into.keepAlive.insert(into.keepAlive.end(), execution->keepAlive.begin(), execution->keepAlive.end());
-		}
+		// This ticket's segments run after those of the earlier tickets in the same execution. When a batch of those off the
+		// stream waits for one of their segments, their exit needed a host submission of its own (exitSplit): this ticket's
+		// segments, which may wait for that batch, start one.
+		auto& into = *finishing.execution;
+		if (!execution->segments.empty() && into.exitSplit) execution->segments.front().split = true;
+		into.exitSplit = into.exitSplit || execution->exitSplit;
+		for (auto& segment : execution->segments) into.segments.push_back(std::move(segment));
+		into.keepAlive.insert(into.keepAlive.end(), execution->keepAlive.begin(), execution->keepAlive.end());
 	}
 	if (submitted.uploadSignal.second) stats.sparedUploadWaits += RenderGraph::PersistentTicketSparedUploadWaits(*ticket);
 	{
@@ -4279,6 +4308,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 		posts->messages.push_back(std::move(submitted));
 		lap(timings.postUs);
 		if (!ok) throw std::runtime_error("Async epoch submission failed");
+		finishing.ok = true;
 		return;
 	}
 	try {
@@ -4291,6 +4321,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	lap(timings.postUs);
 	++stats.submitted;
 	if (!ok) throw std::runtime_error("Async epoch submission failed");
+	finishing.ok = true;
 }
 
 } // namespace org

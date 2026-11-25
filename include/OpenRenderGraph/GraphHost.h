@@ -125,8 +125,9 @@ public:
 		bool reportStaleAliasPlacements = false;
 		// Async epochs: SubmitEpoch runs the caller's commit and the revision check on the calling thread, then hands the rest of
 		// the submission to a submission thread of the host's, in order. That rest is the upload lists, the admission, the passes
-		// recorded at execution and the queue submissions. External epochs still submit on the calling thread. A queue user that
-		// must come after the epochs submitted so far drains the thread first (DrainSubmissions).
+		// recorded at execution and the queue submissions. An external epoch's execution is handed out at once (TakeExternalExecution)
+		// and filled in on the thread (ExternalEpochExecution::WaitFinished). A queue user that must come after the epochs submitted so
+		// far drains the thread first (DrainSubmissions).
 		bool submissionThread = false;
 		// With a submission thread: the tickets queued together are finished as one group, and a
 		// ticket's first queue submission joins the one the ticket before it left held, when both are on one queue and it waits
@@ -729,7 +730,8 @@ public:
 	 * @brief Submitting thread, after SubmitEpoch of an external epoch: its execution (null: none since the last call). The caller
 	 * must execute its segments (ExternalEpochExecution::Execute), or signal the ones it did not unexecuted: the graphs' later
 	 * work on their timelines waits for those signals. Until it is taken, the next external tickets' segments are appended to it,
-	 * so a caller that takes it after several SubmitEpoch calls executes their tickets in order as one execution.
+	 * so a caller that takes it after several SubmitEpoch calls executes their tickets in order as one execution. With a
+	 * submission thread its tickets may still be finishing there: read its segments only after ExternalEpochExecution::WaitFinished.
 	 */
 	std::shared_ptr<ExternalEpochExecution> TakeExternalExecution() noexcept { return std::move(m_externalExecution); }
 	/**
@@ -1045,6 +1047,15 @@ public:
 	// Any thread: the last seal the thread has passed. It never has a pending part, so its values can be read at once. It may be
 	// a frame older than SealedPoint. Use it to ask whether a point is sealed, not to wait for the frame boundary.
 	GpuPoint PassedSealedPoint() const;
+	/**
+	 * @brief Submitting thread: what the tickets submitted from now on carry, for the code their submission calls (the queue
+	 * submission hooks), wherever it runs. Returns the one it replaces.
+	 */
+	std::shared_ptr<void> SetSubmissionContext(std::shared_ptr<void> a_context);
+	/** @brief The thread finishing a ticket (the submission thread, or the submitting thread without one): that ticket's context. */
+	void* SubmissionContext() const noexcept { return m_finishingContext; }
+	/** @brief Any thread: whether it is the host's submission thread. */
+	bool OnSubmissionThread() const noexcept;
 	// Render owner: runs a_closure on the submission thread, in order after everything queued so far. Without a submission thread
 	// it runs at once on the calling thread. A closure that throws is logged. Waits for room when the queue is full.
 	void EnqueueOnSubmitThread(std::function<void()> a_closure);
@@ -1384,6 +1395,8 @@ private:
 	std::shared_ptr<const EpochRecording> m_chosenRecording;  // submitting thread: UseEpochRecording's, until SubmitEpoch takes it
 	// Submitting thread, during SubmitTicket's beforeSubmit: the ticket being submitted.
 	const RenderGraph::PersistentTicket* m_submittingTicket = nullptr;
+	std::shared_ptr<void> m_submissionContext;  // submitting thread: SetSubmissionContext's
+	void* m_finishingContext = nullptr;         // the finishing thread, during FinishTicket: its ticket's context
 	AsyncStats m_asyncStats{};
 	void StartAsync();
 	void StopAsync();
@@ -1415,8 +1428,10 @@ private:
 	void SubmitTicket(Async& state, uint32_t epochIndex, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
 		const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner = {}, std::shared_ptr<const EpochRecording> recording = {});
 	// A submission in two parts. CommitTicket runs on the render thread: the caller's commit (beforeSubmit), the recording
-	// choice, and the revision check with its re-preparation, which all read the caller's state. FinishTicket does the rest, in
-	// the same order as before: the upload lists, the admission, the submission and the post to the host's thread.
+	// choice, and the revision check with its re-preparation, which all read the caller's state. An external ticket's execution
+	// is made there too, for the caller to take at once. FinishTicket does the rest, in the same order as before: the upload
+	// lists, the admission, the submission (an external ticket's segments added to its execution) and the post to the host's
+	// thread.
 	struct TicketCommit;
 	TicketCommit CommitTicket(Async& state, uint32_t epochIndex, std::shared_ptr<RenderGraph::PersistentTicket> ticket,
 		const FrameCallback& beforeSubmit, std::shared_ptr<const void> resourceOwner, std::shared_ptr<const EpochRecording> recording);

@@ -6,6 +6,18 @@
 
 namespace org {
 
+bool ExternalEpochExecution::WaitFinished() const noexcept {
+	for (uint32_t finished = m_finished.load(std::memory_order_acquire); finished < tickets; finished = m_finished.load(std::memory_order_acquire))
+		m_finished.wait(finished, std::memory_order_acquire);
+	return !m_failed.load(std::memory_order_acquire);
+}
+
+void ExternalEpochExecution::FinishTicket(bool a_ok) noexcept {
+	if (!a_ok) m_failed.store(true, std::memory_order_release);
+	m_finished.fetch_add(1, std::memory_order_acq_rel);
+	m_finished.notify_all();
+}
+
 void ExternalEpochExecution::Execute(size_t a_segment, rhi::CommandList a_primary) const {
 	BT_ZONE_SCOPE("ORG.ExternalEpoch.Execute");
 	if (a_segment >= segments.size()) throw std::out_of_range("An external epoch's execution has no such segment");

@@ -666,6 +666,10 @@ static int Run(int argc, char** argv) {
 	// is taken or executed by the test.
 	bool inlineLate = false;
 	for (int arg = 1; arg < argc; ++arg) inlineLate = inlineLate || std::strcmp(argv[arg], "inline") == 0;
+	// "thread" after "stream": the host finishes the tickets on its submission thread (Desc::submissionThread). Each frame submits
+	// two tickets before it takes their execution, which is handed out at once and filled in there (ExternalEpochExecution::
+	// WaitFinished). Their compute batches are submitted from that thread.
+	const bool threaded = stream && argc > 2 && std::strcmp(argv[2], "thread") == 0;
 	HostDevice host;
 	if (const int created = CreateHostDevice(host); created != 0) {
 		std::puts(created == 77 ? "SKIP: no Vulkan device with VK_EXT_descriptor_heap" : "FAIL: host device");
@@ -1493,7 +1497,7 @@ static int Run(int argc, char** argv) {
 			// and the copy's segment split from it. With them the upload goes to the compute queue, ahead of the write.
 			for (const bool scopedUploads : {false, true}) {
 				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0},
-					.externalHomeStates = home, .queueScopedUploads = scopedUploads});
+					.externalHomeStates = home, .queueScopedUploads = scopedUploads, .submissionThread = threaded});
 				auto program = CreateProgram(device.Get());
 				REQUIRE(program, "compute program");
 				// "home": a texture the host owns, home in Common on the graphics queue.
@@ -1556,21 +1560,34 @@ static int Run(int argc, char** argv) {
 				host.SetAsyncEpochs({0});
 				SegmentExecutor executor{device.Get()};
 				size_t splits = 0, segments = 0;
+				// The context each ticket carries, as its finish sees it (the queue hooks' view).
+				struct Context {
+					uint32_t frame = 0;
+				};
 				for (uint32_t frame = 0; frame < 8; ++frame) {
 					value = 50000u + 10u * frame + (scopedUploads ? 5000u : 0u);
+					auto context = std::make_shared<Context>(Context{frame});
+					host.SetSubmissionContext(context);
 					host.SubmitEpoch(0, upload);
+					if (threaded) host.SubmitEpoch(0, upload);
+					host.SetSubmissionContext(nullptr);
 					auto execution = host.TakeExternalExecution();
-					REQUIRE(execution && !execution->segments.empty(), "a stream epoch's execution");
+					REQUIRE(execution && execution->tickets == (threaded ? 2u : 1u), "a stream epoch's execution, one per ticket taken");
+					REQUIRE(execution->WaitFinished() && !execution->segments.empty(), "the stream epoch's tickets finished");
+					REQUIRE(host.SubmissionContext() == nullptr, "a ticket's context only while it is finished");
 					segments += execution->segments.size();
 					for (const auto& segment : execution->segments) splits += segment.split ? 1 : 0;
 					REQUIRE(executor.Execute(*execution), "the stream's segments");
 					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the copy in the stream reads what the compute write wrote");
 				}
-				std::printf("stream (%s%s, %s uploads): %zu segments, %zu split over 8 frames\n", open ? "open" : "closed",
-					home ? ", external home" : "", scopedUploads ? "queue-scoped" : "stream", segments, splits);
+				std::printf("stream (%s%s%s, %s uploads): %zu segments, %zu split over 8 frames\n", open ? "open" : "closed",
+					home ? ", external home" : "", threaded ? ", submission thread" : "", scopedUploads ? "queue-scoped" : "stream", segments, splits);
 				// External home: the texture is released from the graphics queue in a segment ahead (the write waits for it, so the
 				// copy's segment is split), and acquired back in a segment after the copy's (its wait is the copy's: no split).
-				if (home) REQUIRE(splits == 8 && segments == (scopedUploads ? 24u : 32u), "the host texture's release and acquire segments");
+				// Threaded: two tickets per execution. The second's first segment is split when the first's exit is (exitSplit).
+				if (threaded) REQUIRE(scopedUploads ? (splits == 0 && segments == 16) : (splits == 24 && segments == 32),
+					"two tickets' segments in one execution, the second split after the first's exit");
+				else if (home) REQUIRE(splits == 8 && segments == (scopedUploads ? 24u : 32u), "the host texture's release and acquire segments");
 				else if (!scopedUploads) REQUIRE(splits == 8 && segments == 16, "the copy's segment is split from the uploads' when the write waits for them");
 				else REQUIRE(splits == 0 && segments == 8, "an upload on the write's queue needs no segment of its own, and no split");
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");

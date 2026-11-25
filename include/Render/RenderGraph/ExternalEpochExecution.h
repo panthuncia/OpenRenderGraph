@@ -29,6 +29,9 @@ namespace org {
  * a batch of the execution on another queue. A segment marked `split` must start a new host submission: one of its waits
  * is for a batch that waits for an earlier segment's signal, so a submission that held both would wait for itself. A host
  * that cannot execute a segment signals it as unexecuted (GraphHost::SignalExternalExecutionUnexecuted).
+ *
+ * With a submission thread (GraphHost::Desc::submissionThread) the host hands the execution out before its tickets are
+ * finished. Its segments and exitSplit are complete only once WaitFinished returns.
  */
 class ExternalEpochExecution {
 public:
@@ -58,6 +61,17 @@ public:
 	ExternalEpochExecution(const ExternalEpochExecution&) = delete;
 	ExternalEpochExecution& operator=(const ExternalEpochExecution&) = delete;
 
+	// The tickets that add their segments to it. Set by the host on the submitting thread, before it hands the execution out.
+	uint32_t tickets = 0;
+
+	/**
+	 * @brief Any thread: blocks until every ticket of the execution was finished (each added its segments). Returns false when one
+	 * failed: then the segments are only what the others added, and the host's submissions fail from then on.
+	 */
+	bool WaitFinished() const noexcept;
+	// The host, once per ticket, after it added the ticket's segments (or failed to).
+	void FinishTicket(bool a_ok) noexcept;
+
 	/**
 	 * @brief Records segment a_segment into a_primary, outside any pass. Call it once per segment, in order, on the host's
 	 * executing thread. Afterwards, everything a_primary had bound is undefined: pipeline, heaps, push data and dynamic state.
@@ -69,6 +83,8 @@ public:
 
 private:
 	mutable std::atomic<size_t> m_executed{ 0 };
+	std::atomic<uint32_t> m_finished{ 0 };
+	std::atomic<bool> m_failed{ false };
 };
 
 }  // namespace org
