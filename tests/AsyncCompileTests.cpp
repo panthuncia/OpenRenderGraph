@@ -156,7 +156,8 @@ int main() {
 
         // Streams: a stream's cells name its batches' producers, and a capture's waits follow their latest signals. A writer and a
         // reader on two queues, frame after frame: the predicted waits are a full resolution's. From the second frame on, neither
-        // commit changes the cell (the same writer keeps the reader since), so both captures hold from the third.
+        // commit changes the cell (the same writer keeps the reader since), so the writer's capture holds from the third. The
+        // reader's depends on the cell's writer alone (its readers give a read no wait), which is the same from the first frame on.
         BackingAccessAdmissionLedger streams;
         handle.index = 42;
         PreparedBackingState streamed{.graphResourceID = 99, .resource = handle, .shape = {2, 1, false}};
@@ -183,7 +184,7 @@ int main() {
             read.batches = {{{22, 10 * frame + 5}, {}}};
             streams.Commit(readMip0, one, read, UINT32_MAX, 7, reads);
         }
-        ENSURE(predicted == 6);  // frames 3 to 5, both streams
+        ENSURE(predicted == 7);  // the writer in frames 3 to 5, the reader in frames 2 to 5
         // A commit of fixed points in between: the writer's capture no longer holds, and the full resolution sees the new reader.
         GraphExecutionTimeline other;
         other.batches = {{{22, 100}, {}}};
@@ -199,6 +200,113 @@ int main() {
         for (int i = 0; i < 1100; ++i) streams.CloseStream(streams.OpenStream(1));
         ENSURE(admit(readMip0, readerCapture) == std::vector<ExecutionTimelinePoint>{{11, 200}});
         streams.CloseStream(reads);
+
+        // Quiet grids. Once a stream's commit leaves a grid as it found it, the next commit of the same graph and backings skips
+        // the grid and only moves its producers' signals. The waits still name the latest ones. A change the stream did not make
+        // (a fixed point, other backings, a grid made again) sends it through the walk again. Each frame returns the accesses its
+        // two commits skipped.
+        BackingAccessAdmissionLedger quiet;
+        handle.index = 43;
+        PreparedBackingState backingA{.graphResourceID = 99, .resource = handle, .shape = {2, 1, false}};
+        handle.index = 44;
+        PreparedBackingState backingB{.graphResourceID = 99, .resource = handle, .shape = {2, 1, false}};
+        const auto writer = quiet.OpenStream(1), reader = quiet.OpenStream(1);
+        uint64_t value = 0;
+        // One frame: a write on queue 0 and a read on queue 1, both streams on backing set `set`. Returns how many commits were quiet.
+        auto frame = [&](PreparedBackingState& backing, uint64_t set) {
+            basic_telemetry::Session session({ .mode = basic_telemetry::CaptureMode::Trace,
+                .traceRootScopes = {"ORG.Execution.CommitCrossFrameHazards"} });
+            const auto one = std::span{&backing, size_t{1}};
+            GraphExecutionTimeline written;
+            written.batches = {{{11, ++value}, {}}};
+            quiet.Commit(writeMip0, one, written, UINT32_MAX, set, writer);
+            std::vector<std::vector<ExecutionTimelinePoint>> waits(1);
+            quiet.AppendIncomingWaits(readMip0, one, queues, waits);
+            ENSURE(waits[0] == std::vector<ExecutionTimelinePoint>{{11, value}});
+            GraphExecutionTimeline read;
+            read.batches = {{{22, ++value}, {}}};
+            quiet.Commit(readMip0, one, read, UINT32_MAX, set, reader);
+            waits.assign(1, {});
+            quiet.AppendIncomingWaits(writeMip0, one, queues, waits);
+            ENSURE(waits[0] == std::vector<ExecutionTimelinePoint>{{22, value}});
+            const auto snapshot = session.Snapshot();
+            const auto metric = std::ranges::find_if(snapshot.metrics,
+                [](const auto& m) { return m.name == "ORG.Execution.QuietCrossFrameAccesses"; });
+            return metric == snapshot.metrics.end() ? 0 : static_cast<int>(metric->current);
+        };
+        ENSURE(frame(backingA, 8) == 0);  // makes the cells
+        ENSURE(frame(backingA, 8) == 0);  // the same cells: the first walk that changes nothing
+        ENSURE(frame(backingA, 8) == 2);
+        ENSURE(frame(backingA, 8) == 2);
+        // A fixed point on the same backing: both streams walk again (the writer's cell changed, the reader's read is new).
+        GraphExecutionTimeline outside;
+        outside.batches = {{{11, ++value}, {}}};
+        quiet.Commit(writeMip0, std::span{&backingA, size_t{1}}, outside);
+        ENSURE(frame(backingA, 8) == 0);
+        ENSURE(frame(backingA, 8) == 0);
+        ENSURE(frame(backingA, 8) == 2);
+        // Other backings under the same streams: never quiet on their first commits, and their cells are made.
+        ENSURE(frame(backingB, 9) == 0);
+        ENSURE(frame(backingB, 9) == 0);
+        ENSURE(frame(backingB, 9) == 2);
+        // Back to the first backings: the streams' last commits were of the other ones, so they walk again (and change nothing).
+        ENSURE(frame(backingA, 8) == 0);
+        ENSURE(frame(backingA, 8) == 2);
+        // A grid retired and made again: the walk makes its cells anew.
+        std::map<uint64_t, uint64_t> completed{{11, value}, {22, value}};
+        ENSURE(quiet.RetireCompleted(backingB.resource, completed));
+        ENSURE(frame(backingA, 8) == 2);  // another grid went: this one is still quiet
+        ENSURE(frame(backingB, 9) == 0);
+        ENSURE(frame(backingB, 9) == 0);
+        ENSURE(frame(backingB, 9) == 2);
+        // Boundary waits (a write ahead of the execution on any queue) name the writer and every reader at their latest signals.
+        ENSURE(frame(backingA, 8) == 0);
+        BackingAccessAdmissionLedger::ResourceWaits boundary(1);
+        const std::array<uint8_t, 1> selected{1};
+        quiet.AppendBoundaryAccessWaits(writeMip0, std::span{&backingA, size_t{1}}, selected, boundary, 8);
+        ENSURE((boundary[0] == std::vector<std::pair<uint32_t, ExecutionTimelinePoint>>{{0, {11, value - 1}}, {0, {22, value}}}));
+        quiet.CloseStream(writer);
+        quiet.CloseStream(reader);
+
+        // Alternating frames. A stage that reads only on odd frames leaves the cell with or without its read when the next frame's
+        // writer is admitted. Each state's capture holds again when that state comes back (an admission keeps several), and its
+        // waits are a full resolution's.
+        BackingAccessAdmissionLedger alternating;
+        handle.index = 45;
+        PreparedBackingState shared{.graphResourceID = 99, .resource = handle, .shape = {2, 1, false}};
+        const auto sharedOne = std::span{&shared, size_t{1}};
+        const auto consumer = alternating.OpenStream(1), producer = alternating.OpenStream(1), sometimes = alternating.OpenStream(1);
+        std::vector<AccessPrediction> captures;
+        uint32_t held = 0;
+        uint64_t point = 0;
+        for (uint64_t frame = 1; frame <= 8; ++frame) {
+            std::vector<std::vector<ExecutionTimelinePoint>> full(1), predictedWaits(1);
+            alternating.AppendIncomingWaits(writeMip0, sharedOne, queues, full);
+            bool hit = false;
+            for (auto& capture : captures)
+                if (alternating.PredictedWaits(capture, writeMip0, sharedOne, queues, predictedWaits, 10)) {
+                    hit = true;
+                    break;
+                }
+            if (hit) {
+                ++held;
+                ENSURE(predictedWaits == full);
+            } else {
+                captures.emplace_back();
+                alternating.AppendIncomingWaits(writeMip0, sharedOne, queues, predictedWaits, 10, &captures.back());
+                ENSURE(predictedWaits == full);
+            }
+            const auto commit = [&](const Schedule& graph, uint64_t timeline, uint64_t stream) {
+                GraphExecutionTimeline done;
+                done.batches = {{{timeline, ++point}, {}}};
+                alternating.Commit(graph, sharedOne, done, UINT32_MAX, 10, stream);
+            };
+            commit(writeMip0, 22, consumer);
+            commit(writeMip0, 11, producer);
+            if (frame % 2) commit(readMip0, 22, sometimes);
+        }
+        ENSURE(captures.size() == 3);  // the first frame's (no grid yet), then one per state
+        ENSURE(held == 5);
     }
 
     // Physical aliases are ordered by the realized heap interval even when

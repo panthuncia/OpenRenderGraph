@@ -1095,7 +1095,7 @@ void AppendWait(std::vector<ExecutionTimelinePoint>& waits, ExecutionTimelinePoi
 
 uint64_t BackingAccessAdmissionLedger::OpenStream(uint32_t batches) {
     const auto stream = m_nextStream++;
-    auto& producers = m_streams[stream];
+    auto& producers = m_streams[stream].producers;
     producers.reserve(batches);
     for (uint32_t batch = 0; batch < batches; ++batch) {
         uint32_t id = 0;
@@ -1115,13 +1115,14 @@ uint64_t BackingAccessAdmissionLedger::OpenStream(uint32_t batches) {
 void BackingAccessAdmissionLedger::CloseStream(uint64_t stream) {
     const auto found = m_streams.find(stream);
     if (found == m_streams.end()) return;
-    for (const auto id : found->second) m_producers[id].closed = true;
-    m_closedProducers += found->second.size();
+    for (const auto id : found->second.producers) m_producers[id].closed = true;
+    m_closedProducers += found->second.producers.size();
     m_streams.erase(found);
     if (m_closedProducers >= 1024) FixClosedProducers();
 }
 
 void BackingAccessAdmissionLedger::FixClosedProducers() {
+    const uint64_t change = ++m_commits;
     m_accesses.ForEach([&](uint64_t, AccessGrid& grid) {
         bool changed = false;
         const auto fix = [&](AccessRef& ref) {
@@ -1143,7 +1144,10 @@ void BackingAccessAdmissionLedger::FixClosedProducers() {
                     }
             }
         }
-        if (changed) grid.fingerprint = Fingerprint(grid);
+        if (changed) {
+            Fingerprint(grid);
+            grid.changedIn = change;
+        }
     });
     for (uint32_t id = 1; id < m_producers.size(); ++id)
         if (m_producers[id].closed) {
@@ -1153,19 +1157,21 @@ void BackingAccessAdmissionLedger::FixClosedProducers() {
     m_closedProducers = 0;
 }
 
-uint64_t BackingAccessAdmissionLedger::Fingerprint(const AccessGrid& grid) {
-    uint64_t hash = 1469598103934665603ull;
-    const auto mix = [&](uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
-    const auto mixRef = [&](const AccessRef& ref) {
-        if (ref.producer) mix(0x8000000000000000ull | ref.producer);
-        else { mix(ref.point.timeline); mix(ref.point.value); }
+void BackingAccessAdmissionLedger::Fingerprint(AccessGrid& grid) {
+    uint64_t all = 1469598103934665603ull, writers = all;
+    const auto mix = [](uint64_t& hash, uint64_t value) { hash = (hash ^ value) * 1099511628211ull; };
+    const auto mixRef = [&](uint64_t& hash, const AccessRef& ref) {
+        if (ref.producer) mix(hash, 0x8000000000000000ull | ref.producer);
+        else { mix(hash, ref.point.timeline); mix(hash, ref.point.value); }
     };
     for (const auto& cell : grid.cells) {
-        mixRef(cell.writer);
-        mix(cell.readers.size());
-        for (const auto& reader : cell.readers) mixRef(reader);
+        mixRef(all, cell.writer);
+        mixRef(writers, cell.writer);
+        mix(all, cell.readers.size());
+        for (const auto& reader : cell.readers) mixRef(all, reader);
     }
-    return hash;
+    grid.fingerprint = all;
+    grid.writersFingerprint = writers;
 }
 
 void BackingAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
@@ -1179,27 +1185,37 @@ void BackingAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
     if (graph.incomingBoundaryAccessesByBatch.size() != graph.batches.size())
         throw std::invalid_argument("Compiled graph has no boundary access stream");
     auto& resolved = m_accesses.Resolve(resources, backingSet);
-    // A capture lists each resource once, and each batch's sources once; one with very many sources is not kept.
+    // A capture lists each resource once (taken: 1 listed, 2 also written), and each batch's sources once. A producer is found
+    // listed by its mark, a fixed point by a search among the batch's fixed points (there are few).
     std::vector<uint8_t> taken;
-    bool keep = capture != nullptr;
     if (capture) {
         capture->valid = false;
         capture->entries.clear();
         capture->waits.assign(graph.batches.size(), {});
         taken.assign(ordered.size(), 0);
+        if (m_producerMarks.size() < m_producers.size()) m_producerMarks.resize(m_producers.size(), 0);
     }
     uint64_t waitsAdded = 0;
     for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
         const auto& batch = graph.batches[batchIndex];
         const auto consumerTimeline = queues[batch.queue].timeline;
         const auto before = incoming[batchIndex].size();
+        const uint64_t mark = capture ? ++m_mark : 0;
+        // Neighbouring cells mostly name the same access: one added just before adds nothing new.
+        AccessRef last{};
         const auto add = [&](const AccessRef& ref) {
+            if (ref == last) return;
+            last = ref;
             AppendWait(incoming[batchIndex], PointOf(ref), consumerTimeline);
-            if (!keep || (!ref.producer && !ref.point.value)) return;
+            if (!capture || (!ref.producer && !ref.point.value)) return;
             auto& sources = capture->waits[batchIndex];
-            if (std::ranges::find(sources, ref) != sources.end()) return;
-            if (sources.size() >= 64) keep = false;
-            else sources.push_back(ref);
+            if (ref.producer) {
+                if (m_producerMarks[ref.producer] == mark) return;
+                m_producerMarks[ref.producer] = mark;
+            } else if (std::ranges::find(sources, ref) != sources.end()) {
+                return;
+            }
+            sources.push_back(ref);
         };
         for (const auto& access : graph.incomingBoundaryAccessesByBatch[batchIndex]) {
             const auto resourceIndex = access.resource;
@@ -1207,9 +1223,9 @@ void BackingAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
             if (!ordered[resourceIndex].resource.valid()) continue;
             auto*& grid = resolved[resourceIndex];
             if (!grid) grid = const_cast<AccessGrid*>(m_accesses.Find(Key(ordered[resourceIndex].resource)));
-            if (capture && !taken[resourceIndex]) {
-                taken[resourceIndex] = 1;
-                capture->entries.push_back({resourceIndex, grid != nullptr, grid ? grid->fingerprint : 0});
+            if (capture) {
+                if (!taken[resourceIndex]) capture->entries.push_back({resourceIndex, grid != nullptr, false, 0});
+                taken[resourceIndex] |= write ? 3 : 1;
             }
             if (!grid) continue;
             if (grid->shape != ordered[resourceIndex].shape)
@@ -1222,7 +1238,15 @@ void BackingAccessAdmissionLedger::AppendIncomingWaits(const Schedule& graph,
         }
         waitsAdded += incoming[batchIndex].size() - before;
     }
-    if (capture) capture->valid = keep;
+    if (capture) {
+        // The fingerprints the waits depend on: a written resource's whole grid, a read one's writers.
+        for (auto& entry : capture->entries) {
+            entry.readers = taken[entry.resource] == 3;
+            if (const auto* grid = resolved[entry.resource])
+                entry.fingerprint = entry.readers ? grid->fingerprint : grid->writersFingerprint;
+        }
+        capture->valid = true;
+    }
     BT_PLOT("ORG.Execution.CrossFrameHazardWaits", static_cast<int64_t>(waitsAdded));
     if (waitsAdded) basic_telemetry::AddCounter(
         "ORG.Execution.CrossFrameHazardWaits", static_cast<int64_t>(waitsAdded));
@@ -1245,7 +1269,7 @@ bool BackingAccessAdmissionLedger::PredictedWaits(const AccessPrediction& predic
             if (entry.present) return false;
             continue;
         }
-        if (!entry.present || grid->fingerprint != entry.fingerprint) return false;
+        if (!entry.present || (entry.readers ? grid->fingerprint : grid->writersFingerprint) != entry.fingerprint) return false;
     }
     uint64_t waitsAdded = 0;
     for (uint32_t batchIndex = 0; batchIndex < graph.batches.size(); ++batchIndex) {
@@ -1279,7 +1303,12 @@ void BackingAccessAdmissionLedger::AppendBoundaryAccessWaits(const Schedule& gra
             // One entry per timeline among this access's own: another access of the resource may add the same timeline again, which
             // the reader merges (the latest value per timeline). Searching every earlier entry would cost the batch's accesses squared.
             const size_t first = waits.size();
-            const auto append = [&](ExecutionTimelinePoint point) {
+            // Neighbouring cells mostly name the same access: one appended just before adds nothing new.
+            AccessRef last{};
+            const auto append = [&](const AccessRef& ref) {
+                if (ref == last) return;
+                last = ref;
+                const auto point = PointOf(ref);
                 if (!point.timeline || !point.value) return;
                 for (size_t i = first; i < waits.size(); ++i)
                     if (waits[i].second.timeline == point.timeline) {
@@ -1290,8 +1319,8 @@ void BackingAccessAdmissionLedger::AppendBoundaryAccessWaits(const Schedule& gra
             };
             Visit(grid->shape, access.range, [&](uint32_t mip, uint32_t slice) {
                 const auto& cell = grid->cells[CellIndex(grid->shape, mip, slice)];
-                append(PointOf(cell.writer));
-                for (const auto& reader : cell.readers) append(PointOf(reader));
+                append(cell.writer);
+                for (const auto& reader : cell.readers) append(reader);
             });
         }
     }
@@ -1306,32 +1335,41 @@ void BackingAccessAdmissionLedger::Commit(const Schedule& graph,
     const auto ordered = OrderBackings(graph, resources);
     if (graph.boundaryAccessesByBatch.size() != graph.batches.size())
         throw std::invalid_argument("Compiled graph has no boundary access stream");
-    const std::vector<uint32_t>* producers = nullptr;
+    Stream* open = nullptr;
     // A stream closed since the admission (its executable admitted again with other backings first) commits fixed points.
     if (const auto found = stream ? m_streams.find(stream) : m_streams.end(); found != m_streams.end()) {
-        if (found->second.size() != graph.batches.size()) throw std::invalid_argument("Commit to an access stream of other batches");
-        producers = &found->second;
+        if (found->second.producers.size() != graph.batches.size())
+            throw std::invalid_argument("Commit to an access stream of other batches");
+        open = &found->second;
     }
     batchCount = (std::min)(batchCount, static_cast<uint32_t>(graph.batches.size()));
+    // A stream's batch moves its producer's latest signal, which every cell the stream touched names. The same stream touches
+    // the same cells every time, so no cell is left naming a later signal than its own.
+    const auto moveProducer = [&](uint32_t batchIndex) {
+        const auto signal = execution.batches[batchIndex].signal;
+        if (!signal.timeline || !signal.value) throw std::invalid_argument("Unsubmitted hazard point");
+        if (!open) return AccessRef{0, signal};
+        const AccessRef ref{open->producers[batchIndex], {}};
+        auto& producer = m_producers[ref.producer];
+        if (producer.signal.timeline && producer.signal.timeline != signal.timeline)
+            throw std::logic_error("A stream's batch signalled another timeline");
+        producer.signal = signal;
+        return ref;
+    };
     auto& resolved = m_accesses.Resolve(resources, backingSet);
     // The grids this commit changes, each hashed once at the end: a grid's fingerprint covers all its cells, and a resource
     // has several accesses a frame.
     const uint64_t commit = ++m_commits;
     thread_local std::vector<AccessGrid*> changedGrids;
     changedGrids.clear();
+    // The same stream on the same graph, backings and batches as its last commit: a grid that commit left as it found it, and that
+    // nothing changed since, needs no walk (Stream).
+    const uint64_t quietBefore = open && open->lastCommit && open->graph == &graph && open->backingSet == backingSet && backingSet
+        && open->batchCount == batchCount ? open->lastCommit : 0;
+    uint64_t skipped = 0;
     for (uint32_t batchIndex = 0; batchIndex < batchCount; ++batchIndex) {
+        const auto ref = moveProducer(batchIndex);
         const auto signal = execution.batches[batchIndex].signal;
-        if (!signal.timeline || !signal.value) throw std::invalid_argument("Unsubmitted hazard point");
-        // A stream's batch: its producer's latest signal, which every cell the stream touched names (the same stream touches the
-        // same cells every time, so none is left naming a later signal than its own).
-        AccessRef ref{0, signal};
-        if (producers) {
-            ref = {(*producers)[batchIndex], {}};
-            auto& producer = m_producers[ref.producer];
-            if (producer.signal.timeline && producer.signal.timeline != signal.timeline)
-                throw std::logic_error("A stream's batch signalled another timeline");
-            producer.signal = signal;
-        }
         for (const auto& access : graph.boundaryAccessesByBatch[batchIndex]) {
             const auto resourceIndex = access.resource;
             const bool write = access.state.write;
@@ -1346,6 +1384,10 @@ void BackingAccessAdmissionLedger::Commit(const Schedule& graph,
                 grid.cells.resize(size_t{grid.shape.mips} * grid.shape.slices);
             } else if (grid.shape != backing.shape) {
                 throw std::invalid_argument("Backing access shape changed without identity change");
+            }
+            if (!inserted && grid.changedIn < quietBefore) {
+                ++skipped;
+                continue;
             }
             // A cell is written only when who touched it changes, so a frame that repeats leaves it (and the grid's fingerprint) as it
             // was. Its readers are those since its writer last changed, one per producer (a stream's batch) and one per timeline
@@ -1380,7 +1422,14 @@ void BackingAccessAdmissionLedger::Commit(const Schedule& graph,
             }
         }
     }
-    for (auto* grid : changedGrids) grid->fingerprint = Fingerprint(*grid);
+    for (auto* grid : changedGrids) Fingerprint(*grid);
+    if (open) {
+        open->lastCommit = commit;
+        open->graph = &graph;
+        open->backingSet = backingSet;
+        open->batchCount = batchCount;
+    }
+    if (skipped) basic_telemetry::AddCounter("ORG.Execution.QuietCrossFrameAccesses", static_cast<int64_t>(skipped));
 }
 
 namespace {
@@ -1514,12 +1563,14 @@ void BackingAccessAdmissionLedger::ResolvePlannedPoints(
         if (const auto found = points.find(point.value); found != points.end()) point = found->second;
     };
     for (auto& producer : m_producers) resolve(producer.signal);
+    const uint64_t change = ++m_commits;
     m_accesses.ForEach([&](uint64_t, AccessGrid& grid) {
         for (auto& cell : grid.cells) {
             if (!cell.writer.producer) resolve(cell.writer.point);
             for (auto& reader : cell.readers) if (!reader.producer) resolve(reader.point);
         }
-        grid.fingerprint = Fingerprint(grid);
+        Fingerprint(grid);
+        grid.changedIn = change;
     });
 }
 

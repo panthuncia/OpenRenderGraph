@@ -136,8 +136,16 @@ struct AccessRef {
 // first (its writers and readers, as references), and the earlier accesses each batch's waits came from. While the ledger holds the
 // same references, the waits are those accesses' points now.
 struct AccessPrediction {
+    struct Entry {
+        uint32_t resource = 0;
+        bool present = false;
+        // A batch writes the resource, so its readers are waited for too: the grid's whole fingerprint is compared. Otherwise
+        // only its writers can give waits, and only their fingerprint is.
+        bool readers = false;
+        uint64_t fingerprint = 0;
+    };
     bool valid = false;
-    std::vector<StatePrediction::Entry> entries;
+    std::vector<Entry> entries;
     std::vector<std::vector<AccessRef>> waits;  // per batch, each once
 };
 
@@ -349,8 +357,10 @@ private:
     struct AccessGrid {
         CompileResourceShape shape{};
         std::vector<Cell> cells;
-        uint64_t fingerprint = 0;  // of the cells' references, kept by every change (AccessPrediction)
-        uint64_t changedIn = 0;    // the last Commit that changed it (m_commits), whose end hashes it once
+        // Of the cells' references, kept by every change (AccessPrediction): all of them, and the writers alone.
+        uint64_t fingerprint = 0;
+        uint64_t writersFingerprint = 0;
+        uint64_t changedIn = 0;  // the last change to its cells (m_commits). A Commit's end hashes each grid it changed once
     };
     struct Producer {
         ExecutionTimelinePoint signal{};  // the latest; its timeline is set by the first commit
@@ -360,16 +370,30 @@ private:
         return ref.producer ? m_producers[ref.producer].signal : ref.point;
     }
     uint64_t TimelineOf(const AccessRef& ref) const noexcept { return PointOf(ref).timeline; }
-    static uint64_t Fingerprint(const AccessGrid& grid);
+    // Sets both fingerprints.
+    static void Fingerprint(AccessGrid& grid);
     // Closed producers' references become their points, and the producers are reused (after enough have closed).
     void FixClosedProducers();
     detail::BackingTable<AccessGrid> m_accesses;
     std::vector<Producer> m_producers{1};  // [0] unused: AccessRef::producer 0 is a point
     std::vector<uint32_t> m_freeProducers;
     size_t m_closedProducers = 0;
-    std::unordered_map<uint64_t, std::vector<uint32_t>> m_streams;  // id -> its batches' producers
+    // An open stream. A grid its last commit left as it found it, and that nothing changed since, is left as it is again: the walk
+    // over its cells would find them naming these producers already (Commit skips it). That holds only for the same graph,
+    // backings and batches as that commit.
+    struct Stream {
+        std::vector<uint32_t> producers;  // per batch
+        uint64_t lastCommit = 0;          // m_commits
+        const Schedule* graph = nullptr;
+        uint64_t backingSet = 0;
+        uint32_t batchCount = 0;
+    };
+    std::unordered_map<uint64_t, Stream> m_streams;
     uint64_t m_nextStream = 1;
-    uint64_t m_commits = 0;  // Commit calls so far
+    uint64_t m_commits = 0;  // Commit calls and other changes so far
+    // AppendIncomingWaits' capture lists each producer once per batch: the batch's mark per producer.
+    mutable std::vector<uint64_t> m_producerMarks;
+    mutable uint64_t m_mark = 0;
 };
 
 // Tracks submitted use of physical placed-resource ranges. Different graph
