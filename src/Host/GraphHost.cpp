@@ -3990,7 +3990,7 @@ GraphHost::TicketCommit GraphHost::CommitTicket(Async& async, uint32_t index, st
 		throw std::logic_error("A revision's recording was given for a live epoch, which records every run");
 	}
 	if (async.revisionDriven[index]) {
-		std::string why = "no recording given";
+		std::string why;  // empty unless the bind says why (no allocation on the common path)
 		const bool bound = recording && recording->epoch == async.epochs[index] && run.Published() && run.copy < recording->copies.size()
 			&& RenderGraph::BindPersistentTicketRecording(*ticket, recording->copies[run.copy], async.backingVersion.load(std::memory_order_acquire), &why);
 		if (!bound) {
@@ -3999,7 +3999,8 @@ GraphHost::TicketCommit GraphHost::CommitTicket(Async& async, uint32_t index, st
 			discard.epochIndex = index;
 			discard.ticket = std::move(ticket);
 			postDiscard(discard);
-			throw std::logic_error("A revision-driven epoch was submitted without its revision's copy for the run: " + why);
+			throw std::logic_error("A revision-driven epoch was submitted without its revision's copy for the run: "
+				+ (why.empty() ? std::string("no recording given") : why));
 		}
 		++m_asyncStats.revisionSubmissions;
 	}
@@ -4088,16 +4089,17 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	// An external epoch's uploads go into the slot's secondary, which its execution runs first: nothing is submitted here.
 	const bool external = commit.external;
 	// Taken at the commit: a ticket without uploads begins, records and closes no list (most have none). Its lists are begun
-	// here, external epochs' too. The other queues' lists only for a ticket with batches on them: otherwise nothing is routed there.
+	// here, external epochs' too. Another queue's list only for a ticket with batches on that queue: uploads go only to the queue of
+	// a batch that uses them (PlanTicketUploads), so nothing is routed to the others.
 	const bool hasUploads = commit.uploads.Any() || !commit.uploads.supported;
 	if (hasUploads && !(external ? lease.uploadSecondary : lease.upload).Recording()) {
 		BT_ZONE_SCOPE("ORG.Host.BeginUploadLists");
 		if (external) async.uploadSecondaryPool->Begin(lease.uploadSecondary);
 		else async.uploadPool->Begin(lease.upload);
 		lease.queueUploads.resize(async.queueUploadKinds.size());
-		const bool otherQueues = m_desc.queueScopedUploads && !RenderGraph::PersistentTicketOnQueue(*ticket, async.graphicsSlot);
-		for (size_t queue = 0; queue < async.queueUploadKinds.size() && otherQueues; ++queue)
-			if (async.queueUploadKinds[queue] && !lease.queueUploads[queue].Recording())
+		for (size_t queue = 0; queue < async.queueUploadKinds.size() && m_desc.queueScopedUploads; ++queue)
+			if (async.queueUploadKinds[queue] && !lease.queueUploads[queue].Recording()
+				&& RenderGraph::PersistentTicketUsesQueue(*ticket, static_cast<uint32_t>(queue)))
 				async.queueUploadPools[static_cast<size_t>(*async.queueUploadKinds[queue])]->Begin(lease.queueUploads[queue]);
 	}
 	lap(timings.checkUs);

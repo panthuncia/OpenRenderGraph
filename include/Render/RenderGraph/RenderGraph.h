@@ -494,8 +494,8 @@ private:
 	// After RecordTakenUploads planned the ticket's uploads by queue: its batches off the graphics queue that will not wait for
 	// the graphics queue's uploads (statistics); 0 when not planned.
 	static uint32_t PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept;
-	// Whether every batch of the ticket's segments runs on queue slot `queue`.
-	static bool PersistentTicketOnQueue(const PersistentTicket& ticket, uint32_t queue) noexcept;
+	// Whether any batch of the ticket's segments runs on queue slot `queue`.
+	static bool PersistentTicketUsesQueue(const PersistentTicket& ticket, uint32_t queue) noexcept;
 	// After RecordTakenUploads planned the ticket's uploads by queue (statistics; zeros when not planned):
 	// - lateRouted, lateWaits: its destinations that are a late-bound version's backing (VersionedBuffer::CreateLateBound) that went to a
 	//   declaring batch's queue, and those a batch off the graphics queue waits for;

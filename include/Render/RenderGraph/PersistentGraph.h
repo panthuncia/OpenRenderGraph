@@ -706,6 +706,8 @@ private:
     uint64_t m_predicted = 0, m_planned = 0;
     uint64_t m_domain = 0;
     std::map<uint64_t,uint64_t> m_submitted;
+    // Commit's check that a receipt's signals rise: each timeline's last value so far (kept, under the sequencer's mutex).
+    std::vector<std::pair<uint64_t,uint64_t>> m_commitRising;
     struct RetainedFrame {
         std::shared_ptr<const SelectedPublication> publication;
         std::vector<compiler::ExecutionTimelinePoint> completions;

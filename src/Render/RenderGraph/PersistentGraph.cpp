@@ -2026,14 +2026,20 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const compiler::G
     Require(receipt.batches.size() == graph.batches.size(), "Invalid admission receipt");
     const auto count = signaledBatches == UINT32_MAX ? static_cast<uint32_t>(graph.batches.size()) : signaledBatches;
     Require(count <= graph.batches.size(), "Invalid partial admission receipt");
-    auto submitted = m_submitted;
+    // Checked against the submitted values without copying them; m_submitted changes only once the ledgers have committed.
+    auto& rising = m_commitRising;
+    rising.clear();
     for (uint32_t i = 0; i < count; ++i) {
         const auto& batch = receipt.batches[i];
         Require(batch.signal.timeline && batch.signal.value, "Admission receipt has no signal");
         Require(batch.signal.timeline == frame.queueTimelines.at(graph.batches[i].queue), "Receipt uses the wrong queue timeline");
-        auto& previous = submitted[batch.signal.timeline];
-        Require(batch.signal.value > previous, "Admission signal is not monotonic");
-        previous = batch.signal.value;
+        auto found = std::ranges::find(rising, batch.signal.timeline, &std::pair<uint64_t, uint64_t>::first);
+        if (found == rising.end()) {
+            const auto submitted = m_submitted.find(batch.signal.timeline);
+            found = rising.insert(rising.end(), {batch.signal.timeline, submitted == m_submitted.end() ? 0 : submitted->second});
+        }
+        Require(batch.signal.value > found->second, "Admission signal is not monotonic");
+        found->second = batch.signal.value;
     }
     RetainedFrame retained{frame.publication,{}};
     auto appendCompletion = [&](compiler::ExecutionTimelinePoint point) {
@@ -2044,8 +2050,11 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const compiler::G
     };
     for (uint32_t i = 0; i < count; ++i) appendCompletion(receipt.batches[i].signal);
     for (const auto point : receipt.tailCompletions) appendCompletion(point);
-    for (const auto point : retained.completions)
-        submitted[point.timeline] = (std::max)(submitted[point.timeline],point.value);
+    for (const auto point : retained.completions) {
+        const auto found = std::ranges::find(rising, point.timeline, &std::pair<uint64_t, uint64_t>::first);
+        if (found == rising.end()) rising.push_back({point.timeline, point.value});
+        else found->second = (std::max)(found->second, point.value);
+    }
     // Allocate retention before mutating submission-backed ledgers.
     if (!retained.completions.empty()) m_retained.push_back(std::move(retained));
     const auto& barriers = frame.Barriers();
@@ -2055,7 +2064,10 @@ void SynchronousAdmission::Commit(const FrameAdmission& frame, const compiler::G
             ResourceSequencer::IncomingRevision{effect.revision,effect.completion});
     m_sequencer->accesses.Commit(graph, frame.backings, receipt, count, frame.backings.Id(), frame.stream);
     m_sequencer->aliases.Commit(graph, frame.backings, receipt, count);
-    m_submitted = std::move(submitted);
+    for (const auto& [timeline, value] : rising) {
+        auto& submitted = m_submitted[timeline];
+        submitted = (std::max)(submitted, value);
+    }
     ErasePendingOwner(frame.sequence);
     m_pending.erase(pending);
 }

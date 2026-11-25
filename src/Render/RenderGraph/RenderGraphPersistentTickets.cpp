@@ -140,13 +140,14 @@ uint64_t RenderGraph::PersistentTicketHostFrame(const PersistentTicket& ticket) 
 ExecutionHandle RenderGraph::PersistentTicketExecution(const PersistentTicket& ticket) noexcept { return ExecutionHandle(ticket.execution); }
 uint64_t RenderGraph::PersistentTicketHostTag(const PersistentTicket& ticket) noexcept { return ticket.hostTag; }
 void RenderGraph::SetPersistentTicketHostTag(PersistentTicket& ticket, uint64_t tag) noexcept { ticket.hostTag = tag; }
-bool RenderGraph::PersistentTicketOnQueue(const PersistentTicket& ticket, uint32_t queue) noexcept {
+bool RenderGraph::PersistentTicketUsesQueue(const PersistentTicket& ticket, uint32_t queue) noexcept {
 	for (const auto& segment : ticket.segments) {
 		const auto& publication = segment.admission.publication;
-		if (!publication || !publication->executable || !publication->executable->graph) return false;
-		if (!std::ranges::all_of(publication->executable->graph->batches, [&](const auto& batch) { return batch.queue == queue; })) return false;
+		// Unknown: taken as used.
+		if (!publication || !publication->executable || !publication->executable->graph) return true;
+		if (std::ranges::any_of(publication->executable->graph->batches, [&](const auto& batch) { return batch.queue == queue; })) return true;
 	}
-	return true;
+	return false;
 }
 uint32_t RenderGraph::PersistentTicketSparedUploadWaits(const PersistentTicket& ticket) noexcept {
 	return ticket.queueUploads.planned ? ticket.queueUploads.spared : 0;
@@ -165,6 +166,21 @@ bool RenderGraph::PersistentRecordingReplayable(const PersistentRecording& recor
 	return recording.replayable;
 }
 
+namespace {
+// A candidate's segment for its ticket. A candidate holds only what AddPersistentTicketCandidate sets, so only that is copied (the
+// rest of a segment, its admission's plan above all, is empty until the ticket is admitted).
+void TakeCandidateSegment(std::vector<RenderGraph::PersistentTicket::Segment>& segments, const RenderGraph::PersistentTicket::Segment& candidate) {
+	auto& segment = segments.emplace_back();
+	segment.admission.publication = candidate.admission.publication;
+	segment.recording = candidate.recording;
+	segment.bindings = candidate.bindings;
+	segment.resourceHeap = candidate.resourceHeap;
+	segment.samplerHeap = candidate.samplerHeap;
+	segment.waits = candidate.waits;
+	segment.rebindings = candidate.rebindings;
+}
+}
+
 bool RenderGraph::BindPersistentTicketRecording(PersistentTicket& ticket, std::shared_ptr<const PersistentRecording> recording, uint64_t hostTag,
 	std::string* why) {
 	auto fail = [&](const char* reason) {
@@ -177,7 +193,7 @@ bool RenderGraph::BindPersistentTicketRecording(PersistentTicket& ticket, std::s
 		for (const auto* candidate = ticket.candidates.load(std::memory_order_acquire); candidate; candidate = candidate->next) {
 			if (candidate->segment.recording != recording) continue;
 			recording->lastUse.store(ticket.hostFrame, std::memory_order_relaxed);
-			ticket.segments.push_back(candidate->segment);
+			TakeCandidateSegment(ticket.segments, candidate->segment);
 			ticket.chosen = candidate;
 			ticket.revisions = recording->revisions;
 			return true;
@@ -191,7 +207,7 @@ bool RenderGraph::BindPersistentTicketRecording(PersistentTicket& ticket, std::s
 		recording->lastUse.store(ticket.hostFrame, std::memory_order_relaxed);
 		for (auto& segment : ticket.segments) ticket.displaced.push_back(std::move(segment));
 		ticket.segments.clear();
-		ticket.segments.push_back(candidate->segment);
+		TakeCandidateSegment(ticket.segments, candidate->segment);
 		ticket.chosen = candidate;
 		ticket.revisions = recording->revisions;
 		return true;
@@ -305,9 +321,10 @@ namespace {
 // another's) starts from the states it leaves.
 void CommitTicketSegment(persistent::SynchronousAdmission& admission, RenderGraph::PersistentTicket::Segment& segment,
 	std::span<const compiler::ExecutionBatchTimeline> batches) {
-	compiler::GraphExecutionTimeline receipt;
-	receipt.batches.reserve(batches.size());
-	for (const auto& batch : batches) receipt.batches.push_back({batch.signal, batch.waits, {}, {}});
+	// The commit reads only the signals. The receipt is kept (render or submission thread), so a steady frame allocates nothing.
+	thread_local compiler::GraphExecutionTimeline receipt;
+	receipt.batches.resize(batches.size());
+	for (size_t i = 0; i < batches.size(); ++i) receipt.batches[i].signal = batches[i].signal;
 	admission.Commit(segment.admission, receipt);
 	segment.committed = true;
 }
@@ -901,7 +918,12 @@ bool RenderGraph::SubmitPersistentTicket(PersistentTicket& ticket, std::span<uin
 						waitsOffStream = true;
 						split = split || afterStream[producer];
 					}
-				if (execution.segments.empty() || waitsOffStream) execution.segments.emplace_back().split = split;
+				if (execution.segments.empty() || waitsOffStream) {
+					auto& added = execution.segments.emplace_back();
+					added.split = split;
+					added.items.reserve(batchCount - i);
+					added.signals.reserve(batchCount - i);
+				}
 				auto& stream = execution.segments.back();
 				if (streamHandoff[i]) stream.leading.push_back(streamHandoff[i]);
 				for (const auto wait : batches[i].waits) {
