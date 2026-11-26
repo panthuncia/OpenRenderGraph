@@ -164,9 +164,9 @@ private:
             m_popped = reversed;
             return;
         }
-        auto* last = m_popped;
-        while (last->next) last = last->next;
-        last->next = reversed;
+        auto* tail = m_popped;
+        while (tail->next) tail = tail->next;
+        tail->next = reversed;
     }
 
     struct Cell {
