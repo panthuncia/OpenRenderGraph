@@ -225,7 +225,10 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 		if (!queues.IsAutoAssignable(index)) continue;
 		const auto kind = queues.GetKind(index);
 		const bool automatic = resources.queueAssignmentPolicy == QueueAssignmentPolicy::Automatic && kindCompatible(kind);
-		if (automatic || kind == resources.preferredQueueKind) compatible.push_back(static_cast<uint32_t>(slot));
+		if (!automatic && kind != resources.preferredQueueKind) continue;
+		// A kind without a queue of its own runs on the queue the device aliases it to, in that queue's slot.
+		const auto physical = static_cast<uint32_t>(ToUnderlying(queues.PhysicalSlot(index)));
+		if (std::find(compatible.begin(), compatible.end(), physical) == compatible.end()) compatible.push_back(physical);
 	}
 	// Pick the pass's device. It is the primary device unless the pass's backend affinity names another one. A preferred
 	// device falls back to the primary when it is not available.

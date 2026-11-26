@@ -140,6 +140,11 @@ public:
 	/// Find any Graphics-kind queue slot (for transition fallback).
 	QueueSlotIndex FindGraphicsSlot() const noexcept;
 
+	/// The first slot of the same device on the same native queue as slot i, or i. A kind the device has no queue of its own
+	/// for (it aliases another kind's queue) folds into that queue's slot: passes placed there share its timeline, so no
+	/// cross-queue wait or semaphore is left between them.
+	QueueSlotIndex PhysicalSlot(QueueSlotIndex i) const noexcept;
+
 	/// Returns true if the queue at this slot supports the full range of resource state transitions.
 	bool SupportsFullTransitions(QueueSlotIndex i) const noexcept {
 		return GetKind(i) == QueueKind::Graphics;

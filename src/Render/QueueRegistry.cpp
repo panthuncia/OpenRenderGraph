@@ -180,6 +180,20 @@ QueueSlotIndex QueueRegistry::FindGraphicsSlot() const noexcept {
 	return static_cast<QueueSlotIndex>(0);
 }
 
+QueueSlotIndex QueueRegistry::PhysicalSlot(QueueSlotIndex i) const noexcept {
+	const auto& slot = m_slots[ToUnderlying(i)];
+	if (!slot.queue) return i;
+	const auto handle = slot.queue.GetQueueHandle();
+	for (size_t earlier = 0; earlier < ToUnderlying(i); ++earlier) {
+		const auto& other = m_slots[earlier];
+		if (other.backendInstance != slot.backendInstance || !other.queue) continue;
+		const auto otherHandle = other.queue.GetQueueHandle();
+		if (otherHandle.index == handle.index && otherHandle.generation == handle.generation)
+			return static_cast<QueueSlotIndex>(static_cast<uint8_t>(earlier));
+	}
+	return i;
+}
+
 void QueueRegistry::Clear() {
 	ShutdownTaskWorkers();
 	for (auto& slot : m_slots) {
