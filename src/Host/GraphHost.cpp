@@ -1056,12 +1056,36 @@ void GraphHost::DestroyGraph() {
 	ReleaseRetiredGraphs(true);
 }
 
+void GraphHost::RetireGraph(std::unique_ptr<RenderGraph> graph, GpuPoint done, uint32_t epoch) {
+	BT_ZONE_SCOPE("ORG.Host.RetireGraph");
+	// Its running builds, frame-worker tasks and ownership retirements finish on the workers. Those run below the render
+	// thread's priority, so on a busy machine they can take seconds: the graph is released once they have (ReleaseRetiredGraphs).
+	graph->CancelFrameProduction();
+	m_retiredGraphs.push_back({std::move(graph), std::move(done), epoch});
+}
+
 void GraphHost::ReleaseRetiredGraphs(bool all) {
 	if (m_retiredGraphs.empty()) return;
-	if (!all && std::ranges::none_of(m_retiredGraphs, [](const RetiredGraph& retired) { return retired.done.Reached(); })) return;
+	// GPU work done and CPU work drained. Both only move forward once the graph is retired.
+	const auto releasable = [](RetiredGraph& retired) {
+		if (!retired.done.Reached()) return false;
+		const auto busy = retired.graph->FrameProductionBusy();
+		if (!busy) return true;
+		const auto waited = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - retired.retired).count();
+		if (!retired.reported && waited >= 100.0) {
+			retired.reported = true;
+			spdlog::info("GraphHost: epoch {}'s replaced graph is held {:.0f} ms after its attach: its GPU work is done, and its{}{}{} "
+						 "tasks still run or wait for a worker",
+				retired.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(retired.epoch), waited,
+				(busy & RenderGraph::kFrameProductionBuild) ? " build" : "", (busy & RenderGraph::kFrameProductionWorker) ? " frame-worker" : "",
+				(busy & RenderGraph::kFrameProductionRetirement) ? " ownership-retirement" : "");
+		}
+		return false;
+	};
+	if (!all && std::ranges::none_of(m_retiredGraphs, releasable)) return;
 	const auto release = [&] {
 		std::erase_if(m_retiredGraphs, [&](RetiredGraph& retired) {
-			if (!all && !retired.done.Reached()) return false;
+			if (!all && !releasable(retired)) return false;
 			if (all) (void)retired.done.Wait();
 			BT_ZONE_SCOPE("ORG.Host.ReleaseRetiredGraph");
 			retired.graph->ShutdownExtensions();
@@ -1080,9 +1104,13 @@ void GraphHost::ReleaseRetiredGraphs(bool all) {
 			return true;
 		});
 	};
+	const auto begin = std::chrono::steady_clock::now();
+	const auto before = m_retiredGraphs.size();
 	// A graph's teardown touches services the host's thread uses (its upload client's timelines, descriptors): it holds still.
 	if (m_async && !m_async->holding) HoldAsync({}, release);
 	else release();
+	if (const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(); !all && ms >= 10.0)
+		spdlog::info("GraphHost: released {} replaced graph(s) in {:.3f} ms; {} still held", before - m_retiredGraphs.size(), ms, m_retiredGraphs.size());
 }
 
 void GraphHost::SetGpuPassRangeCallbacks(RenderGraph::GpuPassRangeBegin begin, RenderGraph::GpuPassRangeEnd end) {
@@ -1289,8 +1317,7 @@ void GraphHost::InstallGraph(size_t index, std::unique_ptr<RenderGraph> graph, u
 	// while it is still listed. It is released once that is done, the other epochs running meanwhile.
 	auto done = instance.graph ? SubmittedPoint() : GpuPoint{};
 	if (auto old = std::move(instance.graph)) {
-		old->StopFrameProduction();
-		m_retiredGraphs.push_back({std::move(old), std::move(done)});
+		RetireGraph(std::move(old), std::move(done), instance.epoch);
 		++m_asyncStats.rebuilds;
 	}
 	instance.graph = std::move(graph);
@@ -1471,9 +1498,7 @@ void GraphHost::RetireStaged(size_t index) {
 	if (instance.staged && instance.staged->m_graph) {
 		// Never submitted: it is released once the work submitted so far is done, like a replaced graph.
 		instance.staged->m_uploads = nullptr;
-		auto graph = std::move(instance.staged->m_graph);
-		graph->StopFrameProduction();
-		m_retiredGraphs.push_back({std::move(graph), SubmittedPoint()});
+		RetireGraph(std::move(instance.staged->m_graph), SubmittedPoint(), instance.epoch);
 	}
 	instance.staged.reset();
 	instance.stagedGeneration = 0;

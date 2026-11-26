@@ -622,6 +622,13 @@ public:
 	// Serialized producer boundary. Joins CPU frame work without releasing
 	// submitted ownership; the caller can then wait for every device to idle.
 	void StopFrameProduction();
+	// Owner thread, never blocks: frame production stops, and the queued builds and frame-worker tasks are dropped. Tasks
+	// already running and the ownership retirements finish on their own (FrameProductionBusy). For a graph an attach replaces.
+	void CancelFrameProduction() noexcept;
+	// The scopes whose tasks are still queued or running, as FrameProductionScope bits. None once CancelFrameProduction's
+	// work has drained. Never blocks.
+	enum FrameProductionScope : uint32_t { kFrameProductionBuild = 1, kFrameProductionWorker = 2, kFrameProductionRetirement = 4 };
+	uint32_t FrameProductionBusy() const noexcept;
 	// Requires GPU idle. Releases frame ownership after CPU production stopped.
 	void ShutdownTaskWorkers();
 	// Owner thread, after ShutdownTaskWorkers: gives back the alias placements the graph made and its requirements in the

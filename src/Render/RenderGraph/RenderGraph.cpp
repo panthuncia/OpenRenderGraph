@@ -1,6 +1,7 @@
 #include <algorithm>
 
 #include "RenderGraphInternal.h"
+#include "RenderGraphPersistentState.h"
 #include "Render/Runtime/RuntimeDevice.h"
 #include "OpenRenderGraph/Runtime.h"
 #include "OpenRenderGraph/ExternalClient.h"
@@ -279,13 +280,32 @@ RenderGraph::~RenderGraph() {
 
 void RenderGraph::StopFrameProduction() {
     BT_ZONE_SCOPE("ORG.Frame.StopProduction");
-    m_compilerState->frameProductionStopped = true;
-    if (m_compilerState->persistentBuildScope) m_compilerState->persistentBuildScope->CancelAndWait();
+    CancelFrameProduction();
+    if (m_compilerState->persistentBuildScope) m_compilerState->persistentBuildScope->Wait();
     m_compilerState->persistentBuildScope.reset();
-    if (m_compilerState->frameWorkerScope) m_compilerState->frameWorkerScope->CancelAndWait();
+    if (m_compilerState->frameWorkerScope) m_compilerState->frameWorkerScope->Wait();
     m_compilerState->frameWorkerScope.reset();
     if (m_compilerState->ownershipRetirementScope) m_compilerState->ownershipRetirementScope->Wait();
     m_compilerState->ownershipRetirementScope.reset();
+}
+
+void RenderGraph::CancelFrameProduction() noexcept {
+    auto& compiler = *m_compilerState;
+    compiler.frameProductionStopped = true;
+    // A structural build already running stops at its next check.
+    if (compiler.persistent && compiler.persistent->pending) compiler.persistent->pending->cancelled.store(true, std::memory_order_relaxed);
+    if (compiler.persistentBuildScope) compiler.persistentBuildScope->Cancel();
+    if (compiler.frameWorkerScope) compiler.frameWorkerScope->Cancel();
+    // The retirements are never dropped: each releases what a finished frame owned.
+}
+
+uint32_t RenderGraph::FrameProductionBusy() const noexcept {
+    const auto& compiler = *m_compilerState;
+    uint32_t busy = 0;
+    if (compiler.persistentBuildScope && !compiler.persistentBuildScope->Idle()) busy |= kFrameProductionBuild;
+    if (compiler.frameWorkerScope && !compiler.frameWorkerScope->Idle()) busy |= kFrameProductionWorker;
+    if (compiler.ownershipRetirementScope && !compiler.ownershipRetirementScope->Idle()) busy |= kFrameProductionRetirement;
+    return busy;
 }
 
 void RenderGraph::ShutdownTaskWorkers() {

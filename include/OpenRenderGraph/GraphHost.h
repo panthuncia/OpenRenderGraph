@@ -439,6 +439,12 @@ public:
 	/** @brief Any thread. */
 	AttachStats AttachStatsTotal() const noexcept;
 	/**
+	 * @brief Owner thread: the graphs attaches replaced (or staged graphs dropped) that are not released yet. One is released
+	 * once its submitted work is done and its own CPU work (builds, frame-worker tasks, ownership retirements) has drained.
+	 * An attach never waits for that. An application that attaches often can hold its next attach while this is high.
+	 */
+	size_t RetiredGraphCount() const noexcept { return m_retiredGraphs.size(); }
+	/**
 	 * @brief Owner thread: the epochs whose graph has alias placements in a pool generation another graph replaced (the pool
 	 * grew). With Desc::reportStaleAliasPlacements the application rebuilds them (BuildEpochGraph). Otherwise the next build
 	 * point does. A graph placed from a frame placement that is no longer current is not listed: it places again from the
@@ -1201,11 +1207,16 @@ private:
 	// AttachStatsTotal's counters.
 	std::atomic<uint64_t> m_attachCount{0}, m_stageCount{0}, m_setAttachCount{0};
 	std::array<std::atomic<uint64_t>, static_cast<size_t>(AttachRefusal::Count)> m_refusalCounts{};
-	// A graph an epoch's rebuild replaced, released once the work it submitted is done.
+	// A graph an epoch's rebuild replaced, released once the work it submitted is done and its CPU work drained.
 	struct RetiredGraph {
 		std::unique_ptr<RenderGraph> graph;
 		GpuPoint done;
+		uint32_t epoch = UINT32_MAX;
+		std::chrono::steady_clock::time_point retired = std::chrono::steady_clock::now();
+		bool reported = false;  // a long drain was logged
 	};
+	// Retires a graph an attach replaced, or a staged graph never attached. Never blocks (RenderGraph::CancelFrameProduction).
+	void RetireGraph(std::unique_ptr<RenderGraph> graph, GpuPoint done, uint32_t epoch);
 	static constexpr size_t kNoInstance = ~size_t{0};
 	size_t InstanceOf(uint32_t epoch) const noexcept;
 	// The first graph built, null with none: what the runtime's services are reached through on the owner thread.
@@ -1240,7 +1251,7 @@ private:
 	void FailAsyncEpoch(Async& state, uint32_t epochIndex, std::string error);
 	// Owner thread: builds every instance BuildDue names (all: every one requested, explicit builds or not).
 	bool BuildDueInstances(bool all);
-	// Releases the retired graphs whose work is done (all: waits for the rest).
+	// Releases the retired graphs whose GPU and CPU work is done (all: waits for the rest).
 	void ReleaseRetiredGraphs(bool all);
 	// Host-owned queue timelines, made at the first build: graphics, compute, copy.
 	void EnsureTimelines();

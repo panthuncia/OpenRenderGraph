@@ -17,6 +17,8 @@ public:
     virtual void Cancel() noexcept = 0;
     virtual void Wait() = 0;
     virtual void CancelAndWait() = 0;
+    // Whether none of the scope's tasks is queued or running. Never blocks.
+    virtual bool Idle() const noexcept = 0;
 };
 
 class ITaskService {

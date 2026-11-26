@@ -58,6 +58,10 @@ public:
         m_idle.wait(lock, [&] { return m_outstanding == 0; });
     }
     void CancelAndWait() override { Cancel(); Wait(); }
+    bool Idle() const noexcept override {
+        std::lock_guard lock(m_mutex);
+        return m_outstanding == 0;
+    }
 
     bool Cancelled() const noexcept { return m_cancelled.load(std::memory_order_acquire); }
     void Enter() { std::lock_guard lock(m_mutex); ++m_outstanding; }
@@ -68,7 +72,7 @@ public:
 
 private:
     std::atomic_bool m_cancelled{false};
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
     std::condition_variable m_idle;
     size_t m_outstanding = 0;
 };

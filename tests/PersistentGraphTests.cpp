@@ -23,6 +23,10 @@ struct ManualTasks final : org::runtime::ITaskService {
         void Cancel() noexcept override {}
         void Wait() override { owner.RunAll(); }
         void CancelAndWait() override { Wait(); }
+        bool Idle() const noexcept override {
+            for (const auto& job : owner.jobs) if (job) return false;
+            return true;
+        }
     };
     bool reject = false;
     std::vector<std::function<void()>> jobs;
