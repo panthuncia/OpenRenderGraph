@@ -1202,6 +1202,8 @@ struct GraphHost::BuildInputs {
 	uint32_t framePosition = alias::FrameSpans::kNoPosition;
 	bool frameTransients = false;  // the host has frame transients: the graph reports what its passes use
 	std::shared_ptr<rhi::TimelinePtr> frameWaitTimeline;
+	// The kept recordings' timestamps (SetRecordingTimestampMode). The graph keeps the mode it was built with.
+	RenderGraph::RecordingTimestampMode recordingTimestamps = RenderGraph::RecordingTimestampMode::Off;
 	RenderGraph::GpuPassRangeBegin gpuPassRangeBegin;
 	RenderGraph::GpuPassRangeEnd gpuPassRangeEnd;
 	uint64_t hostConfiguration = 0, epochConfiguration = 0, requests = 0, serial = 0;
@@ -1236,6 +1238,7 @@ GraphHost::BuildInputs GraphHost::SnapshotBuildInputs(size_t index) {
 	}
 	inputs.frameTransients = static_cast<bool>(m_frameTransients);
 	inputs.frameWaitTimeline = m_frameWaitTimeline;
+	inputs.recordingTimestamps = m_recordingTimestamps.load(std::memory_order_acquire);
 	inputs.gpuPassRangeBegin = m_gpuPassRangeBegin;
 	inputs.gpuPassRangeEnd = m_gpuPassRangeEnd;
 	inputs.hostConfiguration = m_hostConfiguration.load(std::memory_order_acquire);
@@ -1329,7 +1332,7 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 			});
 		}
 		graph->SetPersistentRecordingReuse(m_desc.reuseRecordings);
-		graph->SetPersistentRecordingTimestampMode(m_recordingTimestamps.load(std::memory_order_acquire));
+		graph->SetPersistentRecordingTimestampMode(inputs.recordingTimestamps);
 		graph->SetScheduleTraceEnabled(m_scheduleTrace.load(std::memory_order_acquire));
 		{
 			auto boundary = m_desc.queueBoundary;

@@ -56,8 +56,9 @@ submission point is an **epoch**.
         (`RebuildRequested(epoch)`).
     -   The attach is rejected, with a reason, when the build failed, when the host's configuration changed since the build
         started, or when the epoch runs a graph whose build started later. Configuration means: an extension of the epoch
-        added or removed, the epoch made external or not, the frame-wait timeline, the queue boundary, recording timestamps,
-        `DestroyGraph`. The caller drops the graph and builds again.
+        added or removed, the epoch made external or not, the frame-wait timeline, the queue boundary, `DestroyGraph`. The
+        caller drops the graph and builds again. Recording timestamps are a build input instead: a graph keeps the mode it was
+        built with, and a change only requests a rebuild.
     -   Builds of different epochs may run in parallel, and so may two builds of one epoch. Each makes a graph of its own;
         only one that started after the attached graph's build can be attached.
     -   A dropped `EpochGraph` is destroyed on the dropping thread. It never ran, so its teardown waits for nothing. Drop or

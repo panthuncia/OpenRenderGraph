@@ -185,14 +185,14 @@ public:
 	// Pass and barrier-batch timestamps in the recordings kept across frames (RenderGraph::SetPersistentRecordingTimestamps),
 	// off by default: read back with the other pass timestamps (IStatisticsService::GetCompletedTimestamps, in the completed
 	// frame callback). A change requests a rebuild, so every kept recording (a revision's epochs) is recorded again with them,
-	// or without; until that build, kept recordings stay as they were recorded.
+	// or without; until that build, kept recordings stay as they were recorded. The mode is a build input, not host
+	// configuration: a graph built, staged or attached with the old mode stays valid and runs until its rebuild replaces it.
 	void SetRecordingTimestamps(bool enabled) noexcept {
 		SetRecordingTimestampMode(enabled ? RenderGraph::RecordingTimestampMode::Passes : RenderGraph::RecordingTimestampMode::Off);
 	}
 	// Per pass (Passes) or one range per kept list (Lists; RenderGraph::SetPersistentRecordingTimestampMode).
 	void SetRecordingTimestampMode(RenderGraph::RecordingTimestampMode mode) noexcept {
 		if (m_recordingTimestamps.exchange(mode, std::memory_order_acq_rel) == mode) return;
-		m_hostConfiguration.fetch_add(1, std::memory_order_acq_rel);
 		RequestRebuild("recording timestamps switched");
 	}
 	bool RecordingTimestamps() const noexcept {
@@ -336,7 +336,7 @@ public:
 	 * Rejected, with a reason, when:
 	 * - the build failed,
 	 * - the host's configuration changed since the build started: an extension of the epoch added or removed, its epoch made
-	 *   external or not, the frame-wait timeline, the queue boundary, recording timestamps, DestroyGraph,
+	 *   external or not, the frame-wait timeline, the queue boundary, DestroyGraph,
 	 * - the epoch runs a graph whose build started after this one's.
 	 */
 	AttachResult AttachEpochGraph(std::unique_ptr<EpochGraph>& graph);
