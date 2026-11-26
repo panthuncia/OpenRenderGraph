@@ -30,6 +30,8 @@ int Run(int argc, char** argv) {
     bool streaming = true;
     bool grouped = false;
     bool checkTarget = false, passed = true;
+    // Measured frames per run (after 1000 warm-up frames), and runs. ctest takes fewer: a full run takes about a minute in Debug.
+    uint32_t frames = 10000, runs = 5;
     for (int i = 1; i < argc; ++i) {
         if (i + 1 < argc && std::string(argv[i]) == "--replay") replayPath = argv[++i];
         else if (i + 1 < argc && std::string(argv[i]) == "--sequence") sequencePath = argv[++i];
@@ -37,8 +39,11 @@ int Run(int argc, char** argv) {
         else if (std::string(argv[i]) == "--static") streaming = false;
         else if (std::string(argv[i]) == "--groups") grouped = true;
         else if (std::string(argv[i]) == "--check-target") checkTarget = true;
-        else { std::fprintf(stderr,"Usage: [--replay FILE] [--write-replay FILE] [--static] [--groups] [--check-target] | --sequence FILE\n"); return 2; }
+        else if (i + 1 < argc && std::string(argv[i]) == "--frames") frames = static_cast<uint32_t>(std::stoul(argv[++i]));
+        else if (i + 1 < argc && std::string(argv[i]) == "--runs") runs = static_cast<uint32_t>(std::stoul(argv[++i]));
+        else { std::fprintf(stderr,"Usage: [--replay FILE] [--write-replay FILE] [--static] [--groups] [--check-target] [--frames N] [--runs N] | --sequence FILE\n"); return 2; }
     }
+    if (!frames || !runs) { std::fprintf(stderr,"--frames and --runs must be positive\n"); return 2; }
     if (!sequencePath.empty()) {
         if (!replayPath.empty() || !exportPath.empty() || !streaming || grouped || checkTarget)
             throw std::invalid_argument("Sequence replay must be run without synthetic benchmark options");
@@ -112,18 +117,18 @@ int Run(int argc, char** argv) {
         std::ofstream output(exportPath);
         WriteGraphReplay(output,*program.Select()->executable->graph->structure);
     }
-    for (int run = 0; run < 5; ++run) {
+    for (uint32_t run = 0; run < runs; ++run) {
         SynchronousAdmission admission;
         std::vector<ExecutionTimelinePoint> queues(program.Select()->executable->graph->structure->queues.size());
         for (uint32_t i = 0; i < queues.size(); ++i) queues[i] = {i+1,0};
-        std::vector<double> samples; samples.reserve(10000);
+        std::vector<double> samples; samples.reserve(frames);
         uint64_t digest = 0;
         uint64_t generationBuilds = 0, bindingChanges = 0;
         double publicationBuildMs = 0;
         std::vector<SynchronousAdmission::RetirementTicket> retirements;
         size_t peakStateBackings = 0, peakHazardBackings = 0, peakRetirements = 0;
         uint64_t retiredBindings = 0;
-        for (uint32_t frame = 0; frame < 11000; ++frame) {
+        for (uint32_t frame = 0; frame < frames + 1000; ++frame) {
             const auto begin = std::chrono::steady_clock::now();
             // Include maintenance in the timed scope rather than hiding its
             // owner-thread cost. The previous iteration's CPU roots are gone.
@@ -192,11 +197,12 @@ int Run(int argc, char** argv) {
             throw std::runtime_error("Streaming retirement failed to bound admission metadata");
         const auto mean = std::accumulate(samples.begin(),samples.end(),0.0)/samples.size();
         std::sort(samples.begin(),samples.end());
-        passed &= mean <= 1.0 && samples[9899] <= 2.0;
-        std::printf("{\"run\":%d,\"scope\":\"%s\",\"workload\":\"%s\",\"frames\":10000,\"mean_ms\":%.6f,\"p50_ms\":%.6f,\"p95_ms\":%.6f,\"p99_ms\":%.6f,\"max_ms\":%.6f,\"digest\":%llu,\"binding_changes\":%llu,\"generation_builds\":%llu,\"publication_build_ms\":%.6f,\"retired_bindings_including_warmup\":%llu,\"peak_state_backings\":%zu,\"peak_hazard_backings\":%zu,\"peak_retirement_tickets\":%zu}\n",
+        const auto percentile = [&](double fraction) { return samples[static_cast<size_t>(std::ceil(samples.size()*fraction))-1]; };
+        passed &= mean <= 1.0 && percentile(.99) <= 2.0;
+        std::printf("{\"run\":%u,\"scope\":\"%s\",\"workload\":\"%s\",\"frames\":%u,\"mean_ms\":%.6f,\"p50_ms\":%.6f,\"p95_ms\":%.6f,\"p99_ms\":%.6f,\"max_ms\":%.6f,\"digest\":%llu,\"binding_changes\":%llu,\"generation_builds\":%llu,\"publication_build_ms\":%.6f,\"retired_bindings_including_warmup\":%llu,\"peak_state_backings\":%zu,\"peak_hazard_backings\":%zu,\"peak_retirement_tickets\":%zu}\n",
             run,grouped ? "synthetic_groups_bindings_and_admission" :
                 (recordingBindings.empty() ? "synthetic_bindings_and_admission" : "synthetic_typed_bindings_and_admission"),
-            streaming ? "streaming" : "static",mean,samples[4999],samples[9499],samples[9899],samples.back(),static_cast<unsigned long long>(digest),
+            streaming ? "streaming" : "static",frames,mean,percentile(.5),percentile(.95),percentile(.99),samples.back(),static_cast<unsigned long long>(digest),
             static_cast<unsigned long long>(bindingChanges),static_cast<unsigned long long>(generationBuilds),publicationBuildMs,
             static_cast<unsigned long long>(retiredBindings),peakStateBackings,peakHazardBackings,peakRetirements);
     }

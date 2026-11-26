@@ -42,6 +42,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <Resources/ExternalTextureResource.h>
 #include <Render/RenderGraph/PersistentAliasArena.h>
@@ -1908,6 +1909,12 @@ static int Run(int argc, char** argv) {
 					std::atomic<bool>& finished;
 					std::thread& thread;
 					~JoinWatchdog() {
+						// A throw with executions held cannot unwind: the host's end would wait for runs that are never executed.
+						if (std::uncaught_exceptions()) {
+							std::puts("FAIL: leases: an exception while executions were held");
+							std::fflush(stdout);
+							std::_Exit(1);
+						}
 						finished.store(true, std::memory_order_release);
 						if (thread.joinable()) thread.join();
 					}
@@ -1923,7 +1930,7 @@ static int Run(int argc, char** argv) {
 					// Every run of the frame had a lease of its own.
 					for (size_t a = 0; a < frameRuns.size(); ++a) {
 						// With replayable recordings a live run may hold a kept copy, which names its copy like a published one.
-						REQUIRE(frameRuns[a].Leased() && (wide || !frameRuns[a].Published()), "a live run is leased");
+						REQUIRE((wide && frameRuns[a].Published()) || (frameRuns[a].Leased() && !frameRuns[a].Published()), "a live run is leased");
 						for (size_t b = 0; b < a; ++b) REQUIRE(!(frameRuns[a] == frameRuns[b]), "runs in flight have leases of their own");
 					}
 					frameRuns.clear();

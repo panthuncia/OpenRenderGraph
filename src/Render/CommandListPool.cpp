@@ -452,6 +452,8 @@ std::vector<CommandListPair> CommandListPool::AcquireBatch(size_t count, uint64_
         bool inlineAfterWait = false;
         if (m_backgroundResetScheduled.load(std::memory_order_acquire)) {
             waited = true;
+            // The reset's worker runs at this thread's priority meanwhile.
+            const auto raised = m_taskService ? m_taskService->RaiseWorkersForWait() : nullptr;
             const bool ready = m_availableReady.wait_for(lock, std::chrono::milliseconds(20), [this, count] {
                 return m_available.size() >= count || m_stopBackgroundReset
                     || m_backgroundFailure

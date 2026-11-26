@@ -631,9 +631,10 @@ public:
 	uint32_t FrameProductionBusy() const noexcept;
 	// Requires GPU idle. Releases frame ownership after CPU production stopped.
 	void ShutdownTaskWorkers();
-	// Owner thread, after ShutdownTaskWorkers: gives back the alias placements the graph made and its requirements in the
-	// shared alias arena, as its destruction would. Then the graph may be destroyed on another thread (GraphHost::Desc::
-	// destroyRetiredGraphsDetached): nothing else it holds is placed into, or used, by the graphs still running.
+	// Once its frame production has drained (ShutdownTaskWorkers, or FrameProductionBusy clear), on the thread that places the
+	// other graphs' transients: gives back the alias placements the graph made and its requirements in the shared alias arena,
+	// as its destruction would. Then the graph may be destroyed on another thread (GraphHost::Desc::destroyRetiredGraphsDetached):
+	// nothing else it holds is placed into, or used, by the graphs still running.
 	void ReleaseAliasPlacements();
 	// The runtime's services for those this graph has none of (never set, or dropped by a rebuild).
 	void UseRuntimeServices();

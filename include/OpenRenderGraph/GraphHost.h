@@ -140,7 +140,9 @@ public:
 		// A retired graph (replaced by an attach) is destroyed on the runtime's deleter thread once its work completes
 		// (ReleaseRetiredGraphs), instead of on the owner thread. Its extensions and task workers are shut down, and its alias
 		// placements given back (RenderGraph::ReleaseAliasPlacements), on the owner thread first. For a host whose passes,
-		// extensions and resources may be destroyed on any thread. Only without async epochs.
+		// extensions and resources may be destroyed on any thread. Async epochs always do this: there the host's thread gives back
+		// the alias placements (it places transients itself) and hands the graph to the deleter thread, which shuts down its task
+		// workers. The owner thread does none of it.
 		bool destroyRetiredGraphsDetached = false;
 	};
 
@@ -1251,7 +1253,8 @@ private:
 	void FailAsyncEpoch(Async& state, uint32_t epochIndex, std::string error);
 	// Owner thread: builds every instance BuildDue names (all: every one requested, explicit builds or not).
 	bool BuildDueInstances(bool all);
-	// Releases the retired graphs whose GPU and CPU work is done (all: waits for the rest).
+	// Releases the retired graphs whose GPU and CPU work is done (all: waits for the rest). With async epochs (not all) it only
+	// hands them to the host's thread (Async::Message::Kind::Release), and never blocks.
 	void ReleaseRetiredGraphs(bool all);
 	// Host-owned queue timelines, made at the first build: graphics, compute, copy.
 	void EnsureTimelines();
@@ -1417,7 +1420,7 @@ private:
 	// The same, with replace(index) in place of BuildInstance. replace returns true when the instance's graph was replaced.
 	void ReplaceAsyncInstances(std::span<const size_t> indices, const std::function<bool(size_t)>& replace);
 	// Owner thread, async epochs running: the host's thread lets go of the instances to detach and holds still while work runs on
-	// this thread (a build, a retired graph's release: both change services every graph shares).
+	// this thread (a build, an attach, a release of every retired graph: they change services every graph shares).
 	void HoldAsync(std::span<const size_t> detach, const std::function<void()>& work);
 	// Host thread: prepares the epoch's next ticket. reprepare: a stale ticket's run lease, prepared again (its latch regions were
 	// written); otherwise a new lease, or for a revision-driven epoch a published copy's (TakeCopyLease).

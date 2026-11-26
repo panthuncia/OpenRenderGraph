@@ -1640,7 +1640,12 @@ FrameAdmission SynchronousAdmission::PrepareFrame(std::shared_ptr<const Selected
         throw std::logic_error("Previous synchronous admission has not terminated (" + PendingOwners() + "; this one on thread "
             + std::to_string(CurrentThreadNumber()) + (entryOnly ? ", at submission" : "") + ")");
     Require(m_nextSequence != UINT64_MAX, "Admission sequence exhausted");
-    Require(m_retained.size() < m_capacity, "Synchronous frame capacity exhausted");
+    // Runs in flight are not bounded by frames: each takes a run lease of its own (GraphHost), and a host may hold many runs'
+    // executions until its frame's end. So the retention grows with them. It is reserved here, before a commit changes the ledgers.
+    if (m_retained.size() >= m_capacity) {
+        m_capacity *= 2;
+        m_retained.reserve(m_capacity);
+    }
     if (SharingValidationEnabled()) ValidateSharedBackings(*publication->executable, publication->bindings);
     FrameAdmission frame;
     frame.publication = std::move(publication);

@@ -223,6 +223,12 @@ std::shared_ptr<const GraphExecutionTimeline> ExecutionTimelineAdmission::Record
     if (!bundle || !bundle->graph || packets.size() != bundle->graph->batches.size())
         throw std::invalid_argument("Recorded packet count mismatch");
     std::vector<std::shared_ptr<const void>> leases(packets.begin(), packets.end());
+    // Already on the GPU, so recorded however many executions are in flight: a host may hold many runs' executions until its
+    // frame's end (GraphHost's run leases). The capacity grows with them.
+    if (InFlight() >= m_maximumInFlight) {
+        m_maximumInFlight *= 2;
+        m_retained.reserve(m_maximumInFlight);
+    }
     auto execution = Prepare(std::move(bundle), incomingWaits, std::move(leases), packets, signals);
     for (uint32_t i = 0; i < packets.size(); ++i) CommitBatch(execution->submission, i);
     return execution;

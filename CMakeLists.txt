@@ -368,7 +368,8 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
     add_executable(OpenRenderGraphHeadlessBenchmark tests/HeadlessGraphBenchmark.cpp tests/GraphReplayRunner.h)
     target_compile_features(OpenRenderGraphHeadlessBenchmark PRIVATE cxx_std_23)
     target_link_libraries(OpenRenderGraphHeadlessBenchmark PRIVATE OpenRenderGraph)
-    add_test(NAME OpenRenderGraphHeadlessBenchmark COMMAND OpenRenderGraphHeadlessBenchmark)
+    # A short run: the full benchmark (5 runs of 10000 frames) takes about five minutes in a Debug build.
+    add_test(NAME OpenRenderGraphHeadlessBenchmark COMMAND OpenRenderGraphHeadlessBenchmark --runs 1 --frames 1000)
     add_test(NAME OpenRenderGraphHeadlessBenchmark.Sequence COMMAND OpenRenderGraphHeadlessBenchmark
         --sequence "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/binding_rotation_tail.orgsequence")
     set_tests_properties(OpenRenderGraphHeadlessBenchmark OpenRenderGraphHeadlessBenchmark.Sequence PROPERTIES TIMEOUT 120)

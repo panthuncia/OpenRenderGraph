@@ -120,8 +120,9 @@ struct GraphHost::Async {
 	struct Message {
 		// Detach: the host's thread lets go of instances (their epochs' tickets abandoned, their recording requests dropped), says
 		// so (detached) and holds still until the owner thread has built them (holding). Attach: the instances, built again, are the
-		// host's thread's once more, at new build generations.
-		enum class Kind : uint8_t { Submitted, Discard, Detach, Attach, Stop } kind = Kind::Stop;
+		// host's thread's once more, at new build generations. Release: retired graphs whose work is done (ReleaseRetiredGraphs). The
+		// host's thread gives back their alias placements and hands them to the runtime's deleter thread.
+		enum class Kind : uint8_t { Submitted, Discard, Detach, Attach, Release, Stop } kind = Kind::Stop;
 		std::shared_ptr<Ticket> ticket;
 		RenderGraph::PersistentTicketSubmission submission;
 		uint32_t epochIndex = 0;
@@ -130,6 +131,7 @@ struct GraphHost::Async {
 		bool reprepare = false;  // Discard: the epoch's replacement ticket is prepared into the same run lease
 		std::shared_ptr<void> keepAlive;          // the uploads' staging, until the run completes
 		std::shared_ptr<void> retired;            // Submitted: GPU objects that retired at this submission, destroyed on the host's thread
+		std::vector<std::unique_ptr<RenderGraph>> graphs;  // Release: the retired graphs
 		std::shared_ptr<const void> resourceOwner;
 		std::pair<uint32_t, uint64_t> uploadSignal{UINT32_MAX, 0};
 		uint64_t number = 0;  // Submitted: its number (SubmissionsMade)
@@ -283,6 +285,7 @@ struct GraphHost::Async {
 	std::atomic<uint64_t> released{0};
 	uint64_t holds = 0;  // render thread: the last hold begun
 	bool holding = false;  // render thread: inside a hold
+	double holdDrainMs = 0.0, holdWaitMs = 0.0;  // render thread: the last hold's drain of the submission thread and wait for this thread
 	std::atomic<bool> failed{false};
 	std::string error;  // written before failed is set
 	// Per epoch index: its preparation failed (FailAsyncEpoch). Set by the host's thread. Cleared by the owner thread when a build of
@@ -1064,6 +1067,28 @@ void GraphHost::RetireGraph(std::unique_ptr<RenderGraph> graph, GpuPoint done, u
 	m_retiredGraphs.push_back({std::move(graph), std::move(done), epoch});
 }
 
+namespace {
+// Retired graphs on the runtime's deleter thread: their task workers are shut down (joining their command-list pools' resets),
+// then they are destroyed. Their alias placements were given back already.
+struct RetiredGraphTeardown {
+	std::vector<std::unique_ptr<RenderGraph>> graphs;
+	double aliasMs = 0.0;  // giving back their alias placements, on the host's thread
+	~RetiredGraphTeardown() {
+		if (graphs.empty()) return;
+		BT_ZONE_SCOPE("ORG.Host.RetiredGraphTeardown");
+		const auto begin = std::chrono::steady_clock::now();
+		const auto count = graphs.size();
+		for (auto& graph : graphs) {
+			graph->ShutdownTaskWorkers();
+			graph.reset();
+		}
+		spdlog::info("GraphHost: {} replaced graph(s) torn down in {:.3f} ms on the deleter thread (alias placements given back in {:.3f} ms on the "
+					 "host's thread)",
+			count, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), aliasMs);
+	}
+};
+} // namespace
+
 void GraphHost::ReleaseRetiredGraphs(bool all) {
 	if (m_retiredGraphs.empty()) return;
 	// GPU work done and CPU work drained. Both only move forward once the graph is retired.
@@ -1083,14 +1108,34 @@ void GraphHost::ReleaseRetiredGraphs(bool all) {
 		return false;
 	};
 	if (!all && std::ranges::none_of(m_retiredGraphs, releasable)) return;
+	const auto noteReleased = [](const RetiredGraph& retired) {
+		if (retired.reported)
+			spdlog::info("GraphHost: epoch {}'s replaced graph released {:.0f} ms after its attach, once its tasks drained",
+				retired.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(retired.epoch),
+				std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - retired.retired).count());
+	};
+	if (m_async && !all) {
+		// Nothing of the teardown runs here. The host's thread gives back the alias placements, in order with its own placements
+		// (it places the graphs' transients), and the deleter thread does the rest. The render thread never holds the host's thread
+		// or joins a task for it.
+		Async::Message message;
+		message.kind = Async::Message::Kind::Release;
+		std::erase_if(m_retiredGraphs, [&](RetiredGraph& retired) {
+			if (!releasable(retired)) return false;
+			noteReleased(retired);
+			// Extensions are the owner thread's (none does anything at shutdown yet).
+			retired.graph->ShutdownExtensions();
+			message.graphs.push_back(std::move(retired.graph));
+			return true;
+		});
+		if (!message.graphs.empty() && !m_async->Post(message)) m_async->ThrowIfFailed();
+		return;
+	}
 	const auto release = [&] {
 		std::erase_if(m_retiredGraphs, [&](RetiredGraph& retired) {
 			if (!all && !releasable(retired)) return false;
 			if (all) (void)retired.done.Wait();
-			if (retired.reported)
-				spdlog::info("GraphHost: epoch {}'s replaced graph released {:.0f} ms after its attach, once its tasks drained",
-					retired.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(retired.epoch),
-					std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - retired.retired).count());
+			noteReleased(retired);
 			BT_ZONE_SCOPE("ORG.Host.ReleaseRetiredGraph");
 			retired.graph->ShutdownExtensions();
 			retired.graph->ShutdownTaskWorkers();
@@ -1098,7 +1143,7 @@ void GraphHost::ReleaseRetiredGraphs(bool all) {
 			// registries and ledgers, deferred deletion and descriptor release, the upload policy and backing resize registries,
 			// the ECS entity hooks, which defer to their thread). So the rest of its destruction (about 10 ms for a large graph:
 			// its external client's and queues' timelines, its passes and resources, its compiled state) can run on the runtime's
-			// deleter thread. Not with async epochs, whose host thread holds still for it (HoldAsync), nor at a release of all.
+			// deleter thread. With async epochs the host's thread hands it there (Async::Message::Kind::Release). Not at a release of all.
 			const bool detached = m_desc.destroyRetiredGraphsDetached && !all && !m_async && m_desc.runtime;
 			if (detached) {
 				// What other graphs place into goes back here, on the owner thread: they may place it again at once.
@@ -1110,7 +1155,7 @@ void GraphHost::ReleaseRetiredGraphs(bool all) {
 	};
 	const auto begin = std::chrono::steady_clock::now();
 	const auto before = m_retiredGraphs.size();
-	// A graph's teardown touches services the host's thread uses (its upload client's timelines, descriptors): it holds still.
+	// A release of all with async epochs running: the host's thread holds still meanwhile.
 	if (m_async && !m_async->holding) HoldAsync({}, release);
 	else release();
 	if (const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(); !all && ms >= 10.0)
@@ -1673,8 +1718,9 @@ GraphHost::AttachResult GraphHost::AttachStagedEpochGraphs(std::span<const uint3
 	}
 	m_attachCount.fetch_add(indices.size(), std::memory_order_relaxed);
 	m_setAttachCount.fetch_add(1, std::memory_order_relaxed);
-	spdlog::info("GraphHost: staged graphs of epochs {} attached together in {:.3f} ms", names,
-		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count());
+	spdlog::info("GraphHost: staged graphs of epochs {} attached together in {:.3f} ms (submission drain {:.3f} ms, host thread's hold {:.3f} ms)", names,
+		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), m_async ? m_async->holdDrainMs : 0.0,
+		m_async ? m_async->holdWaitMs : 0.0);
 	return {true, {}};
 }
 
@@ -2909,6 +2955,18 @@ void GraphHost::StartAsync() {
 								state->inHand[index] = 0;
 							}
 						break;
+					case Async::Message::Kind::Release: {
+						// Given back here, in order with this thread's own placements: another graph may place the memory at its next
+						// preparation. Their GPU work and tasks are done.
+						BT_ZONE_SCOPE("ORG.Host.ReleaseAliasPlacements");
+						auto teardown = std::make_shared<RetiredGraphTeardown>();
+						const auto begin = std::chrono::steady_clock::now();
+						for (auto& graph : message.graphs) graph->ReleaseAliasPlacements();
+						teardown->aliasMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+						teardown->graphs = std::move(message.graphs);
+						m_desc.runtime->DestroyDetached(std::move(teardown), "retired epoch graphs");
+						break;
+					}
 					case Async::Message::Kind::Stop:
 						stop = true;
 						break;
@@ -3066,7 +3124,9 @@ void GraphHost::StartAsync() {
 
 void GraphHost::HoldAsync(std::span<const size_t> detach, const std::function<void()>& work) {
 	// The work changes graphs that tickets still on the submission thread were prepared on: they are submitted first.
+	const auto begin = std::chrono::steady_clock::now();
 	DrainSubmissions("a hold of the host's thread (a build)");
+	const auto drained = std::chrono::steady_clock::now();
 	auto& async = *m_async;
 	async.ThrowIfFailed();
 	// The host's thread lets go of the instances to detach and holds still while the work runs: whatever it was given before
@@ -3096,6 +3156,8 @@ void GraphHost::HoldAsync(std::span<const size_t> detach, const std::function<vo
 			async.detached.wait(seen, std::memory_order_acquire);
 		}
 	}
+	async.holdDrainMs = std::chrono::duration<double, std::milli>(drained - begin).count();
+	async.holdWaitMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - drained).count();
 	async.ThrowIfFailed();
 	work();
 }

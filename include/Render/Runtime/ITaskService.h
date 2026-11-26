@@ -42,6 +42,11 @@ public:
         std::string_view taskName,
         std::function<void()>&& func) = 0;
 
+    // A thread about to wait for one of the service's tasks outside a scope's Wait. While the returned guard lives, the service's
+    // workers run at least at the calling thread's priority, so a worker below it cannot be starved by the threads in between.
+    // Null when the service does nothing for it. A scope's Wait does it itself.
+    virtual std::shared_ptr<void> RaiseWorkersForWait() { return {}; }
+
     // Optional telemetry hook — default is a no-op.
     virtual void ReportTaskTelemetry(std::string_view /*name*/, uint64_t /*durationMicros*/) {}
 };
