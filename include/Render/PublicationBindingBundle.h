@@ -13,6 +13,8 @@ namespace org {
 class Resource;
 class AliasHeapGeneration;
 class BindingTableVersion;
+class GloballyIndexedResource;
+struct BackingAllocationSnapshot;
 
 // Exact recording version. Incoming states and timeline waits are deliberately
 // absent: those belong to an execution, not a publication.
@@ -46,6 +48,11 @@ public:
     // Capture only on the producer/preparation owner, before making the
     // immutable bundle visible. Workers consume snapshots, never Resource.
     static Snapshot Capture(Resource& resource);
+    // What Capture will return for resource once it adopted a prepared backing (BackedResource::AdoptPreparedBacking): allocation
+    // is that backing's, slots holds the descriptor slots written for it. Any thread: it reads only what does not change with
+    // the backing.
+    static Snapshot CapturePrepared(Resource& resource, std::shared_ptr<const BackingAllocationSnapshot> allocation,
+        const GloballyIndexedResource& slots);
 private:
     std::vector<Snapshot> m_bindings;
     std::vector<std::shared_ptr<const void>> m_semanticOwners;

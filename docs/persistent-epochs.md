@@ -60,6 +60,12 @@ submission point is an **epoch**.
         `DestroyGraph`. The caller drops the graph and builds again.
     -   Builds of different epochs may run in parallel, and so may two builds of one epoch. Each makes a graph of its own;
         only one that started after the attached graph's build can be attached.
+    -   A dropped `EpochGraph` never takes anything from the attached graphs, also after its transients were placed at its build
+        (`PlaceEpochGraphs`). A frame placement records every graph that binds a placed resource (the one that placed it and
+        each newer build that found it in place and claimed it); a graph's end gives the placement back only when no other
+        binds it. Before, a dropped build that had claimed a resource of the running graph gave its backing back at its end, and
+        the running graph's next preparation failed (`Binding replacement requires a structural alias edit`). Test:
+        `staged-placement` 2a.
     -   A dropped `EpochGraph` is destroyed on the dropping thread. It never ran, so its teardown waits for nothing. Drop or
         attach every one, and finish every build, before the host is destroyed.
     -   An application that drives its builds this way calls `SetExplicitBuilds(true)` and does not call `BuildIfRequested`
@@ -350,6 +356,101 @@ effect). Pipelines and other objects a recording binds are retained by the recor
         run's commit does not write then reads zeros, as a new lease's would.
     -   Passes recorded at execution are still recorded at each submission (`PreparedPass::RecordAgain`).
     -   Statistics: `AsyncStats::liveReused`, `liveKept`, `liveUnkeepable` and `liveSpilled`.
+-   **Kept recordings of synchronous epochs** (`GraphHost::SetKeptEpochs`, without async epochs; `Desc::reuseRecordings` is
+    not needed). `ExecuteFrame` keeps recordings for the listed epochs on the calling thread.
+    -   Each kept epoch has `framesInFlight + 1` kept copies: leases whose LatchBlock regions stay at their index. Its runs take
+        them in turn, so a copy's last run is complete when it is taken again (frame pacing waited for the epoch's run
+        `framesInFlight` back). Each run clears the copy's regions first (`LatchBlock::ZeroStableRun`), then runs
+        `beforePrepare` and the passes' `Update` as before.
+    -   The preparation then binds the frame: placements, versions, rebindings, the publication's bindings. It checks the copy's
+        kept recording against them. The first condition that fails names the record, in this order: the graph's placement
+        serial (`frame placement`: a frame placement version taken in place, a prepared re-placement installed, an alias plan
+        installed at a preparation), the publication (`new executable`, `binding: <resource>`, or a slot the epoch does not
+        bind), each versioned slot's version by its own number (`version: <resource>`; a version of a resource the epoch does
+        not bind leaves it current), the bindings object, the descriptor heaps, the backings it bound (`backing moved`), each
+        pass's revision (`revision: <pass>`) and skip answer (`skip: <pass>`), and the timelines its waits are on
+        (`foreign timelines`). A copy with none records for `first run` or `not kept: <why its last recording was not kept>`.
+    -   A current recording is admitted and submitted with this frame's waits and handoff: nothing is prepared or recorded.
+        Passes recorded at execution are recorded inline at each submission (`SetInlineAtExecution`; `PreparedPass::RecordAgain`).
+    -   Otherwise the epoch prepares and records as before. The recording is kept for the copy when every pass reports a
+        revision, no per-frame version (a swapchain image) is bound, the admission has no incoming effect, its late passes and
+        packets are replayable. Otherwise the copy keeps nothing, and why is kept as its next run's reason.
+    -   A rebuilt graph starts with no kept recordings, unless they were recorded ahead (staged recordings, below). `SetKeptEpochs`
+        without an epoch drops its graph's.
+    -   Statistics: `FrameTimings::kept` (the run's outcome), `GraphHost::TakeKeptStats` (runs, reused, kept, not keepable,
+        and the reasons' counts), `RenderGraph::LastKeptRun`.
+    -   **The revision audit** (`GraphHost::SetKeptRecordingAudit(everyN)`, `RenderGraph::SetKeptRecordingAudit`; off by
+        default). Every N-th reuse of a copy also prepares the epoch's passes. It compares each pass's frame data with the
+        frame data the kept recording was prepared with (`PreparedPass::AuditFrameData`), then abandons what it prepared; the
+        run still submits the kept recording. A pass whose frame data differs while its revision is the same misses an input
+        in its `Revision()`: it is counted by name (`KeptRun::auditMismatches`, `KeptStats::mismatches`) and warned about once.
+        Frame data compares by `operator==`, by bytes for a type with a unique byte representation, and always equal for an
+        empty type. Other frame data is counted as not comparable. A recording keeps its passes' frame data only while the
+        audit is on. The audit sees only frame data: what `Record` reads elsewhere (a manager's state, a pipeline's payload)
+        stays the revision's job.
+    -   A pass declared with `RenderPassBuilder::RecordAtExecution()` (as `ExternalPassDesc::RecordAtExecution`) is recorded
+        inline at each submission of a kept recording, with the frame data it was prepared with. Values it needs per run come
+        from elsewhere, for example state its `Update` writes. It must be replayable (no lifecycle effect, callback or external
+        signal), or the recording is not kept. The builder's flag counts for an extension's pass (`ExternalPassDesc`) as well as
+        for a pass the graph builds. Before BR's M6 step 9b the graph read only the description's flag for an extension's pass:
+        such a pass was recorded ahead, in a batch with other passes, and a kept recording submitted its commands again
+        without recording it.
+    -   **Staged recordings** (`GraphHost::RecordStagedCopies(graph, frame)`). A graph `BuildEpochGraph` made can record its
+        kept copies on the thread that built it, before it is staged or attached. Each copy is recorded for its own lease, as its
+        first run would be, and the attach adopts the recordings with the graph. So the first runs after an attach submit kept
+        recordings instead of recording on the host's thread.
+        -   `frame` stands in for the frame the first runs prepare: its host data, owned host data and resolver capture context
+            (an application gives its frame inputs for the build). The passes' `RenderGraphPass::TakeFrameValues` run with it, then
+            their `Prepare` and `Record`. Their `Update` does not run, nothing is uploaded, and nothing is admitted against the
+            ledgers or submitted: the body is recorded from a plan (`SynchronousAdmission::PreparePlan`), as a ticket's.
+        -   `TakeFrameValues` is the part of a pass's per-run work that its `Revision` and `Prepare` read: values it takes from the
+            host data, with no side effect beyond its own members. The graph calls it before `Update` at every run. A pass that
+            takes those values in `Update` instead has its staged recording found stale at the first run (`staged: revision:
+            <pass>`).
+        -   A copy's first run checks its staged recording as any kept recording. It also prepares the passes once and compares
+            each pass's frame data with the staged ones (as the revision audit does). The staging's host data may differ from the
+            run's in what no revision names. On a difference the run records from that preparation instead (`staged: frame data
+            of <pass>`), so a staged recording never runs with other frame data than its first run's own. Any failed check is
+            named with a `staged: ` prefix; `KeptRun::staged` and `KeptStats::stagedReused`/`stagedRecorded` count them.
+        -   Nothing is recorded ahead (`StagedRecordings::why`) for an epoch that keeps nothing, whose copies do not exist yet (it
+            has not run), whose graph has a pass without a revision (checked before anything is prepared: such a pass's
+            `Prepare` may do what only the host's thread may), whose alias placement is left to the attach
+            (`PlaceDeferredAliasesAtBuild` refuses), or whose recording cannot be kept. A pass whose `TakeFrameValues`,
+            `Prepare` or `Record` throws on the stand-in frame refuses the staging the same way (`its recording failed: ...`);
+            the build is unaffected, and the copies' first runs record.
+        -   What only an `Update` sizes or takes is missing from a staged recording. A pass whose first `Update` in a new graph
+            grows a buffer (a new backing: `staged: binding: <resource>`) or takes a value its revision names
+            (`staged: revision: <pass>`) has its copies recorded again at their first runs. Such a pass can size from the build's
+            frame at its declaration, or take the value in `TakeFrameValues`, when the value does not decide its declarations
+            (`DeclaredResourcesChanged`). A pass that redeclares when no `Update` ran (a "changed" flag that starts set and only
+            `Update` clears) redeclares for each staged copy.
+        -   Test: `PersistentVulkanHostTests sync-reuse` (and `sync-reuse inline`): a graph built on another thread records its 4
+            copies there; after the attach 8 runs reuse, 4 of them staged recordings, and the copy pass records nothing (inline:
+            once per submission). A staging with another input of the write pass's frame data records each copy again, named
+            `staged: frame data of test.write`; a revision changed after the staging, `staged: revision: test.copy-to-host`.
+        -   Staging is all or nothing per epoch, also with batch reuse (below): an epoch with one pass without a revision records
+            nothing ahead. Staging the batches whose passes all report revisions is not done yet.
+    -   **Batch reuse** (`GraphHost::SetKeptBatchReuse`, `RenderGraph::SetKeptBatchReuse`; off by default). A kept recording is
+        checked per batch. A batch body depends only on its own passes and the compiled graph: its entry barriers are recorded
+        at submission, and its barriers between passes come from the compiled graph's barrier plan.
+        -   First the conditions every batch shares are checked for the whole recording, as without batch reuse: frame placement,
+            publication, versions, bindings, descriptor heaps, backings and foreign timelines. A failure records every batch.
+        -   Then each batch: it is current when its packet was kept (every pass of it reported a revision, a late pass is
+            replayable, the packet is replayable) and its passes' revisions and skip answers are unchanged. When every batch is
+            current the recording is submitted as it is. When some are, the run is partial (`KeptRunOutcome::Partial`): only the
+            stale batches' passes are prepared, the sealed frame leaves the others out (`SealPersistentFrame`'s `absent`), their
+            jobs take the kept packets (`FrameRecordingJob::reuse`), and the merged recording is kept with each batch's
+            revisions. So an epoch with passes that report no revision still submits its other batches again.
+        -   Per batch reasons: `KeptRun::batchesReused`, `batchesRecorded`, `batchReasons` ("not kept: uncheckable: <pass>",
+            "revision: <pass>"), summed in `KeptStats` with `partial`. Once per executable the graph logs each batch's passes,
+            the ones without a revision marked, and why a batch is not kept (`Kept recording batches (epoch N)`).
+        -   The revision audit compares the passes of the batches a partial run submits again (prepared for it only).
+        -   A publication of one slot still records every batch: per-slot batch invalidation (only the batches that bind the
+            slot) is not done.
+        -   Test: `sync-reuse inline` (the late copy is a batch of its own): a revision of the copy makes 4 partial runs, the
+            write's batch submitted again and its pass not prepared; a copy pass without a revision records its batch at every
+            run while the write's is reused, and the audit compares the write. `sync-reuse` (one batch): a stale pass records
+            the batch whole.
 -   **Published recordings** are a revision-driven epoch's (below): recorded once, submitted many times.
 -   **What a replayable recording leaves out.** Profiler GPU zones and GPU statistics queries the statistics service owns.
     With `GraphHost::SetRecordingTimestamps` a replayable list owns its timestamp queries instead
@@ -628,6 +729,59 @@ A host's graphs place their transients into one `PersistentAliasArena` (`RenderG
     build places its transients at its first preparation after the attach, where it may grow a pool.
 -   **Test.** `PersistentVulkanHostTests arena`: two epochs whose scratch buffers share one pool at offset 0 (the second's
     write on the compute queue). Each epoch's copy reads what it wrote, synchronous and async.
+-   **A transient several epochs' graphs bind never goes to a graph's own pools.** Those pools see only their graph's uses,
+    and every graph packs from offset 0, so another epoch's transient would reuse its bytes, and two graphs binding one
+    placement put two unordered placements into one heap. Each graph declares the aliasable resources its slots bind, with its
+    epoch, when it bootstraps and at each plan (`persistent_impl::DeclareEpochUses`, by graph state). A plan places a resource
+    another epoch's graph also declares only from a frame placement; otherwise it keeps the backing the resource has (a frame
+    placement or a backing of its own that another graph gave it) or gives it one of its own. A graph that finds another
+    graph's own-pool placement takes it off (a backing of its own); the other graph, finding its placement taken, binds that
+    backing at its next preparation, in a structural edit (its re-placement). A graph whose own-pool transient another epoch's
+    graph declares later (a graph built after it) moves it out at its next preparation. A placement a graph leaves where it is
+    but whose bindings name an older backing is bound again in the plan's structural edit, so a later preparation never meets
+    a placement change as a plain binding edit ("Binding replacement requires a structural alias edit"). A graph built alone,
+    before the graphs that share its transients exist, places its first frame without knowing: that frame may read wrong
+    contents in the later epoch. Staged sets built together (`BuildEpochGraph` per epoch, then `PlaceEpochGraphs`) know at once.
+    Test: `PersistentVulkanHostTests shared-rebuild` (`on`/`off`: with the frame placement on or off only).
+-   **A staged set places every graph at its build, from one version.** `PlaceEpochGraphs` places the set's graphs in epoch order
+    from the set's staging (`FramePlacement::BeginStaging`). A later graph whose new transients are not covered makes a newer
+    version, which keeps where they are both the resources the set's graphs share with the running graphs (what the set's
+    published graphs use) and the placements of the set's graphs that placed already, also for a set that rebuilds every epoch
+    (a resize). Packed from scratch, it moved those, and the set's graph left its placement to the attach. Then a second pass
+    lets each earlier graph take the newest version in place (`RenderGraph::PlaceAgainAtBuild`, `TakeFramePlacementInPlace`
+    with `atBuild`, where a resource now shared with another epoch only stops being the graph's own placement to give back),
+    and a graph left for its attach tries again. A graph whose placements the newest version moves keeps its own and places
+    again at its first preparation; it is never planned again at the build, since a plan would treat what it adopted from the
+    running graphs as its own and could move it under them.
+-   **The set's summaries come first.** Before the first graph of a set places, every graph of it publishes its usage summary to
+    the staging (`RenderGraph::PublishPlacementSummaryAtBuild`: the plan's gather only, nothing placed), and the staging keeps
+    them without computing (`FramePlacement::CollectStaged`). So the version the first graph's new transients need is computed
+    from all of the set's summaries: it places the later graphs' transients too, and their resources newly shared with the
+    first graph are live over both epochs in it already. Without it, a later graph's summary made a newer version in which a
+    resource the first graph had placed was now live together with another in its bytes (`Keeping`'s KeptMoved, logged with
+    the resource it met), and the first graph placed again at its first preparation, on the owner thread (Visibility at a
+    resize: 4-5 ms). `FramePlacementSettings::summariesFirst` (on by default) turns it off; the second pass above stays for
+    whatever a summary did not foresee. Test: `PersistentVulkanHostTests staged-placement` (a set of both epochs with every
+    transient new, both ways: the set's graphs place from one version and the first frame runs it).
+-   **A new version the worker makes once quiet is prepared before it is published.** The settled layout and the trim of the
+    heaps re-place every running graph. With `FramePlacementSettings::prepareReplacements` (on by default) the worker offers the
+    version instead of publishing it (`FramePlacement::Offered`, its heaps allocated first). At the next frame boundary
+    (`SealSubmitted`, `CommitRelocations`) the host asks each graph to prepare its re-placement
+    (`RenderGraph::PrepareFramePlacementReplacement`): on a task-service worker, from what the graph captured at the start (its
+    placements, its slots, the running publication), each frame placed resource takes its place in the version, the placement
+    orderings are derived as the plan derives them, each resource that moves gets a backing made ahead at its new place with
+    descriptor slots written for it (`BackedResource::PreparePlacedBacking`; one per resource for every graph that binds it),
+    and the publication that binds those is built and validated. Once every graph's preparation finished (or after 500 ms), the
+    host publishes the version at a frame boundary (`FramePlacement::PublishOffered`), and each graph's next preparation installs
+    what it prepared (`InstallPreparedReplacement`): the resources switch to their prepared backings (`AdoptPreparedBacking`: the
+    old descriptor slots retire as a dematerialization's do), binding edits made meanwhile are replayed, and the publication
+    installs. No plan and no structural build run on the owner thread. A resource that keeps its heap and offset (only a newer
+    version's block id) keeps its backing, as a plan leaves a resource already at its frame placement. A graph whose
+    executable, plan or placements changed since, or whose resource another graph placed again meanwhile, re-places as before;
+    so does a graph that binds a resource another epoch's graph placed on its own path. A staged set drops an offer; an offer no
+    frame boundary takes is published by the worker after `offerTimeout`. Test: `PersistentVulkanHostTests staged-placement`
+    (the trim after a kept version, prepared on and off; the outputs are right in every frame) and `FramePlacementTests`
+    (offers: published at a frame boundary, dropped by a staged set, published after the timeout).
 
 ## Latches
 
@@ -695,5 +849,8 @@ keeps a shard of its own, and Begin resets the whole allocator.
         an older build rejected after a newer one; and stale alias placements reported, not rebuilt, then built again;
     -   `stream` and `stream open home`;
     -   `arena`;
+    -   `staged-placement` (staged sets placed at their build, kept versions, a dropped set, a set of every epoch with the
+        summaries first or not, the trim prepared on a worker or not) and `shared-rebuild` (sets of two
+        epochs for new objects of new sizes, a transient shared by both, with the frame placement off and on);
     -   `leases` and `leases open` (an epoch that runs many times a frame, each run with a lease of its own, and the frame
         arena's regions), and `leases-wide` (260 runs a frame, so lease indices pass 255, with replayable recordings).

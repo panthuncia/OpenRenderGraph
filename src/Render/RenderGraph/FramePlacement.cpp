@@ -395,11 +395,16 @@ std::shared_ptr<FramePlacementVersion> FramePlacementVersion::Keeping(const Fram
 	for (const auto& pin : pinned) {
 		auto& entry = version->m_entries[pin.entry];
 		const alias::SpannedRange range{pin.offset, pin.offset + entry.size, entry.frameFirst, entry.frameLast, 0};
-		bool conflict = false;
-		for (const auto& other : occupied[pin.block])
-			if (alias::SpansConflict(range, other) && range.begin < other.end && other.begin < range.end) conflict = true;
-		if (conflict) {
-			if (version->m_keptMoved.size() < 4) version->m_keptMoved.push_back(entry.name);
+		uint32_t conflictWith = UINT32_MAX;
+		for (size_t o = 0; o < occupied[pin.block].size() && conflictWith == UINT32_MAX; ++o) {
+			const auto& other = occupied[pin.block][o];
+			if (alias::SpansConflict(range, other) && range.begin < other.end && other.begin < range.end) conflictWith = occupants[pin.block][o];
+		}
+		if (conflictWith != UINT32_MAX) {
+			if (version->m_keptMoved.size() < 4) {
+				version->m_keptMoved.push_back(entry.name);
+				version->m_keptMovedWith.push_back(version->m_entries[conflictWith].name);
+			}
 			++version->m_keptMovedCount;
 			free.push_back(pin.entry);
 			continue;

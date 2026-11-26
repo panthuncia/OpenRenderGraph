@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <rhi.h>
 
 #include "Resources/RelocationRecord.h"
@@ -15,6 +16,30 @@
 namespace org {
 
 class AliasHeapGeneration;
+class SymbolicTracker;
+struct ResourceBindingSnapshot;
+
+/**
+ * @brief A backing made ahead for a resource that keeps its current one until the backing switches (BackedResource::
+ * PreparePlacedBacking): the resource placed at another heap and offset, with descriptor slots written for it. A graph builds the
+ * publication that binds it on a worker, and the backing switches at a frame boundary (AdoptPreparedBacking), so nothing that runs
+ * before then sees it.
+ */
+class PreparedPlacedBacking {
+public:
+    virtual ~PreparedPlacedBacking() = default;
+    // The new backing's state tracker: a new resource's state.
+    virtual SymbolicTracker* StateTracker() = 0;
+    // The binding the resource publishes once it adopted this backing (at generation fromGeneration + 1).
+    std::shared_ptr<const ResourceBindingSnapshot> snapshot;
+    uint64_t resourceID = 0;
+    // The generation of the backing it replaces. AdoptPreparedBacking does nothing once the backing changed since.
+    uint64_t fromGeneration = 0;
+    std::shared_ptr<const AliasHeapGeneration> heap;
+    uint64_t offset = 0, poolID = 0;
+    // Set by the adoption, on the owner thread.
+    std::atomic<bool> adopted{false};
+};
 
 // Allocation ownership only: never implies descriptor-slot or alias-range
 // ownership. Unsupported/imported/aliased backings return an empty snapshot.
@@ -65,6 +90,17 @@ public:
         m_publishedGeneration = generation;
         return m_publishedAllocation;
     }
+    // A backing placed at heap and offset, made now while the current backing stays (PreparedPlacedBacking). Any thread. Null, with
+    // why, when the resource cannot switch that way (no backing of its own, a representation attached, a buffer view ref pair).
+    virtual std::shared_ptr<PreparedPlacedBacking> PreparePlacedBacking(std::shared_ptr<const AliasHeapGeneration> /*heap*/,
+        uint64_t /*offset*/, uint64_t /*poolID*/, std::string* why = nullptr) {
+        if (why) *why = "not supported";
+        return {};
+    }
+    // Owner thread, at a frame boundary: switches to a prepared backing. Its descriptor slots become the resource's, the old ones
+    // retire as a dematerialization retires them, and the generation advances by one. False, changing nothing, when the backing
+    // changed since the preparation.
+    virtual bool AdoptPreparedBacking(PreparedPlacedBacking& /*prepared*/) { return false; }
     // The relocation class of this resource's backings (relocation::Class), from now on and for every later backing.
     // An owner marks a resource ReadOnly once nothing writes it any more (a sealed resource or version). Unset, each
     // backing keeps the class DeviceManager gave it. Owner thread of the resource.
@@ -93,6 +129,12 @@ protected:
         std::scoped_lock lock(m_publicationMutex);
         m_publishedAllocation.reset();
         m_publishedGeneration = UINT64_MAX;
+    }
+    // An adopted backing's allocation snapshot is the one its prepared publication holds, so later captures return the same token.
+    void SeedPublishedAllocation(std::shared_ptr<const BackingAllocationSnapshot> allocation, uint64_t generation) {
+        std::scoped_lock lock(m_publicationMutex);
+        m_publishedAllocation = std::move(allocation);
+        m_publishedGeneration = generation;
     }
 private:
     static constexpr uint8_t kNoRelocationClass = 0xFF;

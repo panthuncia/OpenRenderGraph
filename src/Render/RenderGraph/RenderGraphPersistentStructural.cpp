@@ -5,6 +5,7 @@
 #include <bit>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <tuple>
 #include <unordered_set>
 
@@ -564,9 +565,10 @@ struct FramePlacedRecord {
 	std::weak_ptr<Resource> resource;
 	const AliasHeapGeneration* heap = nullptr;
 	uint64_t offset = 0, generation = 0;
-	// The graph state that gives the placement back at its end. A newer build of the same epoch that finds the resource at its
-	// frame placement claims it, so the build it replaces does not take the backing away from it when it ends.
-	const void* owner = nullptr;
+	// The graph states that bind the placement: the one that placed it, and each newer build that found the resource at its frame
+	// placement and claimed it. The last of them to end gives it back. So the build a newer one replaces does not take the backing
+	// away from it when it ends, and a newer build dropped before its attach does not take it from the graph that keeps running.
+	std::vector<const void*> owners;
 	// For the memory log (FramePlacedResidents): its bytes, and the epoch whose graph placed it.
 	uint64_t size = 0;
 	uint32_t epoch = UINT32_MAX;
@@ -587,7 +589,7 @@ void NoteFramePlaced(Resource* concrete, const AliasHeapGeneration* heap, uint64
 	std::lock_guard lock(g_framePlacedMutex);
 	// Records of resources that are gone are dropped now and then.
 	if (g_framePlaced.size() > 4096) std::erase_if(g_framePlaced, [](const auto& entry) { return entry.second.resource.expired(); });
-	g_framePlaced[concrete] = {concrete->weak_from_this(), heap, offset, generation, owner, size, epoch};
+	g_framePlaced[concrete] = {concrete->weak_from_this(), heap, offset, generation, {owner}, size, epoch};
 }
 
 // Where concrete is placed from a frame placement now (its heap, offset and bytes), if it still is.
@@ -608,14 +610,22 @@ bool FramePlacedWhere(Resource* concrete, const AliasHeapGeneration*& heap, uint
 // Makes owner the graph state that gives the frame placement of concrete back.
 void ClaimFramePlaced(const void* concrete, const void* owner) {
 	std::lock_guard lock(g_framePlacedMutex);
-	if (const auto found = g_framePlaced.find(concrete); found != g_framePlaced.end()) found->second.owner = owner;
+	if (const auto found = g_framePlaced.find(concrete); found != g_framePlaced.end() && std::ranges::find(found->second.owners, owner) == found->second.owners.end())
+		found->second.owners.push_back(owner);
 }
 
 // Whether another graph state claimed the frame placement of concrete since owner placed it.
 bool FramePlacementClaimedByOther(const void* concrete, const void* owner) {
 	std::lock_guard lock(g_framePlacedMutex);
 	const auto found = g_framePlaced.find(concrete);
-	return found != g_framePlaced.end() && !found->second.resource.expired() && found->second.owner && found->second.owner != owner;
+	return found != g_framePlaced.end() && !found->second.resource.expired()
+		&& std::ranges::any_of(found->second.owners, [&](const void* other) { return other && other != owner; });
+}
+
+// owner ends: it binds none of the placements it made or claimed any more.
+void ForgetFramePlacementClaims(const void* owner) {
+	std::lock_guard lock(g_framePlacedMutex);
+	for (auto& [key, record] : g_framePlaced) std::erase(record.owners, owner);
 }
 
 // A candidate's key in usage summaries (PlacementUse::key): its name and memory description. Resources are made again when a
@@ -646,7 +656,8 @@ std::vector<FramePlacedResident> FramePlacedResidents() {
 void persistent_impl::ReleaseOwnAliasPlacements(const std::unordered_map<Resource*, AliasPlacementOwner>& owners, const void* self) noexcept {
 	size_t released = 0;
 	for (const auto& [concrete, owner] : owners) {
-		// A newer build placed from the same frame placement uses it now.
+		// Another graph binds it: a newer build that placed from the same frame placement, or, when this is a build dropped before
+		// its attach, the running graph it found the resource with.
 		if (FramePlacementClaimedByOther(concrete, self)) continue;
 		const auto resource = owner.resource.lock();
 		auto* backed = resource ? dynamic_cast<BackedResource*>(resource.get()) : nullptr;
@@ -662,7 +673,88 @@ void persistent_impl::ReleaseOwnAliasPlacements(const std::unordered_map<Resourc
 		NoteAliasPlaced(concrete, false);
 		++released;
 	}
+	ForgetFramePlacementClaims(self);
 	if (released) spdlog::info("Persistent alias placements given back at a graph's end: {}", released);
+}
+
+namespace {
+// By resource: the graph states that declare it, with their pass epoch filters (DeclareEpochUses).
+std::mutex g_epochUsesMutex;
+std::unordered_map<const void*, std::vector<std::pair<const void*, uint32_t>>> g_epochUses;
+std::atomic<uint64_t> g_crossEpochSerial{0};
+std::atomic<uint64_t> g_placementTakenSerial{0};
+}
+
+void persistent_impl::NoteAliasPlacementTaken() noexcept { g_placementTakenSerial.fetch_add(1, std::memory_order_acq_rel); }
+
+uint64_t persistent_impl::AliasPlacementTakenSerial() noexcept { return g_placementTakenSerial.load(std::memory_order_acquire); }
+
+bool persistent_impl::DeclareEpochUses(const void* state, uint32_t epoch, std::vector<const void*>& declared, std::vector<const void*> resources) {
+	std::sort(resources.begin(), resources.end());
+	resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
+	if (resources == declared) return false;
+	bool crossed = false;
+	{
+		std::lock_guard lock(g_epochUsesMutex);
+		std::vector<const void*> gone, added;
+		std::set_difference(declared.begin(), declared.end(), resources.begin(), resources.end(), std::back_inserter(gone));
+		std::set_difference(resources.begin(), resources.end(), declared.begin(), declared.end(), std::back_inserter(added));
+		for (const auto* resource : gone) {
+			const auto found = g_epochUses.find(resource);
+			if (found == g_epochUses.end()) continue;
+			std::erase_if(found->second, [&](const auto& use) { return use.first == state; });
+			if (found->second.empty()) g_epochUses.erase(found);
+		}
+		for (const auto* resource : added) {
+			auto& uses = g_epochUses[resource];
+			for (const auto& use : uses) crossed = crossed || use.second != epoch;
+			uses.emplace_back(state, epoch);
+		}
+	}
+	declared = std::move(resources);
+	if (crossed) g_crossEpochSerial.fetch_add(1, std::memory_order_acq_rel);
+	return crossed;
+}
+
+void persistent_impl::ForgetEpochUses(const void* state, std::vector<const void*>& declared) noexcept {
+	if (declared.empty()) return;
+	std::lock_guard lock(g_epochUsesMutex);
+	for (const auto* resource : declared) {
+		const auto found = g_epochUses.find(resource);
+		if (found == g_epochUses.end()) continue;
+		std::erase_if(found->second, [&](const auto& use) { return use.first == state; });
+		if (found->second.empty()) g_epochUses.erase(found);
+	}
+	declared.clear();
+}
+
+bool persistent_impl::DeclaredByOtherEpoch(const void* resource, uint32_t epoch) {
+	std::lock_guard lock(g_epochUsesMutex);
+	const auto found = g_epochUses.find(resource);
+	if (found == g_epochUses.end()) return false;
+	for (const auto& use : found->second)
+		if (use.second != epoch) return true;
+	return false;
+}
+
+uint64_t persistent_impl::CrossEpochUsesSerial() noexcept {
+	return g_crossEpochSerial.load(std::memory_order_acquire);
+}
+
+void persistent_impl::SyncEpochUses(State& state, uint32_t epoch) {
+	std::vector<const void*> resources;
+	resources.reserve(state.entries.size());
+	for (const auto& entry : state.entries) {
+		if (entry.retired || entry.versioned || !entry.resource || entry.subscribers.empty()) continue;
+		auto* concrete = UnwrapDynamic(entry.resource);
+		// Only what an alias plan may place. Resources their makers materialize are bound as they are by every graph.
+		bool aliasable = false;
+		if (auto* texture = dynamic_cast<PixelBuffer*>(concrete)) aliasable = texture->GetDescription().allowAlias;
+		else if (auto* buffer = dynamic_cast<BufferBase*>(concrete))
+			aliasable = buffer->IsAliasingAllowed() && buffer->GetAccessType() == rhi::HeapType::DeviceLocal;
+		if (aliasable) resources.push_back(concrete);
+	}
+	DeclareEpochUses(&state, epoch, state.declaredUses, std::move(resources));
 }
 
 void RenderGraph::ReportFrameTransientUses(const persistent::SelectedPublication& scheduled) {
@@ -718,6 +810,29 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	// nothing here touches them.
 	const bool placeVersions = m_framePlacementEnabled && m_framePlacementEnabled();
 	for (auto& entry : state.entries) entry.aliasPlannedVersion = 0;
+	// Which of this graph's transients other epochs' graphs declare too. The serial first: a declaration made after it makes the
+	// next preparation look again (BindPersistentFrame).
+	state.crossEpochSerialAtPlan = CrossEpochUsesSerial();
+	state.placementTakenSerialAtPlan = AliasPlacementTakenSerial();
+	SyncEpochUses(state, m_passEpochFilter);
+	// Placements of this graph's that another graph has taken since (given a backing of its own, or placed again): no longer this
+	// graph's, so this plan neither keeps them as they were nor gives their backings back.
+	for (auto it = state.aliasPlacementOwners.begin(); it != state.aliasPlacementOwners.end();) {
+		const auto resource = it->second.resource.lock();
+		auto* backed = resource ? dynamic_cast<BackedResource*>(resource.get()) : nullptr;
+		if (backed && backed->IsMaterialized() && backed->GetBackingGeneration() == it->second.generation) { ++it; continue; }
+		state.aliasPlaced.erase(it->first);
+		it = state.aliasPlacementOwners.erase(it);
+	}
+	// Another graph placed it in its own pools, not at a frame placement. Those pools see only that graph's uses, and every graph of
+	// an arena packs its pools from offset 0, so binding it there puts two unordered placements into one heap. This graph gives it
+	// a backing of its own instead, and the other graph, finding its placement taken, binds that one (see above).
+	const auto inOtherOwnPool = [&](Resource* concrete) {
+		if (state.aliasPlaced.contains(concrete) || !AliasPlacedAnywhere(concrete)) return false;
+		const AliasHeapGeneration* heldHeap = nullptr;
+		uint64_t heldOffset = 0, heldSize = 0;
+		return !FramePlacedWhere(concrete, heldHeap, heldOffset, heldSize);
+	};
 
 	std::vector<uint32_t> rank(structure.passes.size(), UINT32_MAX);
 	std::vector<uint8_t> backendByPass(structure.passes.size(), 0);
@@ -784,6 +899,9 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		// Placed from a frame placement: its lifetime in this graph's ranks, as the version's bytes see it. Its uses, from rank 0
 		// when its contents come from an earlier epoch, to the last rank when they go on to a later one (or across runs).
 		uint32_t frameFirst = 0, frameLast = 0;
+		// A graph of another epoch declares it too (DeclaredByOtherEpoch). This graph's own pools see only its own uses, so it is
+		// never placed there: only a frame placement places it, or it keeps a backing of its own.
+		bool otherEpochs = false;
 		// Its own path, as planned before the frame placement step. Restored when the frame placement does not take it.
 		bool ownPooled = false;
 		uint64_t ownPoolID = 0;
@@ -846,6 +964,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		// A version's place comes from a frame placement alone, so a manual pool means nothing for it.
 		if (c.version) c.manualPool.reset();
 		c.shared = state.multiDeviceResources.contains(concrete);
+		c.otherEpochs = DeclaredByOtherEpoch(concrete, m_passEpochFilter);
 		c.acrossRuns = concrete->ContentAcrossRuns();
 		if (c.shared) c.resourceClass = c.texture ? 3u : 1u; // Render targets and depth do not qualify (IsSharedAliasEligible).
 		rhi::ResourceAllocationInfo info{};
@@ -1027,6 +1146,12 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	// A plan for any other reason (a structural build at a preparation) while the host has a newer version takes that one: placing
 	// from the older version would move the resources several epochs share back to its offsets, under the other epochs' graphs,
 	// which placed them from the newer one.
+	if (state.summaryOnly) {
+		// PublishPlacementSummaryAtBuild: the summary the plan would publish first, and nothing else.
+		--state.aliasPlans;
+		if (!state.framePlacementTaken && m_framePlacementEnabled && m_framePlacementEnabled()) publishSummary(false);
+		return false;
+	}
 	if (state.framePlacementTaken && m_framePlacementProbe && m_framePlacementProbe() != (state.framePlacement ? state.framePlacement->Id() : 0))
 		state.framePlacementTaken = false;
 	if (!state.framePlacementTaken) {
@@ -1051,6 +1176,21 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		c.exclusion = "frame placement does not cover it (used by several epochs)";
 		++frameWithheld;
 	};
+	// A transient a graph of another epoch declares too, which no frame placement places here: it keeps the backing it has (where
+	// another graph put it), or gets one of its own. This graph's own pools would reuse its bytes after its last use here, while the
+	// other epoch still reads it (or write it before an earlier epoch's contents arrive). The usage summary counts it uncovered, so
+	// the host computes a version that places it across the frame.
+	uint64_t crossEpochKept = 0;
+	const auto keepCrossEpoch = [&] {
+		crossEpochKept = 0;
+		for (auto& c : candidates) {
+			if (!c.otherEpochs || c.framePlaced || !c.pooled || c.manualPool || c.shared || c.version) continue;
+			c.pooled = false;
+			c.keepBacking = true;
+			c.exclusion = "another epoch's graph uses it and no frame placement places it here";
+			++crossEpochKept;
+		}
+	};
 	// The frame placement step: places the candidates from a version, starting from their own paths.
 	const auto placeFrom = [&](const std::shared_ptr<const FramePlacementVersion>& framePlacement) {
 		for (auto& c : candidates) {
@@ -1062,7 +1202,10 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			c.offset = 0;
 		}
 		framePlacedBytes = framePlacedCount = frameWithheld = frameOwnPath = frameMoved = frameFitted = 0;
-		if (!framePlacement) return;
+		if (!framePlacement) {
+			keepCrossEpoch();
+			return;
+		}
 		const auto epoch = m_passEpochFilter;
 		const auto slot = std::ranges::find_if(framePlacement->Slots(), [&](const auto& s) { return s.epoch == epoch; });
 		const bool repeatedSlot = slot != framePlacement->Slots().end() && slot->repeated;
@@ -1188,7 +1331,8 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 		std::vector<uint32_t> unplaced;
 		for (uint32_t i = 0; i < candidates.size(); ++i) {
 			const auto& c = candidates[i];
-			if (c.framePlaced || !c.ownPooled || c.shared || c.manualPool || c.acrossRuns || c.keepBacking || c.version || c.firstUse == UINT32_MAX) continue;
+			if (c.framePlaced || !c.ownPooled || c.shared || c.manualPool || c.acrossRuns || c.keepBacking || c.version || c.otherEpochs
+				|| c.firstUse == UINT32_MAX) continue;
 			unplaced.push_back(i);
 		}
 		std::stable_sort(unplaced.begin(), unplaced.end(), [&](uint32_t l, uint32_t r) {
@@ -1268,6 +1412,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				}
 			}
 		}
+		keepCrossEpoch();
 	};
 	placeFrom(state.framePlacement);
 	// Candidates the version leaves on this graph's own path or held back (new transients that did not fit, new resources other
@@ -1284,6 +1429,13 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			placeFrom(state.framePlacement);
 		}
 	}
+	// Whether the plan's apply gives a candidate it does not pool, which another graph placed, a backing of its own: one in another
+	// graph's own pools, or one an older build of this epoch placed (unless another epoch's graph binds it).
+	const auto takesOffPlacement = [&](const Candidate& c) {
+		if (!AliasPlacedAnywhere(c.concrete)) return false;
+		if (inOtherOwnPool(c.concrete)) return true;
+		return !c.keepBacking && !c.otherEpochs && !AliasPlacedByOtherEpoch(c.concrete, m_passEpochFilter);
+	};
 	// Placed before the graph is attached: resources the running graphs bind (materialized by someone else) must stay where they
 	// are. The first offender under a version, or null.
 	const auto movesForeign = [&](const std::shared_ptr<const FramePlacementVersion>& version) -> const Candidate* {
@@ -1298,7 +1450,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				if (!heap || !AtFramePlacement(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration())) return &c;
 			} else if (c.pooled) {
 				return &c;
-			} else if (!c.version && !c.keepBacking && AliasPlacedAnywhere(c.concrete)) {
+			} else if (!c.version && takesOffPlacement(c)) {
 				return &c;
 			}
 		}
@@ -1386,7 +1538,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				const auto heap = framePlacement->AcquireBlock(c.frameBlock);
 				if (!AtFramePlacement(c.concrete, heap.get(), c.offset, backed->GetBackingGeneration()))
 					refusal = "it would move a resource another graph binds";
-			} else if (!c.version && !c.keepBacking && AliasPlacedAnywhere(c.concrete))
+			} else if (!c.version && takesOffPlacement(c))
 				refusal = "it would take a resource another graph placed off its placement";
 			if (refusal) {
 				refused = &c;
@@ -1720,7 +1872,7 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				MaterializePersistentStandalone(std::span<Resource* const>{&c.concrete, 1}, false);
 				++standalone;
 			}
-		} else if (c.keepBacking && backed->IsMaterialized() && !state.aliasPlaced.contains(c.concrete)) {
+		} else if (c.keepBacking && backed->IsMaterialized() && !state.aliasPlaced.contains(c.concrete) && !inOtherOwnPool(c.concrete)) {
 			// Placed by another graph and shared with it: bound as it is, in this structural edit, so the executable admits its
 			// current placement. If that graph moves it, this one re-places (adoptedBackings).
 			state.aliasPlacementOwners.erase(c.concrete);
@@ -1728,14 +1880,37 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 			state.adoptedBackings[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
 		} else {
 			state.aliasPlacementOwners.erase(c.concrete);
-			if (state.aliasPlaced.erase(c.concrete) && backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
-			// Placed by another graph of the arena and standalone in this one: it leaves that placement for a backing of its own.
-			if (NoteAliasPlaced(c.concrete, false) && backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
+			const bool own = state.aliasPlaced.erase(c.concrete) != 0;
+			if (own && backed->IsMaterialized()) { dematerialize(c.concrete); ++rematerialized; }
+			// Placed by an older build of this epoch, whose pools go with it, or in another graph's own pools, and standalone in this
+			// one: it leaves that placement for a backing of its own. A frame placement another epoch's graph made, or a backing of
+			// its own another epoch's graph binds, stays: moving it would take it from under that graph's executable.
+			const bool otherHolds = !own && backed->IsMaterialized() && !inOtherOwnPool(c.concrete)
+				&& (AliasPlacedByOtherEpoch(c.concrete, m_passEpochFilter) || c.otherEpochs);
+			if (!otherHolds && NoteAliasPlaced(c.concrete, false) && backed->IsMaterialized()) {
+				dematerialize(c.concrete);
+				++rematerialized;
+				NoteAliasPlacementTaken();
+			}
 			if (!backed->IsMaterialized()) {
 				MaterializePersistentStandalone(std::span<Resource* const>{&c.concrete, 1}, false);
 				++standalone;
 				rebind(c.concrete);
+			} else {
+				// Materialized by someone else (another graph's placement or standalone backing): bound where it is now, in this
+				// structural edit. A later preparation's binding refresh could not admit a placement change, which only a structural
+				// edit may make. If its backing changes after this, this graph re-places (adoptedBackings).
+				bool stale = false;
+				for (const auto entryIndex : entriesByConcrete[c.concrete]) {
+					auto& entry = state.entries[entryIndex];
+					stale = stale || !entry.isBound || !(RotationKeyOf(entry) == entry.bound);
+				}
+				if (stale) rebind(c.concrete);
 			}
+			// Another epoch's graph may place it later (a frame placement that covers it there): followed the same way. Only what
+			// ORG graphs place or share: a backing its maker materialized stays where it is, and each preparation checks the list.
+			if (backed->IsMaterialized() && (c.otherEpochs || (!state.ownMaterialized.contains(c.concrete) && AliasPlacedAnywhere(c.concrete))))
+				state.adoptedBackings[c.concrete] = {c.concrete->weak_from_this(), backed->GetBackingGeneration()};
 		}
 	}
 	state.aliasRematerializations += rematerialized;
@@ -1815,11 +1990,11 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 	if (logging || state.aliasPlans <= 2 || rematerialized)
 		spdlog::info("Persistent alias plan #{}: epoch={} inHostStream={} candidates={} placed={} excluded={} pools={} overlapPairs={} "
 			"orderings={} rematerialized={} standalone={} independentMB={:.2f} requiredMB={:.2f} reservedMB={:.2f} rebuild={} "
-			"framePlacement={} framePlaced={} framePlacedMB={:.2f} frameWithheld={} frameOwnPath={} frameMoved={} frameFitted={}",
+			"framePlacement={} framePlaced={} framePlacedMB={:.2f} frameWithheld={} frameOwnPath={} frameMoved={} frameFitted={} crossEpochKept={}",
 			state.aliasPlans, m_passEpochFilter, PassEpochInHostStream(), candidates.size(), placed, excludedCount, byPool.size(),
 			overlapPairs, edges.size(), rematerialized, standalone, independentBytes / (1024.0 * 1024.0), requiredBytes / (1024.0 * 1024.0),
 			reservedBytes / (1024.0 * 1024.0), changed, framePlacement ? framePlacement->Id() : 0, framePlacedCount,
-			framePlacedBytes / (1024.0 * 1024.0), frameWithheld, frameOwnPath, frameMoved, frameFitted);
+			framePlacedBytes / (1024.0 * 1024.0), frameWithheld, frameOwnPath, frameMoved, frameFitted, crossEpochKept);
 	// Which queue slots this epoch's batches use, once per plan under logging: with inHostStream, which of them are in the host's stream.
 	if (logging) {
 		std::vector<uint32_t> queues;
@@ -1863,6 +2038,477 @@ bool RenderGraph::PlanPersistentAliasPlacement(persistent::GraphEditTransaction&
 				c.firstUseIsWrite ? "write" : "read", c.lastUse, nameByRank[c.lastUse], c.users.size());
 	}
 	return changed;
+}
+
+// ---- Re-placement prepared on a worker (PrepareFramePlacementReplacement, InstallPreparedReplacement) ----
+
+namespace {
+// Prepared backings by frame placement version and resource. Graphs of several epochs that bind one resource bind one prepared
+// backing, made by whichever graph prepares first.
+std::mutex g_preparedBackingsMutex;
+std::map<std::pair<uint64_t, const Resource*>, std::weak_ptr<PreparedPlacedBacking>> g_preparedBackings;
+
+std::shared_ptr<PreparedPlacedBacking> PreparedBackingFor(uint64_t versionId, Resource& concrete, BackedResource& backed,
+	const std::shared_ptr<const AliasHeapGeneration>& heap, uint64_t offset, uint64_t poolID, std::string& why) {
+	std::lock_guard lock(g_preparedBackingsMutex);
+	std::erase_if(g_preparedBackings, [&](const auto& entry) { return entry.second.expired() || entry.first.first < versionId; });
+	auto& slot = g_preparedBackings[{versionId, &concrete}];
+	if (auto existing = slot.lock()) {
+		if (existing->heap == heap && existing->offset == offset) return existing;
+		why = "another graph prepared '" + concrete.GetName() + "' at another placement";
+		return {};
+	}
+	auto made = backed.PreparePlacedBacking(heap, offset, poolID, &why);
+	if (!made) why = "'" + concrete.GetName() + "': " + why;
+	slot = made;
+	return made;
+}
+
+// What a preparation reads of the graph, captured on the owner thread when it starts.
+struct PreparedReplacementInputs {
+	uint32_t epoch = UINT32_MAX;
+	struct Item {
+		Resource* concrete = nullptr;
+		std::shared_ptr<Resource> keep;  // alive while the preparation runs
+		State::AliasPlacementRecord record;
+		bool own = false;    // this graph gives the placement back at its end (aliasPlacementOwners)
+		bool frame = false;  // placed from a frame placement, not in the graph's own pools
+		std::vector<uint32_t> entries;  // bound slot entries of it
+	};
+	std::vector<Item> items;
+	// By slot (entry) index: the concrete resource of a direct, unversioned slot, and the slot with its shape.
+	std::vector<Resource*> slotResource;
+	std::vector<std::pair<persistent::ResourceSlotId, CompileResourceShape>> slots;
+	std::unordered_map<uint32_t, persistent::PassId> idBySlot;
+};
+
+using PreparedJob = State::PreparedReplacement;
+
+// The worker's half. Reads only the inputs, the immutable base publication and the version, and makes the prepared backings, which
+// change nothing a running graph uses.
+void RunPreparedReplacement(PreparedJob& job, const PreparedReplacementInputs& in) {
+	using Clock = std::chrono::steady_clock;
+	const auto ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+	const auto begin = Clock::now();
+	const auto refuse = [&](std::string why) {
+		job.why = std::move(why);
+		job.phase.store(-1, std::memory_order_release);
+	};
+	try {
+		const auto& version = *job.version;
+		const auto& executable = *job.base->executable;
+		const auto& graph = *executable.graph;
+		const auto& structure = *graph.structure;
+		// Ranks and users as the plan computes them, from the publication the graph runs now.
+		std::vector<uint32_t> rank(structure.passes.size(), UINT32_MAX);
+		uint32_t nextRank = 0;
+		for (const auto& batch : graph.batches)
+			for (const auto pass : batch.passes) rank.at(pass) = nextRank++;
+		std::unordered_map<Resource*, uint32_t> itemOf;
+		for (uint32_t i = 0; i < in.items.size(); ++i) itemOf.emplace(in.items[i].concrete, i);
+		struct Life {
+			uint32_t first = UINT32_MAX, last = 0;
+			std::vector<uint32_t> users;
+		};
+		std::vector<Life> life(in.items.size());
+		const auto itemFor = [&](uint32_t resourceIndex) -> uint32_t {
+			if (resourceIndex >= executable.resourceSlots.size()) return UINT32_MAX;
+			const auto slot = executable.resourceSlots[resourceIndex];
+			if (slot.index >= in.slotResource.size() || !in.slotResource[slot.index]) return UINT32_MAX;
+			const auto found = itemOf.find(in.slotResource[slot.index]);
+			return found == itemOf.end() ? UINT32_MAX : found->second;
+		};
+		for (uint32_t p = 0; p < structure.passes.size(); ++p) {
+			const auto& pass = structure.passes[p];
+			const auto touch = [&](uint32_t resource) {
+				const auto index = itemFor(resource);
+				if (index == UINT32_MAX || rank[p] == UINT32_MAX) return;
+				auto& l = life[index];
+				l.first = (std::min)(l.first, rank[p]);
+				l.last = (std::max)(l.last, rank[p]);
+				if (l.users.empty() || l.users.back() != p) l.users.push_back(p);
+			};
+			for (const auto& use : pass.entryStates) touch(use.resource);
+			for (const auto& use : pass.exitStates) touch(use.resource);
+			for (const auto& access : pass.accesses) touch(access.resourceIndex);
+		}
+		for (auto& l : life) {
+			std::sort(l.users.begin(), l.users.end());
+			l.users.erase(std::unique(l.users.begin(), l.users.end()), l.users.end());
+		}
+		// Where each placement goes under the version, by the rules TakeFramePlacementInPlace checks, except that a resource may move.
+		const auto slotIt = std::ranges::find_if(version.Slots(), [&](const auto& s) { return s.epoch == in.epoch; });
+		const bool repeatedSlot = slotIt != version.Slots().end() && slotIt->repeated;
+		const uint32_t lastRank = nextRank ? nextRank - 1 : 0;
+		struct Placed {
+			std::shared_ptr<const AliasHeapGeneration> heap;
+			State::AliasPlacementRecord record;
+			uint32_t block = UINT32_MAX, frameFirst = 0, frameLast = 0;
+			bool multiEpoch = false;
+		};
+		std::vector<Placed> placed(in.items.size());
+		for (uint32_t i = 0; i < in.items.size(); ++i) {
+			const auto& item = in.items[i];
+			const auto* entry = version.FindObject(item.concrete->GetGlobalResourceID() + 1);
+			const auto name = "'" + item.concrete->GetName() + "'";
+			if (life[i].first == UINT32_MAX) return refuse(name + " is not used by the running publication");
+			if (!item.frame) {
+				if (entry && entry->placed) return refuse("the version places " + name + ", which is in the graph's own pools");
+				placed[i].record = item.record;
+				continue;
+			}
+			if (!entry || !entry->placed) return refuse("the version does not place " + name);
+			if (!entry->UseIn(in.epoch)) return refuse("the version has no use of " + name + " in this epoch");
+			auto heap = version.PeekBlock(entry->block);
+			if (!heap) return refuse("the version's block for " + name + " has no heap yet");
+			if (entry->size != item.record.sizeBytes) return refuse("the size of " + name + " changed");
+			const bool firstInFrame = entry->uses.front().epoch == in.epoch;
+			const bool lastInFrame = entry->uses.back().epoch == in.epoch;
+			const bool continues = !firstInFrame || entry->acrossRuns;
+			if (continues != item.record.continues) return refuse("the contents flow of " + name + " changed");
+			const bool wholeSlot = entry->acrossRuns || (entry->MultiEpoch() && repeatedSlot);
+			auto& p = placed[i];
+			p.block = entry->block;
+			p.frameFirst = firstInFrame && !wholeSlot ? life[i].first : 0;
+			p.frameLast = lastInFrame && !wholeSlot ? life[i].last : lastRank;
+			p.multiEpoch = entry->MultiEpoch();
+			p.record = {version.Blocks().at(entry->block).poolID, entry->offset, entry->size, heap.get(), continues};
+			p.heap = std::move(heap);
+		}
+		// Two of this graph's frame placed resources that share bytes and are live together here: the plan would move one of them.
+		// Then byte overlaps per pool or block: placement orderings between their users, as the plan derives them.
+		std::map<uint64_t, std::vector<uint32_t>> byPool;
+		for (uint32_t i = 0; i < in.items.size(); ++i) byPool[placed[i].record.poolID].push_back(i);
+		std::vector<std::pair<uint32_t, uint32_t>> edges;
+		for (auto& [poolID, members] : byPool) {
+			for (size_t a = 0; a < members.size(); ++a)
+				for (size_t b = a + 1; b < members.size(); ++b) {
+					const auto& pa = placed[members[a]];
+					const auto& pb = placed[members[b]];
+					if (pa.record.heap != pb.record.heap) continue;
+					if (pa.record.offset >= pb.record.offset + pb.record.sizeBytes || pb.record.offset >= pa.record.offset + pa.record.sizeBytes) continue;
+					const auto& la = life[members[a]];
+					const auto& lb = life[members[b]];
+					const auto& nameA = in.items[members[a]].concrete->GetName();
+					const auto& nameB = in.items[members[b]].concrete->GetName();
+					if (in.items[members[a]].frame && in.items[members[b]].frame
+						&& !(pa.frameLast < pb.frameFirst || pb.frameLast < pa.frameFirst))
+						return refuse("'" + nameA + "' and '" + nameB + "' share bytes and are live together");
+					const bool aFirst = la.last < lb.first;
+					const auto& earlier = aFirst ? la : lb;
+					const auto& later = aFirst ? lb : la;
+					if (!(earlier.last < later.first)) return refuse("'" + nameA + "' and '" + nameB + "' overlap in bytes and in time");
+					for (const auto u : earlier.users)
+						for (const auto v : later.users) edges.emplace_back(structure.passes[u].preparedPassIndex, structure.passes[v].preparedPassIndex);
+				}
+		}
+		std::sort(edges.begin(), edges.end());
+		edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+		// Moved: another heap, offset or size, as the plan's apply decides (AtFramePlacement). Only another block pool id (a newer
+		// version's block in the same heap) or another set of epochs changes the records alone, as the plan's apply does for a
+		// resource already at its frame placement: its backing and bindings stay.
+		std::vector<uint32_t> movedItems, updatedItems;
+		for (uint32_t i = 0; i < in.items.size(); ++i) {
+			const auto& item = in.items[i];
+			if (!item.frame) continue;
+			const auto& to = placed[i].record;
+			if (to.heap != item.record.heap || to.offset != item.record.offset || to.sizeBytes != item.record.sizeBytes) movedItems.push_back(i);
+			else if (!(to == item.record) || placed[i].multiEpoch == item.own) updatedItems.push_back(i);
+		}
+		if (movedItems.empty()) return refuse("it moves nothing");
+		for (const auto i : updatedItems) {
+			PreparedJob::Moved updated;
+			updated.resource = in.items[i].keep;
+			updated.from = in.items[i].record;
+			updated.to = placed[i].record;
+			updated.multiEpoch = placed[i].multiEpoch;
+			job.updated.push_back(std::move(updated));
+		}
+		const auto planned = Clock::now();
+		job.planMs = ms(begin, planned);
+		// The backings the moved resources switch to, made now. A resource another epoch's graph binds gets one backing for both.
+		for (const auto i : movedItems) {
+			const auto& item = in.items[i];
+			auto* backed = dynamic_cast<BackedResource*>(item.concrete);
+			if (!backed) return refuse("'" + item.concrete->GetName() + "' has no backing to switch");
+			std::string why;
+			auto prepared = PreparedBackingFor(job.versionId, *item.concrete, *backed, placed[i].heap, placed[i].record.offset,
+				placed[i].record.poolID, why);
+			if (!prepared) return refuse(why);
+			PreparedJob::Moved moved;
+			moved.resource = item.keep;
+			moved.prepared = std::move(prepared);
+			moved.from = item.record;
+			moved.to = placed[i].record;
+			moved.multiEpoch = placed[i].multiEpoch;
+			moved.entries = item.entries;
+			job.moved.push_back(std::move(moved));
+		}
+		const auto backingsMade = Clock::now();
+		job.backingsMs = ms(planned, backingsMade);
+		// The publication: the running one with the new orderings and the moved resources' bindings, validated here.
+		persistent::GraphEditTransaction edit(job.base);
+		edit.ClearPlacementOrderings();
+		for (const auto& [from, to] : edges) {
+			const auto a = in.idBySlot.find(from), b = in.idBySlot.find(to);
+			if (a == in.idBySlot.end() || b == in.idBySlot.end()) return refuse("an ordering names an unknown pass slot");
+			edit.AddPlacementOrdering(a->second, b->second);
+		}
+		for (const auto& moved : job.moved) {
+			for (const auto entryIndex : moved.entries) {
+				const auto& [slot, shape] = in.slots.at(entryIndex);
+				auto binding = CapturePreparedSlotBinding(*moved.resource, *moved.prepared, slot.index, shape, moved.to.continues);
+				if (!binding) return refuse("no binding for '" + moved.resource->GetName() + "'");
+				edit.ReplaceBinding(slot, std::move(*binding));
+			}
+		}
+		job.ready = edit.Build(job.workspace, job.cancelled, true);
+		if (!job.ready) return refuse("the validated build produced no publication");
+		job.edges = std::move(edges);
+		job.kept = in.items.size() - movedItems.size() - updatedItems.size();
+		job.buildMs = ms(backingsMade, Clock::now());
+		job.phase.store(1, std::memory_order_release);
+	} catch (const std::exception& error) {
+		refuse(std::string("it failed: ") + error.what());
+	}
+}
+
+// Slots whose binding the live publication changed since base: false when they differ in size.
+bool ChangedSlots(const persistent::SelectedPublication& base, const persistent::SelectedPublication& live, std::vector<uint32_t>& out) {
+	if (base.bindings.Size() != live.bindings.Size()) return false;
+	for (uint32_t i = 0; i < base.bindings.Size(); ++i) {
+		const auto* a = base.bindings.TryAt(i);
+		const auto* b = live.bindings.TryAt(i);
+		if (a == b) continue;
+		if (!a || !b) return false;
+		if (a->identity == b->identity && a->backingRevision == b->backingRevision && a->descriptorRevision == b->descriptorRevision
+			&& a->contentRevision == b->contentRevision && a->recording == b->recording && a->bound == b->bound && a->active == b->active)
+			continue;
+		out.push_back(i);
+	}
+	return true;
+}
+}  // namespace
+
+bool RenderGraph::PrepareFramePlacementReplacement(std::shared_ptr<const FramePlacementVersion> version) {
+	if (!version || !m_compilerState || m_compilerState->frameProductionStopped || !m_compilerState->persistent || !m_taskService) return false;
+	auto& state = *m_compilerState->persistent;
+	if (state.preparedReplacement && state.preparedReplacement->versionId == version->Id()) return true;
+	state.preparedReplacement.reset();
+	if (state.pending || !state.framePlacementTaken || !state.framePlacement || state.aliasPlacementDeferred || !version->HasEpoch(m_passEpochFilter)
+		|| state.framePlacement->Id() >= version->Id())
+		return false;
+	// A resource this graph binds where another epoch's graph placed it on its own path: that graph's re-placement moves it, so this
+	// graph re-places after it, as before.
+	if (!state.adoptedBackings.empty()) return false;
+	auto live = state.program.Select();
+	if (!live || !live->executable) return false;
+	auto inputs = std::make_shared<PreparedReplacementInputs>();
+	inputs->epoch = m_passEpochFilter;
+	std::unordered_map<Resource*, uint32_t> itemOf;
+	bool anyFrame = false;
+	for (const auto& [concrete, record] : state.aliasPlaced) {
+		PreparedReplacementInputs::Item item;
+		item.concrete = concrete;
+		item.keep = concrete->weak_from_this().lock();
+		if (!item.keep) return false;
+		item.record = record;
+		item.own = state.aliasPlacementOwners.contains(concrete);
+		item.frame = FramePlacementVersion::IsBlockPoolID(record.poolID);
+		anyFrame = anyFrame || item.frame;
+		itemOf.emplace(concrete, static_cast<uint32_t>(inputs->items.size()));
+		inputs->items.push_back(std::move(item));
+	}
+	if (!anyFrame) return false;
+	inputs->slotResource.assign(state.entries.size(), nullptr);
+	inputs->slots.resize(state.entries.size());
+	for (uint32_t index = 0; index < state.entries.size(); ++index) {
+		const auto& entry = state.entries[index];
+		if (entry.retired || entry.versioned || !entry.resource) continue;
+		auto* concrete = UnwrapDynamic(entry.resource);
+		inputs->slotResource[index] = concrete;
+		inputs->slots[index] = {entry.slot, entry.shape};
+		if (const auto found = itemOf.find(concrete); found != itemOf.end() && entry.isBound) inputs->items[found->second].entries.push_back(index);
+	}
+	for (const auto& main : state.mainPasses) inputs->idBySlot.emplace(main.id.index, main.id);
+	auto job = std::make_shared<State::PreparedReplacement>();
+	job->versionId = version->Id();
+	job->version = std::move(version);
+	job->base = std::move(live);
+	job->aliasPlans = state.aliasPlans;
+	job->startedFrame = state.frameNumber;
+	job->started = std::chrono::steady_clock::now();
+	job->workspace.SetScheduleCache(m_runtime->Schedules());
+	auto& compiler = *m_compilerState;
+	if (!compiler.persistentBuildScope) compiler.persistentBuildScope = m_taskService->CreateScope("ORG.Persistent.Build");
+	auto run = [job, inputs] {
+		BT_ZONE_SCOPE("ORG.Persistent.PrepareReplacement");
+		RunPreparedReplacement(*job, *inputs);
+	};
+	if (!compiler.persistentBuildScope
+		|| !m_taskService->Submit(compiler.persistentBuildScope, runtime::TaskPriority::Streaming, "ORG.Persistent.PrepareReplacement", run))
+		return false;
+	state.preparedReplacement = std::move(job);
+	return true;
+}
+
+bool RenderGraph::FramePlacementReplacementSettled(uint64_t versionId) const {
+	if (!m_compilerState || !m_compilerState->persistent) return true;
+	const auto job = m_compilerState->persistent->preparedReplacement;
+	return !job || job->versionId != versionId || job->phase.load(std::memory_order_acquire) != 0;
+}
+
+bool RenderGraph::PersistentStructuralBuildPending() const {
+	return m_compilerState && m_compilerState->persistent && m_compilerState->persistent->pending;
+}
+
+std::pair<uint64_t, uint64_t> RenderGraph::PreparedReplacementCounts() const {
+	if (!m_compilerState || !m_compilerState->persistent) return {0, 0};
+	const auto& state = *m_compilerState->persistent;
+	return {state.preparedReplacementsInstalled, state.preparedReplacementsRefused};
+}
+
+bool RenderGraph::InstallPreparedReplacement() {
+	auto& state = *m_compilerState->persistent;
+	auto job = state.preparedReplacement;
+	if (!job) return false;
+	const uint64_t current = m_framePlacementProbe ? m_framePlacementProbe() : 0;
+	if (job->versionId != current) {
+		// Made for another version: an older one is of no use any more, a newer one waits for its publication.
+		if (job->versionId < current) state.preparedReplacement.reset();
+		return false;
+	}
+	state.preparedReplacement.reset();
+	const auto begin = std::chrono::steady_clock::now();
+	const auto decline = [&](const std::string& why) {
+		++state.preparedReplacementsRefused;
+		spdlog::info("Persistent alias re-placement: epoch {} does not install the one prepared for frame placement {} ({}); it places again "
+					 "here: frame={}", m_passEpochFilter, job->versionId, why, state.frameNumber);
+		return false;
+	};
+	const int phase = job->phase.load(std::memory_order_acquire);
+	if (phase == 0) {
+		// Still running: cancelled, and this preparation places as before.
+		job->cancelled.store(true, std::memory_order_release);
+		return decline("its preparation had not finished");
+	}
+	if (phase < 0) {
+		if (job->why == "it moves nothing") return false;
+		return decline(job->why);
+	}
+	const auto live = state.program.Select();
+	if (!live || live->executable != job->base->executable) return decline("the graph's executable changed since");
+	if (state.aliasPlans != job->aliasPlans || state.pending) return decline("the graph planned again since");
+	// Everything is checked before anything changes.
+	for (const auto& moved : job->moved) {
+		auto* concrete = moved.resource.get();
+		auto* backed = dynamic_cast<BackedResource*>(concrete);
+		const auto found = state.aliasPlaced.find(concrete);
+		if (!backed || found == state.aliasPlaced.end() || !(found->second == moved.from))
+			return decline("'" + concrete->GetName() + "' was placed again since");
+		const auto generation = backed->GetBackingGeneration();
+		const bool adopted = moved.prepared->adopted.load(std::memory_order_acquire);
+		if (adopted ? generation != moved.prepared->fromGeneration + 1 : generation != moved.prepared->fromGeneration)
+			return decline("the backing of '" + concrete->GetName() + "' changed since");
+	}
+	for (const auto& updated : job->updated) {
+		auto* concrete = updated.resource.get();
+		const auto found = state.aliasPlaced.find(concrete);
+		if (found == state.aliasPlaced.end() || !(found->second == updated.from)) return decline("'" + concrete->GetName() + "' was placed again since");
+	}
+	// Binding edits installed since the preparation started go onto its publication.
+	auto ready = job->ready;
+	std::vector<uint32_t> changed;
+	if (live != job->base) {
+		if (!ChangedSlots(*job->base, *live, changed)) return decline("the graph's slots changed since");
+		if (!changed.empty()) {
+			std::unordered_set<uint32_t> movedSlots;
+			for (const auto& moved : job->moved) movedSlots.insert(moved.entries.begin(), moved.entries.end());
+			try {
+				persistent::GraphEditTransaction replay(ready);
+				for (const auto index : changed) {
+					if (movedSlots.contains(index)) return decline("a moved resource's binding changed since");
+					const auto* binding = live->bindings.TryAt(index);
+					const auto* prepared = ready->bindings.TryAt(index);
+					if (!binding || !prepared) return decline("a slot retired since");
+					const auto slot = ready->bindings.CurrentSlot(index);
+					if (!binding->bound) {
+						if (prepared->bound) replay.Unbind(slot);
+					} else if (prepared->bound) replay.ReplaceBinding(slot, *binding);
+					else replay.BindReserved(slot, *binding);
+				}
+				std::atomic_bool cancelled{false};
+				ready = replay.Build(m_compilerState->synchronousCompileWorkspace, cancelled);
+			} catch (const std::exception& error) {
+				return decline(std::string("its binding replay failed: ") + error.what());
+			}
+			if (!ready) return decline("its binding replay produced no publication");
+		}
+	}
+	// The switch: the moved resources take their prepared backings (a resource another epoch's graph adopted earlier in the frame
+	// has it already), then the publication that binds them installs.
+	size_t adoptedHere = 0;
+	std::vector<bool> adoptedBy(job->moved.size(), false);
+	for (size_t i = 0; i < job->moved.size(); ++i) {
+		auto& moved = job->moved[i];
+		if (moved.prepared->adopted.load(std::memory_order_acquire)) continue;
+		auto* backed = dynamic_cast<BackedResource*>(moved.resource.get());
+		if (!backed->AdoptPreparedBacking(*moved.prepared))
+			throw std::runtime_error("Persistent prepared re-placement: '" + moved.resource->GetName() + "' could not switch to its prepared backing");
+		adoptedBy[i] = true;
+		++adoptedHere;
+	}
+	if (!state.program.InstallRebased(ready)) throw std::runtime_error("Persistent prepared re-placement failed to install");
+	// The plan's records, as its apply leaves them for a resource placed again (or found at its new placement, when another epoch's
+	// graph adopted it first).
+	for (size_t i = 0; i < job->moved.size(); ++i) {
+		const auto& moved = job->moved[i];
+		auto* concrete = moved.resource.get();
+		auto* backed = dynamic_cast<BackedResource*>(concrete);
+		const auto generation = backed->GetBackingGeneration();
+		state.aliasPlaced[concrete] = moved.to;
+		NoteAliasPlaced(concrete, true, m_passEpochFilter);
+		if (adoptedBy[i]) NoteFramePlaced(concrete, moved.to.heap, moved.to.offset, generation, &state, moved.to.sizeBytes, m_passEpochFilter);
+		else ClaimFramePlaced(concrete, &state);
+		if (moved.multiEpoch) state.aliasPlacementOwners.erase(concrete);
+		else state.aliasPlacementOwners[concrete] = {concrete->weak_from_this(), generation};
+		for (const auto entryIndex : moved.entries) {
+			auto& entry = state.entries[entryIndex];
+			entry.isBound = true;
+			entry.bound = RotationKeyOf(entry);
+			for (const auto subscriber : entry.subscribers) state.mainPasses[subscriber].slotsDirty = true;
+		}
+	}
+	// Already where the version puts them: the records follow the version, and whether the placement is this graph's own its epochs.
+	// Their claims stay as they are (as TakeFramePlacementInPlace leaves them): a newer build of this epoch, staged and placed from
+	// this version meanwhile, may have claimed one, and taking the claim back would make this graph's end give its backing away.
+	for (const auto& updated : job->updated) {
+		auto* concrete = updated.resource.get();
+		auto* backed = dynamic_cast<BackedResource*>(concrete);
+		state.aliasPlaced[concrete] = updated.to;
+		if (updated.multiEpoch) state.aliasPlacementOwners.erase(concrete);
+		else if (backed && !state.aliasPlacementOwners.contains(concrete))
+			state.aliasPlacementOwners[concrete] = {concrete->weak_from_this(), backed->GetBackingGeneration()};
+	}
+	state.aliasEdges = job->edges;
+	state.framePlacement = job->version;
+	++state.placementSerial;
+	m_framePlacementVersion.store(job->versionId, std::memory_order_release);
+	++state.structuralBuilds;
+	++state.preparedReplacementsInstalled;
+	basic_telemetry::AddCounter("ORG.Persistent.PreparedReplacements");
+	spdlog::info("Persistent alias re-placement (prepared on a worker): epoch {} takes frame placement {}: {} moved ({} switched here), {} stay ({} with new records), "
+				 "{} orderings, {} bindings replayed; install {:.2f} ms, prepared in {:.2f} ms (plan {:.2f}, backings {:.2f}, validated build {:.2f}) "
+				 "over {} frames: frame={}",
+		m_passEpochFilter, job->versionId, job->moved.size(), adoptedHere, job->kept + job->updated.size(), job->updated.size(), job->edges.size(), changed.size(),
+		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), job->planMs + job->backingsMs + job->buildMs,
+		job->planMs, job->backingsMs, job->buildMs, state.frameNumber - job->startedFrame, state.frameNumber);
+	// What the preparation holds (its compile workspace, the publication it started from, the prepared backings' records) goes on a
+	// worker, not in this frame.
+	if (m_taskService && m_compilerState->persistentBuildScope)
+		(void)m_taskService->Submit(m_compilerState->persistentBuildScope, runtime::TaskPriority::Background, "ORG.Persistent.ReleasePreparedReplacement",
+			[job = std::move(job)]() mutable { job.reset(); });
+	return true;
 }
 
 } // namespace org

@@ -1054,6 +1054,7 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 					}
 
 					const auto start = std::chrono::steady_clock::now();
+					obj.pass->TakeFrameValues(context);
 					obj.pass->Update(context);
 					noteUpdate(toMilliseconds(std::chrono::steady_clock::now() - start), obj.name);
 					if (traceLifecycle) {
@@ -1087,6 +1088,8 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 	}
 	const double passUpdatesMs = toMilliseconds(passUpdatesEnd - updateBegin);
 	const double beforeCompileMs = toMilliseconds(beforeCompileEnd - passUpdatesEnd);
+	const auto preparationEnd = std::chrono::steady_clock::now();
+	m_lastPersistentUpdateTimings = {passUpdatesMs * 1000.0, beforeCompileMs * 1000.0, toMilliseconds(preparationEnd - beforeCompileEnd) * 1000.0};
 	const auto preparations = m_compilerState ? m_compilerState->asyncPreparationFrameNumber : 0;
 	if (preparations <= 2 || passUpdatesMs + beforeCompileMs > 1.5) {
 		std::string slowest;

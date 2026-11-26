@@ -14,6 +14,9 @@
 #include <span>
 #include <mutex>
 #include <set>
+#include <map>
+#include <cstdlib>
+#include <spdlog/spdlog.h>
 #include <string_view>
 #include <rhi.h>
 #include <rhi_colors.h>
@@ -73,9 +76,11 @@ struct RenderFrameSnapshot {
 
 // Async sealing is an explicit ownership operation. Synchronous preparation
 // need not allocate this packet or construct a compile request/candidate.
+// absent: per prepared pass, 1 where the pass was not prepared because its batch is submitted from a kept recording (batch reuse,
+// RenderGraph::SetKeptBatchReuse). No recording list is built for such a batch. Empty: every active pass is prepared.
 inline std::shared_ptr<const RenderFrameSnapshot> SealPersistentFrame(
     uint64_t frameNumber, const persistent::FrameAdmission& admission,
-    std::vector<PreparedPass> invocations) {
+    std::vector<PreparedPass> invocations, std::span<const uint8_t> absent = {}) {
     const auto selected = admission.publication;
     // A plan (SynchronousAdmission::PreparePlan, a ticket's body) has no sequence: it is sealed the same way.
     if (!frameNumber || !admission.domain || !selected || !selected->executable
@@ -112,6 +117,7 @@ inline std::shared_ptr<const RenderFrameSnapshot> SealPersistentFrame(
     }
     for (size_t i = 0; i < invocations.size(); ++i) {
         const bool active = layout->placements[i].preparedPass != UINT32_MAX;
+        if (active && !invocations[i] && i < absent.size() && absent[i]) continue;
         if (active != bool(invocations[i]) || (active && (invocations[i].IsConsumed() || !invocations[i].IsWorkerSafe())))
             throw std::invalid_argument("Persistent frame seal requires fresh active invocations");
     }
@@ -848,6 +854,42 @@ inline std::atomic<uint64_t>& UntouchedEntryBarriers() {
     return count;
 }
 
+// Diagnostics (ORG_INLINE_RECORD_TIMING=1): the CPU time of each inline late batch's recording (PreparedRhiExecutionBatch::
+// RecordInline: begin, barriers, passes, end) and of each of its passes' Record, logged per batch every 600 recordings.
+inline bool InlineRecordTimingEnabled() {
+    static const bool enabled = [] {
+        char* value = nullptr;
+        size_t size = 0;
+        const bool set = _dupenv_s(&value, &size, "ORG_INLINE_RECORD_TIMING") == 0 && value && value[0] && value[0] != '0';
+        free(value);
+        return set;
+    }();
+    return enabled;
+}
+// The pass times of the inline recording on this thread, by pass index (RecordOwnedRecordingCommands writes them).
+inline std::vector<double>& InlineRecordPassTimes() {
+    thread_local std::vector<double> times;
+    return times;
+}
+inline void NoteInlineRecordTiming(const std::string& a_key, std::span<const std::string_view> a_passes, double a_totalMs,
+    std::span<const double> a_passMs) {
+    struct Entry { double total = 0; std::vector<double> passes; uint32_t count = 0; };
+    static std::mutex mutex;
+    static std::map<std::string, Entry, std::less<>> entries;
+    std::scoped_lock lock(mutex);
+    auto& entry = entries[a_key];
+    entry.total += a_totalMs;
+    entry.passes.resize(a_passMs.size());
+    for (size_t i = 0; i < a_passMs.size(); ++i) entry.passes[i] += a_passMs[i];
+    if (++entry.count < 600) return;
+    std::string passes;
+    for (size_t i = 0; i < a_passes.size() && i < entry.passes.size(); ++i)
+        passes += (i ? ", " : "") + std::string(a_passes[i]) + " " + std::to_string(entry.passes[i] / entry.count).substr(0, 6);
+    spdlog::info("ORG inline record timing over {}: batch of {} passes, mean {:.4f} ms; passes' Record means (ms): {}", entry.count,
+        a_passes.size(), entry.total / entry.count, passes);
+    entry = {};
+}
+
 } // namespace org::diagnostics
 
 namespace org::compiler {
@@ -1294,8 +1336,15 @@ inline size_t RecordOwnedRecordingCommands(RecordingContext& context, const Owne
                 subRanges.passName = debugName.empty() ? "<unnamed>" : debugName.data();
             }
             runtime::RecordingRangeScope subRangeScope(ownedQueries || ranges ? &subRanges : nullptr);
+            const bool timed = recording.inlineAtExecution && diagnostics::InlineRecordTimingEnabled();
+            const auto timedStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (a_again) recording.passes[passIndex].RecordAgain(context);
             else recording.passes[passIndex].Record(context);
+            if (timed) {
+                auto& times = diagnostics::InlineRecordPassTimes();
+                if (times.size() < recording.passes.size()) times.resize(recording.passes.size());
+                times[passIndex] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - timedStart).count();
+            }
         }
         if (ranges) ranges->end(context.Commands(), queue);
         if (statisticsIndex >= 0) {
@@ -1390,6 +1439,26 @@ inline void PreparedRhiExecutionBatch::RecordDeferred(rhi::CommandList a_list) c
 
 inline rhi::CommandList PreparedRhiExecutionBatch::RecordInline(std::span<const uint8_t> a_skips, const UntouchedResources* a_untouched) const noexcept {
     BT_ZONE_SCOPE("ORG.Execution.RecordInline");
+    const bool timed = diagnostics::InlineRecordTimingEnabled();
+    const auto timedStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (timed) diagnostics::InlineRecordPassTimes().assign(m_deferred->passes.size(), 0.0);
+    struct TimedReport {
+        bool timed;
+        std::chrono::steady_clock::time_point start;
+        const OwnedRecordingList& deferred;
+        ~TimedReport() {
+            if (!timed) return;
+            std::string key;
+            std::vector<std::string_view> names;
+            for (const auto& pass : deferred.passes) {
+                names.push_back(pass.DebugName());
+                key.append(pass.DebugName()).push_back('|');
+            }
+            diagnostics::NoteInlineRecordTiming(key, names,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                diagnostics::InlineRecordPassTimes());
+        }
+    } timedReport{timed, timedStart, *m_deferred};
     try {
         auto& allocation = *m_deferred->allocation;
         // A batch keyed by its passes' skip answers: the list recorded for the same answers is submitted again as it is. Its

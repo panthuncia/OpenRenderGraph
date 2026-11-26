@@ -18,6 +18,9 @@ struct FrameRecordingJob {
     bool deferred = false;
     // When non-empty, the plan's timelines as this job's device sees them. A peer device waits on its imported copies.
     std::vector<PreparedTimelineBinding> timelines;
+    // Batch reuse (RenderGraph::SetKeptBatchReuse): the batch's packet from a kept recording, submitted again instead of a new
+    // recording. The job records nothing.
+    std::shared_ptr<const IPreparedExecutionBatch> reuse;
 };
 
 // Everything the recorder may read is frozen before dispatch. It has no graph,

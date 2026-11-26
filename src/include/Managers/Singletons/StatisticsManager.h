@@ -72,6 +72,9 @@ public:
 
 	// Kept recordings' own queries (IStatisticsService::CreateOwnedTimestamps).
 	std::shared_ptr<OwnedTimestampQueries> CreateOwnedTimestamps(rhi::QueueKind queueKind, uint32_t ranges);
+	// A released kept recording's pool and readback buffer (~OwnedTimestampQueries), for CreateOwnedTimestamps to use again.
+	// False when they were not taken: the caller deletes them.
+	bool RecycleOwnedTimestamps(rhi::QueryPoolPtr& pool, rhi::ResourcePtr& readback, rhi::QueueKind queueKind, uint32_t queries, uint64_t stride);
 	void BeginRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	void EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	void BeginListRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
@@ -99,7 +102,24 @@ public:
 
 private:
 	StatisticsManager() = default;
-	~StatisticsManager() = default;
+	~StatisticsManager();
+
+	// Released kept recordings' pools and readback buffers (RecycleOwnedTimestamps). Making them cost about 0.15-0.35 ms each,
+	// and a Visibility recording makes one per batch: 4-10 ms per re-recorded Visibility before this (M6 step 9b). One is used
+	// again only once kRecycleFrames frames began since its release, which is past any frame that could still run it.
+	struct RecycledTimestamps {
+		rhi::QueryPoolPtr pool;
+		rhi::ResourcePtr readback;
+		rhi::QueueKind queueKind = rhi::QueueKind::Graphics;
+		uint32_t queries = 0;
+		uint64_t stride = 0;
+		uint64_t releasedFrame = 0;
+	};
+	static constexpr uint64_t kRecycleFrames = 8;
+	static constexpr size_t kRecycleMost = 512;
+	std::mutex m_recycleMutex;
+	std::vector<RecycledTimestamps> m_recycledTimestamps;
+	std::atomic<uint64_t> m_recycleFrame{0};  // m_frameSerial, for threads other than the frame's
 
 	void EnsureQueueBuffers(rhi::QueueKind queueKind);
 	bool BeginOwnedRange(OwnedTimestampQueries& owned, std::string_view name, int passIndex, org::runtime::TimestampRangeKind kind, rhi::CommandList& cmd);

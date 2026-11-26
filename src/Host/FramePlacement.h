@@ -79,6 +79,9 @@ public:
 		// Under the owner's mutex: a graph of the set placed from the pending version (or left its placement to the attach while
 		// it was current), so the set keeps it; or the set declined it (DeclineStaged) and places from its base from then on.
 		bool m_pendingUsed = false, m_declined = false;
+		// Under the owner's mutex: the set's graphs publish their first summaries before any of them places (CollectStaged), and
+		// no version is computed from them meanwhile.
+		bool m_collecting = false;
 		// Under the owner's mutex: the set's epochs whose graphs placed at the build (NoteStagedPlacement). A later version of the
 		// staging keeps their resources too.
 		std::vector<uint32_t> m_placedEpochs;
@@ -102,6 +105,14 @@ public:
 		// the running graphs bind where they are (FramePlacementVersion::Keeping), so those graphs take it without placing
 		// again. Off, or when that cannot be done: the version is packed from scratch, and every graph places again from it.
 		bool keepRunning = true;
+		// The worker's versions (the settled layout, the trim) are offered, not published (Offered): the host has each graph prepare its
+		// re-placement on a worker first (RenderGraph::PrepareFramePlacementReplacement) and publishes the version at a frame boundary
+		// once they are ready (PublishOffered). An offer nobody publishes is published after offerTimeout, as without this.
+		bool offerVersions = false;
+		std::chrono::milliseconds offerTimeout{3000};
+		// An offered version's heaps are allocated on the worker before it is offered, so the graphs' preparations place into them.
+		// Off only without a device (tests).
+		bool allocateOffered = true;
 	};
 
 	explicit FramePlacement(std::vector<uint32_t> epochOrder);
@@ -136,6 +147,11 @@ public:
 	std::shared_ptr<Staging> BeginStaging(std::vector<uint32_t> epochs);
 	/** @brief A staged graph's summary. Computes the staging's pending version at once when its plan needs one (as Publish). */
 	void PublishStaged(Staging& staging, PlacementSummary summary);
+	/**
+	 * @brief While on, staged summaries are kept and compute nothing (PublishStaged). The set's graphs publish their summaries
+	 * first, so the version the first graph's uncovered candidates need places every graph of the set.
+	 */
+	void CollectStaged(Staging& staging, bool collecting);
 	/** @brief The version the staging's graphs place from: its pending version, else its base. */
 	std::shared_ptr<const FramePlacementVersion> StagedCurrent(const Staging& staging) const;
 	/**
@@ -158,6 +174,13 @@ public:
 	bool CommitStaging(Staging& staging);
 	/** @brief Closes the staging without changing anything (its set was dropped). */
 	void DropStaging(Staging& staging);
+	/** @brief The version the worker offers (Settings::offerVersions), null for none. */
+	std::shared_ptr<const FramePlacementVersion> Offered() const;
+	/**
+	 * @brief Owner thread, at a frame boundary: publishes the offered version if it is still id, as the worker would have: graphs place
+	 * from it at their next preparation (installing what they prepared). False when it is not offered any more.
+	 */
+	bool PublishOffered(uint64_t id);
 	/** @brief Settings::enabled. Lock-free, for each graph preparation. True before the first version too. */
 	bool Enabled() const noexcept { return m_enabled.load(std::memory_order_acquire); }
 	/** @brief The block memory's heaps (FramePlacementMemory::Heaps). */
@@ -222,6 +245,16 @@ private:
 	std::atomic<uint64_t> m_frozenId{0};
 	std::atomic<bool> m_frozen{false};
 	size_t m_openStagings = 0;  // under m_mutex: the worker publishes nothing while one is open
+	// Under m_mutex: the offered version (Settings::offerVersions), the current version it replaces, when it was offered, and for a
+	// trim the block needs whose unused heaps go at its publication.
+	std::shared_ptr<const FramePlacementVersion> m_offered, m_offeredOver;
+	std::chrono::steady_clock::time_point m_offeredAt{};
+	bool m_offeredTrim = false;
+	std::vector<FramePlacementBlockNeed> m_offeredNeeds;
+	// Under m_mutex: publishes the offer (PublishOffered, or the worker once it timed out).
+	void PublishOfferLocked();
+	// Under m_mutex: drops the offer (a change made it stale).
+	void DropOfferLocked(const char* why);
 	std::chrono::steady_clock::time_point m_nextMemoryLog{};  // MemoryLogDue, under m_mutex
 	bool m_stopping = false;
 	std::thread m_thread;

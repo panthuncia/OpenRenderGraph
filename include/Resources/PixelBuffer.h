@@ -153,6 +153,11 @@ public:
 
     void EnsureVirtualDescriptorSlotsAllocated() override;
 
+    // A placed backing made ahead, and the switch to it at a frame boundary (BackedResource).
+    std::shared_ptr<PreparedPlacedBacking> PreparePlacedBacking(std::shared_ptr<const AliasHeapGeneration> heap, uint64_t offset,
+        uint64_t poolID, std::string* why = nullptr) override;
+    bool AdoptPreparedBacking(PreparedPlacedBacking& prepared) override;
+
     ~PixelBuffer() override;
 
 protected:

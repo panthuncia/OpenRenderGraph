@@ -89,9 +89,9 @@ inline ResourceRegistry::RegistryHandle PersistentResolveByPtrThunk(void* user, 
 	return static_cast<RenderGraph*>(user)->RequestResourceHandle(ptr, allowFailure);
 }
 
-inline std::shared_ptr<const std::vector<PreparedStateRegion>> CaptureRegions(Resource& resource, CompileResourceShape shape) {
+inline std::shared_ptr<const std::vector<PreparedStateRegion>> CaptureTrackerRegions(SymbolicTracker* tracker, CompileResourceShape shape) {
 	auto regions = std::make_shared<std::vector<PreparedStateRegion>>();
-	if (auto* tracker = resource.GetStateTracker()) {
+	if (tracker) {
 		for (const auto& segment : tracker->GetSegments()) {
 			const auto range = LowerRange(segment.rangeSpec, shape);
 			if (!range) continue;
@@ -103,6 +103,9 @@ inline std::shared_ptr<const std::vector<PreparedStateRegion>> CaptureRegions(Re
 			{static_cast<uint64_t>(rhi::ResourceAccessType::None), static_cast<uint64_t>(rhi::ResourceLayout::Undefined),
 				static_cast<uint64_t>(rhi::ResourceSyncState::None), false}});
 	return regions;
+}
+inline std::shared_ptr<const std::vector<PreparedStateRegion>> CaptureRegions(Resource& resource, CompileResourceShape shape) {
+	return CaptureTrackerRegions(resource.GetStateTracker(), shape);
 }
 
 // The admission state of a slot's backing, from a snapshot of `concrete`. It has no alias placement.
@@ -160,6 +163,31 @@ inline std::optional<persistent::BindingVersion> CaptureSlotBinding(Resource& re
 	}
 }
 
+// The binding a slot of concrete takes once it adopted a prepared backing (BackedResource::PreparePlacedBacking): as CaptureSlotBinding
+// makes it from a capture then. The regions are the new backing's: a new resource's state. Any thread.
+inline std::optional<persistent::BindingVersion> CapturePreparedSlotBinding(Resource& concrete, PreparedPlacedBacking& prepared, uint32_t slotIndex,
+	CompileResourceShape shape, bool aliasContinues) {
+	const auto& snapshot = prepared.snapshot;
+	if (!snapshot || !snapshot->resource.GetHandle().valid()) return std::nullopt;
+	PreparedBackingState initial;
+	initial.graphResourceID = uint64_t{slotIndex} + 1;
+	initial.resource = snapshot->resource.GetHandle();
+	initial.shape = shape;
+	initial.regions = CaptureTrackerRegions(prepared.StateTracker(), shape);
+	rhi::ResourceDesc description{};
+	if (concrete.TryGetRHIResourceDesc(description)) initial.heapType = description.heapType;
+	initial.hostOwned = concrete.GoesHome();
+	initial.exempt = concrete.GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource;
+	initial.aliasHeap = snapshot->aliasHeap;
+	initial.aliasHeapIdentity = snapshot->aliasHeap.get();
+	initial.aliasPoolID = snapshot->aliasPoolID;
+	initial.aliasOffset = snapshot->aliasOffset;
+	initial.aliasSize = snapshot->aliasSize;
+	initial.aliasContinues = aliasContinues && snapshot->aliasSize != 0;
+	return persistent::BindingVersion::FromSnapshot(snapshot, initial, reinterpret_cast<uintptr_t>(initial.regions.get()),
+		initial.resource.generation);
+}
+
 // A transient a graph placed in its alias memory: the resource, and its backing generation right after the placement. A later
 // placement by another graph, or a standalone backing, moves the generation.
 struct AliasPlacementOwner {
@@ -170,6 +198,19 @@ struct AliasPlacementOwner {
 // placement stayed bound with no graph that uses it, and kept its pool's memory alive.
 // self: the state ending. Placements another state claimed since are left alone.
 void ReleaseOwnAliasPlacements(const std::unordered_map<Resource*, AliasPlacementOwner>& owners, const void* self) noexcept;
+// Which graphs declare which transients, across every graph (by graph state, with its pass epoch filter). A graph's own pools see
+// only its own uses, so a transient a graph of another epoch also binds must never go there: only a frame placement places it,
+// or it keeps a backing of its own. DeclareEpochUses replaces the state's set (sorted, unique). It returns whether this made a
+// resource newly used by two epochs; the serial then advances (CrossEpochUsesSerial). ForgetEpochUses at the state's end.
+// declared: the state's own copy of its set (PersistentExecutionState::declaredUses).
+bool DeclareEpochUses(const void* state, uint32_t epoch, std::vector<const void*>& declared, std::vector<const void*> resources);
+void ForgetEpochUses(const void* state, std::vector<const void*>& declared) noexcept;
+bool DeclaredByOtherEpoch(const void* resource, uint32_t epoch);
+uint64_t CrossEpochUsesSerial() noexcept;
+// Advances each time a plan takes a resource off a placement another graph made (gives it a backing of its own). A graph checks
+// its own placements' backings only when it moved since its plan (BindPersistentFrame).
+void NoteAliasPlacementTaken() noexcept;
+uint64_t AliasPlacementTakenSerial() noexcept;
 
 struct RotationKey {
 	uint64_t concreteID = 0, backingGeneration = 0;
@@ -467,6 +508,7 @@ struct RenderGraph::PersistentInstanceState {
 		if (aliasPlacementsReleased) return;
 		aliasPlacementsReleased = true;
 		ReleaseOwnAliasPlacements(aliasPlacementOwners, this);
+		ForgetEpochUses(this, declaredUses);
 		frameRegions.clear();
 		if (!aliasArena) return;
 		std::lock_guard lock(aliasArena->mutex);
@@ -491,6 +533,12 @@ struct RenderGraph::PersistentInstanceState {
 	// backing generation then. When that graph re-places one (its own re-placement for a newer frame placement), this graph's
 	// executable no longer admits the backing: the next preparation re-places this graph too (BindPersistentFrame).
 	std::unordered_map<Resource*, AliasPlacementOwner> adoptedBackings;
+	// The transients this graph declares, as last given to DeclareEpochUses, and the cross-epoch serial its latest alias plan saw. A
+	// newer serial (another epoch's graph now binds a resource too) makes the next preparation check whether one of them lies in this
+	// graph's own pools, and re-place if so (BindPersistentFrame).
+	std::vector<const void*> declaredUses;
+	uint64_t crossEpochSerialAtPlan = 0;
+	uint64_t placementTakenSerialAtPlan = 0;
 	// With a frame alias arena (RenderGraph::SetFrameAliasRegion): the range reserved for each pool's transients, by pool id. Each
 	// plan reserves its ranges again and gives back the previous ones. The state's end gives back the last ones.
 	std::unordered_map<uint64_t, std::shared_ptr<FrameAliasArena::Reservation>> frameRegions;
@@ -498,6 +546,9 @@ struct RenderGraph::PersistentInstanceState {
 	// there was none. framePlacementTaken: the first plan has run.
 	std::shared_ptr<const FramePlacementVersion> framePlacement;
 	bool framePlacementTaken = false;
+	// Moves each time the graph's placements change: a frame placement version taken in place, a prepared re-placement installed,
+	// and every alias plan that installs. A kept recording made under another serial is not current (O-M6-3).
+	uint64_t placementSerial = 0;
 	// Concrete resources a pass on another device uses. Their representations are committed allocations shared between the
 	// devices, so they are never alias candidates: a placement would be replaced by those, and rematerializing one drops them.
 	std::unordered_set<Resource*> multiDeviceResources;
@@ -512,6 +563,8 @@ struct RenderGraph::PersistentInstanceState {
 	// RenderGraph::PlaceDeferredAliasesAtBuild: the plan runs before the graph is attached, so it must move nothing another graph
 	// binds. A plan that would sets atBuildRefusal and changes nothing.
 	bool placingAtBuild = false;
+	// RenderGraph::PublishPlacementSummaryAtBuild: the plan publishes the graph's usage summary and stops there.
+	bool summaryOnly = false;
 	std::string atBuildRefusal;
 	// The plan at the build declined a new version (RenderGraph::SetFramePlacementDecline): its new transients may go to its pool.
 	bool atBuildOwnPools = false;
@@ -559,6 +612,38 @@ struct RenderGraph::PersistentInstanceState {
 		std::chrono::steady_clock::time_point started;
 	};
 	std::shared_ptr<PendingStructural> pending;
+	// A re-placement for a newer frame placement version, prepared on a worker while the graph keeps running
+	// (RenderGraph::PrepareFramePlacementReplacement): the plan's placements and orderings, the resources it moves given backings
+	// made ahead, and the validated publication. The preparation that first sees the version current installs it
+	// (InstallPreparedReplacement), or re-places as before when anything it was made from changed.
+	struct PreparedReplacement {
+		uint64_t versionId = 0;
+		std::shared_ptr<const FramePlacementVersion> version;
+		std::shared_ptr<const persistent::SelectedPublication> base;
+		uint64_t aliasPlans = 0;
+		uint64_t startedFrame = 0;
+		std::atomic<int> phase{0}; // 0 running, 1 ready, -1 refused or failed
+		std::string why;
+		std::shared_ptr<const persistent::SelectedPublication> ready;
+		std::vector<std::pair<uint32_t, uint32_t>> edges;
+		struct Moved {
+			std::shared_ptr<Resource> resource;
+			std::shared_ptr<PreparedPlacedBacking> prepared;
+			AliasPlacementRecord from, to;
+			bool multiEpoch = false;
+			std::vector<uint32_t> entries; // slot entry indices bound to it
+		};
+		std::vector<Moved> moved;
+		// Frame placed resources the version leaves where they are, whose records it changes (a block pool id, its epochs).
+		std::vector<Moved> updated;
+		size_t kept = 0;
+		double planMs = 0.0, backingsMs = 0.0, buildMs = 0.0;
+		compiler::CompileWorkspace workspace;
+		std::atomic_bool cancelled{false};
+		std::chrono::steady_clock::time_point started;
+	};
+	std::shared_ptr<PreparedReplacement> preparedReplacement;
+	uint64_t preparedReplacementsInstalled = 0, preparedReplacementsRefused = 0;
 	// Submitted this frame.
 	uint64_t structuralBuilds = 0, bindingBuilds = 0;
 	// Bindings taken out of frames' edits because they change which slots share a backing (SharingChangePolicy::
@@ -580,6 +665,17 @@ struct RenderGraph::PersistentLayoutState {
 		std::vector<std::pair<uint32_t, const void*>> bound;
 	};
 	VersionedOverlay versionedOverlay;
+	// The currency probe's previous preparation (RenderGraph::SetCurrencyProbe), and its counts since the last take. Owner thread.
+	struct CurrencyProbe {
+		bool primed = false;
+		std::shared_ptr<const persistent::SelectedPublication> publication;
+		std::shared_ptr<const void> bindings;
+		std::vector<std::pair<const void*, uint64_t>> versions;
+		uint64_t journalHead = 0;
+		uint64_t placementId = 0, aliasPlans = 0;
+		RenderGraph::CurrencyProbeStats stats;
+	};
+	CurrencyProbe currencyProbe;
 	// Pass names per logical pass slot, per executable.
 	std::shared_ptr<const std::vector<std::string>> mainNames;
 	const void* mainNamesExecutable = nullptr;
@@ -617,6 +713,31 @@ struct RenderGraph::PersistentExecution {
 		std::shared_ptr<const FrozenExecutionBindings> bindings;
 		std::vector<compiler::PreparedTimelineBinding> foreignTimelines;
 		std::vector<std::shared_ptr<const void>> leases;
+		// A synchronous execution's kept copy (PersistentExecutionOptions::keptCopy), UINT32_MAX for none.
+		uint32_t keptCopy = UINT32_MAX;
+		// The copy's kept recording, current for this execution: it is submitted instead of a new recording, and the segment
+		// prepared nothing (invocations is empty).
+		std::shared_ptr<const PersistentRecording> replay;
+		// Recorded for a kept copy: every pass's revision hash, in preparation order with its name, and whether each was skipped
+		// for the host data (RenderGraphPass::SetSkipWhen). uncheckable: a pass reported no revision (uncheckableBy names it).
+		std::vector<std::pair<const RenderGraphPass*, uint64_t>> revisions;
+		std::vector<std::string> revisionNames;
+		std::vector<std::pair<const RenderGraphPass*, uint8_t>> skips;
+		// With the revision audit on (RenderGraph::SetKeptRecordingAudit): each revisions entry's frame data, null where it
+		// cannot be compared.
+		std::vector<std::shared_ptr<const PreparedFrameDataAudit>> audits;
+		bool uncheckable = false;
+		std::string uncheckableBy;
+		// Why the copy's kept recording was not current (LastKeptRun::reason).
+		std::string staleReason;
+		// Batch reuse (RenderGraph::SetKeptBatchReuse), recorded for a kept copy: each revisions entry's prepared pass index, and
+		// the prepared passes with no revision, with their names.
+		std::vector<uint32_t> revisionPrepared;
+		std::vector<std::pair<uint32_t, std::string>> uncheckablePrepared;
+		// A partial run: per batch, 1 where the batch is submitted from `replay` (its passes were not prepared), 0 where it is
+		// recorded now; and per batch why it records. Empty for any other run.
+		std::vector<uint8_t> reuseBatches;
+		std::vector<std::string> staleBatches;
 	};
 	// An upload recorded by an upload pass. Submitted through the graph's external client (RenderGraph::GetExternalClient)
 	// before the main segment.
@@ -675,6 +796,32 @@ struct RenderGraph::PersistentExecutionsState {
 	static constexpr size_t kHandoffCacheEntries = 4;
 	std::vector<std::vector<HandoffCache>> handoffCache;
 	std::vector<uint8_t> tracyFrameBegun;
+	// Kept recordings of synchronous executions, by kept copy (PersistentExecutionOptions::keptCopy): the copy's last replayable
+	// recording and what it was recorded for beyond the recording's own key (RenderGraph::PersistentRecording).
+	struct SyncKept {
+		std::shared_ptr<const PersistentRecording> recording;
+		std::vector<std::string> revisionNames;  // per recording->revisions entry
+		std::vector<std::pair<const RenderGraphPass*, uint8_t>> skips;
+		std::vector<std::shared_ptr<const PreparedFrameDataAudit>> audits;  // per recording->revisions entry, with the audit on
+		uint64_t reusesSinceAudit = 0;
+		std::vector<uint64_t> foreignTimelines;  // the identities its packets bind beyond the queues'
+		uint64_t placementSerial = 0;
+		// Why the copy's last recording was not kept (empty when it was, or before the copy's first run).
+		std::string unkeptReason;
+		// Recorded ahead (RecordStagedCopy) and not used yet: its first run confirms it by its passes' frame data.
+		bool staged = false;
+		// Batch reuse (RenderGraph::SetKeptBatchReuse): each recording->revisions entry's batch; per batch whether its packet can be
+		// submitted again (empty: every batch can), and why not.
+		std::vector<uint32_t> revisionBatches;
+		std::vector<uint8_t> batchReusable;
+		std::vector<std::string> batchWhy;
+	};
+	// Each prepared pass's batch in the executable batchOfPreparedFor, for batch reuse. UINT32_MAX: in none.
+	std::weak_ptr<const persistent::ExecutableGeneration> batchOfPreparedFor;
+	std::vector<uint32_t> batchOfPrepared;
+	// The executable whose kept batches were last logged (batch reuse: once per executable).
+	std::weak_ptr<const persistent::ExecutableGeneration> keptBatchesLogged;
+	std::vector<SyncKept> syncKept;
 	// Diagnostic: preparation cost per main pass index (ns, calls).
 	std::vector<std::pair<uint64_t, uint64_t>> prepareCostByMain;
 };
@@ -707,6 +854,14 @@ struct RenderGraph::PersistentSegmentRun {
 	persistent::FrameAdmission admission;
 	bool keepable = false;
 	bool external = false;
+	// A staged recording's (RecordStagedCopy): admitted from a plan, recorded and kept, never submitted.
+	bool staged = false;
+	// A kept copy's execution that cannot be kept: why (LastKeptRun::reason).
+	std::string unkeptReason;
+	// Batch reuse (RenderGraph::SetKeptBatchReuse), a kept copy's run: per batch whether its new recording can be kept (its passes
+	// all report revisions and a late one is replayable), and why not. Empty without batch reuse.
+	std::vector<uint8_t> batchKeepable;
+	std::vector<std::string> batchUnkept;
 	// Set by recording.
 	std::shared_ptr<const compiler::RenderFrameSnapshot> sealed;
 	std::vector<compiler::FrameRecordingJob> jobs;
@@ -722,6 +877,27 @@ using State = RenderGraph::PersistentExecutionState;
 
 // Queues the pin of a retiring direct slot's resource for release (State::retiredPins). RenderGraphPersistent.cpp.
 void NoteRetiredDirectResource(State& state, const State::SlotEntry& entry);
+
+// Gives DeclareEpochUses the transients the state's live slots bind now (aliasable resources only). RenderGraphPersistentStructural.cpp.
+void SyncEpochUses(State& state, uint32_t epoch);
+
+// Each prepared pass's batch in the executable (batch reuse, RenderGraph::SetKeptBatchReuse): UINT32_MAX for a prepared pass in no
+// batch. Kept in the state until the executable changes.
+inline const std::vector<uint32_t>& BatchOfPrepared(State& state, const std::shared_ptr<const persistent::ExecutableGeneration>& executable) {
+	if (state.batchOfPreparedFor.lock() == executable) return state.batchOfPrepared;
+	const auto& graph = *executable->graph;
+	auto& map = state.batchOfPrepared;
+	map.clear();
+	for (uint32_t batch = 0; batch < graph.batches.size(); ++batch)
+		for (const auto pass : graph.batches[batch].passes) {
+			const auto prepared = graph.structure->passes.at(pass).preparedPassIndex;
+			if (prepared == UINT32_MAX) continue;
+			if (map.size() <= prepared) map.resize(size_t{prepared} + 1, UINT32_MAX);
+			map[prepared] = batch;
+		}
+	state.batchOfPreparedFor = executable;
+	return map;
+}
 
 // Rotation state of an entry's current backing. Type classification is cached
 // per registry object; only dynamic wrappers are unwrapped every frame.

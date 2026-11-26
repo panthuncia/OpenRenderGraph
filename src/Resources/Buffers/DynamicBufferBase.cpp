@@ -19,6 +19,7 @@
 
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DescriptorHeapManager.h"
+#include "Render/PublicationBindingBundle.h"
 #include "Resources/GPUBacking/GpuBufferBacking.h"
 #include "Resources/ExternalBackingResource.h"
 #include "Render/Runtime/IUploadService.h"
@@ -642,6 +643,92 @@ bool BufferBase::AdoptRelocatedBacking(std::unique_ptr<GpuBufferBacking>& next, 
     ++m_backingGeneration;
     ForgetPublishedAllocation();
     if (next) OnBackingMaterialized();
+    return true;
+}
+
+namespace {
+class PreparedBufferBacking final : public PreparedPlacedBacking {
+public:
+    SymbolicTracker* StateTracker() override { return backing ? backing->GetStateTracker() : nullptr; }
+    std::unique_ptr<GpuBufferBacking> backing;
+    std::shared_ptr<PreparedDescriptorSlots> slots;
+    std::shared_ptr<const BackingAllocationSnapshot> allocation;
+};
+}
+
+std::shared_ptr<PreparedPlacedBacking> BufferBase::PreparePlacedBacking(std::shared_ptr<const AliasHeapGeneration> heap, uint64_t offset,
+    uint64_t poolID, std::string* why) {
+    const auto refuse = [&](const char* reason) -> std::shared_ptr<PreparedPlacedBacking> {
+        if (why) *why = reason;
+        return {};
+    };
+    if (!heap) return refuse("no heap");
+    uint64_t fromGeneration = 0;
+    {
+        std::scoped_lock lock(m_materializationMutex);
+        if (!m_dataBuffer) return refuse("no backing of its own");
+        if (GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid()) return refuse("an API representation is attached");
+        const auto current = m_dataBuffer->GetAPIResource().GetHandle();
+        if (current.valid() && DeviceManager::GetInstance().GetDevice().HasBufferViewRef(current)) return refuse("it has a buffer view ref pair");
+        fromGeneration = m_backingGeneration;
+    }
+    auto prepared = std::make_shared<PreparedBufferBacking>();
+    prepared->resourceID = GetGlobalResourceID();
+    prepared->fromGeneration = fromGeneration;
+    prepared->heap = heap;
+    prepared->offset = offset;
+    prepared->poolID = poolID;
+    prepared->backing = GpuBufferBacking::CreateUnique(m_accessType, m_bufferSize, GetGlobalResourceID(), BufferAliasPlacement{heap, offset, poolID},
+        m_unorderedAccess, nullptr, BackingResourceFlags());
+    auto native = prepared->backing->GetAPIResource();
+    rhi::ResourceDesc description{};
+    const bool hasDescription = TryGetRHIResourceDesc(description);
+    prepared->slots = PreparedDescriptorSlots::Create(native, hasDescription ? &description : nullptr, nullptr);
+    if (m_descriptorRequirements.has_value()) {
+        // As EnsureVirtualDescriptorSlotsAllocated and RefreshDescriptorContents do for the resource itself.
+        DescriptorHeapManager::ViewRequirements req{};
+        DescriptorHeapManager::ViewRequirements::BufferViews views{};
+        views.createCBV = m_descriptorRequirements->createCBV;
+        views.createSRV = m_descriptorRequirements->createSRV;
+        views.createUAV = m_descriptorRequirements->createUAV;
+        views.createNonShaderVisibleUAV = m_descriptorRequirements->createNonShaderVisibleUAV;
+        views.cbvDesc = m_descriptorRequirements->cbvDesc;
+        views.srvDesc = m_descriptorRequirements->srvDesc;
+        views.uavDesc = m_descriptorRequirements->uavDesc;
+        views.uavCounterOffset = m_descriptorRequirements->uavCounterOffset;
+        req.views = views;
+        auto& rm = DescriptorHeapManager::GetInstance();
+        rm.ReserveDescriptorSlots(*prepared->slots, req);
+        rm.UpdateDescriptorContents(*prepared->slots, native, req);
+    }
+    BackingAllocationSnapshot allocation{
+        GetGlobalResourceID(), fromGeneration + 1, native, prepared->backing->CaptureAllocationLease(), m_bufferSize};
+    allocation.aliasHeap = prepared->backing->GetAliasHeap();
+    allocation.aliasPoolID = prepared->backing->GetAliasPoolID();
+    allocation.aliasOffset = prepared->backing->GetAliasOffset();
+    allocation.aliasSize = prepared->backing->GetAliasSize();
+    if (!allocation) return refuse("the new backing has no allocation lease");
+    prepared->allocation = std::make_shared<const BackingAllocationSnapshot>(std::move(allocation));
+    prepared->snapshot = PublicationBindingBundle::CapturePrepared(*this, prepared->allocation, *prepared->slots);
+    if (!prepared->snapshot) return refuse("the new backing could not be captured");
+    return prepared;
+}
+
+bool BufferBase::AdoptPreparedBacking(PreparedPlacedBacking& base) {
+    auto* prepared = dynamic_cast<PreparedBufferBacking*>(&base);
+    if (!prepared || !prepared->backing || prepared->adopted.load(std::memory_order_acquire)) return false;
+    ClearAPIRepresentations();
+    ScopedBackingMutation mutation;
+    std::scoped_lock lock(m_materializationMutex);
+    if (!m_dataBuffer || m_backingGeneration != prepared->fromGeneration) return false;
+    // As Dematerialize then Materialize.
+    TakeDescriptorSlotsFrom(*prepared->slots);
+    m_dataBuffer = std::move(prepared->backing);
+    ApplyRelocationClass(GetGlobalResourceID());
+    ++m_backingGeneration;
+    SeedPublishedAllocation(prepared->allocation, m_backingGeneration);
+    OnBackingMaterialized();
+    prepared->adopted.store(true, std::memory_order_release);
     return true;
 }
 

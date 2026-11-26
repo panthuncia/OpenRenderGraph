@@ -59,6 +59,8 @@ struct PassParameters {
 	bool isGeometryPass = false;
 	// The pass may skip its writes in some runs (ExternalPassDesc::mayNotWrite, RenderPassBuilder::MayNotWrite).
 	bool mayNotWrite = false;
+	// Recorded at execution (ExternalPassDesc::recordAtExecution, RenderPassBuilder::RecordAtExecution).
+	bool recordAtExecution = false;
 	QueueKind preferredQueueKind = QueueKind::Graphics;
 	QueueAssignmentPolicy queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 	BackendAffinity backendAffinity{};

@@ -14,9 +14,34 @@
 
 namespace org {
 
+namespace {
+// False once the manager is gone: a recording released after it deletes its queries itself.
+std::atomic<bool> g_statisticsManagerAlive{true};
+}
+
 StatisticsManager& StatisticsManager::GetInstance() {
     static StatisticsManager inst;
     return inst;
+}
+
+StatisticsManager::~StatisticsManager() {
+    g_statisticsManagerAlive.store(false, std::memory_order_release);
+    std::lock_guard lock(m_recycleMutex);
+    auto& deletion = org::DeletionManager::GetInstance();
+    for (auto& recycled : m_recycledTimestamps) {
+        if (recycled.pool) deletion.MarkForDelete(std::move(recycled.pool));
+        if (recycled.readback) deletion.MarkForDelete(std::move(recycled.readback));
+    }
+    m_recycledTimestamps.clear();
+}
+
+bool StatisticsManager::RecycleOwnedTimestamps(rhi::QueryPoolPtr& pool, rhi::ResourcePtr& readback, rhi::QueueKind queueKind, uint32_t queries,
+    uint64_t stride) {
+    if (!pool || !readback || !queries || !stride) return false;
+    std::lock_guard lock(m_recycleMutex);
+    if (m_recycledTimestamps.size() >= kRecycleMost) return false;
+    m_recycledTimestamps.push_back({std::move(pool), std::move(readback), queueKind, queries, stride, m_recycleFrame.load(std::memory_order_acquire)});
+    return true;
 }
 
 StatisticsManager::SharedQueryObjects::~SharedQueryObjects() {
@@ -148,6 +173,7 @@ unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeo
 
 void StatisticsManager::BeginFrame() {
     ++m_frameSerial;
+    m_recycleFrame.store(m_frameSerial, std::memory_order_release);
 
     org::runtime::MemoryBudgetStats memoryBudgetStats{};
     memoryBudgetStats.sampleFrameSerial = m_frameSerial;
@@ -838,6 +864,29 @@ std::shared_ptr<OwnedTimestampQueries> StatisticsManager::CreateOwnedTimestamps(
     rhi::QueryPoolDesc desc;
     desc.type = rhi::QueryType::Timestamp;
     desc.count = ranges * 2u;
+    {
+        // A released one of the same queue and size, from long enough ago (RecycledTimestamps).
+        std::lock_guard lock(m_recycleMutex);
+        const uint64_t frame = m_recycleFrame.load(std::memory_order_acquire);
+        const auto found = std::find_if(m_recycledTimestamps.begin(), m_recycledTimestamps.end(), [&](const RecycledTimestamps& recycled) {
+            return recycled.queueKind == queueKind && recycled.queries == desc.count && frame >= recycled.releasedFrame + kRecycleFrames;
+        });
+        if (found != m_recycledTimestamps.end()) {
+            owned->pool = std::move(found->pool);
+            owned->readback = std::move(found->readback);
+            owned->stride = found->stride;
+            m_recycledTimestamps.erase(found);
+        }
+    }
+    if (owned->pool) {
+        owned->ticksToMilliseconds = GetGpuTicksToMilliseconds();
+        if (const auto ticksPerSecond = DeviceManager::GetInstance().GetDevice().GetTimestampCalibration(queueKind).ticksPerSecond)
+            owned->ticksToMilliseconds = 1000.0 / double(ticksPerSecond);
+        owned->queueKind = queueKind;
+        owned->capacity = ranges;
+        owned->entries.reserve(ranges);
+        return owned;
+    }
     if (device.CreateQueryPool(desc, owned->pool) != rhi::Result::Ok || !owned->pool) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))
@@ -991,8 +1040,11 @@ void StatisticsManager::ClearAll() {
 namespace org::runtime {
 
 OwnedTimestampQueries::~OwnedTimestampQueries() {
-    // A recording is released once its submissions are complete. Deferred deletion keeps the destruction off the thread
-    // that drops the recording. The shared pool is handled the same way.
+    // A recording is released once its submissions are complete. Its pool and buffer go back to the manager for another
+    // kept recording (StatisticsManager::RecycleOwnedTimestamps), or to deferred deletion, which keeps the destruction off the
+    // thread that drops the recording. The shared pool is handled the same way.
+    if (g_statisticsManagerAlive.load(std::memory_order_acquire)
+        && org::StatisticsManager::GetInstance().RecycleOwnedTimestamps(pool, readback, queueKind, capacity * 2u, stride)) return;
     auto& deletion = org::DeletionManager::GetInstance();
     if (pool) deletion.MarkForDelete(std::move(pool));
     if (readback) deletion.MarkForDelete(std::move(readback));

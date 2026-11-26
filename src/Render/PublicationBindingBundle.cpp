@@ -42,6 +42,29 @@ const PublicationBindingBundle::Snapshot* PublicationBindingBundle::FindNative(r
         if (const auto* binding = parent->FindNative(resource, views)) return binding;
     return nullptr;
 }
+PublicationBindingBundle::Snapshot PublicationBindingBundle::CapturePrepared(Resource& resource,
+    std::shared_ptr<const BackingAllocationSnapshot> allocation, const GloballyIndexedResource& slots) {
+    if (!allocation || !allocation->resource.GetHandle().valid()) return {};
+    auto result = std::make_shared<ResourceBindingSnapshot>();
+    result->resourceID = resource.GetGlobalResourceID();
+    result->externallyImmutable = resource.GetGraphOwnership() == Resource::GraphOwnership::ExternalImmutableShaderResource;
+    resource.TryGetRHIResourceDesc(result->description);
+    // As Capture's backed branch, with the prepared backing's allocation and slots.
+    result->resource = allocation->resource;
+    result->backingGeneration = allocation->generation;
+    result->aliasHeap = allocation->aliasHeap;
+    result->aliasPoolID = allocation->aliasPoolID;
+    result->aliasOffset = allocation->aliasOffset;
+    result->aliasSize = allocation->aliasSize;
+    result->allocationOwner = std::move(allocation);
+    result->semanticConsumer = resource.CaptureSemanticConsumerLease();
+    result->views = slots.CaptureBindlessViews();
+    result->descriptorOwner = slots.CaptureDescriptorOwnership();
+    result->bindingTable = resource.GetBindingTableVersion();
+    result->recordingOwner = std::make_shared<const std::tuple<std::shared_ptr<const void>, std::shared_ptr<const void>,
+        std::shared_ptr<const BindingTableVersion>>>(result->allocationOwner, result->descriptorOwner, result->bindingTable);
+    return result;
+}
 PublicationBindingBundle::Snapshot PublicationBindingBundle::Capture(Resource& resource) {
     if (auto* dynamic = dynamic_cast<DynamicResource*>(&resource)) {
         auto concrete = dynamic->GetResource();

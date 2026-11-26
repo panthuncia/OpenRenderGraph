@@ -68,6 +68,11 @@ public:
     // recording. Safe to call at the same time as the pass's own preparation. Returns false when the pass cannot
     // tell, because its recording may depend on anything. A prepared execution that holds it is then never current.
     virtual bool RevisionHash(uint64_t&) const { return false; }
+    // The values the pass's Revision and Prepare read that it takes from the frame's host data (a render size, a setting the
+    // frame carries). The graph calls it before Update in every run, and a staged recording (GraphHost::RecordStagedCopies) calls
+    // it alone, on the thread that records, with the host data the application gives for the build. So it must have no side
+    // effect beyond the pass's own members: no upload, no state another pass or a manager reads. Update keeps those.
+    virtual void TakeFrameValues(const UpdateExecutionContext&) {}
     // A host that turns the pass off for some executions by its host data (a frame description passed as the preparation's
     // host data). At each preparation the graph asks the predicate with that host data. True means the pass does nothing in
     // the execution: its recorder records only the barriers around it, as for a pass recorded at execution that skips. The

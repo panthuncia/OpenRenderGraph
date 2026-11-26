@@ -1165,6 +1165,19 @@ public:
 		return std::move(*this);
 	}
 
+	// Recorded at execution, as ExternalPassDesc::RecordAtExecution: in a batch of such passes alone, recorded when the execution
+	// submits it (RenderGraph::SetInlineAtExecution). A kept recording records the pass again at each of its submissions
+	// (PreparedPass::RecordAgain), with the frame data it was prepared with.
+	RenderPassBuilder& RecordAtExecution()& {
+		m_recordAtExecution = true;
+		return *this;
+	}
+
+	RenderPassBuilder RecordAtExecution() && {
+		m_recordAtExecution = true;
+		return std::move(*this);
+	}
+
     RenderPassBuilder& PreferQueue(QueueKind kind)& {
         if (!IsQueueKindSupportedByRenderPass(kind)) {
             throw std::invalid_argument("Render passes only support the graphics queue");
@@ -1297,6 +1310,7 @@ private:
 
         params.isGeometryPass = m_isGeometryPass;
         params.mayNotWrite = params.mayNotWrite || m_mayNotWrite;
+        params.recordAtExecution = m_recordAtExecution;
         params.preferredQueueKind = m_preferredQueueKind;
         params.queueAssignmentPolicy = m_queueAssignmentPolicy;
 		params.backendAffinity = m_backendAffinity;
@@ -1337,6 +1351,7 @@ private:
         resolverSnapshots_.clear();
         m_isGeometryPass = false;
         m_mayNotWrite = false;
+        m_recordAtExecution = false;
 		m_preferredQueueKind = QueueKind::Graphics;
 		m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 		m_backendAffinity = {};
@@ -1765,6 +1780,7 @@ private:
     bool built_ = false;
     bool m_isGeometryPass = false;
     bool m_mayNotWrite = false;
+    bool m_recordAtExecution = false;
 	QueueKind m_preferredQueueKind = QueueKind::Graphics;
     QueueAssignmentPolicy m_queueAssignmentPolicy = QueueAssignmentPolicy::ForcePreferred;
 	BackendAffinity m_backendAffinity{};

@@ -181,6 +181,11 @@ public:
     // Defragmentation. Creates the current backing's buffer again at the start of destination, when the current backing's
     // allocation is source. Fails when the backing changed, is placed, or for an attached representation. The caller owns the result.
     rhi::Result MakeDefragmentationResource(const rhi::ma::Allocation& source, rhi::ma::Allocation& destination, rhi::ResourcePtr& out);
+    // A placed backing made ahead, and the switch to it at a frame boundary (BackedResource). A buffer with a buffer view ref pair
+    // is refused: its pair is rewritten in place, which only an idle GPU allows.
+    std::shared_ptr<PreparedPlacedBacking> PreparePlacedBacking(std::shared_ptr<const AliasHeapGeneration> heap, uint64_t offset,
+        uint64_t poolID, std::string* why = nullptr) override;
+    bool AdoptPreparedBacking(PreparedPlacedBacking& prepared) override;
 
     /**
      * @brief Chooses the block pool for this buffer's backings (MemoryGroup). Call it before Materialize: a backing made earlier

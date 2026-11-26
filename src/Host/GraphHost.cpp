@@ -1382,6 +1382,11 @@ bool GraphHost::BuildInstance(size_t index) {
 	return true;
 }
 
+uint64_t GraphHost::EpochGraph::PlacedFromVersion() const {
+	const auto version = m_graph ? m_graph->PersistentFramePlacement() : nullptr;
+	return version ? version->Id() : 0;
+}
+
 GraphHost::EpochGraph::~EpochGraph() {
 	if (!m_graph) return;
 	// Never attached, so never prepared or submitted: its teardown waits for nothing.
@@ -1780,8 +1785,31 @@ size_t GraphHost::PlaceEpochGraphs(std::span<EpochGraph* const> graphs) {
 	for (const auto* graph : ordered) epochs.push_back(graph->m_epoch);
 	const auto begin = std::chrono::steady_clock::now();
 	const auto staging = m_framePlacement->BeginStaging(epochs);
+	// Every graph's usage summary first: the version the first graph's new transients need is then computed from all of the set's,
+	// so it places the later graphs' too, and none of them needs a newer one. A newer one (an earlier graph's transient now shared
+	// with a later graph, live together with what it shared bytes with) moved resources the earlier graph had placed, which then
+	// placed again at its first preparation on the render thread (Visibility at a resize: 4-5 ms, M5 step 5).
+	size_t summaries = 0;
+	bool summariesFirst = true;
+	{
+		std::scoped_lock lock(m_configMutex);
+		summariesFirst = m_framePlacementSettings.summariesFirst;
+	}
+	if (summariesFirst) {
+		m_framePlacement->CollectStaged(*staging, true);
+		for (auto* graph : ordered) {
+			graph->m_placementLink->Set(staging);
+			try {
+				if (graph->m_graph->PublishPlacementSummaryAtBuild()) ++summaries;
+			} catch (const std::exception& e) {
+				spdlog::warn("GraphHost: epoch {}'s usage summary was not published before the set placed: {}", graph->m_epoch, e.what());
+			}
+		}
+		m_framePlacement->CollectStaged(*staging, false);
+	}
 	size_t placed = 0;
 	std::string outcomes;
+	std::vector<char> placedOk;  // by index in ordered
 	for (auto* graph : ordered) {
 		graph->m_placementLink->Set(staging);
 		const auto graphBegin = std::chrono::steady_clock::now();
@@ -1797,6 +1825,7 @@ size_t GraphHost::PlaceEpochGraphs(std::span<EpochGraph* const> graphs) {
 			why = graph->m_error;
 		}
 		if (ok) ++placed;
+		placedOk.push_back(ok);
 		// The version it placed from, or the staging's when it left its placement to the attach (it places from that one there): the
 		// set keeps it, and a later graph of the set cannot decline it.
 		if (graph->m_graph) {
@@ -1806,6 +1835,45 @@ size_t GraphHost::PlaceEpochGraphs(std::span<EpochGraph* const> graphs) {
 		const auto epochName = graph->m_epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(graph->m_epoch);
 		outcomes += (outcomes.empty() ? "" : "; ") + epochName + (ok ? " placed" : " left for its attach (" + why + ")")
 			+ fmt::format(" in {:.2f} ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - graphBegin).count());
+	}
+	// A later graph of the set may have needed a newer version than an earlier one placed from (its new transients were not
+	// covered yet). The set's attach publishes the newest, and an earlier graph placed from another would place again at its first
+	// preparation, on the render thread (4-5 ms for Visibility at a resize). The set's graphs run nothing yet, so they place again
+	// here from the newest one; a graph left for its attach tries again too. Twice at most: a pass that changes nothing ends it.
+	for (int round = 0; round < 2; ++round) {
+		const auto newest = staging->CurrentId();
+		bool changed = false;
+		for (size_t index = 0; index < ordered.size(); ++index) {
+			auto* graph = ordered[index];
+			if (!graph->m_graph) continue;
+			const auto version = graph->m_graph->PersistentFramePlacement();
+			// Placed from the newest, or placed with nothing from a version (no transients a version places).
+			if (version ? version->Id() == newest : placedOk[index]) continue;
+			const auto graphBegin = std::chrono::steady_clock::now();
+			std::string why;
+			bool ok = false;
+			try {
+				ok = graph->m_graph->PlaceAgainAtBuild(&why);
+			} catch (const std::exception& e) {
+				graph->m_error = std::string("its alias placement at the build failed: ") + e.what();
+				graph->m_uploads = nullptr;
+				graph->m_graph.reset();
+				why = graph->m_error;
+			}
+			const bool wasLeft = !placedOk[index];
+			if (ok && wasLeft) ++placed;
+			placedOk[index] = placedOk[index] || ok;
+			if (graph->m_graph && ok) {
+				const auto now = graph->m_graph->PersistentFramePlacement();
+				m_framePlacement->NoteStagedPlacement(*staging, now ? now->Id() : staging->CurrentId(), graph->m_epoch, true);
+				changed = changed || (now && now != version);
+			}
+			const auto epochName = graph->m_epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(graph->m_epoch);
+			outcomes += "; " + epochName + (ok ? (wasLeft ? " placed" : " took") : wasLeft ? " left for its attach (" + why + ")" : " kept its placement (" + why + ")")
+				+ " from " + std::to_string(newest)
+				+ fmt::format(" in {:.2f} ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - graphBegin).count());
+		}
+		if (!changed || staging->CurrentId() == newest) break;
 	}
 	// Each graph's external client (readbacks, streaming uploads, copies after the frame) makes a queue slot at its first submission
 	// on it, and that submission waits for the slot's first command list. The slots the epoch's graphs used are made ready now.
@@ -1826,9 +1894,10 @@ size_t GraphHost::PlaceEpochGraphs(std::span<EpochGraph* const> graphs) {
 	} catch (const std::exception& e) {
 		spdlog::warn("GraphHost: a staged frame placement's memory was not allocated at the build ({}); its attach allocates it", e.what());
 	}
-	spdlog::info("GraphHost: transients of {} of {} built graphs placed at the build in {:.2f} ms (from frame placement {}; heaps {:.2f} ms): {}",
+	spdlog::info("GraphHost: transients of {} of {} built graphs placed at the build in {:.2f} ms (from frame placement {}; heaps {:.2f} ms; "
+		"{} summaries first): {}",
 		placed, ordered.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(), staging->CurrentId(),
-		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acquireBegin).count(), outcomes);
+		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acquireBegin).count(), summaries, outcomes);
 	return placed;
 }
 
@@ -2054,6 +2123,9 @@ void GraphHost::SealSubmitted() {
 	if (const auto& arena = m_desc.runtime->Arena()) arena->Trim();
 	// The frame boundary: relocations switch here, before the next frame prepares anything.
 	(void)CommitRelocationsNow(false);
+	// And an offered frame placement version is published here, once the graphs prepared their re-placements for it.
+	// The thread that runs the frames (not the submission thread, which never prepares a graph).
+	if (!queue || std::this_thread::get_id() != queue->threadId) AdvanceFramePlacementOffer();
 	// Now and then, where alias memory goes (FramePlacementSettings::memoryLogSeconds). The owner thread reads the instances.
 	if (m_framePlacement && IsOwnerThread() && m_framePlacement->MemoryLogDue()) LogFramePlacementMemory();
 }
@@ -2084,7 +2156,58 @@ void GraphHost::LogFramePlacementMemory() const {
 
 size_t GraphHost::CommitRelocations(bool gpuIdle) {
 	CheckOwner("CommitRelocations");
-	return CommitRelocationsNow(gpuIdle);
+	const auto committed = CommitRelocationsNow(gpuIdle);
+	AdvanceFramePlacementOffer();
+	return committed;
+}
+
+uint64_t GraphHost::CurrentFramePlacementId() const noexcept {
+	return m_framePlacement ? m_framePlacement->CurrentId() : 0;
+}
+
+void GraphHost::AdvanceFramePlacementOffer() {
+	if (!m_framePlacement) return;
+	const auto offered = m_framePlacement->Offered();
+	if (!offered) {
+		m_offerPrepared = 0;
+		return;
+	}
+	const auto id = offered->Id();
+	const auto now = std::chrono::steady_clock::now();
+	// A graph with a structural build in flight cannot re-place until the build installs, so a version published now would leave it
+	// binding what another graph moves. The offer waits for such builds (they take a few frames), 2 s at most, as it then would anyway.
+	bool buildPending = false;
+	if (!m_async)
+		for (const auto& instance : m_instances)
+			if (instance.graph && instance.graph->PersistentStructuralBuildPending()) buildPending = true;
+	if (m_offerPrepared != id && buildPending) {
+		if (m_offerWaitSince == 0 || m_offerWaitSince != id) {
+			m_offerWaitSince = id;
+			m_offerWaitStarted = now;
+		}
+		if (now - m_offerWaitStarted < std::chrono::seconds(2)) return;
+	}
+	if (m_offerPrepared != id) {
+		m_offerPrepared = id;
+		m_offerStarted = now;
+		m_offerGraphs = 0;
+		// Async epochs prepare on the host's thread, which this does not drive: the version is published as it is.
+		if (!m_async)
+			for (auto& instance : m_instances)
+				if (instance.graph && !instance.failed && instance.graph->PrepareFramePlacementReplacement(offered)) ++m_offerGraphs;
+		// The graphs prepare during the frames that follow; the next boundary looks again.
+		if (m_offerGraphs) return;
+	}
+	bool settled = true;
+	for (const auto& instance : m_instances)
+		if (instance.graph && !instance.graph->FramePlacementReplacementSettled(id)) settled = false;
+	// A preparation that takes this long is left behind: its graph re-places at its preparation, as without preparations.
+	if (!settled && now - m_offerStarted < std::chrono::milliseconds(500)) return;
+	if (buildPending && now - m_offerStarted < std::chrono::seconds(2)) return;
+	if (m_framePlacement->PublishOffered(id))
+		spdlog::info("Frame placement {}: published at a frame boundary after {} graphs prepared their re-placements on a worker ({:.2f} ms{})", id,
+			m_offerGraphs, std::chrono::duration<double, std::milli>(now - m_offerStarted).count(), settled ? "" : "; some had not finished");
+	m_offerPrepared = 0;
 }
 
 size_t GraphHost::CommitRelocationsNow(bool gpuIdle) {
@@ -2345,7 +2468,9 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 		(void)RetireReachedLeases(nullptr);
 	}
 	lap(m_lastTimings.waitUs);
-	auto& lease = OpenLease(nullptr);
+	// A kept epoch's run takes its next kept copy (SetKeptEpochs), whose regions and recording stay at its index.
+	const bool keptEpoch = std::ranges::find(m_keptEpochs, m_instances[index].epoch) != m_keptEpochs.end();
+	auto& lease = keptEpoch ? TakeSyncCopy(index) : OpenLease(nullptr);
 	const uint32_t slot = lease.index;
 	m_syncRun = lease.Ref();
 	// A failure before submission gives the lease back: nothing of the run reached the GPU. Once Execute ran, the lease holds its
@@ -2369,6 +2494,9 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	// of the graph attached last, which names another resource (or none) at that index.
 	if (m_instances.size() > 1)
 		if (auto* uploads = graph.GetUploadService()) uploads->SetUploadResolveContext({&graph.GetResourceRegistry(), 0});
+	// The copy's regions still hold its last run's values. A new lease's would be zeros, and a client whose commit does not
+	// write its block this run relies on that.
+	if (keptEpoch) LatchBlock::ZeroStableRun(lease.index);
 	if (beforePrepare) {
 		BT_ZONE_SCOPE("ORG.Host.CommitInputs");
 		beforePrepare(graph);
@@ -2386,12 +2514,23 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 		update.ownedHostData = m_frameContext->ownedHostData;
 		update.beforeCompileFrame = m_frameContext->beforeCompileFrame;
 	}
+	if (graph.CurrencyProbeOn() != m_currencyProbe) graph.SetCurrencyProbe(m_currencyProbe);
+	if (graph.KeptRecordingAudit() != m_keptAudit) graph.SetKeptRecordingAudit(m_keptAudit);
+	if (graph.KeptBatchReuse() != m_keptBatchReuse) graph.SetKeptBatchReuse(m_keptBatchReuse);
+	RenderGraph::PersistentExecutionOptions options{};
+	options.run = m_syncRun;
+	if (keptEpoch) options.keptCopy = lease.copy;
 	try {
-		graph.Update(update, m_device);
+		graph.Update(update, m_device, options);
 	} catch (const std::exception& e) {
 		throw failEpoch(e.what());
 	}
 	lap(m_lastTimings.updateUs);
+	m_lastTimings.update = graph.LastPersistentUpdateTimings();
+	if (m_currencyProbe) {
+		m_lastTimings.probe = graph.TakeCurrencyProbeStats();
+		m_lastTimings.probed = true;
+	}
 	PassExecutionContext execute{};
 	execute.device = m_device;
 	execute.frameIndex = slot;
@@ -2422,6 +2561,35 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 		throw failEpoch(e.what());
 	}
 	lap(m_lastTimings.executeUs);
+	if (keptEpoch) {
+		const auto& run = graph.LastKeptRun();
+		m_lastTimings.kept = run.outcome;
+		if (m_keptStats.size() < m_instances.size()) m_keptStats.resize(m_instances.size());
+		auto& stats = m_keptStats[index];
+		++stats.runs;
+		switch (run.outcome) {
+		case RenderGraph::KeptRunOutcome::Reused: ++stats.reused; break;
+		case RenderGraph::KeptRunOutcome::Kept: ++stats.kept; break;
+		case RenderGraph::KeptRunOutcome::Unkeepable: ++stats.unkeepable; break;
+		case RenderGraph::KeptRunOutcome::Partial: ++stats.partial; break;
+		case RenderGraph::KeptRunOutcome::None: break;
+		}
+		// A bounded set of names: past 64, only the ones already counted.
+		if (!run.reason.empty() && (stats.reasons.size() < 64 || stats.reasons.contains(run.reason))) ++stats.reasons[run.reason];
+		if (run.staged) ++(run.outcome == RenderGraph::KeptRunOutcome::Reused ? stats.stagedReused : stats.stagedRecorded);
+		stats.batchesReused += run.batchesReused;
+		stats.batchesRecorded += run.batchesRecorded;
+		for (const auto& [reason, count] : run.batchReasons)
+			if (stats.batchReasons.size() < 64 || stats.batchReasons.contains(reason)) stats.batchReasons[reason] += count;
+		if (run.audited) {
+			++stats.audited;
+			stats.auditCompared += run.auditCompared;
+			stats.auditUncomparable += run.auditUncomparable;
+			stats.auditMismatches += run.auditMismatches.size();
+			for (const auto& name : run.auditMismatches)
+				if (stats.mismatches.size() < 64 || stats.mismatches.contains(name)) ++stats.mismatches[name];
+		}
+	}
 	// The frame's frame placement version: the one this graph recorded with. The later epochs of the frame place from it, whatever
 	// is published meanwhile (the worker's settled or trimmed versions), so none moves a resource this graph wrote this frame.
 	if (m_framePlacement && !m_framePlacementFrozen)
@@ -2465,6 +2633,106 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	lap(m_lastTimings.signalUs);
 	m_lastHostFrame = m_frameNumber;
 	++m_frameNumber;
+}
+
+// ---- kept recordings of synchronous epochs ----
+
+void GraphHost::SetKeptEpochs(std::vector<uint32_t> epochs) {
+	CheckOwner("SetKeptEpochs");
+	for (const auto epoch : epochs)
+		if (InstanceOf(epoch) == kNoInstance) throw std::invalid_argument("A kept epoch must be one of the host's epochs");
+	// An epoch that stops keeping lets go of what it kept. Its runs take leases of their own again.
+	for (const auto epoch : m_keptEpochs) {
+		if (std::ranges::find(epochs, epoch) != epochs.end()) continue;
+		const auto index = InstanceOf(epoch);
+		if (index != kNoInstance && m_instances[index].graph) m_instances[index].graph->DropKeptRecordings();
+	}
+	m_keptEpochs = std::move(epochs);
+	std::scoped_lock lock(m_configMutex);
+	m_keptEpochsShared = m_keptEpochs;
+}
+
+GraphHost::StagedRecordings GraphHost::RecordStagedCopies(EpochGraph& built, const UpdateExecutionContext& frame) {
+	BT_ZONE_SCOPE("ORG.Host.RecordStagedCopies");
+	const auto begin = std::chrono::steady_clock::now();
+	StagedRecordings result;
+	const auto finish = [&](std::string why) {
+		result.why = std::move(why);
+		result.milliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+		return result;
+	};
+	if (!built.m_graph) return finish("its build failed");
+	{
+		std::scoped_lock lock(m_configMutex);
+		if (std::ranges::find(m_keptEpochsShared, built.m_epoch) == m_keptEpochsShared.end()) return finish("the epoch keeps no recordings");
+	}
+	// The copies' leases, as the epoch's runs take them. Each is a copy's for good (RunRef::Copy), so its run reference is fixed.
+	std::vector<std::pair<uint32_t, RunRef>> copies;
+	{
+		std::scoped_lock lock(m_leaseMutex);
+		if (built.m_index < m_syncCopyLeases.size())
+			for (const auto* lease : m_syncCopyLeases[built.m_index]) copies.emplace_back(lease->copy, lease->Ref());
+	}
+	result.copies = static_cast<uint32_t>(copies.size());
+	if (copies.empty()) return finish("the epoch has no kept copies yet (it has not run)");
+	auto& graph = *built.m_graph;
+	std::string why;
+	for (const auto& [copy, run] : copies) {
+		auto context = frame;
+		context.frameIndex = context.preparationSlot = run.lease;
+		context.run = run;
+		context.beforeCompileFrame = {};
+		if (!graph.RecordStagedCopy(m_device, context, copy, run, why)) break;
+		++result.recorded;
+	}
+	return finish(result.recorded == result.copies ? std::string() : why);
+}
+
+GraphHost::KeptStats GraphHost::TakeKeptStats(uint32_t epoch) {
+	const auto index = InstanceOf(epoch);
+	if (index == kNoInstance || index >= m_keptStats.size()) return {};
+	return std::exchange(m_keptStats[index], {});
+}
+
+GraphHost::RunLease& GraphHost::TakeSyncCopy(size_t index) {
+	if (m_syncCopyLeases.size() < m_instances.size()) {
+		std::scoped_lock lock(m_leaseMutex);
+		m_syncCopyLeases.resize(m_instances.size());
+		m_syncCopyNext.resize(m_instances.size(), 0);
+	}
+	auto& copies = m_syncCopyLeases[index];
+	if (copies.empty()) {
+		const uint32_t count = (std::max)(m_desc.framesInFlight, 1u) + 1;
+		std::scoped_lock lock(m_leaseMutex);
+		for (uint32_t copy = 0; copy < count; ++copy) {
+			if (m_leaseStore.size() >= Runtime::kMaxSlots) throw std::runtime_error("GraphHost: no lease index left for a kept copy");
+			auto made = std::make_unique<RunLease>();
+			made->index = static_cast<uint32_t>(m_leaseStore.size());
+			made->copy = copy;
+			copies.push_back(made.get());
+			m_leaseTable[made->index].store(made.get(), std::memory_order_release);
+			m_leaseStore.push_back(std::move(made));
+		}
+	}
+	if (const auto& stats = m_desc.runtime->Statistics()) stats->EnsureFrameCapacity(copies.back()->index + 1);
+	auto* lease = copies[m_syncCopyNext[index]++ % copies.size()];
+	if (lease->state == RunLease::State::Submitted) {
+		// Frame pacing waited for the epoch's run framesInFlight back, so this one (a run older still) is normally done.
+		if (!PointsReached(lease->points)) {
+			BT_ZONE_SCOPE("ORG.Host.WaitKeptCopy");
+			for (const auto& [timeline, value] : lease->points) (void)(*timeline)->HostWait(value);
+		}
+		RetireLease(*lease, nullptr);
+	}
+	if (lease->state == RunLease::State::Open) throw std::logic_error("GraphHost: a kept copy's lease is still open");
+	std::scoped_lock lock(m_leaseMutex);
+	if (++lease->generation == 0) lease->generation = 1;
+	lease->state = RunLease::State::Open;
+	lease->external = false;
+	lease->points.clear();
+	lease->hostFrame = lease->submission = lease->seal = 0;
+	m_leasesPeak = (std::max)(m_leasesPeak, ++m_leasesInFlight);
+	return *lease;
 }
 
 // ---- async epochs ----
@@ -2733,6 +3001,7 @@ void GraphHost::ApplyFramePlacementSettings() {
 		applied.memoryLogPeriod = std::chrono::seconds(m_framePlacementSettings.memoryLogSeconds);
 		applied.trimAfter = std::chrono::milliseconds(m_framePlacementSettings.heapTrimMilliseconds);
 		applied.keepRunning = m_framePlacementSettings.keepRunning;
+		applied.offerVersions = m_framePlacementSettings.prepareReplacements;
 	}
 	for (const auto& [epoch, most] : m_ticketsAhead)
 		if (std::ranges::find(applied.repeatedEpochs, epoch) == applied.repeatedEpochs.end()) applied.repeatedEpochs.push_back(epoch);

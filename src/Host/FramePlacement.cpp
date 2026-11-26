@@ -149,6 +149,7 @@ void FramePlacement::Publish(PlacementSummary summary) {
 				m_current = computed;
 				m_currentId.store(computed->Id(), std::memory_order_release);
 				m_lastPublish = std::chrono::steady_clock::now();
+				DropOfferLocked("a version was published at once for a plan");
 				// A plan of this frame needs it now (its candidates are uncovered by the frame's version, which may give it no valid
 				// layout at all), so it is the frame's version from here on. Only the worker's versions wait for the frame's end.
 				if (m_frozen.load(std::memory_order_relaxed)) {
@@ -212,13 +213,14 @@ std::shared_ptr<FramePlacement::Staging> FramePlacement::BeginStaging(std::vecto
 	staging->m_epochs = std::move(epochs);
 	std::lock_guard lock(m_mutex);
 	staging->m_base = m_current;
-	// A set that rebuilds every epoch with transients (a recipe swap, a resize) leaves no graph running beside it: its versions
-	// are packed from scratch, as they cost no running graph a placement.
+	// A set that rebuilds every epoch with transients (a recipe swap, a resize) leaves no graph running beside it after its attach:
+	// it does not compact. Its versions still keep what its graphs share with the running ones (PublishStaged).
 	staging->m_keep = m_settings.keepRunning && std::ranges::any_of(m_summaries, [&](const auto& entry) {
 		return !entry.second->uses.empty() && std::ranges::find(staging->m_epochs, entry.first) == staging->m_epochs.end();
 	});
 	staging->m_currentId.store(m_current ? m_current->Id() : 0, std::memory_order_release);
 	++m_openStagings;
+	DropOfferLocked("a staged set began");
 	return staging;
 }
 
@@ -229,7 +231,7 @@ void FramePlacement::PublishStaged(Staging& staging, PlacementSummary summary) {
 	auto& kept = staging.m_summaries[published->epoch];
 	const bool changed = !kept || kept->hash != published->hash;
 	kept = published;
-	if (!changed || !m_settings.enabled || staging.m_declined) return;
+	if (!changed || !m_settings.enabled || staging.m_declined || staging.m_collecting) return;
 	// As Publish: the first version, or one for the candidates the staging's version leaves uncovered, computed at once. Here it
 	// stays the staging's (pending) until its set attaches, so the running graphs keep the current version and their backings.
 	const auto versionNow = staging.m_pending ? staging.m_pending : staging.m_base;
@@ -254,7 +256,11 @@ void FramePlacement::PublishStaged(Staging& staging, PlacementSummary summary) {
 	inputs.summaries = summaries;
 	const auto id = m_nextId++;
 	const bool detailed = m_settings.logLifetimes;
-	const bool keep = staging.m_keep;
+	// Even a set that rebuilds every epoch (m_keep false: a resize, a recipe swap) keeps what its graphs share with the running ones
+	// (pinEpochs: what the set's published graphs use, say the CLod RT CLAS build arena) and what its graphs that placed already put
+	// somewhere. A version packed from scratch would move those under a running graph or under the set's own placed graph, and the
+	// set's graph would decline it or leave its placement to the attach (a resize: 6-7 ms on the render thread, M5 step 2).
+	const bool keep = staging.m_keep || m_settings.keepRunning;
 	// The graphs that keep running: every epoch the set does not rebuild, and the set's graphs that placed already.
 	std::vector<uint32_t> keptEpochs = staging.m_placedEpochs;
 	for (const auto& [epoch, s] : merged)
@@ -294,6 +300,11 @@ void FramePlacement::PublishStaged(Staging& staging, PlacementSummary summary) {
 		computed->KeptFrom() ? "; it keeps the running graphs' resources where version " + std::to_string(computed->KeptFrom()) + " has them"
 							 : std::string());
 	LogVersion(*computed, summaries, detailed);
+}
+
+void FramePlacement::CollectStaged(Staging& staging, bool collecting) {
+	std::lock_guard lock(m_mutex);
+	staging.m_collecting = collecting;
 }
 
 std::shared_ptr<const FramePlacementVersion> FramePlacement::StagedCurrent(const Staging& staging) const {
@@ -346,7 +357,10 @@ std::shared_ptr<FramePlacementVersion> FramePlacement::KeepRunning(std::shared_p
 	for (const auto& block : keeping->Blocks())
 		if (block.lane) laneBytes += block.capacity;
 	std::string moved;
-	for (const auto& name : keeping->KeptMoved()) moved += (moved.empty() ? "'" : ", '") + name + "'";
+	for (size_t i = 0; i < keeping->KeptMoved().size(); ++i) {
+		moved += (moved.empty() ? "'" : ", '") + keeping->KeptMoved()[i] + "'";
+		if (i < keeping->KeptMovedWith().size()) moved += " (with '" + keeping->KeptMovedWith()[i] + "')";
+	}
 	spdlog::info("Frame placement {}: for {}, keeps the running graphs' resources where version {} has them{}: {:.2f} MB in {} blocks "
 				 "({:.2f} MB in added heap lanes) against {:.2f} MB packed from scratch",
 		keeping->Id(), what, base->Id(),
@@ -409,6 +423,56 @@ void FramePlacement::DropStaging(Staging& staging) {
 		CloseStagingLocked(staging);
 	}
 	m_wake.notify_all();
+}
+
+std::shared_ptr<const FramePlacementVersion> FramePlacement::Offered() const {
+	std::lock_guard lock(m_mutex);
+	return m_offered;
+}
+
+bool FramePlacement::PublishOffered(uint64_t id) {
+	{
+		std::lock_guard lock(m_mutex);
+		if (!m_offered || m_offered->Id() != id) return false;
+		if (m_openStagings || !m_settings.enabled || m_changes != m_computed || m_current != m_offeredOver) {
+			DropOfferLocked("it went stale before its publication");
+			return false;
+		}
+		PublishOfferLocked();
+	}
+	m_wake.notify_all();
+	return true;
+}
+
+void FramePlacement::PublishOfferLocked() {
+	if (!m_offered) return;
+	if (m_offeredTrim) {
+		// The heaps no block uses go now: their placements keep them alive until they move.
+		m_memory->ReleaseUnused(m_offeredNeeds);
+		m_trimChecked = m_offered->Id();
+	}
+	m_current = m_offered;
+	m_currentId.store(m_current->Id(), std::memory_order_release);
+	m_lastPublish = std::chrono::steady_clock::now();
+	spdlog::info("Frame placement {}: published{} (offered {:.1f} ms before); graphs place from it at their next preparation", m_current->Id(),
+		m_offeredTrim ? " as the trim of " + std::to_string(m_offeredOver ? m_offeredOver->Id() : 0) : std::string(),
+		std::chrono::duration<double, std::milli>(m_lastPublish - m_offeredAt).count());
+	m_offered.reset();
+	m_offeredOver.reset();
+	m_offeredNeeds.clear();
+	m_offeredTrim = false;
+}
+
+void FramePlacement::DropOfferLocked(const char* why) {
+	if (!m_offered) return;
+	spdlog::info("Frame placement {}: offer dropped ({}); the worker computes again", m_offered->Id(), why);
+	// The worker checks the trim again for the current version, or computes the layout again (a dropped set changes no summary).
+	if (m_offeredTrim) m_trimChecked = 0;
+	else if (m_computed && m_computed == m_changes) --m_computed;
+	m_offered.reset();
+	m_offeredOver.reset();
+	m_offeredNeeds.clear();
+	m_offeredTrim = false;
 }
 
 std::shared_ptr<const FramePlacementVersion> FramePlacement::Latest() const {
@@ -547,6 +611,23 @@ void FramePlacement::Run() {
 			m_wake.wait(lock);
 			continue;
 		}
+		// An offered version waits for the host to publish it at a frame boundary, once the graphs prepared their re-placements. A change
+		// makes it stale; an offer no frame boundary took is published here after the timeout, as without offers.
+		if (m_offered) {
+			if (m_changes != m_computed || m_current != m_offeredOver) {
+				DropOfferLocked("the summaries or the current version changed");
+				continue;
+			}
+			const auto due = m_offeredAt + m_settings.offerTimeout;
+			if (std::chrono::steady_clock::now() < due) {
+				m_wake.wait_until(lock, due);
+				continue;
+			}
+			spdlog::warn("Frame placement {}: offered {:.0f} ms ago and not published at a frame boundary; published now", m_offered->Id(),
+				std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - m_offeredAt).count());
+			PublishOfferLocked();
+			continue;
+		}
 		if (m_changes == m_computed) {
 			// Quiet. Once the current version has been quiet for the trim time, heaps larger than its need (growth headroom, a
 			// class it no longer uses) are trimmed.
@@ -601,6 +682,18 @@ void FramePlacement::Run() {
 			// Only while nothing changed meanwhile; otherwise a new computation is due. The trim takes the latest layout, which the
 			// current version may have served in its place (Run's serves).
 			if (!trimmed || m_changes != m_computed || m_current != current) continue;
+			if (m_settings.offerVersions) {
+				// The graphs prepare their re-placements for it first (Offered); its unused heaps go at its publication.
+				m_latest = trimmed;
+				m_offered = trimmed;
+				m_offeredOver = current;
+				m_offeredAt = std::chrono::steady_clock::now();
+				m_offeredTrim = true;
+				m_offeredNeeds = needs;
+				spdlog::info("Frame placement {}: offered once quiet, on heaps of its need ({:.2f} MB; the current version is {}); published at a frame "
+							 "boundary once the graphs prepared their re-placements for it", trimmed->Id(), MB(trimmed->Bytes()), current->Id());
+				continue;
+			}
 			m_memory->ReleaseUnused(needs);
 			m_latest = trimmed;
 			m_current = trimmed;
@@ -656,18 +749,42 @@ void FramePlacement::Run() {
 			&& m_latest->Bytes() + FramePlacementMemory::TrimSlack(m_current->Bytes()) < m_current->Bytes();
 		const bool serves = m_current && m_current->Slots().size() == m_latest->Slots().size() && !uncovered && !smaller;
 		bool published = false;
+		std::shared_ptr<const FramePlacementVersion> toOffer, offerOver;
 		if (m_settings.enabled && (!m_current || m_current->LayoutHash() != m_latest->LayoutHash()) && !serves) {
-			m_current = m_latest;
-			m_currentId.store(m_current->Id(), std::memory_order_release);
-			m_lastPublish = std::chrono::steady_clock::now();
-			published = true;
+			if (m_settings.offerVersions && m_current) {
+				toOffer = m_latest;
+				offerOver = m_current;
+			} else {
+				m_current = m_latest;
+				m_currentId.store(m_current->Id(), std::memory_order_release);
+				m_lastPublish = std::chrono::steady_clock::now();
+				published = true;
+			}
 		}
-		if (!newLayout && !published) continue;
+		if (!newLayout && !published && !toOffer) continue;
 		const auto toLog = m_latest;
+		const bool allocateOffered = m_settings.allocateOffered;
 		lock.unlock();
 		if (published) spdlog::info("Frame placement {}: published; graphs place from it at their next alias plan", toLog->Id());
 		if (newLayout) LogVersion(*toLog, summaries, detailed);
+		if (toOffer && allocateOffered) {
+			// Its heaps are made here, as the trim's are: the graphs' preparations place into them, and no graph allocates one.
+			try {
+				for (uint32_t block = 0; block < toOffer->Blocks().size(); ++block) (void)toOffer->AcquireBlock(block);
+			} catch (const std::exception& error) {
+				spdlog::warn("Frame placement {}: its heaps were not allocated ahead ({})", toOffer->Id(), error.what());
+			}
+		}
 		lock.lock();
+		// Offered only while nothing changed meanwhile.
+		if (toOffer && !m_offered && !m_openStagings && m_changes == changes && m_current == offerOver && m_latest == toOffer) {
+			m_offered = toOffer;
+			m_offeredOver = offerOver;
+			m_offeredAt = std::chrono::steady_clock::now();
+			m_offeredTrim = false;
+			m_offeredNeeds.clear();
+			spdlog::info("Frame placement {}: offered; published at a frame boundary once the graphs prepared their re-placements for it", toOffer->Id());
+		}
 	}
 }
 

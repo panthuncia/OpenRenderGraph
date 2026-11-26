@@ -318,6 +318,8 @@ public:
 	 */
 	size_t KeptMovedCount() const noexcept { return m_keptMovedCount; }
 	const std::vector<std::string>& KeptMoved() const noexcept { return m_keptMoved; }
+	/** @brief For each of KeptMoved: the pinned resource it is now live with in its bytes, which stayed. */
+	const std::vector<std::string>& KeptMovedWith() const noexcept { return m_keptMovedWith; }
 	/** @brief Whether a pool id names a frame placement block (Block::poolID), not one of a graph's own pools. */
 	static constexpr bool IsBlockPoolID(uint64_t poolID) noexcept { return (poolID & 0xFFFFFF0000000000ull) == 0xF9A0000000000000ull; }
 
@@ -366,6 +368,7 @@ private:
 	uint64_t m_keptFrom = 0;  // Keeping
 	size_t m_keptMovedCount = 0;
 	std::vector<std::string> m_keptMoved;
+	std::vector<std::string> m_keptMovedWith;
 	std::vector<Slot> m_slots;
 	std::vector<Block> m_blocks;
 	std::vector<Entry> m_entries;

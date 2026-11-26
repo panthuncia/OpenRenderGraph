@@ -16,6 +16,10 @@ RecordedFrame RecordFrame(PlannedFrame plan,
         auto record = [&](size_t batch) {
             BT_ZONE_SCOPE("ORG.Frame.RecordBatch");
             auto& job = plan.jobs[batch];
+            if (job.reuse) {
+                result.m_batches[batch] = job.reuse;
+                return;
+            }
             auto& recording = job.recording;
             const auto& timelines = job.timelines.empty() ? plan.timelines : job.timelines;
             if (job.deferred) {

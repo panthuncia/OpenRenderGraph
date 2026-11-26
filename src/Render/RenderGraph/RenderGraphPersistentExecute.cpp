@@ -78,7 +78,15 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 		}
 		try {
 			if (AdmitPersistentSegment(run)) {
-				RecordPersistentSegment(run);
+				// A current kept recording (PersistentExecutionOptions::keptCopy) is submitted again: nothing is recorded. A partial
+				// run (batch reuse) records its stale batches.
+				if (segment.replay && segment.reuseBatches.empty()) {
+					run.Lap(timings.admissionUs);
+					++timings.segments;
+					timings.batches += static_cast<uint32_t>(segment.publication->executable->graph->batches.size());
+				} else {
+					RecordPersistentSegment(run);
+				}
 				SubmitPersistentSegment(run);
 			}
 		} catch (...) {
@@ -137,8 +145,9 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 		run.timelineBindings.push_back({kFrameWaitTimelineIdentity, (*m_frameWaitTimeline)->GetHandle()});
 	run.admission = [&] {
 		BT_ZONE_SCOPE("ORG.Persistent.PrepareAdmission");
-		// A ticket's body is recorded from a plan: it is admitted when it is submitted (AdmitPersistentTicket).
-		if (run.execution.options.ticket)
+		// A ticket's body is recorded from a plan: it is admitted when it is submitted (AdmitPersistentTicket). So is a staged
+		// recording's (RecordStagedCopy): its copy's first run admits it.
+		if (run.execution.options.ticket || run.staged)
 			return state.admission->PreparePlan(segment.publication, queues, segment.waits, segment.rebindings);
 		return state.admission->Prepare(segment.publication, queues, segment.waits, {}, segment.rebindings);
 	}();
@@ -154,7 +163,7 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 	const auto& options = run.execution.options;
 	// Executed now (not a ticket, which takes its wait when submitted): every batch waits for the frame's values, or with a
 	// scoped frame wait only the batches that read them.
-	if (!options.ticket && HasFrameWaitTimeline() && m_frameWaitValue) {
+	if (!options.ticket && !run.staged && HasFrameWaitTimeline() && m_frameWaitValue) {
 		std::vector<uint8_t> readers;
 		if (m_scopedFrameWait) readers = persistent::FrameWaitReaders(*segment.publication->executable->graph, admission.backings);
 		for (auto* set : {&admission.incomingWaits, &admission.ownWaits})  // ownWaits: kept by its readmission
@@ -177,11 +186,20 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 	// when they are (PreparedPass::RecordAgain: their invocation recorded again by each).
 	bool lateUnreplayable = false;
 	const auto& structure = *segment.publication->executable->graph->structure;
-	for (const auto& batch : segment.publication->executable->graph->batches)
-		for (const auto pass : batch.passes) {
-			if (!structure.passes[pass].recordAtExecution) continue;
-			const auto prepared = structure.passes[pass].preparedPassIndex;
-			lateUnreplayable = lateUnreplayable || prepared >= segment.invocations.size() || !segment.invocations[prepared].IsReplayable();
+	const auto& batches = segment.publication->executable->graph->batches;
+	// A partial run (batch reuse): the batches submitted from the kept recording prepared nothing.
+	const bool partial = !segment.reuseBatches.empty();
+	std::vector<uint8_t> lateBatch(batches.size());
+	if (!segment.replay || partial)
+		for (uint32_t index = 0; index < batches.size(); ++index) {
+			if (partial && index < segment.reuseBatches.size() && segment.reuseBatches[index]) continue;
+			for (const auto pass : batches[index].passes) {
+				if (!structure.passes[pass].recordAtExecution) continue;
+				const auto prepared = structure.passes[pass].preparedPassIndex;
+				const bool unreplayable = prepared >= segment.invocations.size() || !segment.invocations[prepared].IsReplayable();
+				lateUnreplayable = lateUnreplayable || unreplayable;
+				if (unreplayable) lateBatch[index] = 1;
+			}
 		}
 	run.external = ticketTarget && ticketTarget->external;
 	// A body depends only on the compiled graph (its entry barriers are recorded at submission), so a ticket's recording can be
@@ -191,6 +209,46 @@ bool RenderGraph::AdmitPersistentSegment(PersistentSegmentRun& run) {
 	run.keepable = ticketTarget && m_persistentRecordingReuse && !segment.perFrame
 		&& admission.incomingEffects.empty() && !ticketTarget->uncheckable
 		&& !lateUnreplayable;
+	// A synchronous execution for a kept copy (PersistentExecutionOptions::keptCopy) is recorded for resubmission by the same
+	// rules, its passes' revisions taken by its preparation.
+	const bool batchReuse = m_keptBatchReuse && !ticketTarget && segment.keptCopy != UINT32_MAX && !run.staged;
+	if (!ticketTarget && segment.keptCopy != UINT32_MAX && (!segment.replay || partial) && batchReuse) {
+		// Batch reuse (SetKeptBatchReuse): what every batch shares decides whether anything is kept; each batch's own passes
+		// decide whether its packet is.
+		run.keepable = !segment.perFrame && admission.incomingEffects.empty();
+		if (segment.perFrame) run.unkeptReason = "a per-frame version is bound (a swapchain image)";
+		else if (!admission.incomingEffects.empty()) run.unkeptReason = "its admission has incoming effects";
+		run.batchKeepable.assign(batches.size(), run.keepable ? 1 : 0);
+		run.batchUnkept.assign(batches.size(), run.unkeptReason);
+		if (run.keepable) {
+			const auto& batchOf = BatchOfPrepared(state, segment.publication->executable);
+			for (const auto& [prepared, why] : segment.uncheckablePrepared) {
+				const auto batch = prepared < batchOf.size() ? batchOf[prepared] : UINT32_MAX;
+				if (batch >= batches.size() || !run.batchKeepable[batch]) continue;
+				run.batchKeepable[batch] = 0;
+				run.batchUnkept[batch] = "uncheckable: " + why;
+			}
+			for (uint32_t index = 0; index < batches.size(); ++index)
+				if (lateBatch[index] && run.batchKeepable[index]) {
+					run.batchKeepable[index] = 0;
+					run.batchUnkept[index] = "a pass recorded at execution is not replayable";
+				}
+			// A batch submitted again was kept already.
+			for (uint32_t index = 0; partial && index < batches.size() && index < segment.reuseBatches.size(); ++index)
+				if (segment.reuseBatches[index]) run.batchKeepable[index] = 1;
+			if (std::ranges::none_of(run.batchKeepable, [](uint8_t keep) { return keep != 0; })) {
+				run.keepable = false;
+				const auto first = std::ranges::find_if(run.batchUnkept, [](const auto& why) { return !why.empty(); });
+				run.unkeptReason = first != run.batchUnkept.end() ? *first : std::string("no batch can be kept");
+			}
+		}
+	} else if (!ticketTarget && segment.keptCopy != UINT32_MAX && !segment.replay) {
+		run.keepable = !segment.uncheckable && !segment.perFrame && admission.incomingEffects.empty() && !lateUnreplayable;
+		if (segment.uncheckable) run.unkeptReason = "uncheckable: " + segment.uncheckableBy;
+		else if (segment.perFrame) run.unkeptReason = "a per-frame version is bound (a swapchain image)";
+		else if (!admission.incomingEffects.empty()) run.unkeptReason = "its admission has incoming effects";
+		else if (lateUnreplayable) run.unkeptReason = "a pass recorded at execution is not replayable";
+	}
 	return true;
 }
 
@@ -205,8 +263,18 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 	const bool keepable = run.keepable;
 	const bool external = run.external;
 	auto* const ticketTarget = run.execution.options.ticket;
+	// A partial run (batch reuse): the batches submitted from the kept recording have no invocations and record nothing.
+	const bool partial = !segment.reuseBatches.empty() && segment.replay;
+	const auto reusedBatch = [&](uint32_t batch) { return partial && batch < segment.reuseBatches.size() && segment.reuseBatches[batch] != 0; };
+	std::vector<uint8_t> absent;
+	if (partial) {
+		const auto& batchOf = BatchOfPrepared(state, segment.publication->executable);
+		absent.resize(segment.invocations.size());
+		for (size_t prepared = 0; prepared < absent.size() && prepared < batchOf.size(); ++prepared)
+			absent[prepared] = batchOf[prepared] != UINT32_MAX && reusedBatch(batchOf[prepared]) ? 1 : 0;
+	}
 	try {
-		run.sealed = compiler::SealPersistentFrame(run.execution.number, admission, std::move(segment.invocations));
+		run.sealed = compiler::SealPersistentFrame(run.execution.number, admission, std::move(segment.invocations), absent);
 	} catch (...) { state.admission->Abandon(admission); throw; }
 	const auto& graph = *segment.publication->executable->graph;
 	auto& jobs = run.jobs;
@@ -240,6 +308,18 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 	for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
 		const auto slot = graph.batches[batch].queue;
 		if (slot >= slotCount) throw std::runtime_error("Persistent batch queue is unavailable");
+		if (reusedBatch(batch)) {
+			auto& job = jobs[batch];
+			job.slot = static_cast<uint32_t>(slot);
+			job.reuse = batch < segment.replay->packets.size() ? segment.replay->packets[batch] : nullptr;
+			if (!job.reuse) throw std::logic_error("A reused batch has no kept packet");
+			// Its statistics stay the kept recording's (one per batch, or none without a statistics service).
+			if (m_statisticsService)
+				run.recordingStatistics.push_back(batch < segment.replay->statistics.size() ? segment.replay->statistics[batch] : nullptr);
+			continue;
+		}
+		// Batch reuse: whether this batch's new recording can be kept (its passes all report revisions).
+		const bool batchKeepable = keepable && (run.batchKeepable.empty() || (batch < run.batchKeepable.size() && run.batchKeepable[batch]));
 		bool late = false;
 		for (const auto pass : graph.batches[batch].passes) late = late || graph.structure->passes[pass].recordAtExecution;
 		const bool inStream = external && InHostStream(slot);
@@ -290,7 +370,7 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 		job.recording.tags = m_recordingTags;
 		job.recording.externalEntryBarrier = m_externalQueueBoundary.entry && run.firstBatchOnSlot[slot] == batch;
 		job.recording.externalExitBarrier = m_externalQueueBoundary.exit && run.lastBatchOnSlot[slot] == batch;
-		job.recording.replayable = keepable;
+		job.recording.replayable = batchKeepable;
 		if (queueKind != QueueKind::Copy && device == BackendInstanceId::Primary) {
 			job.recording.resourceDescriptorHeap = run.resourceHeap;
 			job.recording.samplerDescriptorHeap = run.samplerHeap;
@@ -312,13 +392,13 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 			// frame-indexed. With recording timestamps it owns its own instead: a range per pass, per barrier batch around one
 			// (before and after it) and for the list's entry and exit barriers.
 			const bool listTimestamps = m_persistentRecordingTimestamps == RecordingTimestampMode::Lists;
-			statistics->gpuQueries = queueKind != QueueKind::Copy && (!keepable || m_persistentRecordingTimestamps != RecordingTimestampMode::Off)
+			statistics->gpuQueries = queueKind != QueueKind::Copy && (!batchKeepable || m_persistentRecordingTimestamps != RecordingTimestampMode::Off)
 				&& m_queueRegistry.GetBackendInstance(index) == BackendInstanceId::Primary;
 			for (const auto& pass : job.recording.passes) {
 				const auto found = run.statisticsIndices->find(pass.DebugName());
 				statistics->passIndices.push_back(found == run.statisticsIndices->end() ? -1 : static_cast<int>(found->second));
 			}
-			if (keepable && statistics->gpuQueries) {
+			if (batchKeepable && statistics->gpuQueries) {
 				// Each pass's range and barrier batches, plus sub-ranges the passes time inside themselves (a draw pass's views
 				// or draw groups: BeginRecordingSubRange).
 				constexpr uint32_t kSubRanges = 256;
@@ -365,15 +445,16 @@ void RenderGraph::RecordPersistentSegment(PersistentSegmentRun& run) {
 			auto ready = pool->AcquireBatch(demand[slot], completed);
 			size_t readyIndex = 0;
 			for (auto& job : jobs) {
-				if (job.slot != slot || job.deferred) continue;
+				if (job.slot != slot || job.deferred || job.reuse) continue;
 				job.recording.allocation->pair = std::move(ready[readyIndex++]);
 				job.recording.allocation->pool = job.pool;
 			}
 			if (readyIndex != ready.size()) throw std::logic_error("Command-list batch demand did not match recording jobs");
-			if (!state.tracyFrameBegun[slot] && !keepable && !external) {
-				// A late batch has no list yet, so the mark goes in the slot's first list recorded ahead.
-				const auto first = std::ranges::find_if(jobs, [slot](const auto& job) { return job.slot == slot && !job.deferred; });
-				if (first != jobs.end()) {
+			if (!state.tracyFrameBegun[slot] && !external) {
+				// A late batch has no list yet, so the mark goes in the slot's first list recorded ahead. Not in a list kept for
+				// resubmission.
+				const auto first = std::ranges::find_if(jobs, [slot](const auto& job) { return job.slot == slot && !job.deferred && !job.reuse; });
+				if (first != jobs.end() && !first->recording.replayable) {
 					// The frame mark is recorded here, so the list is begun here. Its recorder sees it begun and keeps it.
 					auto& allocation = *first->recording.allocation;
 					allocation.pool->Begin(allocation.pair);
@@ -475,9 +556,17 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 	const auto& graph = *segment.publication->executable->graph;
 	std::shared_ptr<const compiler::GraphExecutionTimeline> execution;
 	std::unique_lock<std::recursive_mutex> sequencer;
+	// A kept copy's current recording, submitted instead of a new one; or the new recording kept for the copy. A partial run (batch
+	// reuse) submits the recorded frame, whose reused batches are the kept recording's packets, and keeps the merged recording.
+	const auto& replay = segment.replay;
+	const bool partial = replay && !segment.reuseBatches.empty();
+	std::shared_ptr<PersistentRecording> keep;
+	// Batch reuse: per batch whether the kept recording's packet can be submitted again, and why not.
+	std::vector<uint8_t> batchReusable;
+	std::vector<std::string> batchWhy;
 	try {
-		auto& recorded = *run.recorded;
 		if (auto* ticket = options.ticket) {
+			auto& recorded = *run.recorded;
 			// Submitted later, by the host's submitting thread; completed (or abandoned) by the owner.
 			auto recording = std::make_shared<PersistentRecording>();
 			recording->snapshot = recorded.Snapshot();
@@ -504,6 +593,72 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 			ticket->segments.push_back({std::move(admission), std::move(recording), segment.bindings, run.resourceHeap, run.samplerHeap,
 				segment.waits, segment.rebindings});
 			return;
+		}
+		if ((!replay || partial) && keepable && segment.keptCopy != UINT32_MAX) {
+			// The packets stay valid after their submission: a replayable list is submitted again by the copy's later runs.
+			const auto& recorded = *run.recorded;
+			keep = std::make_shared<PersistentRecording>();
+			keep->snapshot = recorded.Snapshot();
+			keep->packets = recorded.Packets();
+			keep->statistics = run.recordingStatistics;
+			if (!run.batchKeepable.empty()) {
+				batchReusable.assign(keep->packets.size(), 0);
+				batchWhy.assign(keep->packets.size(), {});
+				for (size_t batch = 0; batch < keep->packets.size(); ++batch) {
+					const bool reused = partial && batch < segment.reuseBatches.size() && segment.reuseBatches[batch];
+					if (reused) batchReusable[batch] = 1;
+					else if (batch < run.batchKeepable.size() && !run.batchKeepable[batch]) batchWhy[batch] = run.batchUnkept[batch];
+					else if (!keep->packets[batch]->Replayable()) batchWhy[batch] = "a packet is not replayable (a pass's lifecycle effect or callback)";
+					else batchReusable[batch] = 1;
+				}
+				keep->replayable = std::ranges::any_of(batchReusable, [](uint8_t reusable) { return reusable != 0; });
+				// Only the packets a later run can submit again are kept. The others stay with the execution until it retires, as
+				// an unkept recording's do, and are not released when the copy's next run replaces this recording.
+				for (size_t batch = 0; batch < batchReusable.size(); ++batch) {
+					if (batchReusable[batch]) continue;
+					keep->packets[batch] = nullptr;
+					if (batch < keep->statistics.size()) keep->statistics[batch] = nullptr;
+				}
+			} else {
+				keep->replayable = std::ranges::all_of(keep->packets, [](const auto& packet) { return packet->Replayable(); });
+			}
+			keep->publication = segment.publication;
+			keep->bindings = segment.bindings;
+			keep->resourceHeap = run.resourceHeap;
+			keep->samplerHeap = run.samplerHeap;
+			keep->revisions = segment.revisions;
+			keep->waits = segment.waits;
+			keep->rebindings = segment.rebindings;
+			keep->versions = segment.versions;
+			keep->leases = segment.leases;
+			m_recordingsRecorded.fetch_add(1, std::memory_order_relaxed);
+		}
+		// Batch reuse, once per executable: each batch's passes (those without a revision marked) and why a batch cannot be kept,
+		// which is what converting its passes needs.
+		if (!run.batchKeepable.empty() && (!replay || partial) && state.keptBatchesLogged.lock() != segment.publication->executable) {
+			state.keptBatchesLogged = segment.publication->executable;
+			std::vector<uint8_t> unchecked(segment.names ? segment.names->size() : 0);
+			for (const auto& [prepared, why] : segment.uncheckablePrepared)
+				if (prepared < unchecked.size()) unchecked[prepared] = 1;
+			std::string lines;
+			size_t reusableCount = 0;
+			for (uint32_t batch = 0; batch < graph.batches.size(); ++batch) {
+				const bool reusable = batch < batchReusable.size() ? batchReusable[batch] != 0 : batch < run.batchKeepable.size() && run.batchKeepable[batch];
+				const auto& why = batch < batchWhy.size() && !batchWhy[batch].empty() ? batchWhy[batch]
+					: batch < run.batchUnkept.size() ? run.batchUnkept[batch] : std::string();
+				std::string passes;
+				for (const auto pass : graph.batches[batch].passes) {
+					const auto prepared = graph.structure->passes[pass].preparedPassIndex;
+					passes += (passes.empty() ? "" : ", ")
+						+ (segment.names && prepared < segment.names->size() ? (*segment.names)[prepared] : std::string("?"))
+						+ (prepared < unchecked.size() && unchecked[prepared] ? " (no revision)" : "");
+				}
+				reusableCount += reusable ? 1 : 0;
+				lines += fmt::format("\n  batch {} (queue {}, {} passes){}: {}", batch, graph.batches[batch].queue, graph.batches[batch].passes.size(),
+					reusable ? "" : " not kept, " + why, passes);
+			}
+			spdlog::info("Kept recording batches (epoch {}): {} of {} batches can be kept{}", m_passEpochFilter, reusableCount,
+				graph.batches.size(), lines);
 		}
 		// Admission at submission (docs/job-graphs.md, "Phase 2 investigation"): under the sequencer, the ledger's handoff is
 		// computed again, recorded into a list ahead of each batch that has one, submitted and committed, with no other
@@ -579,8 +734,12 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 				if (handle.valid()) extraTimelines.push_back({wait.timeline, handle});
 			}
 		auto submitWaits = RelayCrossDeviceWaits(run, admission.incomingWaits, extraTimelines);
-		execution = std::move(recorded).Submit(*state.timelines, submitWaits, leading, std::move(handoffLeases),
-			extraTimelines);
+		if (replay && !partial)
+			execution = state.timelines->SubmitPrepared(replay->snapshot->layout->bundle, submitWaits, replay->packets, {}, leading,
+				std::move(handoffLeases), extraTimelines);
+		else
+			execution = std::move(*run.recorded).Submit(*state.timelines, submitWaits, leading, std::move(handoffLeases),
+				extraTimelines);
 		run.Lap(timings.submitUs);
 	} catch (...) {
 		state.admission->Abandon(admission);
@@ -635,7 +794,8 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 		state.pendingExecutions.push_back(state.lastExecution);
 	}
 	if (run.traceSchedule) RecordPersistentScheduleSubmission(*segment.publication->executable, run.execution.number);
-	for (const auto& statistics : run.recordingStatistics) statistics->Publish();
+	for (const auto& statistics : replay && !partial ? replay->statistics : run.recordingStatistics)
+		if (statistics) statistics->Publish();
 	for (size_t batch = 0; batch < execution->batches.size(); ++batch)
 		m_queueRegistry.EnsureNextFenceValueAtLeast(static_cast<QueueSlotIndex>(static_cast<uint8_t>(graph.batches[batch].queue)),
 			execution->batches[batch].signal.value + 1);
@@ -650,7 +810,261 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 				.wait = {m_queueRegistry.GetFence(slot).GetHandle(), execution->batches[batch].signal.value},
 				.queueSlot = slot, .batchIndex = batch, .valid = execution->batches[batch].signal.value != 0};
 		}
+	// The kept copy's recording from now on, and what this run did (LastKeptRun).
+	if (segment.keptCopy != UINT32_MAX && segment.keptCopy < state.syncKept.size()) {
+		auto& kept = state.syncKept[segment.keptCopy];
+		const auto batchCount = static_cast<uint32_t>(graph.batches.size());
+		// Batch reuse: how many batches were submitted again and recorded, and why each recorded batch recorded.
+		if (replay && !partial) {
+			m_lastKeptRun.batchesReused = batchCount;
+		} else {
+			std::map<std::string, uint32_t> reasons;
+			for (uint32_t batch = 0; batch < batchCount; ++batch) {
+				if (partial && batch < segment.reuseBatches.size() && segment.reuseBatches[batch]) {
+					++m_lastKeptRun.batchesReused;
+					continue;
+				}
+				++m_lastKeptRun.batchesRecorded;
+				const auto& why = batch < segment.staleBatches.size() && !segment.staleBatches[batch].empty() ? segment.staleBatches[batch]
+					: segment.staleReason;
+				if (!why.empty()) ++reasons[why];
+			}
+			m_lastKeptRun.batchReasons.assign(reasons.begin(), reasons.end());
+		}
+		// The preparation's audit answers (SetKeptRecordingAudit) stay in LastKeptRun.
+		if (replay && !partial) {
+			m_lastKeptRun.outcome = KeptRunOutcome::Reused;
+			m_lastKeptRun.reason.clear();
+		} else if (keep && keep->replayable) {
+			// The revisions of the passes in its batches, with their names, skip answers, audit frame data and batches: a partial
+			// run's prepared ones, and the reused batches' from the kept recording.
+			const auto& batchOf = BatchOfPrepared(state, segment.publication->executable);
+			auto revisions = segment.revisions;
+			auto names = segment.revisionNames;
+			auto skips = segment.skips;
+			auto audits = segment.audits;
+			std::vector<uint32_t> revisionBatches;
+			for (const auto prepared : segment.revisionPrepared) revisionBatches.push_back(prepared < batchOf.size() ? batchOf[prepared] : UINT32_MAX);
+			if (!audits.empty()) audits.resize(revisions.size());
+			if (partial && kept.recording) {
+				const auto& old = kept.recording->revisions;
+				for (size_t i = 0; i < old.size() && i < kept.revisionBatches.size(); ++i) {
+					const auto batch = kept.revisionBatches[i];
+					if (batch >= segment.reuseBatches.size() || !segment.reuseBatches[batch]) continue;
+					revisions.push_back(old[i]);
+					names.push_back(i < kept.revisionNames.size() ? kept.revisionNames[i] : std::string("?"));
+					skips.push_back(i < kept.skips.size() ? kept.skips[i] : std::pair<const RenderGraphPass*, uint8_t>{old[i].first, 0});
+					revisionBatches.push_back(batch);
+					if (m_keptAuditEvery || !audits.empty()) {
+						audits.resize(revisions.size() - 1);
+						audits.push_back(i < kept.audits.size() ? kept.audits[i] : nullptr);
+					}
+				}
+			}
+			keep->revisions = std::move(revisions);
+			kept.recording = std::move(keep);
+			kept.revisionNames = std::move(names);
+			kept.skips = std::move(skips);
+			kept.audits = std::move(audits);
+			kept.revisionBatches = std::move(revisionBatches);
+			kept.batchReusable = std::move(batchReusable);
+			kept.batchWhy = std::move(batchWhy);
+			if (!partial) kept.reusesSinceAudit = 0;
+			kept.foreignTimelines.clear();
+			for (const auto& binding : segment.foreignTimelines) kept.foreignTimelines.push_back(binding.identity);
+			std::ranges::sort(kept.foreignTimelines);
+			kept.placementSerial = state.placementSerial;
+			kept.unkeptReason.clear();
+			kept.staged = false;
+			if (partial) {
+				m_lastKeptRun.outcome = KeptRunOutcome::Partial;
+				const auto first = std::ranges::find_if(segment.staleBatches, [](const auto& why) { return !why.empty(); });
+				m_lastKeptRun.reason = first != segment.staleBatches.end() ? *first : std::string("?");
+			} else {
+				m_lastKeptRun.outcome = KeptRunOutcome::Kept;
+				m_lastKeptRun.reason = segment.staleReason;
+			}
+		} else {
+			kept = {};
+			const auto firstWhy = std::ranges::find_if(batchWhy, [](const auto& why) { return !why.empty(); });
+			kept.unkeptReason = keep && firstWhy != batchWhy.end() ? *firstWhy
+				: keep ? std::string("a packet is not replayable (a pass's lifecycle effect or callback)")
+				: run.unkeptReason.empty() ? std::string("not replayable") : run.unkeptReason;
+			m_lastKeptRun.outcome = KeptRunOutcome::Unkeepable;
+			m_lastKeptRun.reason = kept.unkeptReason;
+		}
+	}
 	run.Lap(timings.commitUs);
+}
+
+// ---------------------------------------------------------------------------
+// Staged recordings (GraphHost::RecordStagedCopies)
+
+bool RenderGraph::RecordStagedCopy(rhi::Device device, const UpdateExecutionContext& frame, uint32_t copy, RunRef runRef, std::string& why) {
+	BT_ZONE_SCOPE("ORG.Persistent.RecordStagedCopy");
+	auto& compiler = *m_compilerState;
+	if (compiler.frameProductionStopped) {
+		why = "frame production has stopped";
+		return false;
+	}
+	if (!m_taskService || !compiler.persistent) {
+		why = "the graph was not built ahead (PrepareFirstPersistentBuild)";
+		return false;
+	}
+	auto& state = *compiler.persistent;
+	// A graph not placed at its build (GraphHost::PlaceEpochGraphs) places now, by the same rule: only when that moves nothing the
+	// running graphs bind. Otherwise the attach places it, and its first run records.
+	if (state.aliasPlacementDeferred) {
+		std::string placement;
+		if (!PlaceDeferredAliasesAtBuild(&placement)) {
+			why = "its transients are placed at its attach (" + placement + ")";
+			return false;
+		}
+	}
+	if (state.pending) {
+		why = "a structural build is pending";
+		return false;
+	}
+	// Every pass of the epoch names its revision. A recording with one that cannot is never current, and that pass's Prepare may
+	// do what only the host's thread may (an upload, a manager's state).
+	for (const auto& pass : state.mainPasses) {
+		if (!RunsInPersistentEpoch(pass.epoch)) continue;
+		const auto& any = m_masterPassList[pass.masterIndex];
+		const RenderGraphPass* object = std::visit([](auto& value) -> const RenderGraphPass* {
+			using T = std::decay_t<decltype(value)>;
+			if constexpr (std::is_same_v<T, std::monostate>) return nullptr;
+			else return value.pass.get();
+		}, any.pass);
+		uint64_t hash = 0;
+		if (!object || !object->RevisionHash(hash)) {
+			why = "uncheckable: " + any.name + (!object ? " (no pass object)" : " (no revision hash)");
+			return false;
+		}
+	}
+	// The frame the copy's first run prepares stands in for it: its host data, its capture context and the passes' values.
+	m_resolverCaptureContext = frame.resolverCaptureContext;
+	m_asyncUpdateHostData = frame.ownedHostData;
+	struct ResetFrame {
+		RenderGraph& graph;
+		~ResetFrame() {
+			graph.m_asyncUpdateHostData.reset();
+			graph.m_resolverCaptureContext.reset();
+		}
+	} resetFrame{*this};
+	UseRuntimeServices();
+	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
+	PersistentExecutionOptions options{};
+	options.run = runRef;
+	options.keptCopy = copy;
+	options.staged = true;
+	const auto frameIndex = static_cast<uint32_t>(frame.preparationSlot);
+	try {
+		// A pass whose values cannot be taken from the stand-in frame (one that checks what an earlier pass's Update sizes,
+		// which does not run here) refuses the staging, named; its build is unaffected and the copy's first run records.
+		for (auto& any : m_masterPassList)
+			std::visit([&](auto& obj) {
+				using T = std::decay_t<decltype(obj)>;
+				if constexpr (!std::is_same_v<T, std::monostate>)
+					if (RunsInPersistentEpoch(obj.epoch)) obj.pass->TakeFrameValues(frame);
+			}, any.pass);
+		state.frameIndex = frameIndex;
+		state.frameNumber = ++compiler.asyncPreparationFrameNumber;
+		BindPersistentFrame(false);
+		PublishDeclaredVersions();
+		if (state.pending) {
+			why = "a structural build is pending";
+			return false;
+		}
+		auto execution = PreparePersistentExecution(device, frameIndex, frame.hostData, frame.deltaTime, options);
+		if (!execution.main) {
+			why = "the epoch has nothing to record";
+			return false;
+		}
+		auto& segment = *execution.main;
+		const auto abandon = [&] {
+			for (auto& invocation : segment.invocations)
+				if (invocation) invocation.Abandon(AbandonReason::AdmissionFailed);
+		};
+		if (segment.uncheckable) {
+			abandon();
+			why = "uncheckable: " + segment.uncheckableBy;
+			return false;
+		}
+		PersistentExecuteTimings timings{};
+		std::unordered_map<std::string_view, unsigned> statisticsIndices;
+		if (m_statisticsService) {
+			const auto& names = m_statisticsService->GetPassNames();
+			for (unsigned i = 0; i < names.size(); ++i) statisticsIndices.emplace(names[i], i);
+		}
+		const size_t slotCount = m_queueRegistry.SlotCount();
+		state.tracyFrameBegun.assign(slotCount, 0);
+		PersistentSegmentRun run{.execution = execution, .segment = segment, .timings = timings};
+		run.staged = true;
+		run.slotCount = slotCount;
+		run.presentationSlot = m_queueRegistry.FindGraphicsSlot();
+		// The heaps the copy's run checks the recording against (PreparePersistentExecution).
+		run.resourceHeap = DescriptorHeapManager::GetInstance().GetSRVDescriptorHeap(BackendInstanceId::Primary).GetHandle();
+		run.samplerHeap = DescriptorHeapManager::GetInstance().GetSamplerDescriptorHeap(BackendInstanceId::Primary).GetHandle();
+		run.statisticsIndices = &statisticsIndices;
+		run.firstBatchOnSlot.assign(slotCount, UINT32_MAX);
+		run.lastBatchOnSlot.assign(slotCount, UINT32_MAX);
+		const auto& batches = segment.publication->executable->graph->batches;
+		for (uint32_t batch = 0; batch < batches.size(); ++batch) {
+			const auto slot = batches[batch].queue;
+			if (slot >= slotCount) continue;
+			if (run.firstBatchOnSlot[slot] == UINT32_MAX) run.firstBatchOnSlot[slot] = batch;
+			run.lastBatchOnSlot[slot] = batch;
+		}
+		if (!AdmitPersistentSegment(run)) {
+			why = "the epoch has nothing to record";
+			return false;
+		}
+		if (!run.keepable) {
+			abandon();
+			why = run.unkeptReason.empty() ? std::string("not keepable") : run.unkeptReason;
+			return false;
+		}
+		RecordPersistentSegment(run);
+		const auto& recorded = *run.recorded;
+		auto keep = std::make_shared<PersistentRecording>();
+		keep->snapshot = recorded.Snapshot();
+		keep->packets = recorded.Packets();
+		keep->statistics = run.recordingStatistics;
+		keep->replayable = std::ranges::all_of(keep->packets, [](const auto& packet) { return packet->Replayable(); });
+		if (!keep->replayable) {
+			why = "a packet is not replayable (a pass's lifecycle effect or callback)";
+			return false;
+		}
+		keep->publication = segment.publication;
+		keep->bindings = segment.bindings;
+		keep->resourceHeap = run.resourceHeap;
+		keep->samplerHeap = run.samplerHeap;
+		keep->revisions = segment.revisions;
+		keep->waits = segment.waits;
+		keep->rebindings = segment.rebindings;
+		keep->versions = segment.versions;
+		keep->leases = segment.leases;
+		m_recordingsRecorded.fetch_add(1, std::memory_order_relaxed);
+		if (state.syncKept.size() <= copy) state.syncKept.resize(size_t{copy} + 1);
+		auto& kept = state.syncKept[copy];
+		kept = {};
+		kept.recording = std::move(keep);
+		kept.revisionNames = segment.revisionNames;
+		kept.skips = segment.skips;
+		kept.audits = segment.audits;
+		{
+			const auto& batchOf = BatchOfPrepared(state, segment.publication->executable);
+			for (const auto prepared : segment.revisionPrepared) kept.revisionBatches.push_back(prepared < batchOf.size() ? batchOf[prepared] : UINT32_MAX);
+		}
+		for (const auto& binding : segment.foreignTimelines) kept.foreignTimelines.push_back(binding.identity);
+		std::ranges::sort(kept.foreignTimelines);
+		kept.placementSerial = state.placementSerial;
+		kept.staged = true;
+		return true;
+	} catch (const std::exception& e) {
+		why = std::string("its recording failed: ") + e.what();
+		return false;
+	}
 }
 
 std::shared_ptr<const persistent::ExecutableGeneration> RenderGraph::SelectedExecutable() const {

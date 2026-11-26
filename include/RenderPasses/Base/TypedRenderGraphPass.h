@@ -50,7 +50,9 @@ struct NoPassBindings {};
 //
 // Revision appends what Record's output depends on beyond its bindings and the frame's resources: settings,
 // pass state, pipeline generations. While it stays equal, a kept recording of the pass may be submitted again
-// instead of recording anew. A pass without it is never part of a kept recording.
+// instead of recording anew. A pass without it is never part of a kept recording. The revision audit
+// (RenderGraph::SetKeptRecordingAudit) checks it by preparing anyway and comparing FrameData, so give FrameData an
+// `operator==` (a defaulted one is enough).
 //
 // SkipsAtExecution is asked only when the pass is recorded at execution (ExternalPassDesc::RecordAtExecution), after the run's
 // commit. True means the pass has nothing to do this run: its recorder records the barriers around it and nothing else (no
@@ -213,6 +215,8 @@ private:
             else return 0;
         }
         static constexpr bool kKeyedBySkip = KeyedBySkipOf();
+        // The kept-recording audit compares the author's frame data only: the recording's key covers the bindings.
+        static std::shared_ptr<const PreparedFrameDataAudit> AuditFrameData(const DeclaredFrame& frame) { return MakeFrameDataAudit(frame.data); }
     };
     struct UndeclaredFrame {
         FrameData data;
@@ -246,6 +250,7 @@ private:
             else return 0;
         }
         static constexpr bool kKeyedBySkip = KeyedBySkipOf();
+        static std::shared_ptr<const PreparedFrameDataAudit> AuditFrameData(const UndeclaredFrame& frame) { return MakeFrameDataAudit(frame.data); }
     };
 
 protected:

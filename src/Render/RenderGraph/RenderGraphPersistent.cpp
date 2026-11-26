@@ -1,6 +1,7 @@
 // Persistent execution, frame preparation: installing passes into the program, polling declarations, resolver groups and
 // backings, and preparing the frame's invocations and dynamic segments. See RenderGraphPersistentState.h.
 #include "RenderGraphPersistentState.h"
+#include "Resources/Relocation.h"
 
 namespace org {
 
@@ -876,37 +877,85 @@ bool RenderGraph::PlaceDeferredAliasesAtBuild(std::string* why) {
 	return false;
 }
 
+bool RenderGraph::PublishPlacementSummaryAtBuild() {
+	if (!m_compilerState || m_compilerState->frameProductionStopped || !m_compilerState->persistent) return false;
+	auto& state = *m_compilerState->persistent;
+	if (!state.aliasPlacementDeferred || state.framePlacementTaken) return false;
+	org::runtime::ScopedActiveGraphServices activeServices(m_uploadService.get(), m_descriptorService.get());
+	const auto live = state.program.Select();
+	if (!live) return false;
+	// The plan's gather only: nothing is placed, and the placement stays deferred (PlaceDeferredAliasesAtBuild places).
+	auto edit = state.program.BeginEdit();
+	state.summaryOnly = true;
+	struct Reset {
+		bool& flag;
+		~Reset() { flag = false; }
+	} reset{state.summaryOnly};
+	(void)PlanPersistentAliasPlacement(edit, *live);
+	return true;
+}
+
+bool RenderGraph::PlaceAgainAtBuild(std::string* why) {
+	if (!m_compilerState || !m_compilerState->persistent) return PlaceDeferredAliasesAtBuild(why);
+	auto& state = *m_compilerState->persistent;
+	// Left for its attach: it tries again, by the same rules.
+	if (state.aliasPlacementDeferred) return PlaceDeferredAliasesAtBuild(why);
+	// Placed: only a version that leaves its placements where they are is taken. A new plan would treat what this graph adopted
+	// from the running graphs as its own and could move it under them (a resize moved the running Visibility graph's 'CLod RT
+	// CLAS build arena' that way). Otherwise it places again at its first preparation, as before.
+	std::string reason;
+	if (TakeFramePlacementInPlace(&reason, true)) return true;
+	if (why) *why = (reason.empty() ? std::string("the version cannot be taken") : reason) + "; it places again at its first preparation";
+	return false;
+}
+
 std::shared_ptr<const FramePlacementVersion> RenderGraph::PersistentFramePlacement() const {
 	if (!m_compilerState || !m_compilerState->persistent || !m_compilerState->persistent->framePlacementTaken) return nullptr;
 	return m_compilerState->persistent->framePlacement;
 }
 
-bool RenderGraph::TakeFramePlacementInPlace() {
+bool RenderGraph::TakeFramePlacementInPlace(std::string* why, bool atBuild) {
 	if (!m_compilerState || !m_compilerState->persistent || !m_framePlacementSource) return false;
 	auto& state = *m_compilerState->persistent;
 	if (!state.framePlacementTaken || !state.framePlacement) return false;
 	const auto next = m_framePlacementSource();
 	if (!next || next == state.framePlacement || !next->HasEpoch(m_passEpochFilter)) return false;
+	const auto refuse = [&](Resource* concrete, const char* reason) {
+		if (why) *why = std::string(reason) + " ('" + concrete->GetName() + "')";
+		return false;
+	};
 	size_t kept = 0;
+	// At the build (a staged set's graph that has run nothing): a resource the newer version shows shared with another epoch now (or
+	// no longer) changes only who gives its placement back, as a plan would: a shared one is the frame placement's, not this graph's.
+	std::vector<Resource*> nowShared, nowOwn;
 	for (const auto& [concrete, record] : state.aliasPlaced) {
 		const auto* entry = next->FindObject(concrete->GetGlobalResourceID() + 1);
 		if (!FramePlacementVersion::IsBlockPoolID(record.poolID)) {
 			// In this graph's own pools. A version that places it should be taken by a plan, which moves it there.
-			if (entry && entry->placed) return false;
+			if (entry && entry->placed) return refuse(concrete, "a resource of its own pools is placed by the version");
 			continue;
 		}
-		if (!entry || !entry->placed) return false;
+		if (!entry || !entry->placed) return refuse(concrete, "the version does not place a resource it placed");
 		const auto heap = next->PeekBlock(entry->block);
-		if (!heap || heap.get() != record.heap || entry->offset != record.offset || entry->size != record.sizeBytes) return false;
+		if (!heap || heap.get() != record.heap || entry->offset != record.offset || entry->size != record.sizeBytes)
+			return refuse(concrete, heap ? "the version moves a resource it placed" : "the version's block has no heap yet");
 		// Its contents come from an earlier epoch (or across runs) exactly as before, so its bindings enter it the same way.
 		const bool firstInFrame = !entry->uses.empty() && entry->uses.front().epoch == m_passEpochFilter;
-		if ((!firstInFrame || entry->acrossRuns) != record.continues) return false;
+		if ((!firstInFrame || entry->acrossRuns) != record.continues) return refuse(concrete, "its contents flow changed");
 		// This graph's own placement exactly when no other epoch uses it, so its end gives back the same ones.
-		if (entry->MultiEpoch() == state.aliasPlacementOwners.contains(concrete)) return false;
+		if (entry->MultiEpoch() == state.aliasPlacementOwners.contains(concrete)) {
+			if (!atBuild) return refuse(concrete, "its epochs changed");
+			(entry->MultiEpoch() ? nowShared : nowOwn).push_back(concrete);
+		}
 		++kept;
 	}
+	for (auto* concrete : nowShared) state.aliasPlacementOwners.erase(concrete);
+	for (auto* concrete : nowOwn)
+		if (auto* backed = dynamic_cast<BackedResource*>(concrete))
+			state.aliasPlacementOwners[concrete] = {concrete->weak_from_this(), backed->GetBackingGeneration()};
 	const auto previous = state.framePlacement->Id();
 	state.framePlacement = next;
+	++state.placementSerial;
 	m_framePlacementVersion.store(next->Id(), std::memory_order_release);
 	spdlog::info("Persistent alias placement: epoch {} takes frame placement {} as it is (from {}; its {} frame placements stay): frame={}",
 		m_passEpochFilter, next->Id(), previous, kept, state.frameNumber);
@@ -932,6 +981,7 @@ void RenderGraph::PlaceDeferredPersistentAliases() {
 	auto ready = edit.Build(compiler.synchronousCompileWorkspace, cancelled);
 	const auto built = std::chrono::steady_clock::now();
 	if (!ready || !state.program.Install(edit, ready)) throw std::runtime_error("Persistent deferred alias placement failed to install");
+	++state.placementSerial;
 	const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
 	spdlog::info("Persistent deferred alias placement timing: epoch {} plan {:.2f} ms, validated build {:.2f} ms, install {:.2f} ms", m_passEpochFilter,
 		ms(begin, planned), ms(planned, built), ms(built, std::chrono::steady_clock::now()));
@@ -1036,6 +1086,9 @@ void RenderGraph::BootstrapPersistentGraph() {
 		if (!ready || !state.program.Install(edit, ready)) throw std::runtime_error("Persistent graph bootstrap failed to build");
 		++state.structuralBuilds;
 		basic_telemetry::AddCounter("ORG.Persistent.StructuralBuilds");
+		// The transients it binds, for the other epochs' plans: a set's graphs are all built before any of them places (a deferred
+		// placement), so the first to place already knows what the others share with it.
+		SyncEpochUses(state, m_passEpochFilter);
 		size_t unbound = 0; std::string unboundNames;
 		for (const auto& entry : state.entries) {
 			if (!entry.resource || entry.versioned || entry.isBound) continue;
@@ -1239,6 +1292,12 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 		// Alias re-placement when the host published a new frame placement since this graph's plan took one.
 		bool framePlacementChanged = m_framePlacementProbe && state.framePlacementTaken
 			&& m_framePlacementProbe() != (state.framePlacement ? state.framePlacement->Id() : 0);
+		// A re-placement prepared on a worker for this version installs here: no plan, no build on this thread.
+		if (framePlacementChanged && !state.pending) {
+			PreparationLap("before the prepared re-placement");
+			if (InstallPreparedReplacement()) framePlacementChanged = false;
+			PreparationLap("prepared re-placement");
+		}
 		// A version that leaves this graph's placements where they are is taken as it is: no plan, no build.
 		if (framePlacementChanged && !state.pending && TakeFramePlacementInPlace()) framePlacementChanged = false;
 		// A resource several epochs share that this graph bound at another graph's placement, moved by that graph since (its
@@ -1252,7 +1311,35 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 				break;
 			}
 		}
-		if ((packingChanged || framePlacementChanged || adoptedMoved) && !state.pending) {
+		// A graph of another epoch declared one of this graph's transients since its plan (a graph built later binds it too). If
+		// this graph placed it in its own pools, it moves out: those pools see only this graph's uses. Or another graph took one of
+		// this graph's placements (gave it a backing of its own): this graph binds that backing instead, which only a structural
+		// edit admits.
+		bool ownPoolShared = false;
+		if (const auto taken = AliasPlacementTakenSerial(); taken != state.placementTakenSerialAtPlan) {
+			bool ownTaken = false;
+			for (const auto& [concrete, owner] : state.aliasPlacementOwners) {
+				const auto resource = owner.resource.lock();
+				const auto* backed = resource ? dynamic_cast<const BackedResource*>(resource.get()) : nullptr;
+				if (backed && backed->GetBackingGeneration() != owner.generation) {
+					ownTaken = true;
+					break;
+				}
+			}
+			if (ownTaken) adoptedMoved = true;
+			else state.placementTakenSerialAtPlan = taken;
+		}
+		if (!state.pending && state.framePlacementTaken) {
+			if (const auto serial = CrossEpochUsesSerial(); serial != state.crossEpochSerialAtPlan) {
+				for (const auto& [concrete, record] : state.aliasPlaced)
+					if (!FramePlacementVersion::IsBlockPoolID(record.poolID) && DeclaredByOtherEpoch(concrete, m_passEpochFilter)) {
+						ownPoolShared = true;
+						break;
+					}
+				if (!ownPoolShared) state.crossEpochSerialAtPlan = serial;
+			}
+		}
+		if ((packingChanged || framePlacementChanged || adoptedMoved || ownPoolShared) && !state.pending) {
 			BT_ZONE_SCOPE("ORG.Persistent.ForcedRealias");
 			const auto forcedBegin = std::chrono::steady_clock::now();
 			auto forced = state.program.BeginEdit();
@@ -1273,6 +1360,7 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 				state.forceNewAliasHeaps = false;
 				if (!ready || !state.program.Install(forced, ready)) throw std::runtime_error("Persistent forced alias re-placement failed to install");
 				++state.structuralBuilds;
+				++state.placementSerial;
 			} else {
 				// A new frame placement or a moved shared backing changes placements only: planned against the live publication's
 				// ranks (as the deferred placement), so one validated build instead of a schedule build and a placed one. The
@@ -1284,12 +1372,14 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 					auto ready = forced.Build(compiler.synchronousCompileWorkspace, cancelled);
 					if (!ready || !state.program.Install(forced, ready)) throw std::runtime_error("Persistent forced alias re-placement failed to install");
 					++state.structuralBuilds;
+					++state.placementSerial;
 				}
 			}
 			PreparationLap("re-placement");
 			spdlog::info("Persistent alias re-placement ({}): frame={} in {:.2f} ms",
 				packingChanged ? "packing strategy changed" : framePlacementChanged ? "new frame placement"
-				: adoptedMoved ? "a shared resource another epoch placed moved" : "forced", state.frameNumber,
+				: adoptedMoved ? "a shared resource another epoch placed moved"
+				: ownPoolShared ? "another epoch's graph now uses a resource in its own pools" : "forced", state.frameNumber,
 				std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - forcedBegin).count());
 		} else if (!state.pending && state.framePlacementTaken && m_framePlacementEnabled && m_framePlacementEnabled()) {
 			// A versioned candidate whose current version changed since the latest plan (a new extent, a new version). The new
@@ -1317,6 +1407,7 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 					if (!ready || !state.program.Install(moved, ready))
 						throw std::runtime_error("Persistent alias re-placement for new versions failed to install");
 					++state.structuralBuilds;
+					++state.placementSerial;
 				}
 				spdlog::info("Persistent alias re-placement (new versions of versioned candidates): frame={}", state.frameNumber);
 			}
@@ -1613,12 +1704,137 @@ void RenderGraph::BindPersistentFrame(bool bootstrap) {
 	}
 }
 
+namespace {
+// Slots whose binding `live` changed since `base`: false when they differ in size (as ChangedSlots in RenderGraphPersistentStructural.cpp).
+bool ChangedPublicationSlots(const persistent::SelectedPublication& base, const persistent::SelectedPublication& live, std::vector<uint32_t>& out) {
+	if (base.bindings.Size() != live.bindings.Size()) return false;
+	for (uint32_t i = 0; i < base.bindings.Size(); ++i) {
+		const auto* a = base.bindings.TryAt(i);
+		const auto* b = live.bindings.TryAt(i);
+		if (a == b) continue;
+		if (!a || !b) return false;
+		if (a->identity == b->identity && a->backingRevision == b->backingRevision && a->descriptorRevision == b->descriptorRevision
+			&& a->contentRevision == b->contentRevision && a->recording == b->recording && a->bound == b->bound && a->active == b->active)
+			continue;
+		out.push_back(i);
+	}
+	return true;
+}
+}  // namespace
+
+// The currency probe (SetCurrencyProbe): what of a kept recording's key this preparation changed against the previous one.
+void RenderGraph::ProbePersistentCurrency(const std::shared_ptr<const persistent::SelectedPublication>& selected,
+	const persistent::SelectedPublication& executing, std::shared_ptr<const void> bindings,
+	const std::vector<std::pair<std::shared_ptr<const IVersionedResource>, uint64_t>>& boundVersions, bool perFrame) {
+	auto& state = *m_compilerState->persistent;
+	auto& probe = state.currencyProbe;
+	auto& stats = probe.stats;
+	const auto& compiled = executing.executable->resourceIndexBySlot;
+	const auto boundHere = [&](uint32_t slot) { return slot < compiled.size() && compiled[slot] != UINT32_MAX; };
+	const auto nameOf = [&](uint32_t slot) -> std::string {
+		for (const auto& entry : state.entries)
+			if (entry.slot.index == slot && entry.resource) return entry.resource->GetName();
+		return "slot " + std::to_string(slot);
+	};
+	const auto note = [&](std::string name) {
+		if (stats.names.size() < 256 || stats.names.contains(name)) ++stats.names[std::move(name)];
+	};
+	std::vector<std::pair<const void*, uint64_t>> versions;
+	versions.reserve(boundVersions.size());
+	for (const auto& [versioned, number] : boundVersions) versions.emplace_back(versioned.get(), number);
+	uint64_t head = 0;
+	try { head = relocation::Service::Get().Journal().Head(); } catch (...) {}
+	const uint64_t placementId = state.framePlacement ? state.framePlacement->Id() : 0;
+	if (!probe.primed) {
+		++stats.firstRuns;
+	} else {
+		++stats.runs;
+		bool any = false;
+		if (probe.publication != selected) {
+			++stats.publication;
+			std::vector<uint32_t> changed;
+			bool bound = false;
+			if (!probe.publication || !ChangedPublicationSlots(*probe.publication, *selected, changed)) {
+				bound = true;
+				note("slot:<table size changed>");
+			}
+			for (const auto slot : changed) {
+				if (!boundHere(slot)) continue;
+				bound = true;
+				note("slot:" + nameOf(slot));
+			}
+			if (bound) ++stats.publicationBound;
+			any = any || bound;
+		}
+		// By identity, as a kept recording is checked today. Per slot (O-M6-2), a new publication counts only when it changed a
+		// slot this epoch binds; an overlay of other versions on the same publication still counts.
+		const bool identity = probe.publication != selected || probe.bindings != bindings;
+		if (probe.bindings != bindings) {
+			++stats.bindings;
+			if (probe.publication == selected) any = true;
+		}
+		if (perFrame) ++stats.perFrame;
+		if (versions != probe.versions) {
+			++stats.versions;
+			any = true;
+			for (const auto& [versioned, number] : boundVersions) {
+				const auto found = std::find_if(probe.versions.begin(), probe.versions.end(), [&](const auto& v) { return v.first == versioned.get(); });
+				if (found != probe.versions.end() && found->second == number) continue;
+				const auto current = versioned->SelectVersion(nullptr);
+				note("version:" + (current && current->resource ? current->resource->GetName() : std::string("?")));
+			}
+		}
+		if (head != probe.journalHead && probe.publication) {
+			const auto& service = relocation::Service::Get();
+			bool moved = false;
+			const auto& table = probe.publication->bindings;
+			for (uint32_t index = 0; index < table.Size(); ++index) {
+				const auto* binding = table.TryAt(index);
+				if (!binding || !binding->bound || !binding->recording || !boundHere(index)) continue;
+				if (!service.MovedFrom(binding->recording->resourceID, binding->recording->backingGeneration)) continue;
+				moved = true;
+				note("moved:" + nameOf(index));
+			}
+			if (moved) {
+				++stats.backings;
+				any = true;
+			}
+		}
+		if (placementId != probe.placementId || state.aliasPlans != probe.aliasPlans) {
+			++stats.placement;
+			any = true;
+		}
+		if (any) ++stats.any;
+		if (any || identity) ++stats.anyByIdentity;
+	}
+	probe.primed = true;
+	probe.publication = selected;
+	probe.bindings = std::move(bindings);
+	probe.versions = std::move(versions);
+	probe.journalHead = head;
+	probe.placementId = placementId;
+	probe.aliasPlans = state.aliasPlans;
+}
+
+RenderGraph::CurrencyProbeStats RenderGraph::TakeCurrencyProbeStats() {
+	if (!m_compilerState || !m_compilerState->persistent) return {};
+	return std::exchange(m_compilerState->persistent->currencyProbe.stats, {});
+}
+
+void RenderGraph::DropKeptRecordings() {
+	m_lastKeptRun = {};
+	if (!m_compilerState || !m_compilerState->persistent) return;
+	// A run still in flight holds its own reference to the packets it submitted.
+	m_compilerState->persistent->syncKept.clear();
+}
+
 // Steps 3-4 of a preparation: the main segment's invocations against the selected publication, and the uploads.
 RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::Device device, uint32_t frameIndex,
 	const IHostExecutionData* hostData, float deltaTime, const PersistentExecutionOptions& options) {
 	auto& compiler = *m_compilerState;
 	auto& state = *compiler.persistent;
 	PersistentExecution execution;
+	m_lastKeptRun = {};
 	execution.options = options;
 	execution.number = state.frameNumber;
 	execution.frameIndex = frameIndex;
@@ -1743,7 +1959,230 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 	main.perFrame = perFrame;
 	main.bindings = preparation.bindings;
 	main.invocations.resize(selected->logical->passSlots.size());
-	{
+	// A kept copy (synchronous executions, PersistentExecutionOptions::keptCopy): its kept recording is current when what it was
+	// recorded for still holds. The checks come in this order, and the first that fails names the re-record.
+	const bool keeping = executing && !options.ticket && options.keptCopy != UINT32_MAX;
+	PersistentExecutionsState::SyncKept* kept = nullptr;
+	if (keeping) {
+		BT_ZONE_SCOPE("ORG.Persistent.CheckKeptRecording");
+		main.keptCopy = options.keptCopy;
+		if (state.syncKept.size() <= options.keptCopy) state.syncKept.resize(size_t{options.keptCopy} + 1);
+		kept = &state.syncKept[options.keptCopy];
+		const auto nameOfSlot = [&](uint32_t slot) -> std::string {
+			for (const auto& entry : state.entries)
+				if (entry.slot.index == slot && entry.resource && !entry.resource->GetName().empty()) return entry.resource->GetName();
+			return "slot " + std::to_string(slot);
+		};
+		main.staleReason = [&]() -> std::string {
+			if (!kept->recording) return kept->unkeptReason.empty() ? std::string("first run") : "not kept: " + kept->unkeptReason;
+			const auto& recording = *kept->recording;
+			// O-M6-3: a frame placement version taken in place, a prepared re-placement installed, or an alias plan installed.
+			if (kept->placementSerial != state.placementSerial) return "frame placement";
+			if (recording.publication != executing) {
+				if (!recording.publication || recording.publication->executable != executing->executable) return "new executable";
+				std::vector<uint32_t> changed;
+				if (!ChangedPublicationSlots(*recording.publication, *executing, changed)) return "binding table resized";
+				const auto& compiled = executing->executable->resourceIndexBySlot;
+				for (const auto slot : changed)
+					if (slot < compiled.size() && compiled[slot] != UINT32_MAX) return "binding: " + nameOfSlot(slot);
+				return "publication (a slot this epoch does not bind)";
+			}
+			// O-M6-2: the versions of the versioned slots this epoch binds, each by its own number.
+			if (recording.versions != main.versions) {
+				for (const auto& [versioned, number] : main.versions) {
+					const auto found = std::ranges::find_if(recording.versions, [&](const auto& stamp) { return stamp.first == versioned; });
+					if (found != recording.versions.end() && found->second == number) continue;
+					const auto current = versioned ? versioned->SelectVersion(nullptr) : nullptr;
+					return "version: " + (current && current->resource ? current->resource->GetName() : std::string("?"));
+				}
+				return "version: a versioned slot is no longer bound";
+			}
+			if (recording.bindings != preparation.bindings) return "bindings";
+			const auto resourceHeap = DescriptorHeapManager::GetInstance().GetSRVDescriptorHeap(BackendInstanceId::Primary).GetHandle();
+			const auto samplerHeap = DescriptorHeapManager::GetInstance().GetSamplerDescriptorHeap(BackendInstanceId::Primary).GetHandle();
+			if (recording.resourceHeap.index != resourceHeap.index || recording.resourceHeap.generation != resourceHeap.generation
+				|| recording.samplerHeap.index != samplerHeap.index || recording.samplerHeap.generation != samplerHeap.generation)
+				return "descriptor heaps";
+			if (!PersistentRecordingBackingsCurrent(recording)) return "backing moved: " + PersistentRecordingStaleBacking(recording);
+			// Batch reuse: the passes' revisions and skip answers are checked per batch, below. A staged recording is confirmed whole.
+			if (m_keptBatchReuse && !kept->staged) return {};
+			for (size_t i = 0; i < recording.revisions.size(); ++i) {
+				const auto& [pass, hash] = recording.revisions[i];
+				uint64_t now = 0;
+				if (!pass->RevisionHash(now) || now != hash)
+					return "revision: " + (i < kept->revisionNames.size() ? kept->revisionNames[i] : std::string("?"));
+			}
+			for (size_t i = 0; i < kept->skips.size(); ++i) {
+				const auto& [pass, skipped] = kept->skips[i];
+				if (pass->SkipsFor(preparation.preparationData) != (skipped != 0))
+					return "skip: " + (i < kept->revisionNames.size() ? kept->revisionNames[i] : std::string("?"));
+			}
+			return {};
+		}();
+		if (!main.staleReason.empty()) {
+			// A staged recording that is stale at its first use: named so (KeptRun::staged).
+			if (kept->staged) {
+				main.staleReason = "staged: " + main.staleReason;
+				m_lastKeptRun.staged = true;
+				kept->staged = false;
+			}
+			kept->recording.reset();
+		}
+	}
+	// Batch reuse (O-M6-6, SetKeptBatchReuse): what every batch shares holds, so each batch is checked on its own. A batch whose
+	// passes' revisions and skip answers are unchanged, and whose packet was kept, is submitted again; the others record. A batch
+	// body depends only on its own passes and the compiled graph: its entry barriers are recorded at submission.
+	std::vector<uint8_t> reuseBatches;
+	if (keeping && main.staleReason.empty() && m_keptBatchReuse && !kept->staged) {
+		BT_ZONE_SCOPE("ORG.Persistent.CheckKeptBatches");
+		const auto& recording = *kept->recording;
+		const size_t count = executing->executable->graph->batches.size();
+		reuseBatches.assign(count, 1);
+		main.staleBatches.assign(count, {});
+		std::string whole;
+		if (!kept->batchReusable.empty() && kept->batchReusable.size() != count) whole = "batches changed";
+		for (size_t batch = 0; whole.empty() && batch < kept->batchReusable.size(); ++batch)
+			if (!kept->batchReusable[batch]) {
+				reuseBatches[batch] = 0;
+				main.staleBatches[batch] = "not kept: " + (batch < kept->batchWhy.size() ? kept->batchWhy[batch] : std::string("?"));
+			}
+		const bool mapped = kept->revisionBatches.size() == recording.revisions.size();
+		const auto nameOf = [&](size_t i) { return i < kept->revisionNames.size() ? kept->revisionNames[i] : std::string("?"); };
+		for (size_t i = 0; whole.empty() && i < recording.revisions.size(); ++i) {
+			const auto batch = mapped ? kept->revisionBatches[i] : UINT32_MAX;
+			if (batch < count && !reuseBatches[batch]) continue;
+			const auto& [pass, hash] = recording.revisions[i];
+			uint64_t now = 0;
+			std::string why;
+			if (!pass->RevisionHash(now) || now != hash) why = "revision: " + nameOf(i);
+			else if (i < kept->skips.size() && kept->skips[i].first == pass
+				&& pass->SkipsFor(preparation.preparationData) != (kept->skips[i].second != 0))
+				why = "skip: " + nameOf(i);
+			if (why.empty()) continue;
+			if (batch >= count) whole = std::move(why);
+			else {
+				reuseBatches[batch] = 0;
+				main.staleBatches[batch] = std::move(why);
+			}
+		}
+		const auto reused = static_cast<size_t>(std::ranges::count(reuseBatches, uint8_t{1}));
+		if (whole.empty() && reused == count) {
+			// Every batch current: the recording is submitted as it is.
+			reuseBatches.clear();
+			main.staleBatches.clear();
+		} else if (!whole.empty() || reused == 0) {
+			main.staleReason = !whole.empty() ? whole : *std::ranges::find_if(main.staleBatches, [](const auto& why) { return !why.empty(); });
+			if (!whole.empty()) main.staleBatches.clear();
+			reuseBatches.clear();
+			kept->recording.reset();
+		}
+	}
+	bool partial = !reuseBatches.empty();
+	// External waits (explicit and resolver-provided) become per-frame producer waits.
+	const auto appendWaits = [&](const auto& pass) {
+		const auto appendWait = [&](const ExternalTimelinePoint& wait) {
+			if (!wait.timeline || !wait.value) return;
+			const auto handle = wait.timeline.GetHandle();
+			const uint64_t identity = m_runtime->TimelineIdentity(wait.timeline);
+			bool bound = std::ranges::any_of(main.foreignTimelines, [&](const auto& binding) { return binding.identity == identity; });
+			for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !bound; ++slot)
+				bound = SameTimeline(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint32_t>(slot))), wait.timeline);
+			if (!bound) main.foreignTimelines.push_back({identity, handle});
+			main.waits.push_back({pass.id, {identity, wait.value}});
+		};
+		for (const auto& wait : pass.explicitWaits) appendWait(wait);
+		for (const auto groupIndex : pass.groups) for (const auto& wait : state.groups[groupIndex].waits) appendWait(wait);
+	};
+	// A current kept recording: only this frame's waits are taken. Nothing is prepared. Its packets bind the timelines they were
+	// recorded with, so a wait on another timeline records again.
+	if (keeping && main.staleReason.empty()) {
+		for (const auto& pass : state.mainPasses)
+			if (RunsInPersistentEpoch(pass.epoch) && pass.id.index < main.invocations.size()) appendWaits(pass);
+		std::vector<uint64_t> foreign;
+		for (const auto& binding : main.foreignTimelines) foreign.push_back(binding.identity);
+		std::ranges::sort(foreign);
+		if (foreign == kept->foreignTimelines) {
+			main.replay = kept->recording;
+			// The names of the executable it was recorded on: the same one.
+			main.names = state.mainNames;
+			if (partial) main.reuseBatches = std::move(reuseBatches);
+		} else {
+			main.staleReason = kept->staged ? "staged: foreign timelines" : "foreign timelines";
+			main.staleBatches.clear();
+			if (kept->staged) m_lastKeptRun.staged = true;
+			kept->staged = false;
+			kept->recording.reset();
+			main.waits.clear();
+			main.foreignTimelines.clear();
+			partial = false;
+		}
+	}
+	// The revision audit (O-M6-7, SetKeptRecordingAudit): every N-th reuse of a copy prepares the passes anyway, compares each
+	// pass's frame data with the kept recording's and discards what it prepared. The run still submits the kept recording.
+	// A staged recording's first use (RecordStagedCopy) is confirmed: the passes are prepared once more, as an audit does, and
+	// their frame data must equal the staged ones. The staging took its host data from the application's frame for the build,
+	// which may differ from this frame's in what a revision does not name. On a difference the run records instead.
+	const bool confirming = main.replay && kept && kept->staged;
+	if (confirming) {
+		kept->staged = false;
+		m_lastKeptRun.staged = true;
+	}
+	const bool auditing = !confirming && main.replay && kept && m_keptAuditEvery != 0 && ++kept->reusesSinceAudit >= m_keptAuditEvery;
+	if (auditing) {
+		kept->reusesSinceAudit = 0;
+		m_lastKeptRun.audited = true;
+	}
+	std::string confirmRefusal;
+	// One pass's new preparation against the kept recording's, the pass's index among the recording's revisioned passes
+	// counted by auditIndex.
+	size_t auditIndex = 0;
+	// 0: the same frame data, 1: other frame data, 2: not comparable, 3: a pass with no revision (a current recording has none).
+	const auto compareFrameData = [&](const auto& any, const PreparedPass& packet) -> int {
+		const RenderGraphPass* object = std::visit([](auto& value) -> const RenderGraphPass* {
+			using T = std::decay_t<decltype(value)>;
+			if constexpr (std::is_same_v<T, std::monostate>) return nullptr;
+			else return value.pass.get();
+		}, any.pass);
+		uint64_t hash = 0;
+		if (!object || !object->RevisionHash(hash)) return 3;
+		// By the pass: a recording merged by batch reuse holds its entries in another order than this preparation's.
+		const auto& revisions = main.replay->revisions;
+		size_t at = auditIndex;
+		if (at >= revisions.size() || revisions[at].first != object)
+			at = static_cast<size_t>(std::ranges::find(revisions, object, &std::pair<const RenderGraphPass*, uint64_t>::first) - revisions.begin());
+		auditIndex = at + 1;
+		const auto audit = packet.AuditFrameData();
+		if (at >= revisions.size() || at >= kept->audits.size() || !kept->audits[at] || !audit) return 2;
+		return audit->Equal(*kept->audits[at]) ? 0 : 1;
+	};
+	const auto confirmPass = [&](const auto& any, const PreparedPass& packet) {
+		if (!confirmRefusal.empty()) return;
+		const auto compared = compareFrameData(any, packet);
+		if (compared == 1) confirmRefusal = "staged: frame data of " + any.name;
+		else if (compared == 2) confirmRefusal = "staged: frame data not comparable: " + any.name;
+	};
+	const auto auditPass = [&](const auto& any, const PreparedPass& packet) {
+		const auto compared = compareFrameData(any, packet);
+		if (compared == 3) return;
+		if (compared == 2) {
+			++m_lastKeptRun.auditUncomparable;
+			return;
+		}
+		++m_lastKeptRun.auditCompared;
+		if (compared == 0) return;
+		m_lastKeptRun.auditMismatches.push_back(any.name);
+		if (m_keptAuditWarned.size() < 256 && m_keptAuditWarned.insert(any.name).second)
+			spdlog::warn("Kept recording audit: pass '{}' (epoch {}) prepared other frame data than its kept recording's while its "
+				"revision is the same: its Revision() misses an input", any.name, m_passEpochFilter);
+	};
+	// A partial run (batch reuse) prepares the passes of the batches it records, and with the audit also the reused ones, to compare.
+	const std::vector<uint32_t>* batchOf = partial ? &BatchOfPrepared(state, executing->executable) : nullptr;
+	const auto reusedPass = [&](uint32_t prepared) {
+		if (!batchOf) return false;
+		const auto batch = prepared < batchOf->size() ? (*batchOf)[prepared] : UINT32_MAX;
+		return batch < main.reuseBatches.size() && main.reuseBatches[batch] != 0;
+	};
+	if (!main.replay || auditing || confirming || partial) {
 		PreparationLap("bind versions and setup");
 		BT_ZONE_SCOPE("ORG.Persistent.PrepareInvocations");
 		auto passPreparation = preparation;
@@ -1781,6 +2220,9 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 			auto& pass = state.mainPasses[mainIndex];
 			// Another epoch's pass: neither prepared nor recorded now. Its slot patches wait.
 			if (!RunsInPersistentEpoch(pass.epoch)) continue;
+			// In a batch submitted again: nothing to prepare, unless the audit compares it. Its slot patches wait too.
+			const bool reused = reusedPass(pass.id.index);
+			if (reused && !auditing) continue;
 			if (pass.slotsDirty || pass.slotsExecutable != selected->executable.get()) {
 				auto slots = std::make_shared<FramePreparationContext::ResourceSlots>();
 				auto expose = [&](uint32_t entryIndex) {
@@ -1918,6 +2360,13 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 				}, any.pass);
 				object && object->SkipsFor(passPreparation.preparationData))
 				packet.MarkSkippedAhead();
+			if (auditing && (!partial || reused)) {
+				auditPass(any, packet);
+				packet.Abandon(AbandonReason::GenerationInvalidated);
+				continue;
+			}
+			// Kept as a normal preparation's, in case the confirmation fails and the run records.
+			if (confirming) confirmPass(any, packet);
 			main.invocations[pass.id.index] = std::move(packet);
 			if (auto* ticket = options.ticket) {
 				const RenderGraphPass* object = std::visit([](auto& value) -> const RenderGraphPass* {
@@ -1934,29 +2383,63 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 					if (!ticket->uncheckable) ticket->uncheckableBy = any.name + (!object ? " (no pass object)" : " (no revision hash)");
 					ticket->uncheckable = true;
 				}
+			} else if (keeping) {
+				// What a kept copy's next run checks its recording against: each pass's revision and skip answer.
+				const RenderGraphPass* object = std::visit([](auto& value) -> const RenderGraphPass* {
+					using T = std::decay_t<decltype(value)>;
+					if constexpr (std::is_same_v<T, std::monostate>) return nullptr;
+					else return value.pass.get();
+				}, any.pass);
+				uint64_t hash = 0;
+				if (object && object->RevisionHash(hash)) {
+					main.revisions.emplace_back(object, hash);
+					main.revisionNames.push_back(any.name);
+					main.revisionPrepared.push_back(pass.id.index);
+					main.skips.emplace_back(object, object->SkipsFor(passPreparation.preparationData) ? uint8_t{1} : uint8_t{0});
+					if (m_keptAuditEvery || options.staged || confirming)
+						main.audits.push_back(main.invocations[pass.id.index].AuditFrameData());
+				} else {
+					const auto why = any.name + (!object ? " (no pass object)" : " (no revision hash)");
+					if (!main.uncheckable) main.uncheckableBy = why;
+					main.uncheckable = true;
+					main.uncheckablePrepared.emplace_back(pass.id.index, why);
+				}
 			}
 			if (namesDirty) (*mainNames)[pass.id.index] = any.name;
-			// External waits (explicit + resolver-provided) become per-frame producer waits.
-			auto appendWait = [&](const ExternalTimelinePoint& wait) {
-				if (!wait.timeline || !wait.value) return;
-				const auto handle = wait.timeline.GetHandle();
-				const uint64_t identity = m_runtime->TimelineIdentity(wait.timeline);
-				bool bound = std::ranges::any_of(main.foreignTimelines, [&](const auto& binding) { return binding.identity == identity; });
-				for (size_t slot = 0; slot < m_queueRegistry.SlotCount() && !bound; ++slot)
-					bound = SameTimeline(m_queueRegistry.GetFence(static_cast<QueueSlotIndex>(static_cast<uint32_t>(slot))), wait.timeline);
-				if (!bound) main.foreignTimelines.push_back({identity, handle});
-				main.waits.push_back({pass.id, {identity, wait.value}});
-			};
-			for (const auto& wait : pass.explicitWaits) appendWait(wait);
-			for (const auto groupIndex : pass.groups) for (const auto& wait : state.groups[groupIndex].waits) appendWait(wait);
+			// A confirmed reuse, and a partial run, took the frame's waits already, above.
+			if (!confirming && !partial) appendWaits(pass);
 		}
 	}
+	if (confirming) {
+		if (confirmRefusal.empty()) {
+			// Confirmed: the staged recording is submitted, and what was prepared to compare is abandoned.
+			for (auto& invocation : main.invocations)
+				if (invocation) {
+					invocation.Abandon(AbandonReason::GenerationInvalidated);
+					invocation = PreparedPass{};
+				}
+			main.revisions.clear();
+			main.revisionNames.clear();
+			main.skips.clear();
+			main.audits.clear();
+			main.uncheckable = false;
+			main.uncheckableBy.clear();
+		} else {
+			// Recorded from this preparation instead, as a stale copy's run is.
+			main.replay.reset();
+			main.staleReason = std::move(confirmRefusal);
+			kept->recording.reset();
+		}
+	}
+	if (executing && !options.ticket && m_currencyProbe.load(std::memory_order_relaxed)) ProbePersistentCurrency(selected, *executing, main.bindings, main.versions, main.perFrame);
 	if (executing) execution.main = std::move(main);
 	PreparationLap("prepare invocations");
 	// 4. Uploads.
 	// Tickets have none: the host records its uploads itself when it submits the ticket, and tickets don't
 	// support any other upload pass.
-	if (options.ticket) {
+	if (options.staged) {
+		// A staged recording takes no uploads: they belong to the frames that run.
+	} else if (options.ticket) {
 		for (const auto index : state.uploadMasterIndices)
 			if (m_masterPassList[index].name != "org.host.uploads")
 				throw std::logic_error("Tickets do not support the upload pass '" + m_masterPassList[index].name + "'");

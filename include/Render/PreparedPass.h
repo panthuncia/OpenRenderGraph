@@ -4,12 +4,14 @@
 #include <array>
 #include <atomic>
 #include <concepts>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <unordered_map>
 #include <variant>
@@ -641,6 +643,44 @@ private:
     rhi::DescriptorHeapHandle m_resourceHeap{}, m_samplerHeap{};
 };
 
+// The kept-recording audit's copy of a typed pass's frame data (RenderGraph::SetKeptRecordingAudit). Equal says whether two
+// preparations of the pass produced the same frame data. A pass whose frame data has neither operator== nor a plain byte
+// representation has none (PreparedPass::AuditFrameData returns null).
+class PreparedFrameDataAudit {
+public:
+    virtual ~PreparedFrameDataAudit() = default;
+    virtual bool Equal(const PreparedFrameDataAudit& other) const = 0;
+};
+namespace detail {
+template<class Data> struct PreparedFrameDataValue final : PreparedFrameDataAudit {
+    explicit PreparedFrameDataValue(const Data& a_value) : value(a_value) {}
+    bool Equal(const PreparedFrameDataAudit& other) const override {
+        const auto* same = dynamic_cast<const PreparedFrameDataValue*>(&other);
+        if (!same) return false;
+        if constexpr (std::equality_comparable<Data>) return value == same->value;
+        else return std::memcmp(&value, &same->value, sizeof(Data)) == 0;
+    }
+    Data value;
+};
+}
+// The audit copy of a frame's data: by operator==, by bytes when the type has a unique byte representation, always equal for
+// an empty type, else null (it cannot be compared).
+template<class Data>
+std::shared_ptr<const PreparedFrameDataAudit> MakeFrameDataAudit(const Data& data) {
+    if constexpr (std::is_empty_v<Data>) {
+        struct Empty final : PreparedFrameDataAudit {
+            bool Equal(const PreparedFrameDataAudit& other) const override { return dynamic_cast<const Empty*>(&other) != nullptr; }
+        };
+        return std::make_shared<const Empty>();
+    } else if constexpr (std::copy_constructible<Data> && (std::equality_comparable<Data>
+        || (std::is_trivially_copyable_v<Data> && std::has_unique_object_representations_v<Data>))) {
+        return std::make_shared<const detail::PreparedFrameDataValue<Data>>(data);
+    } else {
+        (void)data;
+        return nullptr;
+    }
+}
+
 // One owned packet per submitted frame. Copies share the single-consumption
 // state; no mutable pass object is implicitly retained by the recording thunk.
 class PreparedPass {
@@ -820,6 +860,9 @@ public:
     // 0 without one). A kept list is submitted again only for a run with the same answers and the same keys. Asked with the skip
     // questions' context, so it may read only Run().
     uint64_t RecordKey(const RecordingContext& context) const { return m_storage ? m_storage->RecordKey(context) : 0; }
+    // A copy of a typed pass's frame data for the kept-recording audit (MakeFrameDataAudit), taken before the pass is recorded.
+    // Null for other passes and frame data that cannot be compared.
+    std::shared_ptr<const PreparedFrameDataAudit> AuditFrameData() const { return m_storage ? m_storage->AuditFrameData() : nullptr; }
     // Consumes the packet as Record does, recording nothing (SkipsAtExecution). Its submission and completion follow as usual.
     void RecordNothing() const {
         if (!m_storage) throw std::logic_error("Legacy pass has no owned recording packet");
@@ -887,6 +930,7 @@ private:
         virtual bool SkipsAtExecution(const RecordingContext&) const { return false; }
         virtual bool KeyedBySkip() const noexcept { return false; }
         virtual uint64_t RecordKey(const RecordingContext&) const { return 0; }
+        virtual std::shared_ptr<const PreparedFrameDataAudit> AuditFrameData() const { return nullptr; }
         mutable std::atomic<LifecycleState> state{LifecycleState::Prepared};
         mutable std::shared_ptr<const PreparedDependencySnapshot> dependencies;
         std::vector<ExternalTimelinePoint> externalSignals;
@@ -940,6 +984,12 @@ private:
                 { Derived::RecordKeyAtExecution(value, recording) } -> std::convertible_to<uint64_t>;
             }) return data ? static_cast<uint64_t>(Derived::RecordKeyAtExecution(*data, context)) : 0;
             else return 0;
+        }
+        std::shared_ptr<const PreparedFrameDataAudit> AuditFrameData() const override {
+            if constexpr (requires(const Data& value) {
+                { Derived::AuditFrameData(value) } -> std::convertible_to<std::shared_ptr<const PreparedFrameDataAudit>>;
+            }) return data ? Derived::AuditFrameData(*data) : nullptr;
+            else return nullptr;
         }
 		mutable std::optional<Data> data;
     };

@@ -10,6 +10,7 @@
 #include <spdlog/spdlog.h>
 
 #include "Managers/Singletons/DescriptorHeapManager.h"
+#include "Render/PublicationBindingBundle.h"
 #include "Resources/GPUBacking/GPUTextureBacking.h"
 #include "Utilities/ORGUtilities.h"
 
@@ -295,6 +296,91 @@ bool PixelBuffer::AdoptRelocatedBacking(std::unique_ptr<GpuTextureBacking>& next
     ApplyRelocationClass(GetGlobalResourceID());
     ++m_backingGeneration;
     ForgetPublishedAllocation();
+    return true;
+}
+
+namespace {
+class PreparedTextureBacking final : public PreparedPlacedBacking {
+public:
+    SymbolicTracker* StateTracker() override { return backing ? backing->GetStateTracker() : nullptr; }
+    std::unique_ptr<GpuTextureBacking> backing;
+    std::shared_ptr<PreparedDescriptorSlots> slots;
+    std::shared_ptr<const BackingAllocationSnapshot> allocation;
+};
+}
+
+std::shared_ptr<PreparedPlacedBacking> PixelBuffer::PreparePlacedBacking(std::shared_ptr<const AliasHeapGeneration> heap, uint64_t offset,
+    uint64_t poolID, std::string* why) {
+    const auto refuse = [&](const char* reason) -> std::shared_ptr<PreparedPlacedBacking> {
+        if (why) *why = reason;
+        return {};
+    };
+    if (!heap) return refuse("no heap");
+    uint64_t fromGeneration = 0;
+    {
+        std::scoped_lock lock(m_materializationMutex);
+        if (!m_backing) return refuse("no backing of its own");
+        if (GetAttachedAPIRepresentation(BackendInstanceId::Primary).IsValid()) return refuse("an API representation is attached");
+        fromGeneration = m_backingGeneration;
+    }
+    // The description and views do not change with the backing, so they are read without the lock.
+    auto prepared = std::make_shared<PreparedTextureBacking>();
+    prepared->resourceID = GetGlobalResourceID();
+    prepared->fromGeneration = fromGeneration;
+    prepared->heap = heap;
+    prepared->offset = offset;
+    prepared->poolID = poolID;
+    prepared->backing = GpuTextureBacking::CreateUnique(BackingDescription(), GetGlobalResourceID(), TextureAliasPlacement{heap, offset, poolID},
+        name.empty() ? nullptr : name.c_str());
+    auto native = prepared->backing->GetAPIResource();
+    rhi::ResourceDesc description{};
+    const bool hasDescription = TryGetRHIResourceDesc(description);
+    prepared->slots = PreparedDescriptorSlots::Create(native, hasDescription ? &description : nullptr, &m_clearValue);
+    // The slots as EnsureVirtualDescriptorSlotsAllocatedLocked reserves them, and their contents as Materialize writes them.
+    auto& rm = DescriptorHeapManager::GetInstance();
+    {
+        const uint16_t mipLevels = ResolveTextureMipLevels(BackingDescription());
+        const uint32_t arraySize = m_desc.isCubemap ? 6u * m_desc.arraySize : (m_desc.isArray ? m_desc.arraySize : 1u);
+        DescriptorHeapManager::ViewRequirements views;
+        views.views = BuildTextureViewRequirements(m_desc, mipLevels, arraySize);
+        rm.ReserveDescriptorSlots(*prepared->slots, views);
+    }
+    {
+        DescriptorHeapManager::ViewRequirements views;
+        views.views = BuildTextureViewRequirements(m_desc, prepared->backing->GetMipLevels(), prepared->backing->GetArraySize());
+        rm.UpdateDescriptorContents(*prepared->slots, native, views);
+    }
+    BackingAllocationSnapshot allocation{GetGlobalResourceID(), fromGeneration + 1, native, prepared->backing->CaptureAllocationLease()};
+    allocation.aliasHeap = prepared->backing->GetAliasHeap();
+    allocation.aliasPoolID = prepared->backing->GetAliasPoolID();
+    allocation.aliasOffset = prepared->backing->GetAliasOffset();
+    allocation.aliasSize = prepared->backing->GetAliasSize();
+    if (!allocation) return refuse("the new backing has no allocation lease");
+    prepared->allocation = std::make_shared<const BackingAllocationSnapshot>(std::move(allocation));
+    prepared->snapshot = PublicationBindingBundle::CapturePrepared(*this, prepared->allocation, *prepared->slots);
+    if (!prepared->snapshot) return refuse("the new backing could not be captured");
+    return prepared;
+}
+
+bool PixelBuffer::AdoptPreparedBacking(PreparedPlacedBacking& base) {
+    auto* prepared = dynamic_cast<PreparedTextureBacking*>(&base);
+    if (!prepared || !prepared->backing || prepared->adopted.load(std::memory_order_acquire)) return false;
+    ClearAPIRepresentations();
+    std::scoped_lock lock(m_materializationMutex);
+    if (!m_backing || m_backingGeneration != prepared->fromGeneration) return false;
+    // As Dematerialize then Materialize: the old slots retire behind the frames that bound them, and the old backing goes with
+    // the publications that hold its allocation.
+    TakeDescriptorSlotsFrom(*prepared->slots);
+    m_backing = std::move(prepared->backing);
+    m_mipLevels = m_backing->GetMipLevels();
+    m_arraySize = m_backing->GetArraySize();
+    if (m_desc.aliasingPoolID.has_value())
+        m_backing->ApplyMetadataComponentBundle(EntityComponentBundle().Set<MemoryStatisticsComponents::AliasingPool>({m_desc.aliasingPoolID}));
+    for (const auto& bundle : m_metadataBundles) m_backing->ApplyMetadataComponentBundle(bundle);
+    ApplyRelocationClass(GetGlobalResourceID());
+    ++m_backingGeneration;
+    SeedPublishedAllocation(prepared->allocation, m_backingGeneration);
+    prepared->adopted.store(true, std::memory_order_release);
     return true;
 }
 

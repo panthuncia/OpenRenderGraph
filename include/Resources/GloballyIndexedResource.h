@@ -257,6 +257,45 @@ public:
     void RotateDescriptorSlotsForPublication() {
         RetireDescriptorSlotsForDeferredRelease(DetachDescriptorSlotsForDeferredRelease());
     }
+    // Takes other's descriptor slots, written ahead for a backing this resource adopts (BackedResource::AdoptPreparedBacking).
+    // This resource's own slots retire as RotateDescriptorSlotsForPublication retires them, and other is left with none. What other
+    // captured stays captured here, so a publication made from other's views names the same views as this resource's later captures.
+    void TakeDescriptorSlotsFrom(GloballyIndexedResource& other) {
+        RotateDescriptorSlotsForPublication();
+        const auto views = other.CaptureBindlessViews();
+        const auto ownership = other.CaptureDescriptorOwnership();
+        m_SRVViews = std::move(other.m_SRVViews);
+        m_pSRVHeap = std::move(other.m_pSRVHeap);
+        m_UAVShaderVisibleInfos = std::move(other.m_UAVShaderVisibleInfos);
+        m_UAVViews = std::move(other.m_UAVViews);
+        m_UAVNonShaderVisibleInfos = std::move(other.m_UAVNonShaderVisibleInfos);
+        m_pUAVShaderVisibleHeap = std::move(other.m_pUAVShaderVisibleHeap);
+        m_pUAVNonShaderVisibleHeap = std::move(other.m_pUAVNonShaderVisibleHeap);
+        m_CBVInfo = other.m_CBVInfo;
+        m_pCBVHeap = std::move(other.m_pCBVHeap);
+        m_RTVInfos = std::move(other.m_RTVInfos);
+        m_pRTVHeap = std::move(other.m_pRTVHeap);
+        m_DSVInfos = std::move(other.m_DSVInfos);
+        m_pDSVHeap = std::move(other.m_pDSVHeap);
+        m_counterOffset = other.m_counterOffset;
+        m_primaryViewType = other.m_primaryViewType;
+        other.InvalidateDescriptorCapture();
+        other.m_SRVViews.clear();
+        other.m_SRVViews.resize(static_cast<unsigned int>(SRVViewType::NumSRVViewTypes));
+        other.m_UAVShaderVisibleInfos.clear();
+        other.m_UAVViews.clear();
+        other.m_UAVViews.resize(static_cast<unsigned int>(UAVViewType::NumUAVViewTypes));
+        other.m_UAVNonShaderVisibleInfos.clear();
+        other.m_CBVInfo = {};
+        other.m_RTVInfos.clear();
+        other.m_DSVInfos.clear();
+        other.m_counterOffset = 0;
+        other.m_primaryViewType = SRVViewType::Invalid;
+        m_capturedBindlessViews = views;
+        m_bindlessCaptureValid = true;
+        m_capturedDescriptorOwnership = ownership;
+        m_descriptorCaptureValid = true;
+    }
 protected:
 	virtual bool TryGetPublishedClearValue(rhi::ClearValue&) const { return false; }
 	virtual void OnSetName() override {}
@@ -386,6 +425,40 @@ private:
 	}
 
 	friend class BufferBase;
+};
+
+// The descriptor slots of a prepared backing (BackedResource::PreparePlacedBacking) until its resource takes them
+// (TakeDescriptorSlotsFrom). Its views describe that resource: the description and clear value are the resource's. It has no ECS entity.
+class PreparedDescriptorSlots final : public GloballyIndexedResource {
+public:
+	static std::shared_ptr<PreparedDescriptorSlots> Create(rhi::Resource resource, const rhi::ResourceDesc* description,
+		const rhi::ClearValue* clear) {
+		ScopedECSRegistrationSuppression noEntity;
+		auto slots = std::shared_ptr<PreparedDescriptorSlots>(new PreparedDescriptorSlots());
+		slots->m_resource = resource;
+		if (description) { slots->m_description = *description; slots->m_hasDescription = true; }
+		if (clear) { slots->m_clear = *clear; slots->m_hasClear = true; }
+		return slots;
+	}
+	rhi::Resource GetAPIResource() override { return m_resource; }
+	rhi::BarrierBatch GetEnhancedBarrierGroup(RangeSpec, rhi::ResourceAccessType, rhi::ResourceAccessType, rhi::ResourceLayout,
+		rhi::ResourceLayout, rhi::ResourceSyncState, rhi::ResourceSyncState) override { return {}; }
+	SymbolicTracker* GetStateTracker() override { return nullptr; }
+	bool TryGetRHIResourceDesc(rhi::ResourceDesc& outDesc) const override {
+		if (m_hasDescription) outDesc = m_description;
+		return m_hasDescription;
+	}
+protected:
+	bool TryGetPublishedClearValue(rhi::ClearValue& value) const override {
+		if (m_hasClear) value = m_clear;
+		return m_hasClear;
+	}
+private:
+	PreparedDescriptorSlots() = default;
+	rhi::Resource m_resource;
+	rhi::ResourceDesc m_description{};
+	rhi::ClearValue m_clear{};
+	bool m_hasDescription = false, m_hasClear = false;
 };
 
 

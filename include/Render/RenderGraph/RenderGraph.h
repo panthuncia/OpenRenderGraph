@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <map>
 #include <string>
 #include <string_view>
 #include <memory>
@@ -209,6 +210,98 @@ public:
 		uint32_t batches = 0;
 	};
 	const PersistentExecuteTimings& LastPersistentExecuteTimings() const noexcept { return m_lastPersistentExecuteTimings; }
+	// The calling thread's CPU time in the last Update, by phase. Diagnostics.
+	struct PersistentUpdateTimings {
+		double passUpdatesUs = 0.0;    // the passes' Update calls
+		double beforeCompileUs = 0.0;  // UpdateExecutionContext::beforeCompileFrame
+		double prepareUs = 0.0;        // the frame's preparation (PrepareFrame of every pass, bindings, versions, uploads)
+	};
+	const PersistentUpdateTimings& LastPersistentUpdateTimings() const noexcept { return m_lastPersistentUpdateTimings; }
+	// Currency probe (diagnostic, off by default). While on, each synchronous preparation of the main segment compares what a kept
+	// recording of it would be keyed on with the previous preparation's: the publication (and whether a slot this epoch binds
+	// changed in it), the bindings object, the versioned slots' versions, moved backings and the frame placement. Pass revisions
+	// are not part of it. Owner thread.
+	struct CurrencyProbeStats {
+		uint32_t runs = 0;              // preparations compared with a previous one
+		uint32_t firstRuns = 0;         // preparations with no previous one (a new graph)
+		uint32_t publication = 0;       // a new publication was selected
+		uint32_t publicationBound = 0;  // and it changed a slot this epoch binds
+		uint32_t bindings = 0;          // the bindings object differs (it follows the publication and the versioned overlay)
+		uint32_t perFrame = 0;          // a per-frame versioned slot is bound (the overlay is new each frame)
+		uint32_t versions = 0;          // a versioned slot this epoch binds moved to another version
+		uint32_t backings = 0;          // a backing the previous preparation bound moved (relocation)
+		uint32_t placement = 0;         // another frame placement version, or another alias plan
+		uint32_t any = 0;               // a kept recording would not be current with per-slot checks (publicationBound, bindings on
+		                                // the same publication, versions, backings, placement)
+		uint32_t anyByIdentity = 0;     // nor with the bindings compared by identity (any new publication counts)
+		std::map<std::string, uint32_t> names;  // what changed: "slot:<resource>", "version:<resource>", "moved:<resource id>"
+	};
+	void SetCurrencyProbe(bool on) noexcept { m_currencyProbe.store(on, std::memory_order_relaxed); }
+	bool CurrencyProbeOn() const noexcept { return m_currencyProbe.load(std::memory_order_relaxed); }
+	// Since the last call. Owner thread.
+	CurrencyProbeStats TakeCurrencyProbeStats();
+	// Kept recordings of synchronous executions (GraphHost::SetKeptEpochs). A run that names a kept copy
+	// (PersistentExecutionOptions::keptCopy) checks the copy's kept recording after the passes' Update calls and the frame's
+	// bindings. When it is current, the run submits it: nothing is prepared or recorded. Otherwise the run prepares and records
+	// as before, and keeps its recording for the copy when it is replayable. What the last run did, and why it recorded. Owner
+	// thread.
+	enum class KeptRunOutcome : uint8_t {
+		None,        // the run named no kept copy
+		Reused,      // the copy's kept recording was submitted
+		Kept,        // recorded, and the recording is kept for the copy
+		Unkeepable,  // recorded, and the recording cannot be kept (reason says why)
+		// Batch reuse (SetKeptBatchReuse): the current batches of the copy's kept recording were submitted again, and only the
+		// stale ones were prepared and recorded (reason names the first stale batch's). The merged recording is kept.
+		Partial,
+	};
+	struct KeptRun {
+		KeptRunOutcome outcome = KeptRunOutcome::None;
+		// Kept: why the run recorded, the first condition of the copy's kept recording that failed ("revision: <pass>",
+		// "version: <resource>", "frame placement", "binding: <resource>", ...), or "first run" when the copy had none.
+		// Unkeepable: why the new recording cannot be kept ("uncheckable: <pass> (no revision hash)"). The copy's next run then
+		// records for "not kept: <that reason>".
+		std::string reason;
+		// The revision audit (SetKeptRecordingAudit), on a reused run it audited: the passes whose frame data was compared, the
+		// ones whose frame data cannot be compared, and the passes that prepared other frame data than the kept recording's
+		// while their revision was the same (a revision that misses an input).
+		bool audited = false;
+		uint32_t auditCompared = 0;
+		uint32_t auditUncomparable = 0;
+		std::vector<std::string> auditMismatches;
+		// The copy's kept recording was a staged one (RecordStagedCopy) at its first use: Reused when its frame data matched this
+		// run's preparation, else Kept with reason "staged: ...".
+		bool staged = false;
+		// Batch reuse (SetKeptBatchReuse): the batches submitted from the kept recording and the batches recorded by this run, and
+		// why each recorded batch recorded or cannot be kept, by reason (the first pass of the batch that failed its check, or has
+		// no revision). A run that records every batch counts them all as recorded.
+		uint32_t batchesReused = 0, batchesRecorded = 0;
+		std::vector<std::pair<std::string, uint32_t>> batchReasons;
+	};
+	const KeptRun& LastKeptRun() const noexcept { return m_lastKeptRun; }
+	/**
+	 * @brief The revision audit of kept recordings (O-M6-7), off by default (0). Every everyN-th reuse of a kept copy also prepares
+	 * the epoch's passes, compares each pass's frame data with the kept recording's (PreparedPass::AuditFrameData), and reports
+	 * the passes that differ while their revision says equal (KeptRun::auditMismatches, a warning per pass the first time). The
+	 * prepared result is discarded (abandoned): the run still submits the kept recording. Frame data is kept with a recording
+	 * only while the audit is on, so a recording kept before it was turned on is not compared. It sees only frame data: what a
+	 * pass's Record reads from elsewhere (a manager's state, a pipeline's payload) is outside it. Owner thread.
+	 */
+	void SetKeptRecordingAudit(uint32_t everyN) noexcept { m_keptAuditEvery = everyN; }
+	uint32_t KeptRecordingAudit() const noexcept { return m_keptAuditEvery; }
+	/**
+	 * @brief Batch reuse of kept recordings (O-M6-6), off by default. A kept recording is then checked per batch: a batch whose
+	 * passes all report revisions that still hold, and whose packet is replayable, is submitted again from the kept recording; the
+	 * other batches' passes are prepared and recorded, and the merged recording is kept (KeptRunOutcome::Partial). A batch body
+	 * depends only on its own passes and the compiled graph (entry barriers are recorded at submission), so an epoch with passes
+	 * that cannot report revisions still reuses the batches without them. What every batch shares is still checked for the whole
+	 * recording first, and a failure there records every batch: the build, frame placement, publication, versions, bindings,
+	 * descriptor heaps, backings and foreign timelines. The audit (SetKeptRecordingAudit) compares the reused batches' passes. A
+	 * staged recording (RecordStagedCopy) is confirmed whole, as before. Owner thread.
+	 */
+	void SetKeptBatchReuse(bool on) noexcept { m_keptBatchReuse = on; }
+	bool KeptBatchReuse() const noexcept { return m_keptBatchReuse; }
+	// Drops every kept recording (GraphHost::SetKeptEpochs, when the epoch stops keeping). Owner thread.
+	void DropKeptRecordings();
 	// Schedule introspection (ScheduleTrace.h), off by default. While on, the owner thread traces each executable it selects
 	// (the whole-frame one and each epoch's, once per executable: a steady frame builds nothing) and records what each execution
 	// waits for at submission beyond its batches' own waits, publishing snapshots of both. Off costs one relaxed load per
@@ -838,6 +931,11 @@ public:
 	// The queue slots its external client has used (ExternalClient::UsedSlots), 0 when it has none yet. Does not make one.
 	uint32_t ExternalClientSlots();
 
+	// Owner thread: re-placements installed from a preparation (PrepareFramePlacementReplacement), and preparations the graph did not
+	// install, so far.
+	std::pair<uint64_t, uint64_t> PreparedReplacementCounts() const;
+	// Owner thread: a structural build is in flight (its preparations cannot re-place until it installs).
+	bool PersistentStructuralBuildPending() const;
 private:
 	// Driving the graph is GraphHost's: its declared-graph calls (Build, PrepareFrame, ExecuteFrame)
 	// or its own frames.
@@ -875,13 +973,42 @@ private:
 	// someone else must already be where the plan puts it, and nothing may go to the arena's shared pools. Otherwise it changes
 	// nothing, leaves the placement to the attach and returns false with why. True when it placed (or had nothing to place).
 	bool PlaceDeferredAliasesAtBuild(std::string* why = nullptr);
+	// Before any graph of a staged set places (GraphHost::PlaceEpochGraphs): publishes this graph's usage summary to its staging
+	// and changes nothing else, so the version the set's first graph needs is computed from every graph of the set, and the later
+	// graphs need no newer one that moves what the first placed. True when it published one. Same thread.
+	bool PublishPlacementSummaryAtBuild();
+	// For a graph of a staged set that placed from an older version of the set's staging (a later graph of the set made a newer
+	// one): takes the staging's current version in place when that moves none of its placements (TakeFramePlacementInPlace), so its
+	// first preparation does not place again. A graph left for its attach tries PlaceDeferredAliasesAtBuild again. Same thread.
+	bool PlaceAgainAtBuild(std::string* why = nullptr);
 	// The frame placement version the graph's latest alias plan placed from, null for none. Owner thread.
 	std::shared_ptr<const FramePlacementVersion> PersistentFramePlacement() const;
+	// Staged recordings (GraphHost::RecordStagedCopies): on the thread that built the graph, before it is staged or attached,
+	// records the epoch's kept copy `copy` for `run` (the copy's lease) and keeps it, as the copy's first run would. The passes'
+	// TakeFrameValues run with `frame`'s host data; their Update does not. Nothing is admitted against the ledgers or submitted:
+	// the body is recorded from a plan (SynchronousAdmission::PreparePlan), and the copy's first run admits it. That run checks
+	// it as any kept recording, and also prepares the passes once and compares their frame data with the staged ones
+	// (KeptRun::staged): a difference records instead, named "staged: frame data of <pass>". Returns false with why when the
+	// copy cannot be recorded ahead: a pass without a revision, the alias placement left to the attach, a recording that cannot
+	// be kept.
+	bool RecordStagedCopy(rhi::Device device, const UpdateExecutionContext& frame, uint32_t copy, RunRef run, std::string& why);
 	// Owner thread, at a preparation that finds a new frame placement version: takes it without a plan when it leaves every
 	// resource this graph placed from a frame placement where it is, with the same contents flow (whether it continues from an
 	// earlier epoch, and whether it is this graph's own), and places nothing of this graph's own pools. A version that kept the
 	// running graphs' resources (FramePlacementVersion::Keeping) is one. True when it took it.
-	bool TakeFramePlacementInPlace();
+	// atBuild: the graph has run nothing yet (PlaceAgainAtBuild); a resource now shared with another epoch (or no longer) only changes
+	// who gives its placement back. why: what refused it.
+	bool TakeFramePlacementInPlace(std::string* why = nullptr, bool atBuild = false);
+	// Owner thread, while the host holds a new frame placement version back (FramePlacementSettings::prepareReplacements): starts
+	// preparing this graph's re-placement for it on a worker. The worker places what this graph placed from a frame placement where
+	// version puts it, derives the placement orderings, gives each resource that moves a backing made ahead (BackedResource::
+	// PreparePlacedBacking) and builds the validated publication, while this graph keeps running. The first preparation that finds
+	// version current installs it: the backings switch, the publication installs, and no plan or build runs on this thread. When
+	// anything it was made from changed meanwhile, that preparation re-places as before. False when there is nothing to prepare (the
+	// graph has not placed from a frame placement, has a build in flight, or binds a resource another epoch's graph placed).
+	bool PrepareFramePlacementReplacement(std::shared_ptr<const FramePlacementVersion> version);
+	// Any thread: no preparation for this version is running (it finished, was refused, or none was started).
+	bool FramePlacementReplacementSettled(uint64_t versionId) const;
 	// Before CompileStructural, on a graph built detached: the context its passes' resolvers are captured with and its first
 	// publication binds versions with. Each preparation replaces it with its own (UpdateExecutionContext::resolverCaptureContext).
 	// GraphHost::BuildEpochGraph gives one that names each texture's reshaped version (array-size versions, VersionedResource).
@@ -896,6 +1023,12 @@ private:
 		// What the recording's RecordingContext::Run names. Without one: UpdateExecutionContext::run, else the execution's frame
 		// index outside a lease (RunRef::Unleased).
 		std::optional<RunRef> run;
+		// A synchronous execution's kept copy (GraphHost::SetKeptEpochs): the run reuses the copy's kept recording when it is
+		// current, and keeps its own recording for the copy otherwise. The run must be the copy's own (its latch regions stay at
+		// its index), and the copy's last run must be complete. UINT32_MAX: no kept copy.
+		uint32_t keptCopy = UINT32_MAX;
+		// A staged recording (RecordStagedCopy): no uploads are prepared, and every pass's frame data is kept to confirm it.
+		bool staged = false;
 	};
 	void Update(const UpdateExecutionContext& context, rhi::Device device) { Update(context, device, PersistentExecutionOptions{}); }
 	void Update(const UpdateExecutionContext& context, rhi::Device device, const PersistentExecutionOptions& options);
@@ -984,6 +1117,8 @@ private:
 	// The first preparation of a graph PrepareFirstPersistentBuild built: its alias placement, planned against the installed
 	// schedule, built and installed (a structural edit). Nothing otherwise.
 	void PlaceDeferredPersistentAliases();
+	// BindPersistentFrame: installs the prepared re-placement for the current frame placement version (PrepareFramePlacementReplacement).
+	bool InstallPreparedReplacement();
 	void BindUnboundPersistentEntries(persistent::GraphEditTransaction& edit);
 	// Structural build: bind, schedule, plan alias placement, rebuild if needed.
 	std::shared_ptr<const persistent::SelectedPublication> BuildPersistentStructural(persistent::GraphEditTransaction& edit);
@@ -1001,6 +1136,9 @@ private:
 	void WritePersistentGraphDebugDump(const persistent::SelectedPublication& selected) const;
 	// Schedule introspection, owner thread. Traces the selected executable and its epochs' when it is not the traced one.
 	void RefreshPersistentScheduleTraces(const persistent::SelectedPublication& selected);
+	void ProbePersistentCurrency(const std::shared_ptr<const persistent::SelectedPublication>& selected,
+		const persistent::SelectedPublication& executing, std::shared_ptr<const void> bindings,
+		const std::vector<std::pair<std::shared_ptr<const IVersionedResource>, uint64_t>>& boundVersions, bool perFrame);
 	// Records the submission waits filled into the persistent state's scratch for one execution of `executable` (a segment
 	// labelled segmentLabel), and publishes a snapshot once per round of executions.
 	void RecordPersistentScheduleSubmission(const persistent::ExecutableGeneration& executable, uint64_t frame);
@@ -1039,6 +1177,13 @@ private:
 	std::atomic<uint64_t> m_recordingsRecorded{0};
 	uint32_t m_persistentEpoch = UINT32_MAX;
 	PersistentExecuteTimings m_lastPersistentExecuteTimings{};
+	PersistentUpdateTimings m_lastPersistentUpdateTimings{};
+	std::atomic<bool> m_currencyProbe{false};
+	KeptRun m_lastKeptRun{};
+	uint32_t m_keptAuditEvery = 0;
+	bool m_keptBatchReuse = false;
+	// Pass names the audit warned about once.
+	std::unordered_set<std::string> m_keptAuditWarned;
 	ExternalQueueBoundary m_externalQueueBoundary{};
 	std::unique_ptr<CompilerState> m_compilerState;
     std::shared_ptr<const ResolverCaptureContext> m_resolverCaptureContext;

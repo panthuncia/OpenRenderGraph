@@ -258,6 +258,8 @@ public:
 		double BuildMilliseconds() const noexcept { return m_buildMs; }
 		/** @brief The graph, for diagnostics before it is attached (its schedule trace, say). Null when the build failed. */
 		RenderGraph* Graph() noexcept { return m_graph.get(); }
+		/** @brief The frame placement version its transients were last placed from (PlaceEpochGraphs), 0 for none. */
+		uint64_t PlacedFromVersion() const;
 	private:
 		friend class GraphHost;
 		EpochGraph() = default;
@@ -680,6 +682,16 @@ public:
 		// version as it is, without placing again. False, or when it cannot be done: the version is packed from scratch and every
 		// graph places again from it.
 		bool keepRunning = true;
+		// A staged set placed at its build (PlaceEpochGraphs): every graph of the set publishes its usage summary before the first
+		// places, so the version made for the set places all of its graphs and none needs a newer one that moves what an earlier
+		// graph placed. False: each graph's summary arrives with its own plan, in epoch order.
+		bool summariesFirst = true;
+		// A new version the worker makes once quiet (the settled layout, the heap trim) is published only after every graph prepared
+		// its re-placement for it on a worker (RenderGraph::PrepareFramePlacementReplacement): the plan, the backings of what moves
+		// and the validated publication. The host publishes it at a frame boundary (SealSubmitted, CommitRelocations), and each
+		// graph's next preparation switches the backings and installs. False: each graph re-places at its preparation, on the
+		// owner thread.
+		bool prepareReplacements = true;
 	};
 	/** @brief Owner thread. Kept across rebuilds. */
 	void SetFramePlacement(FramePlacementSettings settings);
@@ -690,6 +702,8 @@ public:
 	std::vector<std::shared_ptr<const PlacementSummary>> PlacementSummaries() const;
 	/** @brief Any thread: the latest frame placement computed, or null. */
 	std::shared_ptr<const FramePlacementVersion> LatestFramePlacement() const;
+	/** @brief Any thread: the id of the frame placement version graphs place from now (0 for none). */
+	uint64_t CurrentFramePlacementId() const noexcept;
 	/** @brief Any thread: the frame placement's heaps, the current ones first, then the replaced ones still alive. */
 	std::vector<FramePlacementMemory::HeapInfo> FramePlacementHeaps() const;
 	/** @brief What a frame placement the epoch's attached graph's latest alias plan took. Owner thread. */
@@ -1127,8 +1141,85 @@ public:
 		double submitUs = 0.0;         // handing the uploads and the ticket to the queue, and committing it
 		double postUs = 0.0;           // handing the submitted ticket back to the host's thread (its completion)
 		RenderGraph::PersistentExecuteTimings execute{};
+		RenderGraph::PersistentUpdateTimings update{};  // updateUs by phase
+		// With the currency probe on (SetCurrencyProbe): the run's comparison with the epoch's previous one.
+		bool probed = false;
+		RenderGraph::CurrencyProbeStats probe{};
+		// A kept epoch's run (SetKeptEpochs): whether it submitted its copy's kept recording, or recorded and kept it, or recorded
+		// a recording that cannot be kept. None for an epoch that keeps nothing.
+		RenderGraph::KeptRunOutcome kept = RenderGraph::KeptRunOutcome::None;
 	};
 	const FrameTimings& LastFrameTimings() const noexcept { return m_lastTimings; }
+	// Owner thread: the currency probe (RenderGraph::SetCurrencyProbe) on every epoch's graph that ExecuteFrame runs. Diagnostic,
+	// off by default.
+	void SetCurrencyProbe(bool on) noexcept { m_currencyProbe = on; }
+
+	/**
+	 * @brief Kept recordings for synchronous epochs (ExecuteFrame). Owner thread, without async epochs.
+	 *
+	 * Each kept epoch has framesInFlight + 1 kept copies. A copy is a run lease whose LatchBlock regions stay at its index
+	 * (RunRef::Copy), and its runs follow each other in turn: by then the copy's last run is complete (frame pacing waits for the
+	 * epoch's run framesInFlight back). Each run still calls beforePrepare and the passes' Update. Then the graph binds the
+	 * frame (versions, rebindings, the publication's bindings) and checks the copy's kept recording. It is current while the
+	 * placements, the publication, every versioned slot's version, the bindings, the descriptor heaps, every backing it bound,
+	 * every pass's revision and skip answer, and the timelines it waits on are unchanged. A current recording is admitted and
+	 * submitted: nothing is prepared or recorded. Passes recorded at execution are recorded inline at each submission
+	 * (SetInlineAtExecution). Otherwise the run prepares and records as before, and keeps its recording for the copy when it is
+	 * replayable: every pass reports a revision (RenderGraphPass::Revision), no per-frame version is bound, and no pass has a
+	 * lifecycle effect. A rebuilt graph starts with no kept recordings, unless RecordStagedCopies recorded them ahead.
+	 * An epoch that leaves the set drops its graph's kept recordings. Kept recordings carry no profiler GPU zones; their per-pass
+	 * timestamps need SetRecordingTimestamps.
+	 */
+	void SetKeptEpochs(std::vector<uint32_t> epochs);
+	const std::vector<uint32_t>& KeptEpochs() const noexcept { return m_keptEpochs; }
+	// What the kept epoch's runs did since the last call, and why the ones that recorded did (RenderGraph::KeptRun::reason, counted
+	// by reason). Owner thread.
+	struct KeptStats {
+		uint64_t runs = 0, reused = 0, kept = 0, unkeepable = 0;
+		std::map<std::string, uint64_t> reasons;
+		// Batch reuse (SetKeptBatchReuse): runs that submitted some batches of the kept recording and recorded the rest, the
+		// batches submitted again and recorded over all runs, and why the recorded batches recorded, by reason.
+		uint64_t partial = 0, batchesReused = 0, batchesRecorded = 0;
+		std::map<std::string, uint64_t> batchReasons;
+		// The revision audit (SetKeptRecordingAudit): reused runs audited, passes compared, passes whose frame data cannot be
+		// compared, and the passes that prepared other frame data while their revision was the same, counted by name.
+		uint64_t audited = 0, auditCompared = 0, auditUncomparable = 0, auditMismatches = 0;
+		std::map<std::string, uint64_t> mismatches;
+		// Staged recordings (RecordStagedCopies) at their first use: submitted, or recorded again (their reasons start "staged: ").
+		uint64_t stagedReused = 0, stagedRecorded = 0;
+	};
+	KeptStats TakeKeptStats(uint32_t epoch);
+	/**
+	 * @brief Staged recordings (O-M6-4): records a built graph's kept copies before it is staged or attached, on the thread that
+	 * built it (or holds it unattached), so its first runs submit kept recordings instead of recording on the host's thread.
+	 *
+	 * For a kept epoch (SetKeptEpochs) whose kept copies exist (the epoch ran), each copy is recorded for its own lease, as its
+	 * first run would be, and kept in the graph (RenderGraph::RecordStagedCopy). frame stands for the frame the graph's first
+	 * runs prepare: its host data (and owned host data) and resolver capture context, typically the application's frame inputs
+	 * for the build. The passes' TakeFrameValues run with it, then their Prepare and Record; their Update does not, and nothing is
+	 * uploaded, admitted against the ledgers or submitted. The attach adopts the recordings with the graph. Each copy's first run
+	 * checks its recording as any kept recording's and, in addition, prepares the passes and compares their frame data with the
+	 * staged ones: frame data the staging's host data made differently records the copy again (KeptStats::stagedRecorded, a reason
+	 * "staged: frame data of <pass>"), so a staged recording is never submitted for other frame data than the run's own.
+	 *
+	 * Nothing is recorded (StagedRecordings::why) for an epoch that keeps nothing, has no copies yet, or whose graph has a pass
+	 * without a revision, its alias placement left to the attach, or a recording that cannot be kept. Without async epochs. The
+	 * host must outlive the call; the graph must not be staged or attached meanwhile.
+	 */
+	struct StagedRecordings {
+		uint32_t copies = 0;    // the epoch's kept copies
+		uint32_t recorded = 0;  // recorded and kept
+		std::string why;        // why the rest were not
+		double milliseconds = 0.0;
+	};
+	StagedRecordings RecordStagedCopies(EpochGraph& graph, const UpdateExecutionContext& frame);
+	// Owner thread: the revision audit of kept recordings on every epoch's graph that ExecuteFrame runs
+	// (RenderGraph::SetKeptRecordingAudit): every everyN-th reuse of a kept copy prepares anyway and compares. 0: off (the
+	// default). Diagnostic.
+	void SetKeptRecordingAudit(uint32_t everyN) noexcept { m_keptAudit = everyN; }
+	// Owner thread: batch reuse of kept recordings on every epoch's graph that ExecuteFrame runs (RenderGraph::SetKeptBatchReuse, O-M6-6):
+	// a kept recording's current batches are submitted again and only its stale batches recorded. Off by default.
+	void SetKeptBatchReuse(bool on) noexcept { m_keptBatchReuse = on; }
 	const Desc& GetDesc() const noexcept { return m_desc; }
 
 	// The submission thread (Desc::submissionThread).
@@ -1190,6 +1281,13 @@ private:
 	// A frame runs one frame placement version (FramePlacement::Freeze): set once a graph that placed from one has recorded in
 	// the frame, cleared at the seal and at an attach. Owner thread.
 	bool m_framePlacementFrozen = false;
+	// The offered frame placement version the graphs prepare their re-placements for (AdvanceFramePlacementOffer), and since when.
+	uint64_t m_offerPrepared = 0;
+	size_t m_offerGraphs = 0;
+	std::chrono::steady_clock::time_point m_offerStarted{};
+	// The offer waiting for a structural build in flight before its preparations start, and since when.
+	uint64_t m_offerWaitSince = 0;
+	std::chrono::steady_clock::time_point m_offerWaitStarted{};
 	// Per instance (index as m_instances): the external client slots its attached graphs have used, so a new build of the epoch
 	// makes them ready ahead (PlaceEpochGraphs). Written on the owner thread, read by builds.
 	std::unique_ptr<std::atomic<uint32_t>[]> m_externalSlots;
@@ -1310,6 +1408,19 @@ private:
 	std::vector<std::pair<uint32_t, std::vector<RunLease*>>> m_stagingLeases;
 	// Each live epoch's kept copies' leases (with Desc::reuseRecordings), made as its runs need them and kept for the host's life.
 	std::vector<std::pair<uint32_t, std::vector<RunLease*>>> m_liveCopyLeases;
+	// SetKeptEpochs, and each epoch instance's kept copies' leases (framesInFlight + 1, made on first use and kept for the host's
+	// life), the copy its next run takes, and its runs' outcomes since TakeKeptStats.
+	std::vector<uint32_t> m_keptEpochs;
+	// m_keptEpochs for other threads (RecordStagedCopies), under m_configMutex.
+	std::vector<uint32_t> m_keptEpochsShared;
+	// Grown and filled under m_leaseMutex: RecordStagedCopies reads it on the building thread.
+	std::vector<std::vector<RunLease*>> m_syncCopyLeases;
+	std::vector<uint64_t> m_syncCopyNext;
+	std::vector<KeptStats> m_keptStats;
+	uint32_t m_keptAudit = 0;
+	bool m_keptBatchReuse = false;
+	// The next kept copy's lease of the instance, open for its run. Its last run is waited for and retired first if it is not yet.
+	RunLease& TakeSyncCopy(size_t index);
 	// The sync path's frame pacing: its runs of the last framesInFlight frames, by position.
 	std::vector<RunLease*> m_syncLeases;
 	// The submission each position's run had (RunLease::submission). A lease is taken again once its run retired: a pointer whose
@@ -1349,6 +1460,7 @@ private:
 	RenderGraph::GpuPassRangeBegin m_gpuPassRangeBegin;
 	RenderGraph::GpuPassRangeEnd m_gpuPassRangeEnd;
 	FrameTimings m_lastTimings{};
+	bool m_currencyProbe = false;
 	uint64_t m_lastHostFrame = 0;
 	std::shared_ptr<rhi::TimelinePtr> m_frameWaitTimeline;  // SetFrameWaitTimeline
 	uint64_t m_frameWaitValue = 0;
@@ -1408,6 +1520,9 @@ private:
 	void ApplyFramePlacementSettings();
 	// Owner thread: the frame placement's memory breakdown (FramePlacement::LogMemory), with which version each graph placed from.
 	void LogFramePlacementMemory() const;
+	// Owner thread, at a frame boundary: has the graphs prepare their re-placements for the offered frame placement version, and
+	// publishes it once they are ready (FramePlacementSettings::prepareReplacements).
+	void AdvanceFramePlacementOffer();
 	// The frame-wide placement: summaries, the worker and its versions. Made with the host. Graphs hold it weakly.
 	std::shared_ptr<FramePlacement> m_framePlacement;
 	std::vector<uint32_t> m_externalEpochs;  // SetExternalEpochs; set on every build's graph

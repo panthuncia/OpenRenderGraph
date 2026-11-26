@@ -263,7 +263,7 @@ LoweredPass LowerPass(RenderGraph& graph, ResourceRegistry& registry, const Queu
 		? queues.GetBackend(static_cast<QueueSlotIndex>(static_cast<uint8_t>(graphicsSlot))) : primaryBackend);
 	// A pass recorded at execution goes in a batch with only such passes. The host's execution records that batch. The other
 	// batches are recorded ahead of time.
-	declaration.recordAtExecution = pass.recordAtExecution;
+	declaration.recordAtExecution = pass.recordAtExecution || resources.recordAtExecution;
 	declaration.mayNotWrite = resources.mayNotWrite;
 	// The pass's own waits. A resolver group's waits are not part of the declaration: every preparation takes the group's
 	// current ones. A resolver lowered as direct uses has no group, so its waits at declaration are added below.

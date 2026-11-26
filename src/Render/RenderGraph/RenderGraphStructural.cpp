@@ -90,6 +90,9 @@ RenderGraph::AnyPassAndResources RenderGraph::MaterializeExternalPass(const Exte
 			par.resources.isGeometryPass = b.params.isGeometryPass;
 			// Set on the description, or by the pass on the builder while it declared.
 			par.resources.mayNotWrite = d.mayNotWrite || b.params.mayNotWrite;
+			// The same for recording at execution. Before this, a pass that set it on the builder was recorded ahead, and a kept
+			// recording then submitted its commands again without recording it.
+			par.resources.recordAtExecution = d.recordAtExecution || b.m_recordAtExecution;
 			par.resources.preferredQueueKind = ResolveExternalPreferredQueueKind(d);
 			par.resources.queueAssignmentPolicy = ResolveExternalQueueAssignmentPolicy(d);
 			if (logStructuralMaterialize) {

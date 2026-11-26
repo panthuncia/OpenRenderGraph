@@ -287,7 +287,82 @@ int TestFramePlacementStaging() {
 		ENSURE(placement.CurrentId() != next->Id() && placement.Current()->FindObject(106));
 		placement.Thaw();
 	}
-	std::puts("frame placement: staged sets (commit, drop, decline) and the per-frame freeze");
+	std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+	// 5. Summaries first (GraphHost::PlaceEpochGraphs, FramePlacementSettings::summariesFirst): while the set collects, its graphs'
+	// summaries compute nothing, even with uncovered candidates. The first uncovered one after it computes one version from every
+	// summary of the set, so a later graph's new resource (here 302, which also shares 301 with epoch 1) is placed in it already.
+	{
+		const auto before = placement.Current();
+		const auto staging = placement.BeginStaging({1, 2});
+		placement.CollectStaged(*staging, true);
+		placement.PublishStaged(*staging, withUncovered(1, {Use(7, 301, 0, 3), Use(16, 303, 0, 1, 8 * kMB)}));
+		placement.PublishStaged(*staging, withUncovered(2, {Use(9, 301, 0, 1), Use(17, 302, 0, 3, 12 * kMB)}));
+		ENSURE(placement.StagedCurrent(*staging) == before && staging->CurrentId() == before->Id());
+		placement.CollectStaged(*staging, false);
+		// Epoch 1's plan again, with its count of uncovered candidates (a new hash): one version for the whole set.
+		org::PlacementSummary again = withUncovered(1, {Use(7, 301, 0, 3), Use(16, 303, 0, 1, 8 * kMB)});
+		again.uncovered = 2;
+		again.Finish();
+		placement.PublishStaged(*staging, std::move(again));
+		const auto pending = placement.StagedCurrent(*staging);
+		ENSURE(pending && pending != before);
+		const auto* shared = pending->FindObject(301);
+		ENSURE(shared && shared->placed && shared->MultiEpoch());
+		ENSURE(pending->FindObject(302) && pending->FindObject(302)->placed && pending->FindObject(303));
+		// Epoch 2's plan finds everything covered: no newer version.
+		placement.PublishStaged(*staging, *Summary(2, 4, {Use(9, 301, 0, 1), Use(17, 302, 0, 3, 12 * kMB)}));
+		ENSURE(placement.StagedCurrent(*staging) == pending);
+		ENSURE(placement.CommitStaging(*staging) && placement.Current() == pending);
+	}
+	// 6. Offered versions (Settings::offerVersions, M5 step 7): the worker's settled layout is offered, not published, until the host
+	// publishes it at a frame boundary (PublishOffered) once the graphs prepared their re-placements. A staged set drops an offer, and
+	// an offer nobody publishes is published once it timed out.
+	{
+		const auto offering = std::make_shared<org::FramePlacement>(std::vector<uint32_t>{0, 1, 2});
+		auto& offers = *offering;
+		auto settings = StagingSettings();
+		settings.offerVersions = true;
+		settings.offerTimeout = std::chrono::milliseconds(10000);
+		settings.allocateOffered = false;  // no device
+		offers.SetSettings(settings);
+		offers.SetFrameEpochs({1, 2});
+		offers.Publish(*Summary(1, 4, {Use(7, 100, 0, 3, 32 * kMB)}));
+		offers.Publish(*Summary(2, 4, {Use(9, 200, 0, 3)}));
+		// The first version is published as before: no graph has placed yet.
+		for (int wait = 0; wait < 200 && !offers.Current(); ++wait) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		const auto first = offers.Current();
+		ENSURE(first && !offers.Offered());
+		const auto waitForOffer = [&] {
+			for (int wait = 0; wait < 200 && !offers.Offered(); ++wait) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+			return offers.Offered();
+		};
+		// A new epoch's slot: a new layout, offered while the graphs keep the current version.
+		offers.Publish(*Summary(0, 2, {Use(11, 300, 0, 1)}));
+		const auto offered = waitForOffer();
+		ENSURE(offered && offered != first && offered->HasEpoch(0));
+		ENSURE(offers.Current() == first && offers.CurrentId() == first->Id());
+		ENSURE(!offers.PublishOffered(offered->Id() + 100) && offers.Current() == first);
+		ENSURE(offers.PublishOffered(offered->Id()) && offers.Current() == offered && !offers.Offered());
+		ENSURE(!offers.PublishOffered(offered->Id()));
+		// A staged set drops an offer: the set's attach publishes its own version, and the worker computes again after it. (A layout
+		// clearly smaller than the current one is offered; one about as large is served by the current version.)
+		offers.Publish(*Summary(1, 4, {Use(7, 101, 0, 3)}));
+		const auto stale = waitForOffer();
+		ENSURE(stale && offers.Current() == offered);
+		{
+			const auto staging = offers.BeginStaging({1});
+			ENSURE(!offers.Offered() && !offers.PublishOffered(stale->Id()));
+			offers.DropStaging(*staging);
+		}
+		ENSURE(offers.Current() == offered);
+		// After the staging closes, the worker offers again; with a short timeout and no host to publish it, it publishes it itself.
+		settings.offerTimeout = std::chrono::milliseconds(30);
+		offers.SetSettings(settings);
+		ENSURE(WaitForNewCurrent(offers, offered->Id()));
+		ENSURE(!offers.Offered());
+	}
+	std::puts("frame placement: staged sets (commit, drop, decline, summaries first), the per-frame freeze and offered versions");
 	return 0;
 }
 

@@ -65,6 +65,10 @@ constexpr uint64_t kBytes = kCount * sizeof(uint32_t);
 // Counts the recordings of CopyToHostPass. In "external" mode the pass is recorded at execution, so each execution
 // records it once more.
 std::atomic<uint32_t> g_copyRecords{0};
+// "sync-reuse": an input of the write pass's frame data that its revision omits, for the revision audit.
+std::atomic<uint32_t> g_unrevisedInput{0};
+// "sync-reuse", batch reuse: the write pass's preparations (a batch submitted from a kept recording prepares nothing).
+std::atomic<uint32_t> g_writePrepares{0};
 
 struct HostDevice {
 	VkInstance instance = VK_NULL_HANDLE;
@@ -268,6 +272,9 @@ struct WriteFrame {
 	uint32_t inputIndex = 0;
 	uint32_t targetIndex = 0;
 	uint32_t count = kCount;
+	// Set by the audit test (g_unrevisedInput), named by no revision, read by no Record.
+	uint32_t unrevised = 0;
+	bool operator==(const WriteFrame&) const = default;
 };
 
 // A scene revision, passed as host data. Used by the "revision" mode. It holds:
@@ -309,8 +316,9 @@ public:
 		return {builder.ShaderResource(m_input).View(), builder.UnorderedAccess(m_target).View()};
 	}
 	WriteFrame Prepare(const WriteBindings& bindings, const org::PassPrepareContext& preparation) const {
+		g_writePrepares.fetch_add(1, std::memory_order_relaxed);
 		return {m_program, preparation.Resolve(bindings.input).index,
-			preparation.Resolve(bindings.target).index, RevisionCount(preparation)};
+			preparation.Resolve(bindings.target).index, RevisionCount(preparation), g_unrevisedInput.load(std::memory_order_relaxed)};
 	}
 	// Revision sees no frame. It names only the pass's own state, so here the host-data count is the default.
 	void Revision(std::vector<uint64_t>& out) const {
@@ -371,6 +379,25 @@ private:
 	org::QueueKind m_queue = org::QueueKind::Graphics;
 };
 
+// CopyToHostPass without a revision ("sync-reuse", batch reuse): a recording with it is never current as a whole, but with batch
+// reuse the other batches of its epoch still are.
+class UncheckedCopyPass final : public org::TypedRenderGraphPass<UncheckedCopyPass, org::EmptyPassFrameData, CopyBindings> {
+public:
+	UncheckedCopyPass(std::shared_ptr<org::ExternalBufferResource> destination, std::shared_ptr<const org::VersionedBuffer> versions)
+		: m_destination(std::move(destination)), m_versions(std::move(versions)) {}
+	CopyBindings Declare(org::PassBuilder& builder) {
+		return {builder.CopySource(*m_versions), builder.CopyDestination(m_destination)};
+	}
+	static void Record(const CopyBindings& bindings, org::PassRecordContext& recording) {
+		g_copyRecords.fetch_add(1, std::memory_order_relaxed);
+		recording.Commands().CopyBufferRegion(recording.Resolve(bindings.destination).GetHandle(), 0,
+			recording.Resolve(bindings.source).GetHandle(), 0, kBytes);
+	}
+private:
+	std::shared_ptr<org::ExternalBufferResource> m_destination;
+	std::shared_ptr<const org::VersionedBuffer> m_versions;
+};
+
 // Where an extension instance was shut down and destroyed ("retired": GraphHost::Desc::destroyRetiredGraphsDetached).
 struct ExtensionEnds {
 	std::mutex mutex;
@@ -402,6 +429,8 @@ public:
 		: m_input(std::move(input)), m_scratch(std::move(scratch)), m_output(std::move(output)), m_program(std::move(program)),
 		m_outputRevision(std::move(outputRevision)), m_versions(std::move(versions)), m_lateCopy(lateCopy), m_splitEpochs(splitEpochs),
 		m_computeWrite(computeWrite), m_hostTexture(std::move(hostTexture)) {}
+	// "sync-reuse", batch reuse: the copy reports no revision (UncheckedCopyPass).
+	void SetUncheckedCopy(bool unchecked) { m_uncheckedCopy = unchecked; }
 	void PrepareForBuild(org::RenderGraph& graph) override {
 		if (m_hostTexture) graph.RegisterResource(org::ResourceIdentifier("test.host-texture"), m_hostTexture);
 		graph.RegisterResource(org::ResourceIdentifier("test.input"), m_input);
@@ -421,7 +450,8 @@ public:
 		// "stream": the copy on the copy queue, which the device aliases to the graphics queue (the host's stream's): in the stream.
 		const auto copyQueue = m_computeWrite ? org::QueueKind::Copy : org::QueueKind::Graphics;
 		auto copy = org::RenderGraph::ExternalPassDesc::Copy("test.copy-to-host",
-			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_scratch, m_output, m_outputRevision, m_versions, copyQueue)))
+			m_uncheckedCopy && m_versions ? std::static_pointer_cast<org::RenderPass>(std::make_shared<UncheckedCopyPass>(m_output, m_versions))
+				: std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_scratch, m_output, m_outputRevision, m_versions, copyQueue)))
 			.PreferQueue(copyQueue);
 		// "split": the write in epoch 0, the copy in epoch 1, so each is a graph of its own and the scratch buffer goes from one
 		// to the other through the runtime's ledgers.
@@ -446,6 +476,7 @@ private:
 	bool m_splitEpochs = false;
 	bool m_computeWrite = false;
 	std::shared_ptr<org::ExternalTextureResource> m_hostTexture;
+	bool m_uncheckedCopy = false;
 };
 
 // "arena": an epoch's write into a scratch buffer of its own, in a manual alias pool, and its copy to a host buffer. Two
@@ -528,25 +559,34 @@ public:
 		std::shared_ptr<std::atomic<uint64_t>> outputRevision)
 		: m_input(std::move(input)), m_shared(std::move(shared)), m_sharedOutput(std::move(sharedOutput)), m_own(std::move(own)),
 		m_ownOutput(std::move(ownOutput)), m_program(std::move(program)), m_outputRevision(std::move(outputRevision)) {}
+	// The input the second epoch's own write reads (the shared write's by default).
+	void SetOwnInput(std::shared_ptr<org::Buffer> input) { m_ownInput = std::move(input); }
+	// A transient the first epoch writes alone, kept across rebuilds (the same object in every graph).
+	void SetKept(std::shared_ptr<org::Buffer> kept) { m_kept = std::move(kept); }
 	void PrepareForBuild(org::RenderGraph& graph) override {
 		graph.RegisterResource(org::ResourceIdentifier("test.staged.input"), m_input);
+		if (m_ownInput) graph.RegisterResource(org::ResourceIdentifier("test.staged.own-input"), m_ownInput);
+		if (m_kept) graph.RegisterResource(org::ResourceIdentifier("test.staged.kept"), m_kept);
 		graph.RegisterResource(org::ResourceIdentifier("test.staged.shared"), m_shared);
 		graph.RegisterResource(org::ResourceIdentifier("test.staged.shared-output"), m_sharedOutput);
 		graph.RegisterResource(org::ResourceIdentifier("test.staged.own"), m_own);
 		graph.RegisterResource(org::ResourceIdentifier("test.staged.own-output"), m_ownOutput);
 	}
 	void GatherStructuralPasses(org::RenderGraph&, std::vector<org::RenderGraph::ExternalPassDesc>& out) override {
+		if (m_kept)
+			out.push_back(org::RenderGraph::ExternalPassDesc::Compute("test.staged.write-kept",
+				std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_kept, m_program))).Epoch(0));
 		out.push_back(org::RenderGraph::ExternalPassDesc::Compute("test.staged.write-shared",
 			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_shared, m_program))).Epoch(0));
 		out.push_back(org::RenderGraph::ExternalPassDesc::Copy("test.staged.copy-shared",
 			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_shared, m_sharedOutput, m_outputRevision))).Epoch(1));
 		out.push_back(org::RenderGraph::ExternalPassDesc::Compute("test.staged.write-own",
-			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_input, m_own, m_program))).Epoch(1));
+			std::static_pointer_cast<org::RenderPass>(std::make_shared<WritePass>(m_ownInput ? m_ownInput : m_input, m_own, m_program))).Epoch(1));
 		out.push_back(org::RenderGraph::ExternalPassDesc::Copy("test.staged.copy-own",
 			std::static_pointer_cast<org::RenderPass>(std::make_shared<CopyToHostPass>(m_own, m_ownOutput, m_outputRevision))).Epoch(1));
 	}
 private:
-	std::shared_ptr<org::Buffer> m_input, m_shared;
+	std::shared_ptr<org::Buffer> m_input, m_shared, m_ownInput, m_kept;
 	std::shared_ptr<org::ExternalBufferResource> m_sharedOutput;
 	std::shared_ptr<org::Buffer> m_own;
 	std::shared_ptr<org::ExternalBufferResource> m_ownOutput;
@@ -655,6 +695,11 @@ static int Run(int argc, char** argv) {
 	// and signals.
 	const bool external = externalReuse || (argc > 1 && std::strcmp(argv[1], "external") == 0);
 	const bool async = reuse || revision || external || (argc > 1 && std::strcmp(argv[1], "async") == 0);
+	// "sync-reuse": synchronous frames with kept recordings (GraphHost::SetKeptEpochs). Steady frames submit their copy's kept
+	// recording; a pass's revision, a version of a slot the epoch binds and a rebuild record again, each with its reason; a
+	// version of a slot the epoch does not bind leaves the recordings current. With "inline", the late copy is recorded at every
+	// submission, the kept ones included.
+	const bool syncReuse = argc > 1 && std::strcmp(argv[1], "sync-reuse") == 0;
 	// "contributor": a contributor registered through the C table (ContributorHostTests.cpp) instead of the graph scenario.
 	const bool contributor = argc > 1 && std::strcmp(argv[1], "contributor") == 0;
 	// "rebinding": slots that start or stop sharing a backing (RebindingGpuTests.cpp) instead of the graph scenario.
@@ -671,6 +716,13 @@ static int Run(int argc, char** argv) {
 	// it is), a dropped set that publishes nothing, and one version a frame while the worker publishes. Also the deviceless staging
 	// and freeze checks, and versions that keep resources on real heaps (FramePlacementTests.cpp).
 	const bool stagedPlacement = argc > 1 && std::strcmp(argv[1], "staged-placement") == 0;
+	// "shared-rebuild": two epochs of a synchronous host with a shared alias arena, a transient written in the first and read in
+	// the second (one object both graphs bind), and a transient of the second's own. Then sets of both epochs built for new objects
+	// of other sizes (a resize: the renderer makes its frame targets again), placed at their build, staged and attached together.
+	// With the frame placement off and on. No graph may place the shared transient in its own pools (they see only its own uses),
+	// move it under the other's executable, or leave a binding to a backing that moved since: each frame's copy reads what the
+	// first epoch wrote.
+	const bool sharedRebuild = argc > 1 && std::strcmp(argv[1], "shared-rebuild") == 0;
 	// "split": a host of two epochs, each its own graph: the write pass in the first and the copy to the host buffer in the
 	// second (SplitEpochsScenario).
 	const bool split = argc > 1 && std::strcmp(argv[1], "split") == 0;
@@ -1463,6 +1515,30 @@ static int Run(int argc, char** argv) {
 				settings.settleMilliseconds = 20;
 				settings.heapTrimMilliseconds = 60;
 				host.SetFramePlacement(settings);
+				// "staged-placement kept": both epochs keep their recordings (GraphHost::SetKeptEpochs). Every version taken in place and
+				// every re-placement installed makes the kept recordings stale (O-M6-3): each frame's outputs must still be right.
+				const bool keptPlacement = argc > 2 && std::strcmp(argv[2], "kept") == 0;
+				if (keptPlacement) host.SetKeptEpochs({0, 1});
+				std::map<std::string, uint64_t> keptReasons;
+				uint64_t keptReused = 0, keptRecorded = 0, keptUnkeepable = 0;
+				const auto keptPhase = [&](const char* phase) {
+					if (!keptPlacement) return;
+					for (const uint32_t epoch : {0u, 1u}) {
+						const auto stats = host.TakeKeptStats(epoch);
+						std::string reasons;
+						for (const auto& [reason, count] : stats.reasons) {
+							reasons += (reasons.empty() ? "" : "; ") + reason + " x" + std::to_string(count);
+							keptReasons[reason] += count;
+						}
+						keptReused += stats.reused;
+						keptRecorded += stats.kept;
+						keptUnkeepable += stats.unkeepable;
+						std::printf("staged placement kept, %s, epoch %u: %llu runs, %llu reused, %llu kept, %llu not keepable (%s)\n", phase, epoch,
+							static_cast<unsigned long long>(stats.runs), static_cast<unsigned long long>(stats.reused),
+							static_cast<unsigned long long>(stats.kept), static_cast<unsigned long long>(stats.unkeepable),
+							reasons.empty() ? "none" : reasons.c_str());
+					}
+				};
 				auto program = CreateProgram(device.Get());
 				REQUIRE(program, "compute program");
 				auto input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
@@ -1515,6 +1591,7 @@ static int Run(int argc, char** argv) {
 				}
 				const auto settled = host.FramePlacementInUse(0).version;
 				REQUIRE(settled && host.FramePlacementInUse(1).version == settled, "staged placement: both epochs place from one version");
+				keptPhase("before any set");
 				const auto stage = [&](std::unique_ptr<org::GraphHost::EpochGraph>& graph) {
 					const auto staged = host.StageEpochGraph(graph);
 					return staged.staged && !staged.attached;
@@ -1546,6 +1623,24 @@ static int Run(int argc, char** argv) {
 					REQUIRE(next != settled && host.FramePlacementInUse(0).version == next, "staged placement: the set's version is every epoch's");
 					REQUIRE(host.Graph(0) == graph0 && host.BuildGeneration(0) == builds0 && generation(shared) == sharedBacking,
 						"staged placement: epoch 0 keeps its graph, and the shared buffer its backing");
+					keptPhase("1. a set of epoch 1");
+					if (keptPlacement) REQUIRE(keptReasons["frame placement"] > 0, "kept: the version epoch 0 takes in place makes its kept recordings stale");
+				}
+				// 2a. A failed build dropped after its placement: epoch 1 built again with the same transients (the same objects the
+				// attached graph binds), placed at its build, then dropped without a staging (a build whose pipelines failed). It found
+				// its own buffer where the attached graph has it and claimed it; its end must not give that backing back, since the
+				// attached graph keeps running on it.
+				{
+					const auto attachedOwnBacking = generation(own);
+					auto graph = host.BuildEpochGraph(1, "test: a failed build dropped after its placement");
+					org::GraphHost::EpochGraph* const graphs[] = {graph.get()};
+					REQUIRE(graph && graph->Built() && host.PlaceEpochGraphs(graphs) == 1, "failed build: placed at the build");
+					REQUIRE(own->IsMaterialized() && generation(own) == attachedOwnBacking, "failed build: it found its transient in place");
+					graph.reset();
+					REQUIRE(own->IsMaterialized() && generation(own) == attachedOwnBacking,
+						"failed build: dropping it leaves the attached graph's backing in place");
+					for (int i = 0; i < 3; ++i)
+						if (const int failed = run("failed build: the attached graphs keep running after the drop")) return failed;
 				}
 				// 2. A dropped set: placed at its build, staged, then dropped. Its staging publishes nothing.
 				{
@@ -1572,9 +1667,224 @@ static int Run(int argc, char** argv) {
 					std::this_thread::sleep_for(std::chrono::milliseconds(3));
 				}
 				REQUIRE(mixedVersions == 0, "staged placement: no frame's epochs placed from different versions");
+				keptPhase("2-3. a dropped set, versions while frames run");
+				// 4. A set of both epochs with every transient new (a resize): epoch 0's new shared buffer is read by epoch 1's new
+				// graph, which also has a new buffer of its own. Placed at the build (PlaceEpochGraphs), first with each summary
+				// arriving with its graph's plan, then with the summaries first. Both ways the set's graphs end on one version at
+				// the build: the second pass makes epoch 0's graph take the newest in place, or the summaries first make one
+				// version for both. The outputs are right after the attach, and the attached graphs placed from that version.
+				for (const bool summariesFirst : {false, true}) {
+					auto changed = settings;
+					changed.summariesFirst = summariesFirst;
+					host.SetFramePlacement(changed);
+					shared = scratch(summariesFirst ? 10 * kMB : 12 * kMB, "test.staged.shared");
+					own = scratch(summariesFirst ? 14 * kMB : 16 * kMB, "test.staged.own");
+					auto graph0 = host.BuildEpochGraph(0, "test: a set of every epoch with new transients");
+					auto graph1 = host.BuildEpochGraph(1, "test: a set of every epoch with new transients");
+					REQUIRE(graph0 && graph0->Built() && graph1 && graph1->Built(), "set of every epoch: built");
+					org::GraphHost::EpochGraph* const graphs[] = {graph0.get(), graph1.get()};
+					REQUIRE(host.PlaceEpochGraphs(graphs) == 2, "set of every epoch: both placed at the build");
+					const auto version0 = graph0->PlacedFromVersion();
+					const auto version1 = graph1->PlacedFromVersion();
+					REQUIRE(version0 && version1, "set of every epoch: both placed from a frame placement");
+					std::printf("staged placement, a set of every epoch (summaries first %d): epoch 0 placed from version %llu, epoch 1 from %llu\n",
+						summariesFirst ? 1 : 0, static_cast<unsigned long long>(version0), static_cast<unsigned long long>(version1));
+					REQUIRE(version0 == version1, "set of every epoch: the set's graphs placed from one version at the build");
+					REQUIRE(shared->IsMaterialized() && own->IsMaterialized(), "set of every epoch: the new transients are placed");
+					REQUIRE(stage(graph0) && stage(graph1), "set of every epoch: staged");
+					const uint32_t both[] = {0, 1};
+					REQUIRE(host.AttachStagedEpochGraphs(both).attached, "set of every epoch: the set attaches");
+					if (const int failed = run("set of every epoch: the first frame after the attach")) return failed;
+					REQUIRE(host.FramePlacementInUse(0).version == version0 && host.FramePlacementInUse(1).version == version0,
+						"set of every epoch: the first frame runs the version the set placed from");
+					for (int i = 0; i < 3; ++i)
+						if (const int failed = run("set of every epoch: after the attach")) return failed;
+				}
+				keptPhase("4. sets of every epoch");
+				// 5. The trim prepared on a worker (FramePlacementSettings::prepareReplacements). A set of epoch 1 with a larger transient
+				// of its own makes a version that keeps the running graphs' resources (a heap lane). Once quiet, the trim packs the frame on
+				// heaps of its need: the host offers it, each graph prepares its re-placement on a worker (backings of what moves made ahead,
+				// the validated publication built), and the version is published at a frame boundary, where each graph installs what it
+				// prepared. Every frame's outputs stay right. With the preparations off, the graphs re-place at their preparation instead.
+				const auto installedCount = [&] {
+					uint64_t installed = 0;
+					for (const uint32_t epoch : {0u, 1u})
+						if (auto* graph = host.Graph(epoch)) installed += graph->PreparedReplacementCounts().first;
+					return installed;
+				};
+				for (const bool prepared : {true, false}) {
+					auto changed = settings;
+					changed.prepareReplacements = prepared;
+					host.SetFramePlacement(changed);
+					for (int i = 0; i < 40; ++i) {
+						if (const int failed = run("trim: frames before the set")) return failed;
+						std::this_thread::sleep_for(std::chrono::milliseconds(3));
+					}
+					own = scratch(prepared ? 40 * kMB : 72 * kMB, "test.staged.own");
+					auto graph = host.BuildEpochGraph(1, "test: a set whose version keeps the running graphs' resources");
+					org::GraphHost::EpochGraph* const graphs[] = {graph.get()};
+					REQUIRE(graph && graph->Built() && host.PlaceEpochGraphs(graphs) == 1 && stage(graph), "trim: the set is placed and staged");
+					const uint32_t one[] = {1};
+					REQUIRE(host.AttachStagedEpochGraphs(one).attached, "trim: the set attaches");
+					for (int i = 0; i < 3; ++i)
+						if (const int failed = run("trim: after the attach")) return failed;
+					const auto attached = host.FramePlacementInUse(0).version;
+					const auto installedBefore = installedCount();
+					mixedVersions = 0;
+					// Until both graphs installed one (prepared), or a while after the first newer version (not prepared).
+					bool trimmed = false;
+					int after = 0;
+					for (int i = 0; i < 600; ++i) {
+						if (const int failed = run("trim: frames until the trim")) return failed;
+						std::this_thread::sleep_for(std::chrono::milliseconds(3));
+						trimmed = trimmed || host.FramePlacementInUse(0).version != attached;
+						if (prepared ? installedCount() - installedBefore >= 2 : trimmed && ++after > 150) break;
+					}
+					REQUIRE(trimmed, "trim: a newer version is published once quiet");
+					for (int i = 0; i < 5; ++i)
+						if (const int failed = run("trim: frames after the trim")) return failed;
+					const auto installed = installedCount() - installedBefore;
+					std::printf("staged placement, the trim (prepared %d): version %llu -> %llu, %llu re-placements installed from a worker\n", prepared ? 1 : 0,
+						static_cast<unsigned long long>(attached), static_cast<unsigned long long>(host.FramePlacementInUse(0).version),
+						static_cast<unsigned long long>(installed));
+					if (prepared) REQUIRE(installed == 2, "trim: both graphs installed the re-placement prepared on a worker");
+					else REQUIRE(installed == 0, "trim: with the preparations off, the graphs re-place at their preparation");
+					REQUIRE(host.FramePlacementInUse(0).version == host.FramePlacementInUse(1).version, "trim: both epochs place from the trim");
+					REQUIRE(mixedVersions == 0, "trim: no frame's epochs placed from different versions");
+					keptPhase(prepared ? "5. the trim, prepared" : "5. the trim, at preparation");
+				}
+				if (keptPlacement) {
+					std::printf("staged placement kept: %llu reused, %llu recorded and kept, %llu not keepable, %llu for a frame placement\n",
+						static_cast<unsigned long long>(keptReused), static_cast<unsigned long long>(keptRecorded),
+						static_cast<unsigned long long>(keptUnkeepable), static_cast<unsigned long long>(keptReasons["frame placement"]));
+					REQUIRE(keptReused > 0 && keptUnkeepable == 0, "kept: steady frames reuse their kept recordings");
+				}
+				host.SetFramePlacement(settings);
 				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
 				host.DestroyGraph();
 				std::puts("staged placement: a set placed at its build, a kept version, a dropped set, one version a frame");
+			}
+			runtime.reset();
+		} else if (sharedRebuild) {
+			auto aliasing = org::runtime::GetOpenRenderGraphSettings();
+			aliasing.autoAliasMode = 3;
+			org::runtime::SetOpenRenderGraphSettings(aliasing);
+			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
+				.tasks = std::make_shared<org::test::TestTaskService>(2)});
+			// "shared-rebuild on" or "off": with the frame placement on or off only.
+			const bool onlyOn = argc > 2 && std::strcmp(argv[2], "on") == 0, onlyOff = argc > 2 && std::strcmp(argv[2], "off") == 0;
+			for (const bool framePlacement : {false, true}) {
+				if ((onlyOn && !framePlacement) || (onlyOff && framePlacement)) continue;
+				const char* const mode = framePlacement ? "shared rebuild (frame placement)" : "shared rebuild (no frame placement)";
+				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1},
+					.sharedAliasArena = true});
+				host.SetFramePositions({{0, 0, false}, {1, 1, false}});
+				org::GraphHost::FramePlacementSettings settings;
+				settings.enabled = framePlacement;
+				settings.settleMilliseconds = 20;
+				settings.heapTrimMilliseconds = 60;
+				host.SetFramePlacement(settings);
+				auto program = CreateProgram(device.Get());
+				REQUIRE(program, "compute program");
+				org::BufferBase::DescriptorRequirements inputViews{};
+				inputViews.createSRV = true;
+				inputViews.srvDesc = {.dimension = rhi::SrvDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+					.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = 4}};
+				auto input = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+				input->SetDescriptorRequirements(inputViews);
+				input->SetName("test.staged.input");
+				// The second epoch's own transient is written with another value than the shared one, so a shared transient in bytes
+				// the second epoch's own pool gives to its own reads back wrong.
+				auto ownInput = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, 16, false);
+				ownInput->SetDescriptorRequirements(inputViews);
+				ownInput->SetName("test.staged.own-input");
+				const auto scratch = [&](uint64_t bytes, const char* name) {
+					auto buffer = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, bytes, true);
+					org::BufferBase::DescriptorRequirements requirements{};
+					requirements.createUAV = true;
+					requirements.uavDesc = {.dimension = rhi::UavDim::Buffer, .formatOverride = rhi::Format::R32_Typeless,
+						.buffer = {.kind = rhi::BufferViewKind::Raw, .firstElement = 0, .numElements = kCount}};
+					buffer->SetDescriptorRequirements(requirements);
+					buffer->SetName(name);
+					buffer->SetAllowAlias(true);
+					return buffer;
+				};
+				constexpr uint64_t kMB = 1024ull * 1024ull;
+				auto shared = scratch(4 * kMB, "test.shared-rebuild.shared");
+				auto own = scratch(4 * kMB, "test.shared-rebuild.own");
+				// Kept across the sets, so a set's version that packs the frame anew would move it under the running graphs.
+				auto kept = scratch(10 * kMB, "test.shared-rebuild.kept");
+				auto sharedOutput = ImportHostBuffer(device.Get(), first, "test.shared-rebuild.shared-output");
+				auto ownOutput = ImportHostBuffer(device.Get(), second, "test.shared-rebuild.own-output");
+				REQUIRE(sharedOutput && ownOutput, "import host buffers");
+				auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
+				// The factory reads the current objects: a build after they were made again binds the new ones.
+				host.AddExtension("test.shared-rebuild", [&] {
+					auto extension = std::make_unique<StagedPlacementExtension>(input, shared, sharedOutput, own, ownOutput, program, outputRevision);
+					extension->SetOwnInput(ownInput);
+					extension->SetKept(kept);
+					return extension;
+				});
+				uint32_t value = 0, frame = 0;
+				const auto upload = [&](org::RenderGraph&) {
+					BUFFER_UPLOAD(&value, sizeof(value), org::runtime::UploadTarget::FromShared(input), 0);
+					const uint32_t ownValue = value + 5000u;
+					BUFFER_UPLOAD(&ownValue, sizeof(ownValue), org::runtime::UploadTarget::FromShared(ownInput), 0);
+				};
+				size_t mixedVersions = 0;
+				// The first frame's graphs are built one at a time, as each epoch first runs: the first epoch's graph places before the
+				// second's exists, so it cannot know they share a transient. Its first frame may copy the wrong contents (the second
+				// graph gives the shared transient a backing of its own); from the next frame on both bind that one.
+				const auto run = [&](const char* what) -> int {
+					const bool firstFrame = frame == 0;
+					value = 90000u + 10u * frame++;
+					host.ExecuteFrame(nullptr, upload, 0);
+					host.ExecuteFrame(nullptr, {}, 1);
+					if (host.FramePlacementInUse(0).version != host.FramePlacementInUse(1).version) ++mixedVersions;
+					host.SealSubmitted();
+					REQUIRE(device->WaitIdle() == rhi::Result::Ok, what);
+					if (!firstFrame && (!Matches(first, value) || !Matches(second, value + 5000u))) {
+						std::printf("FAIL: %s: %s (frame %u: shared %u, own %u, expected %u and %u)\n", mode, what, frame - 1, first.mapped[0],
+							second.mapped[0], value, value + 5000u);
+						return 1;
+					}
+					return 0;
+				};
+				for (int i = 0; i < 30; ++i) {
+					if (const int failed = run("frames before any set")) return failed;
+					std::this_thread::sleep_for(std::chrono::milliseconds(2));
+				}
+				// Sets of both epochs for new objects of other sizes, as a resize makes them. The running graphs keep the old ones.
+				const uint64_t sizes[][2] = {{12, 6}, {2, 3}, {8, 8}, {6, 16}};
+				for (const auto& size : sizes) {
+					shared = scratch(size[0] * kMB, "test.shared-rebuild.shared");
+					own = scratch(size[1] * kMB, "test.shared-rebuild.own");
+					auto graph0 = host.BuildEpochGraph(0, "test: a set for new objects");
+					auto graph1 = host.BuildEpochGraph(1, "test: a set for new objects");
+					REQUIRE(graph0 && graph0->Built() && graph1 && graph1->Built(), "shared rebuild: built");
+					org::GraphHost::EpochGraph* const graphs[] = {graph0.get(), graph1.get()};
+					// With the frame placement, a graph may still leave its placement to the attach (a version that would move what an
+					// earlier graph of the set placed). Either way the frames after the attach must be right.
+					const auto placedAtBuild = host.PlaceEpochGraphs(graphs);
+					REQUIRE(!framePlacement || placedAtBuild >= 1, "shared rebuild: placed at the build");
+					if (const int failed = run("the attached graphs keep running while a set is built")) return failed;
+					REQUIRE(host.StageEpochGraph(graph0).staged && host.StageEpochGraph(graph1).staged, "shared rebuild: staged");
+					const uint32_t both[] = {0, 1};
+					REQUIRE(host.AttachStagedEpochGraphs(both).attached, "shared rebuild: the set attaches");
+					mixedVersions = 0;
+					for (int i = 0; i < 20; ++i) {
+						if (const int failed = run("frames after a set")) return failed;
+						std::this_thread::sleep_for(std::chrono::milliseconds(2));
+					}
+					REQUIRE(shared->IsMaterialized() && own->IsMaterialized(), "shared rebuild: the new objects have backings");
+					REQUIRE(mixedVersions == 0, "shared rebuild: no frame's epochs placed from different versions");
+				}
+				if (framePlacement)
+					REQUIRE(host.FramePlacementInUse(0).version && host.FramePlacementInUse(0).version == host.FramePlacementInUse(1).version,
+						"shared rebuild: both epochs place from one version");
+				REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+				host.DestroyGraph();
+				std::printf("%s: four sets for new objects, each frame's copy right\n", mode);
 			}
 			runtime.reset();
 		} else if (arena) {
@@ -2151,6 +2461,7 @@ static int Run(int argc, char** argv) {
 		org::GraphHost host({.runtime = runtime,
 			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .reuseRecordings = reuse || revision});
 		if (inlineLate) host.SetInlineAtExecution(true);
+		if (syncReuse) host.SetKeptEpochs({0});
 		{
 			auto program = CreateProgram(device.Get());
 			REQUIRE(program, "compute program");
@@ -2190,11 +2501,16 @@ static int Run(int argc, char** argv) {
 			auto outputRevision = std::make_shared<std::atomic<uint64_t>>(1);
 			// "revision": the write pass's target is a versioned buffer, which the revision names a version of.
 			std::shared_ptr<org::VersionedBuffer> versions;
-			if (revision) {
+			if (revision || syncReuse) {
 				scratch->Materialize();
 				versions = org::VersionedBuffer::Create(scratch);
 			}
-			host.AddExtension("test.host", [&] { return std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external || inlineLate); });
+			bool uncheckedCopy = false;
+			host.AddExtension("test.host", [&] {
+				auto extension = std::make_unique<HostExtension>(input, scratch, output, program, outputRevision, versions, external || inlineLate);
+				extension->SetUncheckedCopy(uncheckedCopy);
+				return extension;
+			});
 			if (revision) {
 				host.SetAsyncEpochs({0}, {0});
 				// Records the epoch for a revision of `count` elements; the callback runs on the host's thread.
@@ -2660,6 +2976,220 @@ static int Run(int argc, char** argv) {
 				}
 			}
 			REQUIRE(!counters.unbalanced && counters.locks.load() == counters.unlocks.load(), "balanced host queue locks");
+			if (syncReuse) {
+				// Runs a window of frames and returns what the kept epoch's runs did. Each frame must write its own value.
+				bool windowFailed = false;
+				const auto window = [&](uint32_t frames, uint32_t base, const std::function<void(uint32_t)>& before = {}) {
+					(void)host.TakeKeptStats(0);
+					for (uint32_t frame = 0; frame < frames && !windowFailed; ++frame) {
+						if (before) before(frame);
+						value = base + 10u * frame;
+						host.ExecuteFrame(nullptr, upload, 0);
+						if (device->WaitIdle() != rhi::Result::Ok || !Matches(second, value)) {
+							std::fprintf(stderr, "FAIL: sync-reuse frame %u wrote %u..., expected %u...\n", frame, second.mapped[0], value);
+							windowFailed = true;
+						}
+					}
+					return host.TakeKeptStats(0);
+				};
+				const auto print = [](const char* what, const org::GraphHost::KeptStats& stats) {
+					std::string reasons;
+					for (const auto& [reason, count] : stats.reasons) reasons += (reasons.empty() ? "" : "; ") + reason + " x" + std::to_string(count);
+					std::printf("sync-reuse: %s: %llu runs, %llu reused, %llu recorded and kept, %llu not keepable (%s)\n", what,
+						static_cast<unsigned long long>(stats.runs), static_cast<unsigned long long>(stats.reused),
+						static_cast<unsigned long long>(stats.kept), static_cast<unsigned long long>(stats.unkeepable),
+						reasons.empty() ? "none" : reasons.c_str());
+				};
+				const uint64_t copies = 4;  // framesInFlight (3) + 1
+				// Steady frames: a copy whose recording is older than the host buffer's rotation records once; every later run of a
+				// copy submits its kept recording and records nothing.
+				const auto recordsBefore = g_copyRecords.load(std::memory_order_relaxed);
+				auto steady = window(12, 20000u);
+				print("steady", steady);
+				REQUIRE(!windowFailed, "sync-reuse: steady frames write their values");
+				REQUIRE(steady.runs == 12 && steady.unkeepable == 0 && steady.reused + steady.kept == 12, "every steady run reuses or keeps");
+				REQUIRE(steady.reused >= 12 - copies, "steady runs submit their copies' kept recordings");
+				const auto steadyRecords = g_copyRecords.load(std::memory_order_relaxed) - recordsBefore;
+				if (inlineLate) REQUIRE(steadyRecords == 12, "the inline late copy is recorded at every submission, a kept recording's too");
+				else REQUIRE(steadyRecords == steady.kept, "a reused run records nothing");
+				// A pass's revision changes: each copy records once again, for that reason.
+				outputRevision->fetch_add(1, std::memory_order_release);
+				auto revised = window(8, 21000u);
+				print("revision", revised);
+				REQUIRE(!windowFailed, "sync-reuse: frames after a revision write their values");
+				REQUIRE(revised.kept == copies && revised.reused == 8 - copies && revised.reasons["revision: test.copy-to-host"] == copies,
+					"a revision change records each copy once, named");
+				// O-M6-2: a new version of a versioned buffer the epoch does not bind leaves every kept recording current, the host's
+				// version count notwithstanding.
+				auto unrelatedFirst = org::Buffer::CreateShared(rhi::HeapType::DeviceLocal, kBytes);
+				auto unrelated = org::VersionedBuffer::Create(unrelatedFirst);
+				auto unbound = window(4, 22000u, [&](uint32_t frame) {
+					if (frame != 0) return;
+					(void)unrelated->GrowBytes(kBytes * 2);
+					host.NoteNewVersions();
+				});
+				print("version of an unbound slot", unbound);
+				REQUIRE(!windowFailed && unbound.reused == 4, "a version of a slot the epoch does not bind leaves its recordings current");
+				// A new version of the buffer the epoch writes and copies: each copy records once again, naming it.
+				const auto grown = versions->GrowBytes(kBytes * 2);
+				REQUIRE(grown && versions->Get() == grown->buffer, "the scratch buffer's new version");
+				auto bound = window(8, 23000u);
+				print("version of a bound slot", bound);
+				uint64_t versionRecords = 0;
+				for (const auto& [reason, count] : bound.reasons) if (reason.rfind("version: ", 0) == 0) versionRecords += count;
+				REQUIRE(!windowFailed && bound.kept == copies && versionRecords == copies && bound.reused == 8 - copies,
+					"a version of a bound slot records each copy once, named");
+				// A rebuild: the new graph has no kept recordings.
+				host.RequestRebuild();
+				auto rebuilt = window(6, 24000u);
+				print("rebuild", rebuilt);
+				REQUIRE(!windowFailed && rebuilt.reasons["first run"] == copies && rebuilt.kept == copies && rebuilt.reused == 2,
+					"a rebuilt graph's copies record once each");
+				// Keeping off: the runs take leases of their own again and keep nothing.
+				host.SetKeptEpochs({});
+				auto off = window(3, 25000u);
+				REQUIRE(!windowFailed && off.runs == 0, "an epoch that keeps nothing counts no kept runs");
+				host.SetKeptEpochs({0});
+				// O-M6-7, the revision audit, on every reuse. Recordings keep their frame data only while it is on, so the graph is
+				// built again first. Steady reuses compare equal; an input the write pass's revision omits is reported by name while
+				// the kept recordings stay current (and still write each frame's value).
+				const auto printAudit = [](const char* what, const org::GraphHost::KeptStats& stats) {
+					std::string names;
+					for (const auto& [name, count] : stats.mismatches) names += (names.empty() ? "" : "; ") + name + " x" + std::to_string(count);
+					std::printf("sync-reuse: audit %s: %llu reused, %llu audited, %llu passes compared, %llu not comparable, %llu mismatches (%s)\n",
+						what, static_cast<unsigned long long>(stats.reused), static_cast<unsigned long long>(stats.audited),
+						static_cast<unsigned long long>(stats.auditCompared), static_cast<unsigned long long>(stats.auditUncomparable),
+						static_cast<unsigned long long>(stats.auditMismatches), names.empty() ? "none" : names.c_str());
+				};
+				host.SetKeptRecordingAudit(1);
+				host.RequestRebuild();
+				(void)window(copies + 2, 26000u);
+				auto audited = window(8, 27000u);
+				printAudit("steady", audited);
+				REQUIRE(!windowFailed && audited.reused == 8 && audited.audited == 8 && audited.auditCompared == 16
+					&& audited.auditUncomparable == 0 && audited.auditMismatches == 0, "the audit finds the kept recordings' frame data unchanged");
+				g_unrevisedInput.store(1, std::memory_order_relaxed);
+				auto omitted = window(8, 28000u);
+				printAudit("unrevised input", omitted);
+				REQUIRE(!windowFailed && omitted.reused == 8 && omitted.auditMismatches == 8 && omitted.mismatches["test.write"] == 8,
+					"the audit names a pass whose revision omits an input");
+				g_unrevisedInput.store(0, std::memory_order_relaxed);
+				host.SetKeptRecordingAudit(0);
+				auto unaudited = window(4, 29000u);
+				REQUIRE(!windowFailed && unaudited.audited == 0, "the audit off audits nothing");
+				// O-M6-4, staged recordings: a graph built on another thread records its kept copies there before it is staged
+				// (GraphHost::RecordStagedCopies). After the attach every copy's first run submits its staged recording (confirmed by
+				// its frame data) and records nothing. A staging whose frame data differs from the runs' (an input no revision names)
+				// is recorded again at each copy's first run, named; so is one whose revision changed between the staging and the run.
+				const auto stage = [&](const std::function<void()>& before, const std::function<void()>& after) -> int {
+					org::GraphHost::StagedRecordings staged;
+					std::unique_ptr<org::GraphHost::EpochGraph> graph;
+					const auto recordsBefore = g_copyRecords.load(std::memory_order_relaxed);
+					std::thread builder([&] {
+						graph = host.BuildEpochGraph(0, "staged recordings");
+						if (!graph || !graph->Built()) return;
+						if (before) before();
+						staged = host.RecordStagedCopies(*graph, org::UpdateExecutionContext{});
+						if (after) after();
+					});
+					builder.join();
+					const auto stagedRecords = g_copyRecords.load(std::memory_order_relaxed) - recordsBefore;
+					std::printf("sync-reuse: staged: %u of %u copies recorded on the building thread in %.2f ms (%s)\n", staged.recorded,
+						staged.copies, staged.milliseconds, staged.why.empty() ? "all" : staged.why.c_str());
+					REQUIRE(graph && graph->Built(), "the staged build");
+					REQUIRE(staged.copies == copies && staged.recorded == copies, "every kept copy is recorded on the building thread");
+					if (!inlineLate) REQUIRE(stagedRecords == copies, "each staged copy is recorded once");
+					const auto result = host.StageEpochGraph(graph);
+					REQUIRE(result.staged, "the staged build is staged");
+					const uint32_t epochs[] = {0};
+					REQUIRE(host.AttachStagedEpochGraphs(epochs).attached, "the staged set attaches");
+					return 0;
+				};
+				if (const int failed = stage({}, {})) return failed;
+				const auto stagedRecordsBefore = g_copyRecords.load(std::memory_order_relaxed);
+				auto staged = window(8, 30000u);
+				print("staged", staged);
+				REQUIRE(!windowFailed && staged.reused == 8 && staged.kept == 0 && staged.stagedReused == copies && staged.stagedRecorded == 0,
+					"every copy's first run after the attach submits its staged recording");
+				if (!inlineLate)
+					REQUIRE(g_copyRecords.load(std::memory_order_relaxed) == stagedRecordsBefore, "runs of staged recordings record nothing");
+				else
+					REQUIRE(g_copyRecords.load(std::memory_order_relaxed) == stagedRecordsBefore + 8, "the inline late copy is recorded at each submission");
+				// The staging's frame data differ from the runs' (g_unrevisedInput, which no revision names): confirmed against the
+				// first run's own preparation, each copy records again.
+				if (const int failed = stage([] { g_unrevisedInput.store(1, std::memory_order_relaxed); }, [] { g_unrevisedInput.store(0, std::memory_order_relaxed); }))
+					return failed;
+				auto differs = window(8, 31000u);
+				print("staged, other frame data", differs);
+				REQUIRE(!windowFailed && differs.stagedRecorded == copies && differs.stagedReused == 0 && differs.kept == copies
+					&& differs.reasons["staged: frame data of test.write"] == copies && differs.reused == 8 - copies,
+					"a staged recording whose frame data differ from its first run's records again, named");
+				// A revision that changes between the staging and the attach.
+				if (const int failed = stage({}, [&] { outputRevision->fetch_add(1, std::memory_order_release); })) return failed;
+				auto stale = window(8, 32000u);
+				print("staged, revision changed", stale);
+				REQUIRE(!windowFailed && stale.stagedRecorded == copies && stale.reasons["staged: revision: test.copy-to-host"] == copies
+					&& stale.reused == 8 - copies, "a staged recording whose revision changed records again, named");
+				// O-M6-6, batch reuse (GraphHost::SetKeptBatchReuse): each batch of a kept recording is checked on its own. With "inline"
+				// the late copy is a batch of its own, so the write's batch stays current when only the copy is stale: a partial run
+				// submits the write's kept packet, prepares only the copy and records its batch. Without "inline" the epoch is one
+				// batch, and a stale pass records it, as without batch reuse.
+				const auto printBatches = [](const char* what, const org::GraphHost::KeptStats& stats) {
+					std::string reasons;
+					for (const auto& [reason, count] : stats.batchReasons) reasons += (reasons.empty() ? "" : "; ") + reason + " x" + std::to_string(count);
+					std::printf("sync-reuse: batches, %s: %llu runs, %llu reused, %llu partial, %llu kept, %llu not keepable; batches %llu reused, "
+						"%llu recorded (%s)\n", what, static_cast<unsigned long long>(stats.runs), static_cast<unsigned long long>(stats.reused),
+						static_cast<unsigned long long>(stats.partial), static_cast<unsigned long long>(stats.kept),
+						static_cast<unsigned long long>(stats.unkeepable), static_cast<unsigned long long>(stats.batchesReused),
+						static_cast<unsigned long long>(stats.batchesRecorded), reasons.empty() ? "none" : reasons.c_str());
+				};
+				host.SetKeptBatchReuse(true);
+				host.RequestRebuild();
+				(void)window(copies + 2, 33000u);
+				auto batchSteady = window(8, 34000u);
+				printBatches("steady", batchSteady);
+				REQUIRE(!windowFailed && batchSteady.reused == 8 && batchSteady.partial == 0, "batch reuse: steady runs submit their whole recordings");
+				outputRevision->fetch_add(1, std::memory_order_release);
+				auto prepares = g_writePrepares.load(std::memory_order_relaxed);
+				auto batchRevised = window(8, 35000u);
+				printBatches("revision of the copy", batchRevised);
+				REQUIRE(!windowFailed && batchRevised.reasons["revision: test.copy-to-host"] == copies && batchRevised.reused == 8 - copies,
+					"batch reuse: a revision change records each copy once, named");
+				if (inlineLate) {
+					REQUIRE(batchRevised.partial == copies && batchRevised.kept == 0 && batchRevised.batchesReused == 8 + 8 - copies
+						&& batchRevised.batchesRecorded == copies && g_writePrepares.load(std::memory_order_relaxed) == prepares,
+						"batch reuse: only the copy's batch records; the write's is submitted from the kept recording, not prepared");
+				} else {
+					REQUIRE(batchRevised.partial == 0 && batchRevised.kept == copies, "batch reuse: a one-batch epoch records its batch whole");
+				}
+				// A pass with no revision: its batch records at every run, and with "inline" the write's batch is submitted again.
+				// The audit on before the rebuild: recordings keep their frame data only while it is on.
+				uncheckedCopy = true;
+				host.SetKeptRecordingAudit(1);
+				host.RequestRebuild();
+				(void)window(copies + 2, 36000u);
+				prepares = g_writePrepares.load(std::memory_order_relaxed);
+				auto batchUnchecked = window(8, 37000u);
+				printBatches("a pass without a revision", batchUnchecked);
+				printAudit("a pass without a revision", batchUnchecked);
+				host.SetKeptRecordingAudit(0);
+				if (inlineLate) {
+					REQUIRE(!windowFailed && batchUnchecked.partial == 8 && batchUnchecked.batchesReused == 8 && batchUnchecked.batchesRecorded == 8
+						&& batchUnchecked.batchReasons["not kept: uncheckable: test.copy-to-host (no revision hash)"] == 8,
+						"batch reuse: the batch of a pass without a revision records at every run, the others are submitted again");
+					REQUIRE(batchUnchecked.audited == 8 && batchUnchecked.auditCompared == 8 && batchUnchecked.auditMismatches == 0
+						&& g_writePrepares.load(std::memory_order_relaxed) == prepares + 8,
+						"batch reuse: the audit compares the reused batch's pass (prepared only for it)");
+				} else {
+					REQUIRE(!windowFailed && batchUnchecked.unkeepable == 8 && batchUnchecked.partial == 0,
+						"batch reuse: a one-batch epoch with a pass without a revision keeps nothing");
+				}
+				uncheckedCopy = false;
+				host.SetKeptBatchReuse(false);
+				host.RequestRebuild();
+				(void)window(copies + 2, 38000u);
+				REQUIRE(!windowFailed, "sync-reuse: frames after batch reuse write their values");
+			}
 			if (reuse) {
 				// Steady frames. A live epoch's runs take kept copies. Each copy records once, and its later runs bind that recording.
 				(void)host.TakeAsyncStats();
@@ -2786,7 +3316,7 @@ static int Run(int argc, char** argv) {
 	DestroyHostBuffer(host, second);
 	vkDestroyDevice(host.device, nullptr);
 	vkDestroyInstance(host.instance, nullptr);
-	std::printf("PersistentVulkanHostTests: ok (%s%s, locks=%d)\n", contributor ? "contributor" : external ? "external" : async ? "async" : "sync",
+	std::printf("PersistentVulkanHostTests: ok (%s%s, locks=%d)\n", contributor ? "contributor" : external ? "external" : async ? "async" : syncReuse ? "sync-reuse" : "sync",
 		inlineLate ? ", inline" : "", counters.locks.load());
 	return 0;
 }
