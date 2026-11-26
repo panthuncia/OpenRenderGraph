@@ -1087,6 +1087,10 @@ void GraphHost::ReleaseRetiredGraphs(bool all) {
 		std::erase_if(m_retiredGraphs, [&](RetiredGraph& retired) {
 			if (!all && !releasable(retired)) return false;
 			if (all) (void)retired.done.Wait();
+			if (retired.reported)
+				spdlog::info("GraphHost: epoch {}'s replaced graph released {:.0f} ms after its attach, once its tasks drained",
+					retired.epoch == persistent::AllEpochs ? std::string("(all)") : std::to_string(retired.epoch),
+					std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - retired.retired).count());
 			BT_ZONE_SCOPE("ORG.Host.ReleaseRetiredGraph");
 			retired.graph->ShutdownExtensions();
 			retired.graph->ShutdownTaskWorkers();
