@@ -92,6 +92,17 @@ public:
         }
     }
 
+    bool RevisionRows(std::vector<uint64_t>& rows) const final {
+        if constexpr (kHasRevision) {
+            rows.clear();
+            static_cast<const Derived*>(this)->Revision(rows);
+            return true;
+        } else {
+            (void)rows;
+            return false;
+        }
+    }
+
     PreparedPass PrepareFrame(FramePreparationContext& context) final {
         context.resourceUses = context.preparedResourceUses ? context.preparedResourceUses : this->ResourceUses();
         auto collector = std::make_shared<PreparedDependencyCollector>();

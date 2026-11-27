@@ -489,7 +489,12 @@ bool Service::SubmitCopies(const CommitContext& context, std::span<Relocation*> 
                     for (uint32_t mip = 0; mip < copy.mips; ++mip)
                         list.CopyTextureRegion(rhi::TextureCopyRegion{copy.to, mip, slice}, rhi::TextureCopyRegion{copy.from, mip, slice});
             }
-        }, {}, {}, {}, false);
+        }, {}, {}, {}, false, [count = copies.size()] {
+            // Queued behind a host's submission thread, the batch failed after the moves were adopted. The moved resources'
+            // new backings never got their contents. There is nothing to undo at this point, so say so loudly.
+            spdlog::critical("ORG relocation: a queued relocation batch of {} copies failed on the submission thread; the moved "
+                "resources' new backings were not filled", count);
+        });
     } catch (const std::exception& error) {
         spdlog::error("ORG relocation: the relocation batch of {} copies failed: {}", copies.size(), error.what());
         return false;

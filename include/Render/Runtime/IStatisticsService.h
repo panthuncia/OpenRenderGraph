@@ -7,6 +7,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -23,6 +24,16 @@ enum class TimestampRangeKind : uint8_t {
     List,     // a whole kept list, in list mode (OwnedTimestampQueries::listOnly)
 };
 
+// The pass names with their indices (GetPassNames order), as of one moment. Passes register on build threads while recordings
+// look their indices up on others, so a recording takes one of these instead of reading GetPassNames.
+struct PassIndexTable {
+    std::vector<std::string> names;
+    std::unordered_map<std::string_view, unsigned> indices;  // views into names
+    PassIndexTable() = default;
+    PassIndexTable(const PassIndexTable&) = delete;
+    PassIndexTable& operator=(const PassIndexTable&) = delete;
+};
+
 // The timestamp queries of one recording that is kept for resubmission (CreateOwnedTimestamps).
 // A kept recording replays the same commands at every submission. So it cannot use the frame-indexed slots of the
 // shared pool. That pool is also recreated as passes register, while recordings can outlive it. Instead, a kept
@@ -33,6 +44,8 @@ enum class TimestampRangeKind : uint8_t {
 // A recording belongs to one frame slot. Each submission on that slot starts only after the previous one completed.
 // So when the slot completes, the buffer holds the last submission's values. OnFrameComplete reads them then.
 // The queries are recorded once, on the recording's thread. They are read after submissions, by the completion.
+// The pool and buffer are usually a slice of a larger pool and buffer shared by many recordings (`slice` holds it; `first`
+// is its first query and the buffer offset is first * stride). Without a slice they are the recording's own.
 struct OwnedTimestampQueries {
     struct Entry {
         std::string name;
@@ -40,8 +53,12 @@ struct OwnedTimestampQueries {
         TimestampRangeKind kind = TimestampRangeKind::Pass;
         uint32_t occurrence = 0;  // number of ranges with this name before it in the list
     };
-    rhi::QueryPoolPtr pool;
-    rhi::ResourcePtr readback;
+    rhi::QueryPoolPtr pool;            // without a slice: the recording's own
+    rhi::ResourcePtr readback;         // without a slice: the recording's own
+    std::shared_ptr<void> slice;       // a slice of a shared pool and buffer, given back when the recording goes
+    rhi::QueryPoolHandle poolHandle{}; // the pool the queries are in (the slice's, or pool's)
+    rhi::Resource readbackBuffer{};    // the buffer they resolve into (the slice's, or readback's)
+    uint32_t first = 0;                // the first query of the recording's in the pool
     rhi::QueueKind queueKind = rhi::QueueKind::Graphics;
     double ticksToMilliseconds = 0.0;  // the queue's timestamp calibration
     uint64_t stride = 0;               // bytes per query result
@@ -55,7 +72,7 @@ struct OwnedTimestampQueries {
     OwnedTimestampQueries() = default;
     OwnedTimestampQueries(const OwnedTimestampQueries&) = delete;
     OwnedTimestampQueries& operator=(const OwnedTimestampQueries&) = delete;
-    ~OwnedTimestampQueries();  // the pool and buffer go to deferred deletion
+    ~OwnedTimestampQueries();  // the slice goes back (or its own pool and buffer go to deferred deletion)
 };
 
 // One timestamp pair read back by OnFrameComplete. It is one of:
@@ -103,6 +120,13 @@ public:
     virtual void MergePendingResolves(rhi::QueueKind queueKind, unsigned frameIndex, QueryRecordingContext& ctx) = 0;
 
     virtual const std::vector<std::string>& GetPassNames() const = 0;
+    // The pass names and indices now (PassIndexTable): safe while passes register on other threads.
+    virtual std::shared_ptr<const PassIndexTable> PassIndices() const {
+        auto table = std::make_shared<PassIndexTable>();
+        table->names = GetPassNames();
+        for (unsigned i = 0; i < table->names.size(); ++i) table->indices.emplace(table->names[i], i);
+        return table;
+    }
     virtual const std::vector<std::string>& GetPassTechniquePaths() const = 0;
     virtual const std::vector<PassStats>& GetPassStats() const = 0;
     virtual const std::vector<MeshPipelineStats>& GetMeshStats() const = 0;

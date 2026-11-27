@@ -69,6 +69,23 @@
 
 namespace org {
 
+// ORG_UPDATE_PROFILE=N (diagnostic): RenderGraph::Update adds each pass's TakeFrameValues + Update time and each preparation
+// phase's time (UpdateProfileAdd), and every N updates of an epoch logs the means per update, largest first. Calling thread only.
+bool UpdateProfileOn() noexcept;
+void UpdateProfileAdd(const char* phase, std::string_view name, double microseconds);
+
+// ORG_STAGED_REVISION_DIAG=1: a staged recording that is stale by a pass's revision logs the rows that changed (diagnostic).
+inline bool StagedRevisionDiagnostics() {
+	static const bool on = [] {
+		char* value = nullptr;
+		size_t size = 0;
+		const bool set = _dupenv_s(&value, &size, "ORG_STAGED_REVISION_DIAG") == 0 && value && value[0] && value[0] != '0';
+		std::free(value);
+		return set;
+	}();
+	return on;
+}
+
 namespace persistent_impl {
 
 using compiler::CompileRange;
@@ -810,6 +827,12 @@ struct RenderGraph::PersistentExecutionsState {
 		std::string unkeptReason;
 		// Recorded ahead (RecordStagedCopy) and not used yet: its first run confirms it by its passes' frame data.
 		bool staged = false;
+		// The lease index the recording was made for: its latch regions are that index's. A copy served by another lease since
+		// (GraphHost's second set of copies for staged runs) records again.
+		uint32_t lease = UINT32_MAX;
+		// Diagnostics (ORG_STAGED_REVISION_DIAG=1): each recording->revisions entry's revision rows at the staging, so a staged
+		// recording stale by a revision logs which rows changed.
+		std::vector<std::vector<uint64_t>> stagedRevisionRows;
 		// Batch reuse (RenderGraph::SetKeptBatchReuse): each recording->revisions entry's batch; per batch whether its packet can be
 		// submitted again (empty: every batch can), and why not.
 		std::vector<uint32_t> revisionBatches;

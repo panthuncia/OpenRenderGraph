@@ -58,6 +58,7 @@ class Resource;
 class RenderPassBuilder;
 class ExternalEpochExecution;
 class ExternalClient;
+class ExternalSubmitRouter;
 class PersistentAliasArena;
 class AliasHeapGeneration;
 class IVersionedResource;
@@ -930,6 +931,9 @@ public:
 	ExternalClient& GetExternalClient();
 	// The queue slots its external client has used (ExternalClient::UsedSlots), 0 when it has none yet. Does not make one.
 	uint32_t ExternalClientSlots();
+	// The external client's router (ExternalClient::Desc::router): a host's submission thread. Applies to a client made
+	// already, and to the one made later. Any thread.
+	void SetExternalSubmitRouter(std::shared_ptr<ExternalSubmitRouter> router);
 
 	// Owner thread: re-placements installed from a preparation (PrepareFramePlacementReplacement), and preparations the graph did not
 	// install, so far.
@@ -1076,6 +1080,20 @@ private:
 		float deltaTime, const PersistentExecutionOptions& options);
 	// Execution of the prepared one: its uploads, then its main segment's admission, recording and submission.
 	void ExecutePersistentFrame(PassExecutionContext& context);
+	// Execute in two parts, for a host that submits on a thread of its own (GraphHost::Desc::executeOnSubmissionThread).
+	// - TakePersistentExecution, on the owner thread after Update: takes the prepared execution out of the graph and retires the
+	//   completed ones. It also sets what the owner reads after an execution (GetLastExecutedPreparationSlot,
+	//   GetLastSubmittedFrameData).
+	// - ExecuteTakenPersistentFrame, on the submitting thread: the rest of Execute, from the uploads to the queue submission and
+	//   commit. The graph's earlier executions must have gone through it first, and the graph's next Update must wait for it.
+	//   It does not call the extensions' AfterExecute.
+	// - RunPersistentAfterExecute, on the owner thread: the extensions' AfterExecute.
+	std::shared_ptr<PersistentExecution> TakePersistentExecution();
+	void ExecuteTakenPersistentFrame(PersistentExecution& execution, PassExecutionContext& context);
+	void RunPersistentAfterExecute();
+	// The body of ExecutePersistentFrame and ExecuteTakenPersistentFrame. taken: the execution was taken (TakePersistentExecution),
+	// so retirement and AfterExecute are the owner's.
+	void ExecutePersistentRun(PersistentExecution& execution, PassExecutionContext& context, bool taken);
 	void SubmitPersistentUploads(PersistentExecution& execution);
 	// One execution of the prepared segment, in phases (RenderGraphPersistentExecute.cpp). Admit returns false when the
 	// segment needs nothing more: it was empty, admission-only, or took a kept recording.
@@ -1238,6 +1256,7 @@ private:
 	// Declared after the queue registry, so it is destroyed before the queues it submits to.
 	std::mutex m_externalClientMutex;
 	std::unique_ptr<ExternalClient> m_externalClient;
+	std::shared_ptr<ExternalSubmitRouter> m_externalRouter;  // under m_externalClientMutex
 	std::shared_ptr<rhi::TimelinePtr> m_frameWaitTimeline;  // SetFrameWaitTimeline
 	std::vector<SharedQueueTimeline> m_sharedQueueTimelines;  // SetSharedQueueTimelines
 	uint32_t m_passEpochFilter = UINT32_MAX;  // SetPassEpochFilter (persistent::AllEpochs)

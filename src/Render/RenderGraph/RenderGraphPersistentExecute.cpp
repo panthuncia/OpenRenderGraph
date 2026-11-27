@@ -3,6 +3,14 @@
 
 namespace org {
 
+namespace {
+// The pass indices of a graph without a statistics service: none.
+const std::unordered_map<std::string_view, unsigned>& NoStatisticsIndices() {
+	static const std::unordered_map<std::string_view, unsigned> none;
+	return none;
+}
+}
+
 // ---------------------------------------------------------------------------
 // Execution
 
@@ -14,6 +22,45 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 	// Taken out of the state now: whatever happens below, it is not executed twice.
 	auto execution = std::move(*state.prepared);
 	state.prepared.reset();
+	ExecutePersistentRun(execution, context, false);
+}
+
+std::shared_ptr<RenderGraph::PersistentExecution> RenderGraph::TakePersistentExecution() {
+	BT_ZONE_SCOPE("ORG.Persistent.TakeExecution");
+	if (m_compilerState->frameProductionStopped) throw std::logic_error("Frame production has stopped");
+	if (!m_compilerState->persistent) throw std::logic_error("RenderGraph::Execute before a persistent frame was prepared");
+	auto& compiler = *m_compilerState;
+	auto& state = *compiler.persistent;
+	if (!state.prepared) throw std::logic_error("Persistent execution has no prepared frame");
+	if (state.prepared->options.ticket) throw std::logic_error("A ticket's execution cannot be taken");
+	auto execution = std::make_shared<PersistentExecution>(std::move(*state.prepared));
+	state.prepared.reset();
+	// Retirement reads and changes graph state that the owner thread also reads (the transient resources by name, the retired
+	// pins), so it stays here. The graph's earlier executions have gone through the submitting thread by now.
+	RetirePersistentExecutions();
+	compiler.lastExecutedPreparationSlot = execution->frameIndex;
+	compiler.lastSubmittedFrameData = execution->frameData;
+	return execution;
+}
+
+void RenderGraph::ExecuteTakenPersistentFrame(PersistentExecution& execution, PassExecutionContext& context) {
+	BT_ZONE_SCOPE("ORG.Persistent.Execute");
+	if (!context.beginGpuPassRange && !context.endGpuPassRange && m_gpuPassRangeBegin && m_gpuPassRangeEnd) {
+		context.beginGpuPassRange = m_gpuPassRangeBegin;
+		context.endGpuPassRange = m_gpuPassRangeEnd;
+	}
+	ExecutePersistentRun(execution, context, true);
+}
+
+void RenderGraph::RunPersistentAfterExecute() {
+	BT_ZONE_SCOPE("ORG.Persistent.AfterExecute");
+	for (auto& extension : m_extensions)
+		if (extension) extension->AfterExecute(*this);
+}
+
+void RenderGraph::ExecutePersistentRun(PersistentExecution& execution, PassExecutionContext& context, bool taken) {
+	auto& compiler = *m_compilerState;
+	auto& state = *compiler.persistent;
 	const auto* const ticket = execution.options.ticket;
 	auto& timings = m_lastPersistentExecuteTimings;
 	timings = {};
@@ -39,14 +86,14 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 	// Retirement runs before this frame submits: the presentation tail of the
 	// previous frame has been confirmed by now, so completed executions and
 	// their publications can be released.
-	auto retireStart = std::chrono::steady_clock::now();
-	RetirePersistentExecutions();
-	timings.retireUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - retireStart).count();
-	std::unordered_map<std::string_view, unsigned> statisticsIndices;
-	if (m_statisticsService) {
-		const auto& names = m_statisticsService->GetPassNames();
-		for (unsigned i = 0; i < names.size(); ++i) statisticsIndices.emplace(names[i], i);
+	// A taken execution's retirement ran on the owner thread when it was taken.
+	if (!taken) {
+		auto retireStart = std::chrono::steady_clock::now();
+		RetirePersistentExecutions();
+		timings.retireUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - retireStart).count();
 	}
+	// A table of the pass names now: passes register on build threads meanwhile (RegisterPass).
+	const auto statisticsIndices = m_statisticsService ? m_statisticsService->PassIndices() : nullptr;
 	state.tracyFrameBegun.assign(slotCount, 0);
 	const auto presentationSlot = m_queueRegistry.FindGraphicsSlot();
 
@@ -66,7 +113,7 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 		run.presentationSlot = presentationSlot;
 		run.resourceHeap = context.GetResourceDescriptorHeap().GetHandle();
 		run.samplerHeap = context.GetSamplerDescriptorHeap().GetHandle();
-		run.statisticsIndices = &statisticsIndices;
+		run.statisticsIndices = statisticsIndices ? &statisticsIndices->indices : &NoStatisticsIndices();
 		run.firstBatchOnSlot.assign(slotCount, UINT32_MAX);
 		run.lastBatchOnSlot.assign(slotCount, UINT32_MAX);
 		const auto& batches = segment.publication->executable->graph->batches;
@@ -97,6 +144,11 @@ void RenderGraph::ExecutePersistentFrame(PassExecutionContext& context) {
 	// A ticket's execution is submitted when the ticket completes. One with nothing submitted here is complete now.
 	record->MarkAdmitted();
 	if (!ticket && record->milestone.load(std::memory_order_acquire) == ExecutionMilestone::Admitted) record->Finish(false);
+	// A taken execution's owner set these when it took it, and runs AfterExecute itself.
+	if (taken) {
+		basic_telemetry::AddCounter("ORG.Persistent.SubmittedFrames");
+		return;
+	}
 	compiler.lastExecutedPreparationSlot = execution.frameIndex;
 	if (!ticket) {
 		BT_ZONE_SCOPE("ORG.Persistent.AfterExecute");
@@ -664,6 +716,21 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 		// computed again, recorded into a list ahead of each batch that has one, submitted and committed, with no other
 		// admission in between.
 		sequencer = state.admission->HoldSequencer();
+		// With a submission thread, executions run there, and it holds the sequencer for most of a busy frame. The owner thread's
+		// retirement skips the admission's part while the sequencer is held (RetirePersistentExecutions), so it could fall
+		// behind until the admission runs out of frames. So the admission's completed frames are also retired here, where the
+		// sequencer is held already. It costs one completed-value read per queue.
+		{
+			std::vector<compiler::ExecutionTimelinePoint> completed;
+			completed.reserve(slotCount);
+			for (size_t slot = 0; slot < slotCount; ++slot) {
+				const auto index = static_cast<QueueSlotIndex>(static_cast<uint8_t>(slot));
+				const auto identity = QueueTimelineIdentity(*m_runtime, m_queueRegistry, slot);
+				const uint64_t reached = m_queueRegistry.GetFence(index).GetCompletedValue();
+				completed.push_back({identity, (std::min)(reached, state.admission->Submitted(identity))});
+			}
+			state.admission->RetireCompleted(completed);
+		}
 		std::vector<rhi::CommandList> handoffLists(graph.batches.size());
 		std::vector<std::span<const rhi::CommandList>> leading;
 		std::vector<std::shared_ptr<const void>> handoffLeases;
@@ -863,6 +930,7 @@ void RenderGraph::SubmitPersistentSegment(PersistentSegmentRun& run) {
 			}
 			keep->revisions = std::move(revisions);
 			kept.recording = std::move(keep);
+			kept.lease = run.execution.options.run ? run.execution.options.run->lease : UINT32_MAX;
 			kept.revisionNames = std::move(names);
 			kept.skips = std::move(skips);
 			kept.audits = std::move(audits);
@@ -991,11 +1059,7 @@ bool RenderGraph::RecordStagedCopy(rhi::Device device, const UpdateExecutionCont
 			return false;
 		}
 		PersistentExecuteTimings timings{};
-		std::unordered_map<std::string_view, unsigned> statisticsIndices;
-		if (m_statisticsService) {
-			const auto& names = m_statisticsService->GetPassNames();
-			for (unsigned i = 0; i < names.size(); ++i) statisticsIndices.emplace(names[i], i);
-		}
+		const auto statisticsIndices = m_statisticsService ? m_statisticsService->PassIndices() : nullptr;
 		const size_t slotCount = m_queueRegistry.SlotCount();
 		state.tracyFrameBegun.assign(slotCount, 0);
 		PersistentSegmentRun run{.execution = execution, .segment = segment, .timings = timings};
@@ -1005,7 +1069,7 @@ bool RenderGraph::RecordStagedCopy(rhi::Device device, const UpdateExecutionCont
 		// The heaps the copy's run checks the recording against (PreparePersistentExecution).
 		run.resourceHeap = DescriptorHeapManager::GetInstance().GetSRVDescriptorHeap(BackendInstanceId::Primary).GetHandle();
 		run.samplerHeap = DescriptorHeapManager::GetInstance().GetSamplerDescriptorHeap(BackendInstanceId::Primary).GetHandle();
-		run.statisticsIndices = &statisticsIndices;
+		run.statisticsIndices = statisticsIndices ? &statisticsIndices->indices : &NoStatisticsIndices();
 		run.firstBatchOnSlot.assign(slotCount, UINT32_MAX);
 		run.lastBatchOnSlot.assign(slotCount, UINT32_MAX);
 		const auto& batches = segment.publication->executable->graph->batches;
@@ -1049,6 +1113,7 @@ bool RenderGraph::RecordStagedCopy(rhi::Device device, const UpdateExecutionCont
 		auto& kept = state.syncKept[copy];
 		kept = {};
 		kept.recording = std::move(keep);
+		kept.lease = runRef.lease;
 		kept.revisionNames = segment.revisionNames;
 		kept.skips = segment.skips;
 		kept.audits = segment.audits;
@@ -1060,6 +1125,11 @@ bool RenderGraph::RecordStagedCopy(rhi::Device device, const UpdateExecutionCont
 		std::ranges::sort(kept.foreignTimelines);
 		kept.placementSerial = state.placementSerial;
 		kept.staged = true;
+		if (StagedRevisionDiagnostics()) {
+			kept.stagedRevisionRows.resize(kept.recording->revisions.size());
+			for (size_t i = 0; i < kept.recording->revisions.size(); ++i)
+				(void)kept.recording->revisions[i].first->RevisionRows(kept.stagedRevisionRows[i]);
+		}
 		return true;
 	} catch (const std::exception& e) {
 		why = std::string("its recording failed: ") + e.what();

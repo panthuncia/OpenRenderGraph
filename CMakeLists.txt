@@ -568,6 +568,13 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.StagedPlacementKept COMMAND OpenRenderGraphPersistentVulkanHostTests staged-placement kept)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.SyncReuse COMMAND OpenRenderGraphPersistentVulkanHostTests sync-reuse)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.SyncReuseInline COMMAND OpenRenderGraphPersistentVulkanHostTests sync-reuse inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.SyncSubmit COMMAND OpenRenderGraphPersistentVulkanHostTests sync-submit)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.SyncSubmitInline COMMAND OpenRenderGraphPersistentVulkanHostTests sync-submit inline)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.PlacementSyncSubmit COMMAND OpenRenderGraphPersistentVulkanHostTests placement sync-submit)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.SharedRebuildSyncSubmit COMMAND OpenRenderGraphPersistentVulkanHostTests shared-rebuild sync-submit)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.BuiltSyncSubmit COMMAND OpenRenderGraphPersistentVulkanHostTests built sync-submit)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.SegmentSyncSubmit COMMAND OpenRenderGraphPersistentVulkanHostTests segment sync-submit)
+            add_test(NAME OpenRenderGraphPersistentVulkanHostTests.RetiredSyncSubmit COMMAND OpenRenderGraphPersistentVulkanHostTests retired sync-submit)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.SharedRebuild COMMAND OpenRenderGraphPersistentVulkanHostTests shared-rebuild)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.Leases COMMAND OpenRenderGraphPersistentVulkanHostTests leases)
             add_test(NAME OpenRenderGraphPersistentVulkanHostTests.LeasesOpen COMMAND OpenRenderGraphPersistentVulkanHostTests leases open)
@@ -587,6 +594,11 @@ if(OPENRENDERGRAPH_BUILD_TESTS)
                 OpenRenderGraphPersistentVulkanHostTests.AsyncInline OpenRenderGraphPersistentVulkanHostTests.AsyncOpenInline
                 OpenRenderGraphPersistentVulkanHostTests.ReuseInline OpenRenderGraphPersistentVulkanHostTests.RevisionInline
                 OpenRenderGraphPersistentVulkanHostTests.RevisionOpenInline PROPERTIES TIMEOUT 60)
+            set_tests_properties(OpenRenderGraphPersistentVulkanHostTests.SyncSubmit OpenRenderGraphPersistentVulkanHostTests.SyncSubmitInline
+                OpenRenderGraphPersistentVulkanHostTests.PlacementSyncSubmit OpenRenderGraphPersistentVulkanHostTests.SharedRebuildSyncSubmit
+                OpenRenderGraphPersistentVulkanHostTests.BuiltSyncSubmit OpenRenderGraphPersistentVulkanHostTests.SegmentSyncSubmit
+                OpenRenderGraphPersistentVulkanHostTests.RetiredSyncSubmit
+                PROPERTIES TIMEOUT 120)
 
         endif()
     endif()

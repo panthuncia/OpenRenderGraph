@@ -734,6 +734,7 @@ struct PreparationLaps {
 		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
 		last = now;
 		if (ms >= 0.1) phases += fmt::format("{}{} {:.2f}", phases.empty() ? "" : ", ", name, ms);
+		if (UpdateProfileOn()) UpdateProfileAdd("prepare", name, ms * 1000.0);
 	}
 	void Pass(double ms, const std::string& name) {
 		if (ms < 0.05) return;
@@ -1975,6 +1976,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 		};
 		main.staleReason = [&]() -> std::string {
 			if (!kept->recording) return kept->unkeptReason.empty() ? std::string("first run") : "not kept: " + kept->unkeptReason;
+			if (options.run && kept->lease != options.run->lease) return "copy lease";
 			const auto& recording = *kept->recording;
 			// O-M6-3: a frame placement version taken in place, a prepared re-placement installed, or an alias plan installed.
 			if (kept->placementSerial != state.placementSerial) return "frame placement";
@@ -2006,12 +2008,35 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 			if (!PersistentRecordingBackingsCurrent(recording)) return "backing moved: " + PersistentRecordingStaleBacking(recording);
 			// Batch reuse: the passes' revisions and skip answers are checked per batch, below. A staged recording is confirmed whole.
 			if (m_keptBatchReuse && !kept->staged) return {};
+			std::string firstStale;
 			for (size_t i = 0; i < recording.revisions.size(); ++i) {
 				const auto& [pass, hash] = recording.revisions[i];
 				uint64_t now = 0;
-				if (!pass->RevisionHash(now) || now != hash)
-					return "revision: " + (i < kept->revisionNames.size() ? kept->revisionNames[i] : std::string("?"));
+				if (!pass->RevisionHash(now) || now != hash) {
+					const std::string name = i < kept->revisionNames.size() ? kept->revisionNames[i] : std::string("?");
+					if (kept->staged && i < kept->stagedRevisionRows.size()) {
+						// Diagnostics (ORG_STAGED_REVISION_DIAG): the rows that changed since the staging.
+						std::vector<uint64_t> rows;
+						(void)pass->RevisionRows(rows);
+						const auto& staged = kept->stagedRevisionRows[i];
+						std::string changed;
+						int shown = 0;
+						for (size_t row = 0; row < (std::max)(rows.size(), staged.size()) && shown < 8; ++row) {
+							const uint64_t a = row < staged.size() ? staged[row] : ~0ull, b = row < rows.size() ? rows[row] : ~0ull;
+							if (a == b) continue;
+							changed += fmt::format(" [{}] {:#x} -> {:#x}", row, a, b);
+							++shown;
+						}
+						spdlog::info("Staged revision diagnostics: copy {} pass '{}': {} rows staged, {} now;{}", options.keptCopy, name,
+							staged.size(), rows.size(), changed);
+						// Every stale pass is logged; the first names the re-record.
+						if (firstStale.empty()) firstStale = "revision: " + name;
+						continue;
+					}
+					return "revision: " + name;
+				}
 			}
+			if (!firstStale.empty()) return firstStale;
 			for (size_t i = 0; i < kept->skips.size(); ++i) {
 				const auto& [pass, skipped] = kept->skips[i];
 				if (pass->SkipsFor(preparation.preparationData) != (skipped != 0))
@@ -2350,6 +2375,7 @@ RenderGraph::PersistentExecution RenderGraph::PreparePersistentExecution(rhi::De
 				cost.first += static_cast<uint64_t>(ns);
 				++cost.second;
 				if (t_preparationLaps) t_preparationLaps->Pass(static_cast<double>(ns) / 1e6, any.name);
+				if (UpdateProfileOn()) UpdateProfileAdd("prepare pass", any.name, static_cast<double>(ns) / 1e3);
 			}
 			packet.SetDebugName(any.name);
 			// A pass the host turned off for this execution by its host data (RenderGraphPass::SetSkipWhen) records only its barriers.

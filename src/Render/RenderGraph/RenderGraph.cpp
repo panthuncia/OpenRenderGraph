@@ -12,6 +12,36 @@ using namespace graph_internal;
 
 namespace {
 thread_local ResolverCaptureScope* t_resolverCaptures = nullptr;
+
+struct UpdateProfile {
+	std::map<std::string, std::pair<double, uint64_t>, std::less<>> rows;
+	uint64_t updates = 0;
+};
+thread_local std::map<uint32_t, UpdateProfile>* t_updateProfiles = nullptr;
+thread_local UpdateProfile* t_updateProfile = nullptr;
+uint32_t UpdateProfileEvery() noexcept {
+	static const uint32_t every = [] {
+		char* value = nullptr;
+		size_t size = 0;
+		uint32_t n = 0;
+		if (_dupenv_s(&value, &size, "ORG_UPDATE_PROFILE") == 0 && value) n = static_cast<uint32_t>(std::strtoul(value, nullptr, 10));
+		std::free(value);
+		return n;
+	}();
+	return every;
+}
+}
+
+bool UpdateProfileOn() noexcept { return UpdateProfileEvery() != 0 && t_updateProfile; }
+
+void UpdateProfileAdd(const char* phase, std::string_view name, double microseconds) {
+	if (!t_updateProfile) return;
+	std::string key = phase;
+	key += ' ';
+	key += name;
+	auto& row = t_updateProfile->rows[key];
+	row.first += microseconds;
+	++row.second;
 }
 
 ResolverCaptureScope::ResolverCaptureScope() : m_previous(t_resolverCaptures) { t_resolverCaptures = this; }
@@ -340,6 +370,12 @@ uint32_t RenderGraph::ExternalClientSlots() {
 	return client ? client->UsedSlots() : 0;
 }
 
+void RenderGraph::SetExternalSubmitRouter(std::shared_ptr<ExternalSubmitRouter> router) {
+	std::lock_guard lock(m_externalClientMutex);
+	m_externalRouter = std::move(router);
+	if (m_externalClient) m_externalClient->SetRouter(m_externalRouter);
+}
+
 ExternalClient& RenderGraph::GetExternalClient() {
 	std::lock_guard lock(m_externalClientMutex);
 	if (!m_externalClient) {
@@ -348,6 +384,7 @@ ExternalClient& RenderGraph::GetExternalClient() {
 		desc.runtime = m_runtime;
 		desc.name = "ORG.External";
 		desc.entryFullBarrier = m_externalQueueBoundary.entry;
+		desc.router = m_externalRouter;
 		for (size_t slot = 0; slot < m_queueRegistry.SlotCount(); ++slot) {
 			const auto index = static_cast<QueueSlotIndex>(static_cast<uint32_t>(slot));
 			const auto kind = m_queueRegistry.GetKind(index);
@@ -1015,6 +1052,13 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 	};
 	// Where a slow update's time went outside the preparation (a new graph's first ones): its passes' Update calls.
 	const auto updateBegin = std::chrono::steady_clock::now();
+	if (UpdateProfileEvery()) {
+		if (!t_updateProfiles) t_updateProfiles = new std::map<uint32_t, UpdateProfile>();
+		t_updateProfile = &(*t_updateProfiles)[m_passEpochFilter];
+	}
+	struct ProfileScope {
+		~ProfileScope() { t_updateProfile = nullptr; }
+	} profileScope;
 	std::vector<std::pair<double, std::string>> slowestUpdates;
 	const auto noteUpdate = [&](double ms, const std::string& name) {
 		if (ms < 0.05) return;
@@ -1057,6 +1101,7 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 					obj.pass->TakeFrameValues(context);
 					obj.pass->Update(context);
 					noteUpdate(toMilliseconds(std::chrono::steady_clock::now() - start), obj.name);
+					if (t_updateProfile) UpdateProfileAdd("update", obj.name, toMilliseconds(std::chrono::steady_clock::now() - start) * 1000.0);
 					if (traceLifecycle) {
 						spdlog::info("RG frame {} pass update '{}' complete", context.frameIndex, obj.name);
 					}
@@ -1090,6 +1135,24 @@ void RenderGraph::UpdateOnPreparationOwner(const UpdateExecutionContext& context
 	const double beforeCompileMs = toMilliseconds(beforeCompileEnd - passUpdatesEnd);
 	const auto preparationEnd = std::chrono::steady_clock::now();
 	m_lastPersistentUpdateTimings = {passUpdatesMs * 1000.0, beforeCompileMs * 1000.0, toMilliseconds(preparationEnd - beforeCompileEnd) * 1000.0};
+	if (auto* profile = t_updateProfile) {
+		UpdateProfileAdd("total", "pass updates", passUpdatesMs * 1000.0);
+		UpdateProfileAdd("total", "before compile", beforeCompileMs * 1000.0);
+		UpdateProfileAdd("total", "preparation", toMilliseconds(preparationEnd - beforeCompileEnd) * 1000.0);
+		if (++profile->updates >= UpdateProfileEvery()) {
+			std::vector<std::pair<double, std::string>> rows;
+			for (const auto& [key, row] : profile->rows) rows.emplace_back(row.first / static_cast<double>(profile->updates), key);
+			std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+			std::string text;
+			for (size_t i = 0; i < rows.size() && i < 40; ++i) {
+				if (rows[i].first < 0.5) break;
+				text += fmt::format("{}{} {:.1f}", text.empty() ? "" : "; ", rows[i].second, rows[i].first);
+			}
+			spdlog::info("Update profile: epoch {} over {} updates (us per update): {}", m_passEpochFilter, profile->updates, text);
+			profile->rows.clear();
+			profile->updates = 0;
+		}
+	}
 	const auto preparations = m_compilerState ? m_compilerState->asyncPreparationFrameNumber : 0;
 	if (preparations <= 2 || passUpdatesMs + beforeCompileMs > 1.5) {
 		std::string slowest;

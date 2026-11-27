@@ -79,6 +79,18 @@ using detail::HostUploadExtension;
 
 using TimelinePoints = std::vector<std::pair<std::shared_ptr<rhi::TimelinePtr>, uint64_t>>;
 
+// ORG_STAGED_REVISION_DIAG=1: also logs whether a graph staged by run takes its copies in run order (diagnostic).
+bool StagedRunOrderDiagnostics() {
+	static const bool on = [] {
+		char* value = nullptr;
+		size_t size = 0;
+		const bool set = _dupenv_s(&value, &size, "ORG_STAGED_REVISION_DIAG") == 0 && value && value[0] && value[0] != '0';
+		std::free(value);
+		return set;
+	}();
+	return on;
+}
+
 bool PointsReached(const TimelinePoints& points) {
 	for (const auto& [timeline, value] : points)
 		if (timeline && *timeline && (*timeline)->GetCompletedValue() < value) return false;
@@ -114,6 +126,9 @@ struct GraphHost::RunLease {
 		Free,       // retired: on the free list, or a published copy's lease waiting for its next run
 		Open,       // opened for a run that is not submitted yet (a ticket prepared, an execution running)
 		Submitted,  // its points name the run's completion
+		// Desc::executeOnSubmissionThread: its execution is on the submission thread's queue, and it has no points yet. The thread
+		// fills them in and makes it Submitted (under the lease lock), then sets queued->passed.
+		Queued,
 	};
 	uint32_t index = 0;
 	uint32_t generation = 0;  // bumped at every opening, so two runs of the index differ (RunRef::generation)
@@ -126,6 +141,9 @@ struct GraphHost::RunLease {
 	uint64_t seal = 0;        // the seals before it was submitted (Seals)
 	std::shared_ptr<void> keepAlive;            // the uploads' staging and the submission's handoff lists
 	std::shared_ptr<const void> resourceOwner;  // what the caller pinned for the run (SubmitEpoch's resourceOwner)
+	// Desc::executeOnSubmissionThread: the pending part of its last synchronous execution. Set and read on the owner thread only.
+	// Once passed, state and points are the thread's final values and safe to read there.
+	std::shared_ptr<GraphHost::GpuPoint::Pending> queued;
 	// Its upload lists: begun by the host's thread when it prepares the run's ticket, recorded and submitted by the render
 	// thread, recycled when the run retires. An external epoch's secondary, and a list per compute or copy queue
 	// (Desc::queueScopedUploads), likewise.
@@ -434,13 +452,33 @@ struct GraphHost::DeferredPosts {
 	std::vector<Async::Message> messages;
 };
 
+// A synchronous execution handed to the submission thread (Desc::executeOnSubmissionThread): what ExecuteFrame took on the
+// owner thread, for the thread to finish.
+struct GraphHost::ExecutionEntry {
+	size_t index = 0;  // the epoch's instance
+	uint32_t epoch = 0;
+	RenderGraph* graph = nullptr;  // kept alive by its retirement, which waits for this entry (InstallGraph)
+	std::shared_ptr<RenderGraph::PersistentExecution> execution;
+	PassExecutionContext context{};
+	std::shared_ptr<const void> ownedHostData;  // keeps context.hostData alive when it is owned
+	RunLease* lease = nullptr;
+	std::shared_ptr<const void> resourceOwner;
+	bool kept = false;
+	uint64_t hostFrame = 0;
+	// Opened before the epoch's Update, closed once the execution's queue values are published. Meanwhile deferred deletions and
+	// descriptor releases wait: the frontier does not cover this execution's work yet.
+	std::unique_ptr<Runtime::AssignmentScope> assigned;
+	std::shared_ptr<GpuPoint::Pending> pending;  // the lease's queued part, passed when this entry is done
+};
+
 // The submission thread's queue (Desc::submissionThread). The render thread pushes an entry after each commit. The thread
 // finishes the entries in order.
 struct GraphHost::SubmitQueue {
 	struct Entry {
-		enum class Kind : uint8_t { Ticket, Closure, Marker, Stop } kind = Kind::Stop;
+		enum class Kind : uint8_t { Ticket, Closure, Marker, Execution, Stop } kind = Kind::Stop;
 		Async* async = nullptr;  // a ticket's async state
 		std::optional<TicketCommit> commit;
+		std::unique_ptr<ExecutionEntry> execution;  // Kind::Execution
 		std::function<void()> closure;
 		std::shared_ptr<GpuPoint::Pending> marker;  // SubmittedPoint's pending part, filled in when the thread gets here
 	};
@@ -466,6 +504,40 @@ struct GraphHost::SubmitQueue {
 	// Statistics, under the mutex.
 	GraphHost::SubmitThreadStats stats;
 	std::map<std::string, std::pair<uint64_t, double>> drains;  // by caller
+	std::map<std::string, std::pair<uint64_t, double>> epochWaits;  // by reason (ExecuteFrame's waits for queued executions)
+};
+
+// The graphs' external clients' router (Desc::executeOnSubmissionThread, O-M7-3). A submission made off the thread while the
+// thread still has entries queued, or while the calling thread holds entries back, goes behind them. Otherwise it is made on
+// the calling thread: what the thread was given has reached the queues, so the submission follows it there too.
+struct GraphHost::ExternalRouter final : ExternalSubmitRouter {
+	explicit ExternalRouter(SubmitQueue* a_queue) : queue(a_queue) {}
+	bool MustQueue() const override {
+		std::scoped_lock lock(mutex);
+		if (!queue) return false;
+		std::scoped_lock queueLock(queue->mutex);
+		const auto self = std::this_thread::get_id();
+		if (self == queue->threadId) return false;
+		return queue->passed < queue->pushed || (queue->holdDepth && queue->holder == self && !queue->held.empty());
+	}
+	bool Queue(std::function<void()> submit) override;
+	bool OnThread() const override {
+		std::scoped_lock lock(mutex);
+		if (!queue) return false;
+		std::scoped_lock queueLock(queue->mutex);
+		return std::this_thread::get_id() == queue->threadId;
+	}
+	// The thread stops: later submissions are made on their calling threads. A push under way finishes first, so it is ahead of
+	// the thread's stop.
+	void Close() {
+		std::unique_lock lock(mutex);
+		queue = nullptr;
+		pushed.wait(lock, [&] { return pushing == 0; });
+	}
+	mutable std::mutex mutex;  // guards queue and pushing; taken before the queue's mutex, never held during a push
+	std::condition_variable pushed;
+	uint32_t pushing = 0;  // pushes under way (a full queue makes one wait for room, while the thread may submit through a client)
+	SubmitQueue* queue = nullptr;
 };
 
 // The host's recording requests (RequestEpochRecording): any thread pushes onto a Treiber stack, the host's thread takes it whole
@@ -526,6 +598,7 @@ GraphHost::GraphHost(Desc desc)
 		if (m_desc.mergeTicketSubmissions) m_submitCarry = RenderGraph::MakeSubmitCarry();
 		m_submitQueue = std::make_unique<SubmitQueue>();
 		m_submitQueue->thread = std::thread([this] { RunSubmitThread(); });
+		if (m_desc.executeOnSubmissionThread) m_externalRouter = std::make_shared<ExternalRouter>(m_submitQueue.get());
 	}
 }
 
@@ -549,8 +622,19 @@ GraphHost::~GraphHost() {
 	}
 	m_timelines.clear();
 	m_desc.runtime->Retire();
-	m_uncertainExecutionOwners.clear();
-	m_uncertainUploadOwners.clear();
+	{
+		std::scoped_lock lock(m_uncertainOwnersMutex);
+		m_uncertainExecutionOwners.clear();
+		m_uncertainUploadOwners.clear();
+	}
+	m_threadUncertainOwners.clear();
+}
+
+void GraphHost::KeepUncertainOwners(std::shared_ptr<const void> execution, std::shared_ptr<void> uploads) {
+	if (!execution && !uploads) return;
+	std::scoped_lock lock(m_uncertainOwnersMutex);
+	if (execution) m_uncertainExecutionOwners.push_back(std::move(execution));
+	if (uploads) m_uncertainUploadOwners.push_back(std::move(uploads));
 }
 
 // ---- run leases ----
@@ -590,7 +674,7 @@ GraphHost::RunLease& GraphHost::OpenLease(Async* state) {
 			if (!lease) {
 				const uint64_t seals = m_seals.load(std::memory_order_acquire);
 				for (auto* submitted : m_submittedLeases)
-					if (!submitted->external && (submitted->seal < seals || seals == 0)) {
+					if (!submitted->external && submitted->state == RunLease::State::Submitted && (submitted->seal < seals || seals == 0)) {
 						oldest = submitted;
 						break;
 					}
@@ -687,7 +771,7 @@ void GraphHost::ReleaseLease(RunLease& lease, Async* state) {
 	lease.resourceOwner.reset();
 	lease.points.clear();
 	std::scoped_lock lock(m_leaseMutex);
-	if (lease.state == RunLease::State::Submitted) std::erase(m_submittedLeases, &lease);
+	if (lease.state == RunLease::State::Submitted || lease.state == RunLease::State::Queued) std::erase(m_submittedLeases, &lease);
 	if (lease.state != RunLease::State::Free) --m_leasesInFlight;
 	if (lease.state != RunLease::State::Free && lease.copy == RunRef::kNoCopy) m_freeLeases.push_back(lease.index);
 	lease.state = RunLease::State::Free;
@@ -707,8 +791,9 @@ size_t GraphHost::RetireReachedLeases(Async* state) {
 		std::scoped_lock lock(m_leaseMutex);
 		if (m_submittedLeases.empty()) return 0;
 		CompletedValues completed;
+		// A queued run (Desc::executeOnSubmissionThread) has no points yet: it is not reached.
 		for (auto* lease : m_submittedLeases)
-			if (completed.Reached(lease->points)) reached.push_back(lease);
+			if (lease->state == RunLease::State::Submitted && completed.Reached(lease->points)) reached.push_back(lease);
 	}
 	for (auto* lease : reached) RetireLease(*lease, state);
 	// Retired: every submission below the oldest one still running (all that were seen, with none). Runs complete in any order,
@@ -1040,6 +1125,8 @@ void GraphHost::DestroyGraph() {
 	// A graph built before this (BuildEpochGraph) is not attached after it.
 	m_hostConfiguration.fetch_add(1, std::memory_order_acq_rel);
 	if (!AnyGraph() && m_retiredGraphs.empty()) return;
+	// The executions still queued on the submission thread use the graphs: they go to the device first.
+	DrainSubmissions("the graphs' destruction");
 	for (auto& instance : m_instances)
 		if (instance.graph) instance.graph->StopFrameProduction();
 	// Adopted devices wait on their own timelines only (never the whole device).
@@ -1058,6 +1145,8 @@ void GraphHost::DestroyGraph() {
 		}
 	}
 	m_syncLeases.clear();
+	m_syncPending.clear();
+	m_epochPending.clear();
 	m_externalRetired.clear();
 	for (auto& instance : m_instances) {
 		// The next build starts afresh: a failure is the old graphs'.
@@ -1295,6 +1384,8 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 			}
 			graph->SetExternalQueueBoundary(boundary);
 		}
+		// Its external client's submissions made off the submission thread go behind it (O-M7-3).
+		if (m_externalRouter) graph->SetExternalSubmitRouter(m_externalRouter);
 		graph->SetFrameWaitTimeline(inputs.frameWaitTimeline);
 		graph->SetScopedFrameWait(m_desc.scopedFrameWait);
 		graph->Setup();
@@ -1318,11 +1409,23 @@ std::unique_ptr<RenderGraph> GraphHost::MakeGraph(const BuildInputs& inputs, boo
 
 void GraphHost::InstallGraph(size_t index, std::unique_ptr<RenderGraph> graph, uint64_t serial, uint64_t generation) {
 	auto& instance = m_instances[index];
+	// An execution of the graph it replaces may still be queued on the submission thread (Desc::executeOnSubmissionThread). Its
+	// frame production stops behind that execution, on the thread, so the execution still records and submits. The point taken
+	// below comes after the stop, so the graph is released only once both are done.
+	const bool stopBehind = instance.graph && index < m_epochPending.size() && m_epochPending[index]
+		&& !m_epochPending[index]->passed.load(std::memory_order_acquire);
+	if (stopBehind) EnqueueOnSubmitThread([graph = instance.graph.get(), epoch = instance.epoch] {
+		// It waits for the graph's build scope, which can hold the thread at an attach. Logged, to measure that.
+		const auto begin = std::chrono::steady_clock::now();
+		graph->StopFrameProduction();
+		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+		spdlog::info("GraphHost: epoch {}'s replaced graph stopped its frame production on the submission thread in {:.2f} ms", epoch, ms);
+	});
 	// The graph it replaces: its own submitted work is what every queue has been given so far (the timelines are shared), taken
 	// while it is still listed. It is released once that is done, the other epochs running meanwhile.
 	auto done = instance.graph ? SubmittedPoint() : GpuPoint{};
 	if (auto old = std::move(instance.graph)) {
-		old->StopFrameProduction();
+		if (!stopBehind) old->StopFrameProduction();
 		m_retiredGraphs.push_back({std::move(old), std::move(done)});
 		++m_asyncStats.rebuilds;
 	}
@@ -2418,6 +2521,8 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	};
 	const auto index = epoch == persistent::AllEpochs ? 0 : InstanceOf(epoch);
 	if (index == kNoInstance) throw std::invalid_argument("ExecuteFrame: epoch " + std::to_string(epoch) + " is not one of the host's");
+	// Desc::executeOnSubmissionThread: the execution goes to the submission thread after the epoch's Update.
+	const bool threaded = ExecutionsOnSubmissionThread();
 	ReleaseRetiredGraphs(false);
 	// The external client slots the epoch's graph used by now (the renderer's work after the last frame included).
 	if (m_externalSlots && m_instances[index].graph)
@@ -2452,8 +2557,14 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 			m_syncLeases.assign(positions, nullptr);
 			m_syncSubmissions.assign(positions, 0);
 			m_syncExecutions.assign(m_instances.size(), 0);
+			m_syncPending.assign(positions, nullptr);
 		}
 		m_syncPosition = index * inFlight + m_syncExecutions[index]++ % inFlight;
+		// A run still queued on the submission thread has no points yet: the thread passes it first. Its lease is read after.
+		if (auto& pending = m_syncPending[m_syncPosition]) {
+			WaitExecutionPassed(pending, "frame pacing");
+			pending.reset();
+		}
 		// The run at a position, if its lease still holds it and it is not complete.
 		const auto pending = [&](size_t position) -> RunLease* {
 			auto* run = m_syncLeases[position];
@@ -2482,10 +2593,33 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 			if (lease.state == RunLease::State::Open) host.ReleaseLease(lease, nullptr);
 		}
 	} releaseUnsubmitted{*this, lease};
+	if (threaded) {
+		// The epoch's previous execution must have gone through the submission thread before its Update. A pass's Update may write
+		// what its own Record at execution reads (the upscaler's run values), and the graph's preparation and retirement change
+		// state that execution reads. Normally it passed long ago, and this costs nothing.
+		WaitEpochPassed(index, "the epoch's previous execution");
+		// It failed there: the epoch fails now, as it would have failed inside Execute.
+		std::optional<std::string> failure;
+		{
+			std::scoped_lock lock(m_threadExecutionsMutex);
+			if (index < m_threadFailures.size()) failure = std::exchange(m_threadFailures[index], std::nullopt);
+		}
+		if (failure) {
+			auto& instance = m_instances[index];
+			instance.failed = true;
+			instance.failure = *failure;
+			graph.StopFrameProduction();
+			ReportEpochFailure({instance.epoch, instance.buildGeneration, false, *failure});
+			throw EpochFailedError(instance.epoch, *failure);
+		}
+	}
 	// The run's index retired before it was opened: its upload pages are free again, and what was staged since takes it.
 	if (auto* uploads = graph.GetUploadService()) uploads->ProcessDeferredReleases(slot);
 	m_desc.runtime->Retire();
 	lap(m_lastTimings.releaseUs);
+	// On the submission thread, the execution's queue values are assigned after this frame's Update. Deferred deletions and
+	// descriptor releases made from here on (beforePrepare, the passes' updates, the preparation) wait until they are published.
+	auto assigned = threaded ? std::make_unique<Runtime::AssignmentScope>(*m_desc.runtime) : nullptr;
 	graph.SetPersistentEpoch(epoch);
 	graph.SetFrameWaitValue(m_frameWaitValue);
 	// The shared upload service resolves registry handles in one registry. A pass queues an upload by a handle of its own graph's
@@ -2537,10 +2671,70 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	execute.frameFenceValue = m_frameNumber + 1;
 	execute.hostData = hostData;
 	if (m_frameContext) execute.ownedHostData = m_frameContext->ownedHostData;
+	// The frame's frame placement version: the one this graph recorded with. The later epochs of the frame place from it, whatever
+	// is published meanwhile (the worker's settled or trimmed versions), so none moves a resource this graph wrote this frame.
+	// Set by the preparation: Execute does not change it.
+	const auto freezeFramePlacement = [&] {
+		if (m_framePlacement && !m_framePlacementFrozen)
+			if (auto version = graph.PersistentFramePlacement()) {
+				m_framePlacement->Freeze(std::move(version));
+				m_framePlacementFrozen = true;
+			}
+	};
+	if (threaded) {
+		// The submission thread does the rest (FinishExecution). The lease is queued: frame pacing, kept copies and retirement wait
+		// for the thread to pass it before they read it.
+		std::shared_ptr<RenderGraph::PersistentExecution> taken;
+		try {
+			taken = graph.TakePersistentExecution();
+		} catch (const std::exception& e) {
+			throw failEpoch(e.what());
+		}
+		freezeFramePlacement();
+		auto entry = std::make_unique<ExecutionEntry>();
+		entry->index = index;
+		entry->epoch = m_instances[index].epoch;
+		entry->graph = &graph;
+		entry->execution = std::move(taken);
+		entry->context = execute;
+		entry->ownedHostData = execute.ownedHostData;
+		entry->lease = &lease;
+		entry->resourceOwner = std::move(resourceOwner);
+		entry->kept = keptEpoch;
+		entry->hostFrame = m_frameNumber;
+		entry->assigned = std::move(assigned);
+		entry->pending = std::make_shared<GpuPoint::Pending>();
+		lease.queued = entry->pending;
+		lease.hostFrame = m_frameNumber;
+		lease.submission = ++m_submissions;
+		lease.seal = m_sealsPushed.load(std::memory_order_relaxed);
+		{
+			std::scoped_lock lock(m_leaseMutex);
+			lease.state = RunLease::State::Queued;
+			m_submittedLeases.push_back(&lease);
+		}
+		m_syncLeases[m_syncPosition] = &lease;
+		m_syncSubmissions[m_syncPosition] = lease.submission;
+		m_syncPending[m_syncPosition] = entry->pending;
+		if (m_epochPending.size() < m_instances.size()) m_epochPending.resize(m_instances.size());
+		m_epochPending[index] = entry->pending;
+		SubmitQueue::Entry queued;
+		queued.kind = SubmitQueue::Entry::Kind::Execution;
+		queued.execution = std::move(entry);
+		PushOrHold(*m_submitQueue, std::move(queued));
+		lap(m_lastTimings.executeUs);
+		// After the hand-over, on this thread (the extensions' after-execution work reads the caller's state).
+		graph.RunPersistentAfterExecute();
+		lap(m_lastTimings.signalUs);
+		m_lastHostFrame = m_frameNumber;
+		++m_frameNumber;
+		return;
+	}
 	// Reserve CPU ownership before submission. Execute may fail after accepting a
 	// prefix of its batches, in which case recovery retains this owner.
 	const bool heldResources = static_cast<bool>(resourceOwner);
-	if (heldResources) m_uncertainExecutionOwners.push_back(std::move(resourceOwner));
+	const auto heldOwner = resourceOwner;
+	if (heldResources) KeepUncertainOwners(std::move(resourceOwner), nullptr);
 	try {
 		// Execute takes and publishes the queues' values: deferred deletions are not sealed meanwhile.
 		Runtime::AssignmentScope assigning(*m_desc.runtime);
@@ -2564,39 +2758,10 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	if (keptEpoch) {
 		const auto& run = graph.LastKeptRun();
 		m_lastTimings.kept = run.outcome;
-		if (m_keptStats.size() < m_instances.size()) m_keptStats.resize(m_instances.size());
-		auto& stats = m_keptStats[index];
-		++stats.runs;
-		switch (run.outcome) {
-		case RenderGraph::KeptRunOutcome::Reused: ++stats.reused; break;
-		case RenderGraph::KeptRunOutcome::Kept: ++stats.kept; break;
-		case RenderGraph::KeptRunOutcome::Unkeepable: ++stats.unkeepable; break;
-		case RenderGraph::KeptRunOutcome::Partial: ++stats.partial; break;
-		case RenderGraph::KeptRunOutcome::None: break;
-		}
-		// A bounded set of names: past 64, only the ones already counted.
-		if (!run.reason.empty() && (stats.reasons.size() < 64 || stats.reasons.contains(run.reason))) ++stats.reasons[run.reason];
-		if (run.staged) ++(run.outcome == RenderGraph::KeptRunOutcome::Reused ? stats.stagedReused : stats.stagedRecorded);
-		stats.batchesReused += run.batchesReused;
-		stats.batchesRecorded += run.batchesRecorded;
-		for (const auto& [reason, count] : run.batchReasons)
-			if (stats.batchReasons.size() < 64 || stats.batchReasons.contains(reason)) stats.batchReasons[reason] += count;
-		if (run.audited) {
-			++stats.audited;
-			stats.auditCompared += run.auditCompared;
-			stats.auditUncomparable += run.auditUncomparable;
-			stats.auditMismatches += run.auditMismatches.size();
-			for (const auto& name : run.auditMismatches)
-				if (stats.mismatches.size() < 64 || stats.mismatches.contains(name)) ++stats.mismatches[name];
-		}
+		std::scoped_lock lock(m_keptStatsMutex);
+		AddKeptRun(index, run);
 	}
-	// The frame's frame placement version: the one this graph recorded with. The later epochs of the frame place from it, whatever
-	// is published meanwhile (the worker's settled or trimmed versions), so none moves a resource this graph wrote this frame.
-	if (m_framePlacement && !m_framePlacementFrozen)
-		if (auto version = graph.PersistentFramePlacement()) {
-			m_framePlacement->Freeze(std::move(version));
-			m_framePlacementFrozen = true;
-		}
+	freezeFramePlacement();
 	m_lastTimings.execute = graph.LastPersistentExecuteTimings();
 	// Execute submitted the frame: every batch signalled its queue's timeline, so the value each queue
 	// has reached is the run's completion on it.
@@ -2612,7 +2777,7 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 		lease.submission = ++m_submissions;
 		lease.seal = m_sealsPushed.load(std::memory_order_relaxed);
 		if (heldResources) {
-			const auto& owner = m_uncertainExecutionOwners.back();
+			const auto& owner = heldOwner;
 			if (owner && !lease.points.empty()) {
 				std::vector<DescriptorHeapManager::QueueFenceSnapshotPoint> points;
 				points.reserve(lease.points.size());
@@ -2620,7 +2785,10 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 					points.push_back({timeline->Get(), value});
 				DescriptorHeapManager::GetInstance().RetireExecutionLease(owner, std::move(points));
 			}
-			m_uncertainExecutionOwners.pop_back();
+			// Its own entry: the submission thread may have added others since (FinishTicket).
+			std::scoped_lock lock(m_uncertainOwnersMutex);
+			const auto found = std::find(m_uncertainExecutionOwners.rbegin(), m_uncertainExecutionOwners.rend(), heldOwner);
+			if (found != m_uncertainExecutionOwners.rend()) m_uncertainExecutionOwners.erase(std::next(found).base());
 		}
 		{
 			std::scoped_lock lock(m_leaseMutex);
@@ -2635,6 +2803,165 @@ void GraphHost::ExecuteFrame(const IHostExecutionData* hostData, const FrameCall
 	++m_frameNumber;
 }
 
+void GraphHost::AddKeptRun(size_t index, const RenderGraph::KeptRun& run) {
+	if (m_keptStats.size() < m_instances.size()) m_keptStats.resize(m_instances.size());
+	auto& stats = m_keptStats[index];
+	++stats.runs;
+	switch (run.outcome) {
+	case RenderGraph::KeptRunOutcome::Reused: ++stats.reused; break;
+	case RenderGraph::KeptRunOutcome::Kept: ++stats.kept; break;
+	case RenderGraph::KeptRunOutcome::Unkeepable: ++stats.unkeepable; break;
+	case RenderGraph::KeptRunOutcome::Partial: ++stats.partial; break;
+	case RenderGraph::KeptRunOutcome::None: break;
+	}
+	// A bounded set of names: past 64, only the ones already counted.
+	if (!run.reason.empty() && (stats.reasons.size() < 64 || stats.reasons.contains(run.reason))) ++stats.reasons[run.reason];
+	if (run.staged) ++(run.outcome == RenderGraph::KeptRunOutcome::Reused ? stats.stagedReused : stats.stagedRecorded);
+	stats.batchesReused += run.batchesReused;
+	stats.batchesRecorded += run.batchesRecorded;
+	for (const auto& [reason, count] : run.batchReasons)
+		if (stats.batchReasons.size() < 64 || stats.batchReasons.contains(reason)) stats.batchReasons[reason] += count;
+	if (run.audited) {
+		++stats.audited;
+		stats.auditCompared += run.auditCompared;
+		stats.auditUncomparable += run.auditUncomparable;
+		stats.auditMismatches += run.auditMismatches.size();
+		for (const auto& name : run.auditMismatches)
+			if (stats.mismatches.size() < 64 || stats.mismatches.contains(name)) ++stats.mismatches[name];
+	}
+}
+
+// ---- synchronous executions on the submission thread (Desc::executeOnSubmissionThread) ----
+
+bool GraphHost::LeaseQueued(const RunLease& lease) noexcept {
+	return lease.queued && !lease.queued->passed.load(std::memory_order_acquire);
+}
+
+void GraphHost::WaitExecutionPassed(const std::shared_ptr<GpuPoint::Pending>& pending, const char* why) {
+	if (!pending || pending->passed.load(std::memory_order_acquire)) return;
+	auto* queue = m_submitQueue.get();
+	if (!queue) return;
+	{
+		// What this thread holds goes first, or the wait would never end.
+		std::unique_lock lock(queue->mutex);
+		if (queue->holder == std::this_thread::get_id()) PushHeld(*queue, lock);
+	}
+	BT_ZONE_SCOPE("ORG.Host.WaitQueuedExecution");
+	const auto start = std::chrono::steady_clock::now();
+	// The thread passes every entry without waiting for this thread, and marks a failed execution passed too.
+	while (!pending->passed.load(std::memory_order_acquire)) pending->passed.wait(false, std::memory_order_acquire);
+	const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+	std::scoped_lock lock(queue->mutex);
+	++queue->stats.epochWaits;
+	queue->stats.epochWaitUs += us;
+	auto& reason = queue->epochWaits[why ? why : "unnamed"];
+	++reason.first;
+	reason.second += us;
+}
+
+void GraphHost::WaitEpochPassed(size_t index, const char* why) {
+	if (index < m_epochPending.size()) WaitExecutionPassed(m_epochPending[index], why);
+}
+
+void GraphHost::WaitForEpochExecution(uint32_t epoch, const char* why) {
+	if (!ExecutionsOnSubmissionThread()) return;
+	const auto index = epoch == persistent::AllEpochs ? 0 : InstanceOf(epoch);
+	if (index != kNoInstance) WaitEpochPassed(index, why);
+}
+
+bool GraphHost::FinishExecution(ExecutionEntry& entry) {
+	BT_ZONE_SCOPE("ORG.Host.SubmitThread.Execution");
+	BT_ZONE_VALUE(entry.epoch);
+	auto& graph = *entry.graph;
+	auto& lease = *entry.lease;
+	SubmittedExecution record;
+	record.epoch = entry.epoch;
+	record.hostFrame = entry.hostFrame;
+	runtime::ScopedActiveGraphServices services(graph.GetUploadService(), graph.GetDescriptorService());
+	auto lap = [last = std::chrono::steady_clock::now()](double& a_into) mutable {
+		const auto now = std::chrono::steady_clock::now();
+		a_into += std::chrono::duration<double, std::micro>(now - last).count();
+		last = now;
+	};
+	std::string error;
+	try {
+		// The context names the owned host data, which the entry keeps alive.
+		graph.ExecuteTakenPersistentFrame(*entry.execution, entry.context);
+	} catch (const std::exception& e) {
+		record.failed = true;
+		error = e.what();
+	} catch (...) {
+		record.failed = true;
+		error = "an unknown exception";
+	}
+	lap(record.executeUs);
+	// The execution is done with its preparation's objects.
+	entry.execution.reset();
+	// Every batch signalled its queue's timeline (or, after a failure, some may have been accepted): the value each queue has been
+	// given is the run's completion on it.
+	TimelinePoints points;
+	{
+		auto& queues = graph.GetQueueRegistry();
+		for (size_t queueIndex = 0; queueIndex < queues.SlotCount(); ++queueIndex) {
+			const auto queueSlot = static_cast<QueueSlotIndex>(static_cast<uint8_t>(queueIndex));
+			if (const auto next = queues.GetCurrentFenceValue(queueSlot); next > 1) points.emplace_back(queues.GetFenceOwner(queueSlot), next - 1);
+		}
+	}
+	// Published: the frontier covers this execution's work from here on.
+	entry.assigned.reset();
+	if (entry.resourceOwner) {
+		if (!record.failed && !points.empty()) {
+			std::vector<DescriptorHeapManager::QueueFenceSnapshotPoint> retire;
+			retire.reserve(points.size());
+			for (const auto& [timeline, value] : points) retire.push_back({timeline->Get(), value});
+			DescriptorHeapManager::GetInstance().RetireExecutionLease(entry.resourceOwner, std::move(retire));
+		} else {
+			// Its completion is not known: kept until the device is torn down.
+			std::scoped_lock lock(m_threadExecutionsMutex);
+			m_threadUncertainOwners.push_back(std::move(entry.resourceOwner));
+		}
+		entry.resourceOwner.reset();
+	}
+	if (!record.failed) {
+		record.execute = graph.LastPersistentExecuteTimings();
+		if (entry.kept) {
+			const auto& run = graph.LastKeptRun();
+			record.kept = run.outcome;
+			std::scoped_lock lock(m_keptStatsMutex);
+			AddKeptRun(entry.index, run);
+		}
+	}
+	{
+		std::scoped_lock lock(m_threadExecutionsMutex);
+		if (record.failed) {
+			spdlog::error("GraphHost: epoch {}'s execution failed on the submission thread; its next ExecuteFrame reports it: {}", entry.epoch, error);
+			if (m_threadFailures.size() < m_instances.size()) m_threadFailures.resize(m_instances.size());
+			m_threadFailures[entry.index] = error;
+		}
+	}
+	// The lease holds the run's points now. The owner thread reads them once it sees the pending part passed.
+	{
+		std::scoped_lock lock(m_leaseMutex);
+		lease.points = points;
+		lease.state = RunLease::State::Submitted;
+	}
+	lap(record.signalUs);
+	{
+		std::scoped_lock lock(m_threadExecutionsMutex);
+		if (m_threadExecutions.size() >= 256) m_threadExecutions.erase(m_threadExecutions.begin());
+		m_threadExecutions.push_back(record);
+	}
+	entry.pending->points = std::move(points);
+	entry.pending->passed.store(true, std::memory_order_release);
+	entry.pending->passed.notify_all();
+	return !record.failed;
+}
+
+std::vector<GraphHost::SubmittedExecution> GraphHost::TakeSubmittedExecutions() {
+	std::scoped_lock lock(m_threadExecutionsMutex);
+	return std::exchange(m_threadExecutions, {});
+}
+
 // ---- kept recordings of synchronous epochs ----
 
 void GraphHost::SetKeptEpochs(std::vector<uint32_t> epochs) {
@@ -2645,6 +2972,8 @@ void GraphHost::SetKeptEpochs(std::vector<uint32_t> epochs) {
 	for (const auto epoch : m_keptEpochs) {
 		if (std::ranges::find(epochs, epoch) != epochs.end()) continue;
 		const auto index = InstanceOf(epoch);
+		// An execution still queued on the submission thread keeps its recording for its copy when it is done.
+		if (index != kNoInstance) WaitEpochPassed(index, "a kept epoch that stops keeping");
 		if (index != kNoInstance && m_instances[index].graph) m_instances[index].graph->DropKeptRecordings();
 	}
 	m_keptEpochs = std::move(epochs);
@@ -2653,6 +2982,14 @@ void GraphHost::SetKeptEpochs(std::vector<uint32_t> epochs) {
 }
 
 GraphHost::StagedRecordings GraphHost::RecordStagedCopies(EpochGraph& built, const UpdateExecutionContext& frame) {
+	return RecordStagedRuns(built, std::span<const UpdateExecutionContext>(&frame, 1), true);
+}
+
+GraphHost::StagedRecordings GraphHost::RecordStagedCopies(EpochGraph& built, std::span<const UpdateExecutionContext> runs) {
+	return RecordStagedRuns(built, runs, false);
+}
+
+GraphHost::StagedRecordings GraphHost::RecordStagedRuns(EpochGraph& built, std::span<const UpdateExecutionContext> runs, bool everyCopy) {
 	BT_ZONE_SCOPE("ORG.Host.RecordStagedCopies");
 	const auto begin = std::chrono::steady_clock::now();
 	StagedRecordings result;
@@ -2667,29 +3004,49 @@ GraphHost::StagedRecordings GraphHost::RecordStagedCopies(EpochGraph& built, con
 		if (std::ranges::find(m_keptEpochsShared, built.m_epoch) == m_keptEpochsShared.end()) return finish("the epoch keeps no recordings");
 	}
 	// The copies' leases, as the epoch's runs take them. Each is a copy's for good (RunRef::Copy), so its run reference is fixed.
+	// By run: the instance's other set of copies, which its runs have not used since the last attach that switched sets. The
+	// attach's first run then finds copy 0 of it free (TakeSyncCopy), where copy 0 of the current set may still be on the GPU.
 	std::vector<std::pair<uint32_t, RunRef>> copies;
+	uint8_t set = 0;
 	{
 		std::scoped_lock lock(m_leaseMutex);
-		if (built.m_index < m_syncCopyLeases.size())
+		if (!everyCopy && built.m_index < m_syncCopySets.size() && !m_syncCopySets[built.m_index][0].empty()) {
+			set = static_cast<uint8_t>(m_syncCopySet[built.m_index] ^ 1u);
+			for (const auto* lease : m_syncCopySets[built.m_index][set]) copies.emplace_back(lease->copy, lease->Ref());
+		} else if (built.m_index < m_syncCopyLeases.size()) {
 			for (const auto* lease : m_syncCopyLeases[built.m_index]) copies.emplace_back(lease->copy, lease->Ref());
+		}
 	}
 	result.copies = static_cast<uint32_t>(copies.size());
 	if (copies.empty()) return finish("the epoch has no kept copies yet (it has not run)");
+	if (runs.empty()) return finish("no frame to record for");
+	// By run: copy i for runs[i], in copy order (the graph's first runs take them so, TakeSyncCopy).
+	const size_t recording = everyCopy ? copies.size() : (std::min)(copies.size(), runs.size());
 	auto& graph = *built.m_graph;
 	std::string why;
-	for (const auto& [copy, run] : copies) {
-		auto context = frame;
+	for (size_t i = 0; i < recording; ++i) {
+		const auto& [copy, run] = copies[i];
+		auto context = everyCopy ? runs.front() : runs[i];
 		context.frameIndex = context.preparationSlot = run.lease;
 		context.run = run;
 		context.beforeCompileFrame = {};
 		if (!graph.RecordStagedCopy(m_device, context, copy, run, why)) break;
 		++result.recorded;
 	}
-	return finish(result.recorded == result.copies ? std::string() : why);
+	if (!everyCopy && result.recorded) {
+		std::scoped_lock lock(m_leaseMutex);
+		// A staged graph that was never attached stays listed: keep the list short (an entry only aligns a graph's first run).
+		if (m_stagedByRun.size() >= 32) m_stagedByRun.erase(m_stagedByRun.begin());
+		m_stagedByRun.push_back({&graph, set});
+	}
+	if (result.recorded == recording && recording < copies.size())
+		return finish("copies after the " + std::to_string(recording) + " run(s) given are recorded at their first runs");
+	return finish(result.recorded == recording ? std::string() : why);
 }
 
 GraphHost::KeptStats GraphHost::TakeKeptStats(uint32_t epoch) {
 	const auto index = InstanceOf(epoch);
+	std::scoped_lock lock(m_keptStatsMutex);
 	if (index == kNoInstance || index >= m_keptStats.size()) return {};
 	return std::exchange(m_keptStats[index], {});
 }
@@ -2698,24 +3055,72 @@ GraphHost::RunLease& GraphHost::TakeSyncCopy(size_t index) {
 	if (m_syncCopyLeases.size() < m_instances.size()) {
 		std::scoped_lock lock(m_leaseMutex);
 		m_syncCopyLeases.resize(m_instances.size());
+		m_syncCopySets.resize(m_instances.size());
+		m_syncCopySet.resize(m_instances.size(), 0);
 		m_syncCopyNext.resize(m_instances.size(), 0);
 	}
 	auto& copies = m_syncCopyLeases[index];
 	if (copies.empty()) {
 		const uint32_t count = (std::max)(m_desc.framesInFlight, 1u) + 1;
 		std::scoped_lock lock(m_leaseMutex);
-		for (uint32_t copy = 0; copy < count; ++copy) {
-			if (m_leaseStore.size() >= Runtime::kMaxSlots) throw std::runtime_error("GraphHost: no lease index left for a kept copy");
-			auto made = std::make_unique<RunLease>();
-			made->index = static_cast<uint32_t>(m_leaseStore.size());
-			made->copy = copy;
-			copies.push_back(made.get());
-			m_leaseTable[made->index].store(made.get(), std::memory_order_release);
-			m_leaseStore.push_back(std::move(made));
+		for (auto& set : m_syncCopySets[index]) {
+			for (uint32_t copy = 0; copy < count; ++copy) {
+				if (m_leaseStore.size() >= Runtime::kMaxSlots) throw std::runtime_error("GraphHost: no lease index left for a kept copy");
+				auto made = std::make_unique<RunLease>();
+				made->index = static_cast<uint32_t>(m_leaseStore.size());
+				made->copy = copy;
+				set.push_back(made.get());
+				m_leaseTable[made->index].store(made.get(), std::memory_order_release);
+				m_leaseStore.push_back(std::move(made));
+			}
+		}
+		copies = m_syncCopySets[index][m_syncCopySet[index]];
+	}
+	if (const auto& stats = m_desc.runtime->Statistics()) stats->EnsureFrameCapacity(m_syncCopySets[index][1].back()->index + 1);
+	// A graph's first run (RecordStagedCopies by run): its runs take copy 0, 1, ... as they were staged for, when the copies its
+	// first framesInFlight - 1 runs take are free now. Each later copy is free by its turn: frame pacing waited for the epoch's run
+	// framesInFlight back, and the copy's last run is older. Otherwise the turn goes on, and each staged copy is confirmed at its use.
+	if (m_syncCopyGraph.size() < m_instances.size()) m_syncCopyGraph.resize(m_instances.size(), nullptr);
+	if (const RenderGraph* graph = m_instances[index].graph.get(); m_syncCopyGraph[index] != graph) {
+		m_syncCopyGraph[index] = graph;
+		bool byRun = false;
+		uint8_t stagedSet = 0;
+		{
+			std::scoped_lock lock(m_leaseMutex);
+			const auto found = std::ranges::find_if(m_stagedByRun, [&](const StagedByRun& entry) { return entry.graph == graph; });
+			if (found != m_stagedByRun.end()) {
+				byRun = true;
+				stagedSet = found->set;
+				m_stagedByRun.erase(found);
+			}
+		}
+		if (byRun) {
+			const size_t first = (std::max<size_t>)(m_desc.framesInFlight, 2u) - 1u;
+			const auto& staged = m_syncCopySets[index][stagedSet];
+			bool free = staged.size() > first;
+			// A copy whose run is still queued on the submission thread (Desc::executeOnSubmissionThread) is not free: it has no
+			// points yet, and taking it would wait for the thread. Its state is read only once the thread has passed it.
+			for (size_t copy = 0; free && copy < first; ++copy)
+				free = !LeaseQueued(*staged[copy])
+					&& (staged[copy]->state != RunLease::State::Submitted || PointsReached(staged[copy]->points));
+			const bool switched = free && stagedSet != m_syncCopySet[index];
+			if (switched) {
+				// The other set: its runs start at its copy 0. The current set's copies retire as their runs complete (pacing).
+				std::scoped_lock lock(m_leaseMutex);
+				m_syncCopySet[index] = stagedSet;
+				copies = staged;
+				m_syncCopyNext[index] = 0;
+			} else if (free) {
+				m_syncCopyNext[index] = (m_syncCopyNext[index] + copies.size() - 1) / copies.size() * copies.size();
+			}
+			if (StagedRunOrderDiagnostics())
+				spdlog::info("GraphHost: epoch {}'s new graph {} its staged copies in run order{}", m_instances[index].epoch,
+					free ? "takes" : "cannot take (a copy is still in flight)", switched ? " (the other set of copies)" : "");
 		}
 	}
-	if (const auto& stats = m_desc.runtime->Statistics()) stats->EnsureFrameCapacity(copies.back()->index + 1);
 	auto* lease = copies[m_syncCopyNext[index]++ % copies.size()];
+	// Its last run may still be queued on the submission thread (not when frame pacing waited for an older run of the epoch).
+	if (LeaseQueued(*lease)) WaitExecutionPassed(lease->queued, "a kept copy's last run");
 	if (lease->state == RunLease::State::Submitted) {
 		// Frame pacing waited for the epoch's run framesInFlight back, so this one (a run older still) is normally done.
 		if (!PointsReached(lease->points)) {
@@ -4003,18 +4408,12 @@ void GraphHost::StopAsync() {
 			bool complete = true;
 			for (const auto& [timeline, value] : lease->points)
 				if ((*timeline)->HostWait(value) != rhi::Result::Ok) complete = false;
-			if (!complete) {
-				if (lease->resourceOwner) m_uncertainExecutionOwners.push_back(std::move(lease->resourceOwner));
-				if (lease->keepAlive) m_uncertainUploadOwners.push_back(std::move(lease->keepAlive));
-			}
+			if (!complete) KeepUncertainOwners(std::move(lease->resourceOwner), std::move(lease->keepAlive));
 			if (lease->state == RunLease::State::Submitted) RetireLease(*lease, async.get());
 			else ReleaseLease(*lease, async.get());
 		}
 	}
-	if (async->uncertainResourceOwner)
-		m_uncertainExecutionOwners.push_back(std::move(async->uncertainResourceOwner));
-	if (async->uncertainUploadOwner)
-		m_uncertainUploadOwners.push_back(std::move(async->uncertainUploadOwner));
+	KeepUncertainOwners(std::move(async->uncertainResourceOwner), std::move(async->uncertainUploadOwner));
 }
 
 GraphHost::AsyncStats GraphHost::TakeAsyncStats() noexcept {
@@ -4149,8 +4548,13 @@ void GraphHost::RunSubmitThread() {
 			return;
 		}
 		const auto start = std::chrono::steady_clock::now();
-		uint64_t discarded = 0, finished = 0, joined = 0, entries = 1;
-		if (kind == SubmitQueue::Entry::Kind::Ticket) {
+		uint64_t discarded = 0, finished = 0, joined = 0, entries = 1, executed = 0, failedExecutions = 0;
+		if (kind == SubmitQueue::Entry::Kind::Execution && entry.execution) {
+			// A synchronous execution (Desc::executeOnSubmissionThread). A failure is the epoch's: FinishExecution records it for
+			// the epoch's next ExecuteFrame, and the thread goes on with the other epochs.
+			failedExecutions += FinishExecution(*entry.execution) ? 0 : 1;
+			++executed;
+		} else if (kind == SubmitQueue::Entry::Kind::Ticket) {
 			BT_ZONE_SCOPE("ORG.Host.SubmitThread.Ticket");
 			// The tickets queued right behind it go with it, as one group: their queue submissions may share a vkQueueSubmit
 			// (RenderGraph::SubmitCarry). Only what is queued now: the thread never waits for more.
@@ -4246,6 +4650,8 @@ void GraphHost::RunSubmitThread() {
 			queue.stats.discarded += discarded;
 			queue.stats.tickets += finished;
 			queue.stats.joined += joined;
+			queue.stats.executions += executed;
+			queue.stats.failedExecutions += failedExecutions;
 			if (kind == SubmitQueue::Entry::Kind::Ticket) ++queue.stats.groups;
 		}
 		queue.progress.notify_all();
@@ -4255,6 +4661,8 @@ void GraphHost::RunSubmitThread() {
 void GraphHost::StopSubmitThread() {
 	if (!m_submitQueue || !m_submitQueue->thread.joinable()) return;
 	DrainSubmissions("the host's end");
+	// External client submissions from here on are made on their calling threads. One queued meanwhile is ahead of the stop.
+	if (m_externalRouter) m_externalRouter->Close();
 	{
 		std::scoped_lock lock(m_submitQueue->mutex);
 		m_submitQueue->entries.emplace_back();  // Kind::Stop
@@ -4305,6 +4713,32 @@ void GraphHost::EnqueueOnSubmitThread(std::function<void()> a_closure) {
 	PushOrHold(*m_submitQueue, std::move(entry));
 }
 
+bool GraphHost::ExternalRouter::Queue(std::function<void()> submit) {
+	SubmitQueue* target = nullptr;
+	{
+		std::scoped_lock lock(mutex);
+		if (!queue) return false;
+		target = queue;
+		++pushing;
+	}
+	SubmitQueue::Entry entry;
+	entry.kind = SubmitQueue::Entry::Kind::Closure;
+	entry.closure = std::move(submit);
+	{
+		std::scoped_lock queueLock(target->mutex);
+		++target->stats.externalQueued;
+	}
+	// Not under the router's mutex: a full queue waits for room here, while the thread may call MustQueue for a submission of
+	// a pass it records.
+	PushOrHold(*target, std::move(entry));
+	{
+		std::scoped_lock lock(mutex);
+		--pushing;
+	}
+	pushed.notify_all();
+	return true;
+}
+
 void GraphHost::DrainSubmissions(const char* why) {
 	auto* queue = m_submitQueue.get();
 	if (!queue) return;
@@ -4332,6 +4766,8 @@ GraphHost::SubmitThreadStats GraphHost::TakeSubmitThreadStats() {
 	auto stats = std::exchange(m_submitQueue->stats, {});
 	for (auto& [why, counts] : m_submitQueue->drains) stats.drainsByCaller.emplace_back(why, counts);
 	m_submitQueue->drains.clear();
+	for (auto& [why, counts] : m_submitQueue->epochWaits) stats.epochWaitsByReason.emplace_back(why, counts);
+	m_submitQueue->epochWaits.clear();
 	return stats;
 }
 
@@ -4641,8 +5077,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	} catch (...) {
 		// The queue may have accepted a prefix of this ticket. Completion is
 		// unknown, so preserve both owners until device teardown.
-		if (submitted.resourceOwner) m_uncertainExecutionOwners.push_back(std::move(submitted.resourceOwner));
-		if (submitted.keepAlive) m_uncertainUploadOwners.push_back(std::move(submitted.keepAlive));
+		KeepUncertainOwners(std::move(submitted.resourceOwner), std::move(submitted.keepAlive));
 		throw;
 	}
 	publishQueueValues.Publish();
@@ -4690,8 +5125,7 @@ void GraphHost::FinishTicket(Async& async, TicketCommit& commit, FrameTimings& t
 	try {
 		postControl(submitted);
 	} catch (...) {
-		if (submitted.resourceOwner) m_uncertainExecutionOwners.push_back(std::move(submitted.resourceOwner));
-		if (submitted.keepAlive) m_uncertainUploadOwners.push_back(std::move(submitted.keepAlive));
+		KeepUncertainOwners(std::move(submitted.resourceOwner), std::move(submitted.keepAlive));
 		throw;
 	}
 	lap(timings.postUs);

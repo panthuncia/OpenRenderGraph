@@ -87,6 +87,10 @@ public:
         return StatisticsManager::GetInstance().GetPassNames();
     }
 
+    std::shared_ptr<const PassIndexTable> PassIndices() const override {
+        return StatisticsManager::GetInstance().PassIndices();
+    }
+
     const std::vector<std::string>& GetPassTechniquePaths() const override {
         return StatisticsManager::GetInstance().GetPassTechniquePaths();
     }

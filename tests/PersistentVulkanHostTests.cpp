@@ -36,6 +36,8 @@
 #include "Render/Runtime/IUploadService.h"
 #include "Render/Runtime/StagedUploadBatch.h"
 #include "Render/Runtime/IStatisticsService.h"
+#include "Managers/Singletons/StatisticsManager.h"
+#include "OpenRenderGraph/ExternalClient.h"
 
 #include <atomic>
 #include <chrono>
@@ -69,6 +71,42 @@ std::atomic<uint32_t> g_copyRecords{0};
 std::atomic<uint32_t> g_unrevisedInput{0};
 // "sync-reuse", batch reuse: the write pass's preparations (a batch submitted from a kept recording prepares nothing).
 std::atomic<uint32_t> g_writePrepares{0};
+// "sync-submit": the copy pass's next Record throws (a failing pass on the submission thread).
+std::atomic<uint32_t> g_failCopyRecord{0};
+// "sync-submit" (alone, or after "placement" or "shared-rebuild"): synchronous executions on the submission thread
+// (GraphHost::Desc::executeOnSubmissionThread), with queued seals.
+bool g_syncSubmit = false;
+org::GraphHost::Desc WithSyncSubmit(org::GraphHost::Desc desc) {
+	if (!g_syncSubmit) return desc;
+	desc.submissionThread = true;
+	desc.queuedSeals = true;
+	desc.executeOnSubmissionThread = true;
+	return desc;
+}
+// A device wait after the host's submissions: what the submission thread still holds goes to the device first.
+rhi::Result WaitHostIdle(org::GraphHost& host, rhi::Device device) {
+	if (g_syncSubmit) host.DrainSubmissions("test: a device wait");
+	return device.WaitIdle();
+}
+// Holds the submission thread until the returned gate opens (OpenGate), so that what is queued behind stays queued.
+std::shared_ptr<std::atomic<bool>> HoldSubmissionThread(org::GraphHost& host) {
+	auto gate = std::make_shared<std::atomic<bool>>(false);
+	host.EnqueueOnSubmitThread([gate] {
+		while (!gate->load(std::memory_order_acquire)) gate->wait(false, std::memory_order_acquire);
+	});
+	return gate;
+}
+void OpenGate(const std::shared_ptr<std::atomic<bool>>& gate) {
+	gate->store(true, std::memory_order_release);
+	gate->notify_all();
+}
+// Opens the gate from another thread after a delay, while this thread waits for what the gate holds.
+std::thread OpenGateLater(std::shared_ptr<std::atomic<bool>> gate, int milliseconds) {
+	return std::thread([gate = std::move(gate), milliseconds] {
+		std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+		OpenGate(gate);
+	});
+}
 
 struct HostDevice {
 	VkInstance instance = VK_NULL_HANDLE;
@@ -367,6 +405,7 @@ public:
 		out.push_back(m_destinationRevision->load(std::memory_order_acquire));
 	}
 	static void Record(const CopyBindings& bindings, org::PassRecordContext& recording) {
+		if (g_failCopyRecord.exchange(0, std::memory_order_acq_rel)) throw std::runtime_error("test: the copy pass fails to record");
 		g_copyRecords.fetch_add(1, std::memory_order_relaxed);
 		recording.Commands().CopyBufferRegion(recording.Resolve(bindings.destination).GetHandle(), 0,
 			recording.Resolve(bindings.source).GetHandle(), 0, kBytes);
@@ -699,7 +738,19 @@ static int Run(int argc, char** argv) {
 	// recording; a pass's revision, a version of a slot the epoch binds and a rebuild record again, each with its reason; a
 	// version of a slot the epoch does not bind leaves the recordings current. With "inline", the late copy is recorded at every
 	// submission, the kept ones included.
-	const bool syncReuse = argc > 1 && std::strcmp(argv[1], "sync-reuse") == 0;
+	// "sync-submit": "sync-reuse" with the executions on the submission thread (GraphHost::Desc::executeOnSubmissionThread) and
+	// queued seals. Every check of "sync-reuse" holds, each device wait draining the thread first. Then: an execution still queued
+	// when ExecuteFrame returns, the epoch's next ExecuteFrame waiting for it, frames back to back, a graph staged by run attached
+	// while the last run's kept copy is still queued (that copy is not free, so the new graph's first run takes the next one),
+	// and a pass that fails to record on the thread (the epoch's next ExecuteFrame throws EpochFailedError; a rebuild recovers).
+	// Then external client submissions (O-M7-3): one made with nothing queued goes straight to the queue; one made while the
+	// epoch's execution is still queued is queued behind it and copies what that execution wrote; one made on the thread itself
+	// is made there. And kept recordings' timestamps from shared pool slices (StatisticsManager::CreateOwnedTimestamps).
+	// After "placement" or "shared-rebuild": those scenarios with their executions on the thread; "shared-rebuild" also
+	// attaches each set while both epochs' executions are queued.
+	for (int arg = 1; arg < argc; ++arg) g_syncSubmit = g_syncSubmit || std::strcmp(argv[arg], "sync-submit") == 0;
+	const bool syncSubmit = argc > 1 && std::strcmp(argv[1], "sync-submit") == 0;
+	const bool syncReuse = syncSubmit || (argc > 1 && std::strcmp(argv[1], "sync-reuse") == 0);
 	// "contributor": a contributor registered through the C table (ContributorHostTests.cpp) instead of the graph scenario.
 	const bool contributor = argc > 1 && std::strcmp(argv[1], "contributor") == 0;
 	// "rebinding": slots that start or stop sharing a backing (RebindingGpuTests.cpp) instead of the graph scenario.
@@ -765,8 +816,9 @@ static int Run(int argc, char** argv) {
 		std::puts(created == 77 ? "SKIP: no Vulkan device with VK_EXT_descriptor_heap" : "FAIL: host device");
 		return created == 77 ? 77 : 1;
 	}
-	HostBuffer first, second;
-	REQUIRE(CreateHostBuffer(host, first) && CreateHostBuffer(host, second), "host buffers");
+	// probe: "sync-submit"'s external client copies (O-M7-3).
+	HostBuffer first, second, probe;
+	REQUIRE(CreateHostBuffer(host, first) && CreateHostBuffer(host, second) && CreateHostBuffer(host, probe), "host buffers");
 
 	LockCounters counters;
 	{
@@ -809,8 +861,10 @@ static int Run(int argc, char** argv) {
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
 				.tasks = std::make_shared<org::test::TestTaskService>(2)});
 			{
-				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0},
-					.destroyRetiredGraphsDetached = true});
+				// "retired sync-submit": the executions on the submission thread, so a replaced graph's last execution may still be
+				// queued when it is replaced. It goes to the deleter thread only once its retirement point has passed and is reached.
+				org::GraphHost host(WithSyncSubmit({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2,
+					.epochOrder = {0}, .destroyRetiredGraphsDetached = true}));
 				auto program = CreateProgram(device.Get());
 				REQUIRE(program, "compute program");
 				auto scratch = org::Buffer::CreateSharedUnmaterialized(rhi::HeapType::DeviceLocal, kBytes, true);
@@ -849,7 +903,7 @@ static int Run(int argc, char** argv) {
 					value = 42000u + 10u * frame;
 					host.ExecuteFrame(nullptr, upload, 0);
 					host.SealSubmitted();
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "retired: the new graph runs while the old one is destroyed");
+					REQUIRE(WaitHostIdle(host, device.Get()) == rhi::Result::Ok && Matches(first, value), "retired: the new graph runs while the old one is destroyed");
 				}
 				// The deleter thread runs on its own: wait for it a while.
 				for (int wait = 0; wait < 200 && !ended(2); ++wait) std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -992,8 +1046,10 @@ static int Run(int argc, char** argv) {
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
 				.tasks = std::make_shared<org::test::TestTaskService>(2)});
 			{
-				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1},
-					.reportStaleAliasPlacements = true});
+				// "built sync-submit": with the host's submission thread and its synchronous executions there (O-M7-2: replaced graphs
+				// retired by a pending point, without a drain).
+				org::GraphHost host(WithSyncSubmit({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2,
+					.epochOrder = {0, 1}, .reportStaleAliasPlacements = true}));
 				// Only the test's attaches change graphs: a request alone builds nothing.
 				host.SetExplicitBuilds(true);
 				auto program = CreateProgram(device.Get());
@@ -1030,7 +1086,7 @@ static int Run(int argc, char** argv) {
 					value = 43000u + 10u * frame++;
 					host.SubmitEpoch(0, upload);
 					host.SubmitEpoch(1);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "built: the second epoch copies what the first wrote");
+					REQUIRE(WaitHostIdle(host, device.Get()) == rhi::Result::Ok && Matches(first, value), "built: the second epoch copies what the first wrote");
 					return 0;
 				};
 				for (int i = 0; i < 3; ++i)
@@ -1376,8 +1432,8 @@ static int Run(int argc, char** argv) {
 			auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan, .slots = 4,
 				.tasks = std::make_shared<org::test::TestTaskService>(2)});
 			{
-				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0},
-					.reportStaleAliasPlacements = true});
+				org::GraphHost host(WithSyncSubmit({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2,
+					.epochOrder = {0}, .reportStaleAliasPlacements = true}));
 				host.SetFramePositions({{0, 0, false}});
 				org::GraphHost::FramePlacementSettings settings;
 				settings.enabled = true;
@@ -1424,7 +1480,7 @@ static int Run(int argc, char** argv) {
 					value = 50000u + 10u * frame++;
 					host.ExecuteFrame(nullptr, upload, 0);
 					host.SealSubmitted();
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value) && Matches(second, value),
+					REQUIRE(WaitHostIdle(host, device.Get()) == rhi::Result::Ok && Matches(first, value) && Matches(second, value),
 						"placement: each copy reads what its write wrote");
 					return 0;
 				};
@@ -1776,8 +1832,8 @@ static int Run(int argc, char** argv) {
 			for (const bool framePlacement : {false, true}) {
 				if ((onlyOn && !framePlacement) || (onlyOff && framePlacement)) continue;
 				const char* const mode = framePlacement ? "shared rebuild (frame placement)" : "shared rebuild (no frame placement)";
-				org::GraphHost host({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2, .epochOrder = {0, 1},
-					.sharedAliasArena = true});
+				org::GraphHost host(WithSyncSubmit({.runtime = runtime, .queueBoundary = {.entry = true, .exit = true}, .framesInFlight = 2,
+					.epochOrder = {0, 1}, .sharedAliasArena = true}));
 				host.SetFramePositions({{0, 0, false}, {1, 1, false}});
 				org::GraphHost::FramePlacementSettings settings;
 				settings.enabled = framePlacement;
@@ -1842,7 +1898,7 @@ static int Run(int argc, char** argv) {
 					host.ExecuteFrame(nullptr, {}, 1);
 					if (host.FramePlacementInUse(0).version != host.FramePlacementInUse(1).version) ++mixedVersions;
 					host.SealSubmitted();
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok, what);
+					REQUIRE(WaitHostIdle(host, device.Get()) == rhi::Result::Ok, what);
 					if (!firstFrame && (!Matches(first, value) || !Matches(second, value + 5000u))) {
 						std::printf("FAIL: %s: %s (frame %u: shared %u, own %u, expected %u and %u)\n", mode, what, frame - 1, first.mapped[0],
 							second.mapped[0], value, value + 5000u);
@@ -1868,9 +1924,25 @@ static int Run(int argc, char** argv) {
 					const auto placedAtBuild = host.PlaceEpochGraphs(graphs);
 					REQUIRE(!framePlacement || placedAtBuild >= 1, "shared rebuild: placed at the build");
 					if (const int failed = run("the attached graphs keep running while a set is built")) return failed;
+					// "sync-submit": a frame of both epochs is still queued on the submission thread while the set is staged and attached.
+					// The old graphs' executions still record and submit after the attach, and write that frame's values.
+					std::shared_ptr<std::atomic<bool>> gate;
+					if (g_syncSubmit) {
+						gate = HoldSubmissionThread(host);
+						value = 90000u + 10u * frame++;
+						host.ExecuteFrame(nullptr, upload, 0);
+						host.ExecuteFrame(nullptr, {}, 1);
+						host.SealSubmitted();
+						REQUIRE(!host.SubmittedPoint().Passed(), "shared rebuild: a frame is queued while the set attaches");
+					}
 					REQUIRE(host.StageEpochGraph(graph0).staged && host.StageEpochGraph(graph1).staged, "shared rebuild: staged");
 					const uint32_t both[] = {0, 1};
 					REQUIRE(host.AttachStagedEpochGraphs(both).attached, "shared rebuild: the set attaches");
+					if (gate) {
+						OpenGate(gate);
+						REQUIRE(WaitHostIdle(host, device.Get()) == rhi::Result::Ok && Matches(first, value) && Matches(second, value + 5000u),
+							"shared rebuild: the frame queued across the attach writes its values");
+					}
 					mixedVersions = 0;
 					for (int i = 0; i < 20; ++i) {
 						if (const int failed = run("frames after a set")) return failed;
@@ -2458,8 +2530,9 @@ static int Run(int argc, char** argv) {
 		// pass, and drives persistent execution with the external queue boundary.
 		auto runtime = org::Runtime::Create({.device = device.Get(), .backend = rhi::Backend::Vulkan,
 			.tasks = std::make_shared<org::test::TestTaskService>(2)});
-		org::GraphHost host({.runtime = runtime,
-			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .reuseRecordings = reuse || revision});
+		org::GraphHost host(WithSyncSubmit({.runtime = runtime,
+			.queueBoundary = {.entry = true, .exit = true}, .epochOrder = {0}, .reuseRecordings = reuse || revision}));
+		const auto waitIdle = [&] { return WaitHostIdle(host, device.Get()); };
 		if (inlineLate) host.SetInlineAtExecution(true);
 		if (syncReuse) host.SetKeptEpochs({0});
 		{
@@ -2543,7 +2616,7 @@ static int Run(int argc, char** argv) {
 					value = 40000u + 10u * frame;
 					const auto copies = g_copyRecords.load(std::memory_order_relaxed);
 					host.SubmitEpoch(0, upload, {}, full);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a revision's recording writes every element");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "a revision's recording writes every element");
 					REQUIRE(!inlineLate || g_copyRecords.load(std::memory_order_relaxed) == copies + 1,
 						"a kept recording's inline late pass is recorded again at each submission");
 					REQUIRE(!host.TakeExternalExecution(), "an inline epoch hands no execution back");
@@ -2560,7 +2633,7 @@ static int Run(int argc, char** argv) {
 				for (uint32_t frame = 0; frame < 4; ++frame) {
 					value = 45000u + 10u * frame;
 					host.SubmitEpoch(0, upload, {}, frame < 2 ? full : grownRecording);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value),
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value),
 						frame < 2 ? "the old version's revision after the grown one was recorded" : "the grown version's revision");
 				}
 				// A new revision: half the elements. Until its recording is ready the frames keep submitting the old one.
@@ -2570,7 +2643,7 @@ static int Run(int argc, char** argv) {
 				const uint32_t before = value;
 				value = 50000u;
 				host.SubmitEpoch(0, upload, {}, halfRecording);
-				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for the half revision");
+				REQUIRE(waitIdle() == rhi::Result::Ok, "wait for the half revision");
 				bool halfOk = true;
 				for (uint32_t i = 0; i < kCount; ++i)
 					halfOk &= first.mapped[i] == (i < half ? value + i : before + i);
@@ -2588,7 +2661,7 @@ static int Run(int argc, char** argv) {
 					REQUIRE(pendingRecording, "the pending version's revision's recording");
 					value = 47000u;
 					host.SubmitEpoch(0, upload, {}, pendingRecording);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a revision's recording copies the version it names");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "a revision's recording copies the version it names");
 				}
 				// A revision-driven epoch without its recording is an error, never a re-preparation.
 				bool rejected = false;
@@ -2600,7 +2673,7 @@ static int Run(int argc, char** argv) {
 				REQUIRE(rejected, "a revision-driven epoch without a recording is rejected");
 				value = 60000u;
 				host.SubmitEpoch(0, upload, {}, full);
-				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the host goes on after a rejected submission");
+				REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "the host goes on after a rejected submission");
 				const auto stats = host.TakeAsyncStats();
 				std::printf("revision: %llu recordings (%llu copies), %llu submissions, %llu recorded at tickets, %llu prepared again\n",
 					static_cast<unsigned long long>(stats.revisionRecordings), static_cast<unsigned long long>(stats.revisionCopiesRecorded),
@@ -2624,7 +2697,7 @@ static int Run(int argc, char** argv) {
 							seen = host.CurrentRun();
 						}, {}, slotted);
 						REQUIRE(seen == host.EpochCopyRun(0, slot), "a pinned run is its frame slot's copy");
-						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a pinned copy's recording writes every element");
+						REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "a pinned copy's recording writes every element");
 					}
 					// A frame without the epoch: the next slot is not the copy predicted. A ticket already prepared for the predicted copy
 					// goes back once. One the host's thread prepares after the call takes the named copy at once.
@@ -2637,7 +2710,7 @@ static int Run(int argc, char** argv) {
 						seen = host.CurrentRun();
 					}, {}, slotted);
 					REQUIRE(seen == host.EpochCopyRun(0, 1), "a re-pinned run is the named copy");
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a re-pinned copy's recording writes every element");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "a re-pinned copy's recording writes every element");
 					const auto repinned = host.TakeAsyncStats();
 					std::printf("segment: %llu copy re-pins over %u slotted frames, %llu after a skipped slot\n",
 						static_cast<unsigned long long>(before.copyRepins), 3 * copies, static_cast<unsigned long long>(repinned.copyRepins));
@@ -2650,23 +2723,23 @@ static int Run(int argc, char** argv) {
 					value = 72000u;
 					host.SetEpochCopy(0, 2);
 					host.SubmitEpoch(0, upload, {}, skipped);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, kept), "a pass the host data turns off writes nothing");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, kept), "a pass the host data turns off writes nothing");
 					value = 73000u;
 					host.SetEpochCopy(0, 0);
 					host.SubmitEpoch(0, upload, {}, slotted);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the next revision writes again");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "the next revision writes again");
 					// One copy only: recorded for the slot the next run takes, and submitted with it. Its other copies stay empty.
 					auto single = record(kCount, current, false, 1);
 					REQUIRE(single && single->copies[1] && !single->copies[0], "a recording of one copy has that copy alone");
 					value = 74000u;
 					host.SetEpochCopy(0, 1);
 					host.SubmitEpoch(0, upload, {}, single);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a one-copy recording writes every element");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "a one-copy recording writes every element");
 					// The next slot's run takes the full recording again: the one-copy recording is no candidate for it.
 					value = 75000u;
 					host.SetEpochCopy(0, 2);
 					host.SubmitEpoch(0, upload, {}, slotted);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the other slots go on with their recordings");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "the other slots go on with their recordings");
 					// A staging run per copy (a host that gathers its values at several points and takes the copy once): its own lease
 					// index, CurrentRun while it is used, and copied whole into the copy's run inside the copy's beforeSubmit.
 					{
@@ -2693,7 +2766,7 @@ static int Run(int argc, char** argv) {
 							std::memcpy(&cleared, stale->Bytes(host.CurrentRun()).data(), sizeof(cleared));
 						}, {}, slotted);
 						REQUIRE(copied == 0x5EEDu && cleared == 0u, "the copy's run reads what was staged, and zero where nothing was");
-						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a staged copy's recording writes every element");
+						REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "a staged copy's recording writes every element");
 						// The staging run cleared and staged again further in only: the copy moves the written part, and clears what the last copy
 						// left before it. Then nothing staged at all: the copy's run reads zeros again.
 						org::LatchBlock::ZeroStableRun(staging.lease);
@@ -2708,7 +2781,7 @@ static int Run(int argc, char** argv) {
 								org::LatchBlock::CopyStableRun(staging.lease, host.CurrentRun().lease);
 								std::memcpy(words, staged->Bytes(host.CurrentRun()).data(), sizeof(words));
 							}, {}, slotted);
-							REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "a staged copy's recording writes every element");
+							REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "a staged copy's recording writes every element");
 							REQUIRE(words[0] == 0u && words[1] == 0u && words[2] == (round == 0 ? 0xF00Du : 0u) && words[3] == 0u,
 								"the copy's run reads exactly what was staged since the staging run was cleared");
 						}
@@ -2730,7 +2803,7 @@ static int Run(int argc, char** argv) {
 						value = 78000u;
 						host.SetEpochCopy(0, 2);
 						host.SubmitEpoch(0, upload, {}, slotted);
-						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the attached graph's recording submits while staged");
+						REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "the attached graph's recording submits while staged");
 						REQUIRE(host.AttachStagedEpochGraphs(std::array<uint32_t, 1>{0}).attached, "the staged graph is attached");
 						REQUIRE(host.BuildGeneration(0) == staging.generation && host.StagedGeneration(0) == 0, "the epoch runs the staged build");
 						REQUIRE(host.EpochRecordingCurrent(*stagedRecording) && !host.EpochRecordingCurrent(*slotted), "its recordings are current, the old ones not");
@@ -2738,7 +2811,7 @@ static int Run(int argc, char** argv) {
 							value = 79000u + frame;
 							host.SetEpochCopy(0, frame);
 							host.SubmitEpoch(0, upload, {}, stagedRecording);
-							REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the staged graph's recording submits after the attach");
+							REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "the staged graph's recording submits after the attach");
 						}
 						// A second staging replaces the first; the replaced one's recording request is dropped.
 						auto one = host.BuildEpochGraph(0, "test: staged, then replaced");
@@ -2752,7 +2825,7 @@ static int Run(int argc, char** argv) {
 						value = 79500u;
 						host.SetEpochCopy(0, 0);
 						host.SubmitEpoch(0, upload, {}, last);
-						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the last staged graph's recording submits");
+						REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "the last staged graph's recording submits");
 					}
 					// Versions: the slotted recording bound the current version; the first one bound the version before the growth.
 					REQUIRE(host.EpochRecordingVersionsCurrent(*slotted, 0), "a recording of the current versions is current");
@@ -2802,7 +2875,7 @@ static int Run(int argc, char** argv) {
 				{
 					value = 69990u;
 					host.SubmitEpoch(0, upload);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch after the switch");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch after the switch");
 					auto data = std::make_shared<TestRevision>();
 					data->count = kCount;
 					data->versioned = versions->Key();
@@ -2815,7 +2888,7 @@ static int Run(int argc, char** argv) {
 					for (uint32_t frame = 0; state.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < deadline; ++frame) {
 						value = 70000u + 10u * (frame % 1000u);
 						host.SubmitEpoch(0, upload);
-						REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch draws meanwhile");
+						REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch draws meanwhile");
 					}
 					REQUIRE(state.load(std::memory_order_acquire) == 2, "a live epoch's recording request completes with an error");
 					bool rejected = false;
@@ -2827,7 +2900,7 @@ static int Run(int argc, char** argv) {
 					REQUIRE(rejected, "a recording given to a live epoch is rejected");
 					value = 77000u;
 					host.SubmitEpoch(0, upload);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch submits again after the rejection");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "the live epoch submits again after the rejection");
 				}
 				host.SetAsyncEpochs({});
 			}
@@ -2849,7 +2922,7 @@ static int Run(int argc, char** argv) {
 					const auto before = g_copyRecords.load(std::memory_order_relaxed);
 					REQUIRE(execute(*execution), "the execution in the test's primary");
 					REQUIRE(g_copyRecords.load(std::memory_order_relaxed) == before + 1, "the late copy pass recorded at execution");
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "an external execution writes and copies");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "an external execution writes and copies");
 				}
 				if (externalReuse) {
 					const auto recorded = host.TakeAsyncStats();
@@ -2866,11 +2939,11 @@ static int Run(int argc, char** argv) {
 				auto skipped = host.TakeExternalExecution();
 				REQUIRE(skipped, "the execution to skip");
 				host.SignalExternalExecutionUnexecuted(*skipped);
-				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, kept), "an unexecuted execution writes nothing");
+				REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, kept), "an unexecuted execution writes nothing");
 				value = 96000u;
 				host.SubmitEpoch(0, upload);
 				auto next = host.TakeExternalExecution();
-				REQUIRE(next && execute(*next) && device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the epoch after a skipped execution");
+				REQUIRE(next && execute(*next) && waitIdle() == rhi::Result::Ok && Matches(first, value), "the epoch after a skipped execution");
 				// Collect the pass timestamps of an external epoch by name, including its late pass. They come from the completed
 				// frames, on the host's thread.
 				std::mutex timedMutex;
@@ -2893,7 +2966,7 @@ static int Run(int argc, char** argv) {
 						auto execution = host.TakeExternalExecution();
 						REQUIRE(execution && execute(*execution), "a timed external execution");
 					}
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(first, value), "the timed executions write and copy");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(first, value), "the timed executions write and copy");
 					// Completions are read on the host's thread. Wait until both passes are read, or until one second passes.
 					const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
 					do {
@@ -2932,7 +3005,7 @@ static int Run(int argc, char** argv) {
 				std::weak_ptr<int> ownerWeak = owner;
 				host.SubmitEpoch(0, upload, owner);
 				owner.reset();
-				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for the owned submission");
+				REQUIRE(waitIdle() == rhi::Result::Ok, "wait for the owned submission");
 				const auto ownerDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
 				while (!ownerWeak.expired() && std::chrono::steady_clock::now() < ownerDeadline)
 					std::this_thread::yield();
@@ -2952,6 +3025,8 @@ static int Run(int argc, char** argv) {
 				if (async) {
 					if (frame != 0) host.SubmitEpoch(0, upload);
 				} else host.ExecuteFrame(nullptr, upload, UINT32_MAX, syncOwner);
+				// "sync-submit": the execution may still be queued; the checks below are of a submitted one.
+				if (syncSubmit) host.DrainSubmissions("test: a submitted frame");
 				if (inlineLate && (!async || frame != 0)) {
 					REQUIRE(g_copyRecords.load(std::memory_order_relaxed) == copies + 1, "the inline late copy is recorded once per submission");
 					REQUIRE(!host.TakeExternalExecution(), "an inline epoch hands no execution back");
@@ -2959,7 +3034,7 @@ static int Run(int argc, char** argv) {
 				syncOwner.reset();
 				if (!async || frame != 0)
 					REQUIRE(counters.locks.load() > locksBefore, "Execute submitted the current frame before returning");
-				REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait for BasicRHI timelines");
+				REQUIRE(waitIdle() == rhi::Result::Ok, "wait for BasicRHI timelines");
 				if (!async && frame == 0) {
 					REQUIRE(!syncWeak.expired(), "synchronous owner survives CPU caller release");
 					org::DescriptorHeapManager::GetInstance().ProcessDeferredReleases(0);
@@ -2985,7 +3060,7 @@ static int Run(int argc, char** argv) {
 						if (before) before(frame);
 						value = base + 10u * frame;
 						host.ExecuteFrame(nullptr, upload, 0);
-						if (device->WaitIdle() != rhi::Result::Ok || !Matches(second, value)) {
+						if (waitIdle() != rhi::Result::Ok || !Matches(second, value)) {
 							std::fprintf(stderr, "FAIL: sync-reuse frame %u wrote %u..., expected %u...\n", frame, second.mapped[0], value);
 							windowFailed = true;
 						}
@@ -3081,7 +3156,7 @@ static int Run(int argc, char** argv) {
 				// (GraphHost::RecordStagedCopies). After the attach every copy's first run submits its staged recording (confirmed by
 				// its frame data) and records nothing. A staging whose frame data differs from the runs' (an input no revision names)
 				// is recorded again at each copy's first run, named; so is one whose revision changed between the staging and the run.
-				const auto stage = [&](const std::function<void()>& before, const std::function<void()>& after) -> int {
+				const auto stage = [&](const std::function<void()>& before, const std::function<void()>& after, size_t byRun = 0) -> int {
 					org::GraphHost::StagedRecordings staged;
 					std::unique_ptr<org::GraphHost::EpochGraph> graph;
 					const auto recordsBefore = g_copyRecords.load(std::memory_order_relaxed);
@@ -3089,7 +3164,12 @@ static int Run(int argc, char** argv) {
 						graph = host.BuildEpochGraph(0, "staged recordings");
 						if (!graph || !graph->Built()) return;
 						if (before) before();
-						staged = host.RecordStagedCopies(*graph, org::UpdateExecutionContext{});
+						if (byRun) {
+							const std::vector<org::UpdateExecutionContext> runs(byRun);
+							staged = host.RecordStagedCopies(*graph, runs);
+						} else {
+							staged = host.RecordStagedCopies(*graph, org::UpdateExecutionContext{});
+						}
 						if (after) after();
 					});
 					builder.join();
@@ -3097,8 +3177,9 @@ static int Run(int argc, char** argv) {
 					std::printf("sync-reuse: staged: %u of %u copies recorded on the building thread in %.2f ms (%s)\n", staged.recorded,
 						staged.copies, staged.milliseconds, staged.why.empty() ? "all" : staged.why.c_str());
 					REQUIRE(graph && graph->Built(), "the staged build");
-					REQUIRE(staged.copies == copies && staged.recorded == copies, "every kept copy is recorded on the building thread");
-					if (!inlineLate) REQUIRE(stagedRecords == copies, "each staged copy is recorded once");
+					const auto expected = byRun ? (std::min<uint32_t>)(static_cast<uint32_t>(byRun), copies) : copies;
+					REQUIRE(staged.copies == copies && staged.recorded == expected, "every kept copy asked for is recorded on the building thread");
+					if (!inlineLate) REQUIRE(stagedRecords == expected, "each staged copy is recorded once");
 					const auto result = host.StageEpochGraph(graph);
 					REQUIRE(result.staged, "the staged build is staged");
 					const uint32_t epochs[] = {0};
@@ -3130,6 +3211,24 @@ static int Run(int argc, char** argv) {
 				print("staged, revision changed", stale);
 				REQUIRE(!windowFailed && stale.stagedRecorded == copies && stale.reasons["staged: revision: test.copy-to-host"] == copies
 					&& stale.reused == 8 - copies, "a staged recording whose revision changed records again, named");
+				// M7 step 2, staged recordings by run (RecordStagedCopies with one frame per run): copies 0 and 1 are recorded for the
+				// new graph's first two runs. Its copies are free at its first run (every frame here waits for the device), so its runs
+				// take copy 0, then 1, wherever the old graph's turn was: both submit their staged recordings, and the later copies
+				// record at their first runs. Twice, from two positions of the turn.
+				if (copies >= 3) {
+					for (uint32_t offset = 1; offset <= 2; ++offset) {
+						(void)window(offset, 32500u + 100u * offset);
+						if (const int failed = stage({}, {}, 2)) return failed;
+						auto byRun = window(2, 32600u + 100u * offset);
+						print("staged by run, first two runs", byRun);
+						REQUIRE(!windowFailed && byRun.stagedReused == 2 && byRun.kept == 0 && byRun.reused == 2,
+							"a graph staged by run takes its staged copies in run order");
+						auto later = window(copies, 32700u + 100u * offset);
+						print("staged by run, later runs", later);
+						REQUIRE(!windowFailed && later.reasons["first run"] == copies - 2 && later.reused == 2,
+							"the copies after the staged runs record at their first runs");
+					}
+				}
 				// O-M6-6, batch reuse (GraphHost::SetKeptBatchReuse): each batch of a kept recording is checked on its own. With "inline"
 				// the late copy is a batch of its own, so the write's batch stays current when only the copy is stale: a partial run
 				// submits the write's kept packet, prepares only the copy and records its batch. Without "inline" the epoch is one
@@ -3189,6 +3288,227 @@ static int Run(int argc, char** argv) {
 				host.RequestRebuild();
 				(void)window(copies + 2, 38000u);
 				REQUIRE(!windowFailed, "sync-reuse: frames after batch reuse write their values");
+				if (syncSubmit) {
+					const auto printWaits = [](const char* what, const org::GraphHost::SubmitThreadStats& stats) {
+						std::string reasons;
+						for (const auto& [why, counts] : stats.epochWaitsByReason)
+							reasons += (reasons.empty() ? "" : "; ") + why + " x" + std::to_string(counts.first);
+						std::printf("sync-submit: %s: %llu executions on the thread (%llu failed), %llu waits for queued executions (%.1f ms: %s)\n",
+							what, static_cast<unsigned long long>(stats.executions), static_cast<unsigned long long>(stats.failedExecutions),
+							static_cast<unsigned long long>(stats.epochWaits), stats.epochWaitUs / 1000.0, reasons.empty() ? "none" : reasons.c_str());
+					};
+					// 1. ExecuteFrame returns with its execution still queued. The epoch's next ExecuteFrame waits for it before its
+					// Update, and both frames go through.
+					(void)host.TakeSubmitThreadStats();
+					(void)host.TakeSubmittedExecutions();
+					auto gate = HoldSubmissionThread(host);
+					value = 39000u;
+					host.ExecuteFrame(nullptr, upload, 0);
+					std::this_thread::sleep_for(std::chrono::milliseconds(20));
+					REQUIRE(!Matches(second, value) && !host.SubmittedPoint().Passed(), "sync-submit: ExecuteFrame returns with its execution queued");
+					auto opener = OpenGateLater(gate, 100);
+					const auto waitStart = std::chrono::steady_clock::now();
+					value = 39010u;
+					host.ExecuteFrame(nullptr, upload, 0);
+					const double waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+					opener.join();
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(second, value), "sync-submit: the frame after a queued one writes its value");
+					auto waits = host.TakeSubmitThreadStats();
+					printWaits("a queued execution", waits);
+					bool previousWait = false;
+					for (const auto& [why, counts] : waits.epochWaitsByReason) previousWait = previousWait || why == "the epoch's previous execution";
+					REQUIRE(waitedMs >= 50.0 && waits.epochWaits >= 1 && previousWait && waits.executions == 2,
+						"sync-submit: the epoch's next ExecuteFrame waits for its queued execution before its Update");
+					const auto executions = host.TakeSubmittedExecutions();
+					REQUIRE(executions.size() == 2 && !executions[0].failed && executions[1].kept != org::RenderGraph::KeptRunOutcome::None,
+						"sync-submit: the thread reports each execution with its kept run");
+					// 2. Frames back to back, no device waits between them: the last one's value is written.
+					(void)host.TakeKeptStats(0);
+					for (uint32_t frame = 0; frame < 16; ++frame) {
+						value = 39100u + 10u * frame;
+						host.ExecuteFrame(nullptr, upload, 0);
+					}
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(second, value), "sync-submit: frames back to back");
+					const auto backToBack = host.TakeKeptStats(0);
+					print("back to back", backToBack);
+					REQUIRE(backToBack.runs == 16 && backToBack.reused + backToBack.kept == 16, "sync-submit: back-to-back runs reuse or keep");
+					printWaits("back to back", host.TakeSubmitThreadStats());
+					// 3. A graph staged by run, attached while the last run of the old graph is still queued on kept copy 0. The staging
+					// recorded into the epoch's other set of copies, whose runs are done, so the new graph's first run takes copy 0 of
+					// that set (another lease than the queued run's) and submits its staged recording. Before the second set (M7 step 8),
+					// the queued copy 0 was not free, so the first run took copy 1 and recorded again.
+					uint32_t lastCopy = org::RunRef::kNoCopy;
+					uint32_t lastLease = UINT32_MAX;
+					const auto noteCopy = [&](org::RenderGraph& graph) {
+						upload(graph);
+						lastCopy = host.CurrentRun().copy;
+						lastLease = host.CurrentRun().lease;
+					};
+					for (uint32_t frame = 0; frame < copies && lastCopy != copies - 1; ++frame) {
+						value = 39300u + 10u * frame;
+						host.ExecuteFrame(nullptr, noteCopy, 0);
+						REQUIRE(waitIdle() == rhi::Result::Ok && Matches(second, value), "sync-submit: frames before the staging");
+					}
+					REQUIRE(lastCopy == copies - 1, "sync-submit: the turn reaches the last copy");
+					gate = HoldSubmissionThread(host);
+					value = 39400u;
+					host.ExecuteFrame(nullptr, noteCopy, 0);
+					REQUIRE(lastCopy == 0, "sync-submit: the queued run takes copy 0");
+					const uint32_t queuedLease = lastLease;
+					if (const int failed = stage({}, {}, 2)) return failed;
+					(void)host.TakeKeptStats(0);
+					opener = OpenGateLater(gate, 100);
+					value = 39410u;
+					host.ExecuteFrame(nullptr, noteCopy, 0);
+					opener.join();
+					const uint32_t firstCopy = lastCopy;
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(second, value), "sync-submit: the new graph's first run after a queued one");
+					const auto firstRun = host.TakeKeptStats(0);
+					std::printf("sync-submit: a graph staged by run, attached while copy 0 is queued: its first run takes copy %u (lease %u, the "
+						"queued run's %u), %llu staged reused, %llu recorded again\n", firstCopy, lastLease, queuedLease,
+						static_cast<unsigned long long>(firstRun.stagedReused), static_cast<unsigned long long>(firstRun.stagedRecorded));
+					REQUIRE(firstCopy == 0 && lastLease != queuedLease && firstRun.stagedReused == 1 && firstRun.stagedRecorded == 0,
+						"sync-submit: a graph staged by run takes copy 0 of the other set while the current set's copy 0 is queued");
+					(void)window(copies + 2, 39500u);
+					REQUIRE(!windowFailed, "sync-submit: frames after the attach write their values");
+					// 4. A pass that fails to record on the thread. The thread goes on; the epoch's next ExecuteFrame throws
+					// EpochFailedError, the failure is reported, and a rebuild recovers.
+					(void)host.TakeSubmitThreadStats();
+					outputRevision->fetch_add(1, std::memory_order_release);  // so the copy records (not a kept recording's reuse)
+					g_failCopyRecord.store(1, std::memory_order_release);
+					value = 39600u;
+					host.ExecuteFrame(nullptr, upload, 0);
+					host.DrainSubmissions("test: the failing execution");
+					bool threw = false;
+					try {
+						value = 39610u;
+						host.ExecuteFrame(nullptr, upload, 0);
+					} catch (const org::GraphHost::EpochFailedError& error) {
+						threw = true;
+						std::printf("sync-submit: the next ExecuteFrame threw: %s\n", error.what());
+					}
+					const auto failedStats = host.TakeSubmitThreadStats();
+					printWaits("a failing pass", failedStats);
+					REQUIRE(threw && failedStats.failedExecutions == 1, "sync-submit: a failure on the thread fails the epoch's next ExecuteFrame");
+					REQUIRE(host.PollEpochFailures() >= 1, "sync-submit: the failure is reported");
+					g_failCopyRecord.store(0, std::memory_order_release);
+					host.RequestRebuild();
+					(void)window(copies + 2, 39700u);
+					REQUIRE(!windowFailed, "sync-submit: a rebuild recovers the failed epoch");
+					// 5. External client submissions (O-M7-3): a copy of the output the epoch's copy pass writes, into the probe.
+					{
+						auto* graph = host.Graph();
+						REQUIRE(graph, "sync-submit: the epoch's graph");
+						auto& client = graph->GetExternalClient();
+						const auto copySlot = static_cast<uint32_t>(org::ToUnderlying(graph->GetQueueRegistry().FindGraphicsSlot()));
+						const org::ResourceState copySource{rhi::ResourceAccessType::CopySource, rhi::ResourceLayout::CopySource,
+							rhi::ResourceSyncState::Copy};
+						const org::ResourceState copyDest{rhi::ResourceAccessType::CopyDest, rhi::ResourceLayout::CopyDest,
+							rhi::ResourceSyncState::Copy};
+						auto probeBuffer = ImportHostBuffer(device.Get(), probe, "test.external-probe");
+						REQUIRE(probeBuffer, "sync-submit: the probe buffer");
+						const auto copyOut = [&] {
+							const std::array<org::ExternalClient::Access, 2> accesses{{{output.get(), {}, copySource}, {probeBuffer.get(), {}, copyDest}}};
+							return client.Submit(copySlot, accesses, [&](rhi::CommandList& list) {
+								list.CopyBufferRegion(probeBuffer->GetAPIResource().GetHandle(), 0, output->GetAPIResource().GetHandle(), 0, kBytes);
+							});
+						};
+						const auto reached = [](org::ExternalClient::Signal signal) {
+							return signal.timeline && signal.timeline.HostWait(signal.value, 5000) == rhi::Result::Ok;
+						};
+						(void)host.TakeSubmitThreadStats();
+						// a. Nothing queued: made on the calling thread, after what the thread already submitted.
+						REQUIRE(waitIdle() == rhi::Result::Ok && Matches(second, value), "sync-submit: the frames before the external copies");
+						std::memset(probe.mapped, 0, kBytes);
+						const auto queuedBefore = client.QueuedSubmissions();
+						const auto direct = copyOut();
+						REQUIRE(client.QueuedSubmissions() == queuedBefore, "sync-submit: with nothing queued, an external submission is not queued");
+						REQUIRE(reached(direct) && Matches(probe, value), "sync-submit: the direct external copy reads the last frame's output");
+						// b. The epoch's execution still queued (the thread held): the copy is queued behind it, and reads what it writes.
+						auto heldGate = HoldSubmissionThread(host);
+						value = 39800u;
+						host.ExecuteFrame(nullptr, upload, 0);
+						auto queued = copyOut();
+						std::this_thread::sleep_for(std::chrono::milliseconds(20));
+						REQUIRE(client.QueuedSubmissions() == queuedBefore + 1 && client.PendingQueuedSubmissions() == 1,
+							"sync-submit: an external submission made while an execution is queued is queued behind it");
+						REQUIRE(queued.timeline && queued.timeline.GetCompletedValue() < queued.value && !Matches(probe, value),
+							"sync-submit: the queued external copy has not run before the thread passes the execution");
+						OpenGate(heldGate);
+						REQUIRE(reached(queued) && Matches(probe, value), "sync-submit: the queued external copy reads what the queued execution wrote");
+						REQUIRE(client.PendingQueuedSubmissions() == 0, "sync-submit: the queued external submission passed");
+						// Two in a row behind a queued execution: their values rise, and both run after it.
+						heldGate = HoldSubmissionThread(host);
+						value = 39810u;
+						host.ExecuteFrame(nullptr, upload, 0);
+						const auto queuedFirst = copyOut();
+						const auto queuedSecond = copyOut();
+						REQUIRE(queuedSecond.timeline.GetHandle().index == queuedFirst.timeline.GetHandle().index && queuedSecond.value == queuedFirst.value + 1,
+							"sync-submit: queued submissions take rising values on the slot's queued timeline");
+						OpenGate(heldGate);
+						REQUIRE(reached(queuedFirst) && reached(queuedSecond) && Matches(probe, value), "sync-submit: both queued copies after the execution");
+						// c. Made on the thread itself (a closure there): made at once, not queued again.
+						std::memset(probe.mapped, 0, kBytes);
+						org::ExternalClient::Signal onThread{};
+						host.EnqueueOnSubmitThread([&] { onThread = copyOut(); });
+						host.DrainSubmissions("test: an external submission on the thread");
+						REQUIRE(client.QueuedSubmissions() == queuedBefore + 3 && reached(onThread) && Matches(probe, value),
+							"sync-submit: an external submission made on the submission thread is made there");
+						const auto externalStats = host.TakeSubmitThreadStats();
+						std::printf("sync-submit: %llu external submissions queued behind the thread\n",
+							static_cast<unsigned long long>(externalStats.externalQueued));
+						REQUIRE(externalStats.externalQueued == 3, "sync-submit: the thread counts the queued external submissions");
+						(void)window(copies + 2, 39900u);
+						REQUIRE(!windowFailed, "sync-submit: frames after the external submissions write their values");
+					}
+					// 6. Kept recordings' timestamps are slices of shared pools (StatisticsManager::CreateOwnedTimestamps). Slices do not
+					// overlap; a released one is used again only after kRecycleFrames frames; no new pool is made while one has room. Then
+					// the kept recordings' timestamps read back from their slices.
+					{
+						auto& statistics = org::StatisticsManager::GetInstance();
+						auto a = statistics.CreateOwnedTimestamps(rhi::QueueKind::Graphics, 40);
+						auto b = statistics.CreateOwnedTimestamps(rhi::QueueKind::Graphics, 40);
+						const auto pools = statistics.GetOwnedTimestampPoolStats();
+						REQUIRE(a && b && a->slice && b->slice && a->poolHandle.index == b->poolHandle.index
+							&& (a->first + 80 <= b->first || b->first + 80 <= a->first), "timestamps: two slices of one pool, not overlapping");
+						const auto releasedFirst = a->first;
+						a.reset();
+						auto c = statistics.CreateOwnedTimestamps(rhi::QueueKind::Graphics, 40);
+						REQUIRE(c && c->first != releasedFirst, "timestamps: a released slice is not used again in its frame");
+						for (uint32_t frame = 0; frame < 9; ++frame) statistics.BeginFrame();
+						std::vector<std::shared_ptr<org::runtime::OwnedTimestampQueries>> more;
+						bool reused = false;
+						for (uint32_t i = 0; i < 64 && !reused; ++i) {
+							more.push_back(statistics.CreateOwnedTimestamps(rhi::QueueKind::Graphics, 40));
+							reused = more.back() && more.back()->first == releasedFirst;
+						}
+						const auto after = statistics.GetOwnedTimestampPoolStats();
+						std::printf("timestamps: %u pools (%llu queries, %llu sliced), %llu made, %llu slices made\n", after.blocks,
+							static_cast<unsigned long long>(after.queries), static_cast<unsigned long long>(after.sliced),
+							static_cast<unsigned long long>(after.blocksMade), static_cast<unsigned long long>(after.slicesMade));
+						REQUIRE(reused && after.blocksMade == pools.blocksMade && after.slicesMade >= pools.slicesMade + 2,
+							"timestamps: a released slice is used again after kRecycleFrames frames, from the same pool");
+						more.clear();
+						b.reset();
+						c.reset();
+						// The kept recordings' own timestamps, recorded again with them on, read back from their slices.
+						std::mutex timedMutex;
+						uint32_t replayed = 0;
+						host.SetCompletedFrameCallback([&](uint64_t, const org::runtime::IStatisticsService& a_stats) {
+							std::scoped_lock lock(timedMutex);
+							for (const auto& timestamp : a_stats.GetCompletedTimestamps())
+								if (timestamp.replayed && timestamp.beginTick && timestamp.endTick >= timestamp.beginTick) ++replayed;
+						});
+						host.SetRecordingTimestamps(true);
+						(void)window(copies + 6, 39950u);
+						REQUIRE(!windowFailed, "timestamps: frames with recording timestamps write their values");
+						host.SetRecordingTimestamps(false);
+						(void)window(copies + 2, 39980u);
+						host.SetCompletedFrameCallback({});
+						std::printf("timestamps: %u kept recording timestamps read back\n", replayed);
+						REQUIRE(replayed > 0, "timestamps: kept recordings' timestamps read back from their slices");
+					}
+				}
 			}
 			if (reuse) {
 				// Steady frames. A live epoch's runs take kept copies. Each copy records once, and its later runs bind that recording.
@@ -3196,7 +3516,7 @@ static int Run(int argc, char** argv) {
 				for (uint32_t frame = 0; frame < 12; ++frame) {
 					value = 20000u + 10u * frame;
 					host.SubmitEpoch(0, upload);
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "a run's recording writes its frame's value");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(second, value), "a run's recording writes its frame's value");
 				}
 				const auto steady = host.TakeAsyncStats();
 				std::printf("reuse: steady %llu recorded, %llu bound a kept recording, %llu kept, %llu prepared again\n",
@@ -3217,7 +3537,7 @@ static int Run(int argc, char** argv) {
 						upload(graph);
 						outputRevision->store(base + (frame & 1u), std::memory_order_release);
 					});
-					REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "a prepared-again ticket writes its frame's value");
+					REQUIRE(waitIdle() == rhi::Result::Ok && Matches(second, value), "a prepared-again ticket writes its frame's value");
 					if (frame == 11) warmStale = host.TakeAsyncStats().stale;
 				}
 				const auto alternating = host.TakeAsyncStats();
@@ -3234,7 +3554,7 @@ static int Run(int argc, char** argv) {
 					upload(graph);
 					outputRevision->fetch_add(1, std::memory_order_release);
 				});
-				REQUIRE(device->WaitIdle() == rhi::Result::Ok && Matches(second, value), "a ticket made stale by its commit is prepared again");
+				REQUIRE(waitIdle() == rhi::Result::Ok && Matches(second, value), "a ticket made stale by its commit is prepared again");
 			}
 
 			// A rebuild (e.g. on resize) retires the old graph and keeps rendering.
@@ -3242,7 +3562,7 @@ static int Run(int argc, char** argv) {
 			value = 7000u;
 			if (async) host.SubmitEpoch(0, upload);
 			else host.ExecuteFrame(nullptr, upload);
-			REQUIRE(device->WaitIdle() == rhi::Result::Ok, "wait after rebuild");
+			REQUIRE(waitIdle() == rhi::Result::Ok, "wait after rebuild");
 			REQUIRE(Matches(second, 7000u), "frame after rebuild");
 
 			// The frame-wait timeline. A frame's batches wait on the GPU for the value that the producer of per-frame values
@@ -3261,7 +3581,7 @@ static int Run(int argc, char** argv) {
 					if (async) host.SubmitEpoch(0, upload);
 					else host.ExecuteFrame(nullptr, upload);
 					const auto submitted = host.SubmittedPoint();
-					REQUIRE(!submitted.points.empty(), "a submitted point");
+					REQUIRE(!submitted.points.empty() || submitted.pending, "a submitted point");
 					if (dedicated) {
 						// Not signalled yet: the frame's work has not run.
 						std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -3289,10 +3609,10 @@ static int Run(int argc, char** argv) {
 			{
 				const auto values = [](const org::GraphHost::GpuPoint& a_point) {
 					std::vector<std::pair<const void*, uint64_t>> out;
-					for (const auto& [timeline, at] : a_point.points) out.emplace_back(timeline.get(), at);
+					for (const auto& [timeline, at] : a_point.Resolve()) out.emplace_back(timeline.get(), at);
 					return out;
 				};
-				REQUIRE(host.SealedPoint().points.empty(), "nothing sealed before the first seal");
+				REQUIRE(host.SealedPoint().points.empty() && !host.SealedPoint().pending, "nothing sealed before the first seal");
 				host.SealSubmitted();
 				const auto sealed = values(host.SealedPoint());
 				REQUIRE(!sealed.empty() && sealed == values(host.SubmittedPoint()), "the seal takes what was submitted");
@@ -3314,9 +3634,10 @@ static int Run(int argc, char** argv) {
 	REQUIRE(vkDeviceWaitIdle(host.device) == VK_SUCCESS, "host device survives ORG and BasicRHI shutdown");
 	DestroyHostBuffer(host, first);
 	DestroyHostBuffer(host, second);
+	DestroyHostBuffer(host, probe);
 	vkDestroyDevice(host.device, nullptr);
 	vkDestroyInstance(host.instance, nullptr);
-	std::printf("PersistentVulkanHostTests: ok (%s%s, locks=%d)\n", contributor ? "contributor" : external ? "external" : async ? "async" : syncReuse ? "sync-reuse" : "sync",
+	std::printf("PersistentVulkanHostTests: ok (%s%s, locks=%d)\n", contributor ? "contributor" : external ? "external" : async ? "async" : syncSubmit ? "sync-submit" : syncReuse ? "sync-reuse" : "sync",
 		inlineLate ? ", inline" : "", counters.locks.load());
 	return 0;
 }

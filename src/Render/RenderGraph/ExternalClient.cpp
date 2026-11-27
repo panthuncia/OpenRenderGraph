@@ -3,6 +3,8 @@
 #include "RenderGraphPersistentState.h"
 #include "Render/CommandListPool.h"
 
+#include <spdlog/spdlog.h>
+
 namespace org {
 
 struct ExternalClient::SlotState {
@@ -48,6 +50,18 @@ ExternalClient::ExternalClient(Desc desc) : m_desc(std::move(desc)) {
 }
 
 ExternalClient::~ExternalClient() {
+	// Queued submissions name this client: they go to the queue first. Not on the submission thread itself, which would wait
+	// for its own queue (the host retires a graph only once its queued work has passed, so none is left then).
+	if (m_queuedPending.load(std::memory_order_acquire)) {
+		const auto router = Router();
+		if (router && router->OnThread()) {
+			spdlog::error("ExternalClient {}: destroyed on the submission thread with {} queued submissions", m_desc.name,
+				m_queuedPending.load(std::memory_order_acquire));
+		} else {
+			std::unique_lock done(m_queuedDoneMutex);
+			m_queuedDone.wait(done, [&] { return m_queuedPending.load(std::memory_order_acquire) == 0; });
+		}
+	}
 	std::lock_guard lock(m_mutex);
 	for (auto& slot : m_slots) {
 		if (!slot || !slot->timeline || slot->next == 1) continue;
@@ -59,6 +73,19 @@ ExternalClient::~ExternalClient() {
 			m_desc.runtime->Sequencer()->RetireTimeline(slot->identity);
 			m_desc.runtime->NoteTimelineDestroyed(slot->timeline.Get());
 		}
+	// The queued timelines were signalled with the slots' submissions (or on their queues after a failure), waited for above.
+	for (size_t slot = 0; slot < m_queuedTimelines.size(); ++slot)
+		if (m_queuedTimelines[slot] && m_queuedValues[slot]) (void)m_queuedTimelines[slot]->HostWait(m_queuedValues[slot]);
+}
+
+std::shared_ptr<ExternalSubmitRouter> ExternalClient::Router() {
+	std::lock_guard lock(m_routerMutex);
+	return m_desc.router;
+}
+
+void ExternalClient::SetRouter(std::shared_ptr<ExternalSubmitRouter> router) {
+	std::lock_guard lock(m_routerMutex);
+	m_desc.router = std::move(router);
 }
 
 ExternalClient::SlotState& ExternalClient::Slot(uint32_t slot) {
@@ -136,17 +163,95 @@ struct ExternalClient::Recorded {
 	std::vector<rhi::TimelinePoint> signals;
 	std::vector<rhi::TimelinePoint> waits;
 	std::shared_ptr<const void> keepAlive;
+	// A queued submission's failure report: the flag its Signal shares, and the caller's callback.
+	std::shared_ptr<std::atomic<bool>> failed;
+	std::function<void()> onQueuedFailure;
 };
 
 ExternalClient::Signal ExternalClient::Submit(uint32_t slotIndex, std::span<const Access> accesses,
 	const std::function<void(rhi::CommandList&)>& record, std::span<const rhi::TimelinePoint> signals,
-	std::shared_ptr<const void> keepAlive, std::span<const rhi::TimelinePoint> extraWaits, bool cachePublication) {
-	return SubmitRecorded(Record(slotIndex, accesses, record, signals, std::move(keepAlive), extraWaits, cachePublication));
+	std::shared_ptr<const void> keepAlive, std::span<const rhi::TimelinePoint> extraWaits, bool cachePublication,
+	std::function<void()> onQueuedFailure) {
+	const auto router = Router();
+	if (!router || !router->MustQueue())
+		return SubmitRecorded(Record(slotIndex, accesses, record, signals, std::move(keepAlive), extraWaits, cachePublication));
+	// Off the submission thread, with work queued there: record now (the caller's captures are valid only during this call),
+	// and admit and submit behind that work. The admission then starts from the states the queued executions leave.
+	BT_ZONE_SCOPE("ORG.ExternalClient.Queue");
+	auto recorded = Record(slotIndex, accesses, record, signals, std::move(keepAlive), extraWaits, cachePublication,
+		std::move(onQueuedFailure));
+	recorded->failed = std::make_shared<std::atomic<bool>>(false);
+	// Values are reserved and pushed under one lock: the thread submits them in push order, so each slot's queued timeline
+	// is signalled in increasing order.
+	std::lock_guard queueLock(m_queueMutex);
+	if (m_queuedTimelines.size() < m_desc.queues.size()) {
+		m_queuedTimelines.resize(m_desc.queues.size());
+		m_queuedValues.resize(m_desc.queues.size(), 0);
+	}
+	auto& timeline = m_queuedTimelines[slotIndex];
+	if (!timeline) {
+		const auto name = m_desc.name + ".Queued" + std::to_string(slotIndex);
+		if (m_desc.runtime->Device().CreateTimeline(timeline, 0, name.c_str()) != rhi::Result::Ok || !timeline)
+			throw std::runtime_error("ExternalClient queued timeline creation failed");
+	}
+	const auto value = ++m_queuedValues[slotIndex];
+	recorded->signals.push_back({timeline->GetHandle(), value});
+	const Signal result{timeline.Get(), value, recorded->failed};
+	m_queuedPending.fetch_add(1, std::memory_order_acq_rel);
+	if (router->Queue([this, recorded] { SubmitQueued(recorded); })) {
+		m_queuedTotal.fetch_add(1, std::memory_order_relaxed);
+		basic_telemetry::AddCounter("ORG.ExternalClient.Queued");
+		return result;
+	}
+	// The thread takes no more work (the host's end): submitted here, still in value order (the lock is held).
+	m_queuedPending.fetch_sub(1, std::memory_order_acq_rel);
+	(void)SubmitRecorded(recorded);
+	return result;
+}
+
+void ExternalClient::SubmitQueued(const std::shared_ptr<Recorded>& recorded) {
+	BT_ZONE_SCOPE("ORG.ExternalClient.SubmitQueued");
+	// The caller has returned, so a failure cannot throw to it. It is reported instead:
+	// - the Signal's failed flag is set, and the caller's onQueuedFailure is called,
+	// - then the values are signalled anyway, without the work, so no wait on them hangs.
+	const auto slot = recorded->slot;
+	const auto signals = recorded->signals;
+	const auto failed = recorded->failed;
+	auto onFailure = std::move(recorded->onQueuedFailure);
+	const auto fail = [&](const char* what) {
+		spdlog::error("ExternalClient {}: a queued submission failed: {}", m_desc.name, what);
+		m_queuedFailed.fetch_add(1, std::memory_order_relaxed);
+		basic_telemetry::AddCounter("ORG.ExternalClient.QueuedFailed");
+		if (failed) failed->store(true, std::memory_order_release);
+		if (onFailure) {
+			try {
+				onFailure();
+			} catch (const std::exception& error) {
+				spdlog::error("ExternalClient {}: a queued submission's failure callback threw: {}", m_desc.name, error.what());
+			} catch (...) {
+				spdlog::error("ExternalClient {}: a queued submission's failure callback threw", m_desc.name);
+			}
+		}
+		for (const auto& point : signals) (void)m_desc.queues[slot].queue.Signal(point);
+	};
+	try {
+		(void)SubmitRecorded(recorded);
+	} catch (const std::exception& error) {
+		fail(error.what());
+	} catch (...) {
+		fail("unknown error");
+	}
+	{
+		std::lock_guard done(m_queuedDoneMutex);
+		m_queuedPending.fetch_sub(1, std::memory_order_acq_rel);
+	}
+	m_queuedDone.notify_all();
 }
 
 std::shared_ptr<ExternalClient::Recorded> ExternalClient::Record(uint32_t slotIndex, std::span<const Access> accesses,
 	const std::function<void(rhi::CommandList&)>& record, std::span<const rhi::TimelinePoint> signals,
-	std::shared_ptr<const void> keepAlive, std::span<const rhi::TimelinePoint> extraWaits, bool cachePublication) {
+	std::shared_ptr<const void> keepAlive, std::span<const rhi::TimelinePoint> extraWaits, bool cachePublication,
+	std::function<void()> onQueuedFailure) {
 	BT_ZONE_SCOPE("ORG.ExternalClient.RecordWork");
 	std::lock_guard lock(m_mutex);
 	auto& slot = Slot(slotIndex);
@@ -214,6 +319,7 @@ std::shared_ptr<ExternalClient::Recorded> ExternalClient::Record(uint32_t slotIn
 	recorded->signals.assign(signals.begin(), signals.end());
 	recorded->waits.assign(extraWaits.begin(), extraWaits.end());
 	recorded->keepAlive = std::move(keepAlive);
+	recorded->onQueuedFailure = std::move(onQueuedFailure);
 	return recorded;
 }
 

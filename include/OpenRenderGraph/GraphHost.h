@@ -138,6 +138,13 @@ public:
 		// and the thread passes it in order. Until then SealedPoint has a pending part (GpuPoint::Pending), and Seals counts the
 		// seal already. Off: SealSubmitted drains the thread first.
 		bool queuedSeals = false;
+		// With a submission thread: synchronous epochs submit on it too (O-M7-1). ExecuteFrame runs on the calling thread up to the
+		// end of the epoch's Update: frame pacing, the run's lease, beforePrepare, the passes' updates and the preparation. Then it
+		// hands the execution to the thread and returns. The thread does the rest, in order: the uploads, the admission, the
+		// recording of stale batches and of passes recorded at execution, the queue submission and the commit. See
+		// docs/persistent-epochs.md, "Synchronous epochs on the submission thread", for what that asks of the caller. Off: ExecuteFrame
+		// does everything on the calling thread.
+		bool executeOnSubmissionThread = false;
 		// A retired graph (replaced by an attach) is destroyed on the runtime's deleter thread once its work completes
 		// (ReleaseRetiredGraphs), instead of on the owner thread. Its extensions and task workers are shut down, and its alias
 		// placements given back (RenderGraph::ReleaseAliasPlacements), on the owner thread first. For a host whose passes,
@@ -1213,6 +1220,16 @@ public:
 		double milliseconds = 0.0;
 	};
 	StagedRecordings RecordStagedCopies(EpochGraph& graph, const UpdateExecutionContext& frame);
+	/**
+	 * @brief Staged recordings by run: runs[i] stands for the frame of the graph's run i after its attach (0: its first), for frames
+	 * that differ by run (a history the new graph does not have at its first run). Copy i is recorded for runs[i], for at most the
+	 * epoch's copies; the copies after runs.size() are not recorded, and their first runs record as a rebuilt graph's do.
+	 *
+	 * The graph's first run then takes copy 0, its second copy 1, and so on, when the copies are free at that run (their last runs
+	 * complete, as after a device drain). Otherwise its runs take the copies in turn as before: each staged copy is still confirmed
+	 * at its first use, so a copy whose run is not the one it was recorded for records again, named.
+	 */
+	StagedRecordings RecordStagedCopies(EpochGraph& graph, std::span<const UpdateExecutionContext> runs);
 	// Owner thread: the revision audit of kept recordings on every epoch's graph that ExecuteFrame runs
 	// (RenderGraph::SetKeptRecordingAudit): every everyN-th reuse of a kept copy prepares anyway and compares. 0: off (the
 	// default). Diagnostic.
@@ -1242,8 +1259,39 @@ public:
 		double drainUs = 0.0;             // the time those waited
 		double busyUs = 0.0;              // the thread's time on entries
 		std::vector<std::pair<std::string, std::pair<uint64_t, double>>> drainsByCaller;  // why -> (waits, us)
+		// Desc::executeOnSubmissionThread: synchronous executions the thread finished, and those that failed there.
+		uint64_t executions = 0;
+		uint64_t failedExecutions = 0;
+		// ExecuteFrame's waits for an execution still queued: the epoch's previous one before its next Update, or a run that frame
+		// pacing or a kept copy waits for. Counted only when they had to wait. epochWaitsByReason: why -> (waits, us).
+		uint64_t epochWaits = 0;
+		double epochWaitUs = 0.0;
+		std::vector<std::pair<std::string, std::pair<uint64_t, double>>> epochWaitsByReason;
+		// External client submissions made off the thread and queued behind it (ExternalSubmitRouter).
+		uint64_t externalQueued = 0;
 	};
 	SubmitThreadStats TakeSubmitThreadStats();
+	// Any thread: whether ExecuteFrame hands its executions to the submission thread (Desc::executeOnSubmissionThread).
+	bool ExecutionsOnSubmissionThread() const noexcept { return m_submitQueue && m_desc.executeOnSubmissionThread; }
+	// What the submission thread did with a synchronous execution (Desc::executeOnSubmissionThread). ExecuteFrame's own timings
+	// (LastFrameTimings) then cover only the calling thread's part: their executeUs is the hand-over, and execute and kept are
+	// empty.
+	struct SubmittedExecution {
+		uint32_t epoch = 0;
+		uint64_t hostFrame = 0;   // LastHostFrame of its ExecuteFrame
+		double executeUs = 0.0;   // RenderGraph's part of the execution on the thread
+		double signalUs = 0.0;    // the run's completion points, its descriptor retirement and statistics
+		RenderGraph::PersistentExecuteTimings execute{};
+		RenderGraph::KeptRunOutcome kept = RenderGraph::KeptRunOutcome::None;
+		bool failed = false;
+	};
+	// Any thread: the executions the thread finished since the last call, oldest first (the last 256 at most).
+	std::vector<SubmittedExecution> TakeSubmittedExecutions();
+	// Owner thread: waits until the epoch's last ExecuteFrame has gone through the submission thread (no wait without one, or
+	// once it has). For caller state that the epoch's passes read when they record at execution and the caller changes before
+	// that epoch's next ExecuteFrame. ExecuteFrame makes the same wait itself before the epoch's Update. why names the wait in
+	// SubmitThreadStats::epochWaitsByReason.
+	void WaitForEpochExecution(uint32_t epoch, const char* why);
 
 private:
 	// One epoch's graph (the only one, of every pass, without epochs).
@@ -1413,10 +1461,26 @@ private:
 	std::vector<uint32_t> m_keptEpochs;
 	// m_keptEpochs for other threads (RecordStagedCopies), under m_configMutex.
 	std::vector<uint32_t> m_keptEpochsShared;
-	// Grown and filled under m_leaseMutex: RecordStagedCopies reads it on the building thread.
+	// Grown and filled under m_leaseMutex: RecordStagedCopies reads it on the building thread. Each instance has two sets of
+	// copies (m_syncCopySets): its runs take the current one (m_syncCopyLeases), and a staging by run records into the other, whose
+	// last runs are long done by the attach. Its first run then takes copy 0 of that set without waiting for the GPU.
 	std::vector<std::vector<RunLease*>> m_syncCopyLeases;
+	std::vector<std::array<std::vector<RunLease*>, 2>> m_syncCopySets;
+	std::vector<uint8_t> m_syncCopySet;
 	std::vector<uint64_t> m_syncCopyNext;
+	// Graphs whose copies RecordStagedCopies recorded by run, with the set they were recorded into (under m_leaseMutex), and the
+	// graph each instance's copies last served (owner thread): a graph's first TakeSyncCopy starts its copies at copy 0 of that set
+	// when they are free.
+	struct StagedByRun {
+		const RenderGraph* graph = nullptr;
+		uint8_t set = 0;
+	};
+	std::vector<StagedByRun> m_stagedByRun;
+	std::vector<const RenderGraph*> m_syncCopyGraph;
+	StagedRecordings RecordStagedRuns(EpochGraph& graph, std::span<const UpdateExecutionContext> runs, bool everyCopy);
 	std::vector<KeptStats> m_keptStats;
+	// The submission thread adds to m_keptStats (Desc::executeOnSubmissionThread).
+	std::mutex m_keptStatsMutex;
 	uint32_t m_keptAudit = 0;
 	bool m_keptBatchReuse = false;
 	// The next kept copy's lease of the instance, open for its run. Its last run is waited for and retired first if it is not yet.
@@ -1430,6 +1494,29 @@ private:
 	// Each epoch instance's executions so far, and the position this execution paces on (framesInFlight per instance).
 	std::vector<uint64_t> m_syncExecutions;
 	size_t m_syncPosition = 0;
+	// Desc::executeOnSubmissionThread (owner thread): the pending part of each position's run, and of each instance's last
+	// execution. Its passed flag says the thread has finished the execution: its lease then holds the run's points.
+	std::vector<std::shared_ptr<GpuPoint::Pending>> m_syncPending;
+	std::vector<std::shared_ptr<GpuPoint::Pending>> m_epochPending;
+	// Waits until the thread has passed a queued execution (no wait once it has). why names the wait in SubmitThreadStats.
+	void WaitExecutionPassed(const std::shared_ptr<GpuPoint::Pending>& pending, const char* why);
+	// The instance's last execution, before something on this thread touches the graph's execution state.
+	void WaitEpochPassed(size_t index, const char* why);
+	// Whether a lease's run is still queued on the submission thread. Owner thread.
+	static bool LeaseQueued(const RunLease& lease) noexcept;
+	// The rest of ExecuteFrame with Desc::executeOnSubmissionThread: an execution handed to the thread, and what the thread does.
+	struct ExecutionEntry;
+	// Submission thread: false when the execution failed (the epoch's next ExecuteFrame throws it).
+	bool FinishExecution(ExecutionEntry& entry);
+	// Adds a kept epoch's run to its KeptStats, with m_keptStatsMutex held.
+	void AddKeptRun(size_t index, const RenderGraph::KeptRun& run);
+	// What the thread reports back. Under m_threadExecutionsMutex.
+	std::mutex m_threadExecutionsMutex;
+	std::vector<SubmittedExecution> m_threadExecutions;
+	// A failure on the thread, by instance: the epoch's next ExecuteFrame throws it (EpochFailedError).
+	std::vector<std::optional<std::string>> m_threadFailures;
+	// Owners of executions that failed on the thread, kept until the device is torn down (m_uncertainExecutionOwners).
+	std::vector<std::shared_ptr<const void>> m_threadUncertainOwners;
 	// Opens a live lease (or, at Runtime::kMaxSlots, null). With m_leaseMutex held.
 	RunLease* OpenLeaseLocked(bool external);
 	// Opens a live lease. At Runtime::kMaxSlots in flight, waits for the oldest sealed run and retires it first (throws when none
@@ -1490,8 +1577,11 @@ private:
 	bool m_ending = false;  // the destructor: requests still queued are dropped without their callbacks
 	// A failed/uncertain GPU completion cannot release submitted owners during
 	// a graph rebuild. Keep them until device teardown has stopped execution.
+	// Under m_uncertainOwnersMutex: the submission thread adds to them too (FinishTicket, a failed async submission).
+	std::mutex m_uncertainOwnersMutex;
 	std::vector<std::shared_ptr<const void>> m_uncertainExecutionOwners;
 	std::vector<std::shared_ptr<void>> m_uncertainUploadOwners;
+	void KeepUncertainOwners(std::shared_ptr<const void> execution, std::shared_ptr<void> uploads);
 	// Submitting thread: CurrentRun's sources.
 	RunRef m_syncRun{}, m_asyncRun{};
 	// The caller's update context during ExecuteFrame(const UpdateExecutionContext&), null otherwise.
@@ -1577,6 +1667,10 @@ private:
 	// The submission thread (Desc::submissionThread): its queue, made with the host and stopped first by its destructor.
 	struct SubmitQueue;
 	std::unique_ptr<SubmitQueue> m_submitQueue;
+	// With Desc::executeOnSubmissionThread: the graphs' external clients queue submissions made off the thread behind it
+	// (ExternalSubmitRouter, O-M7-3). Made with the host, closed when the thread stops.
+	struct ExternalRouter;
+	std::shared_ptr<ExternalRouter> m_externalRouter;
 	// The submission thread's held group of batches (RenderGraph::SubmitCarry), across the tickets of one group.
 	std::shared_ptr<RenderGraph::SubmitCarry> m_submitCarry;
 	// SubmittedPoint's values now: every queue's last value handed out.

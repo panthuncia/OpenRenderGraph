@@ -333,6 +333,126 @@ in chunks of 256 KiB (more for a larger region). A chunk never moves and has one
 -   **Size.** The arena holds what the runs in flight wrote. `SealSubmitted` trims chunks that stayed empty for a while,
     keeping one spare.
 
+## Synchronous epochs on the submission thread
+
+With `Desc::submissionThread` and `Desc::executeOnSubmissionThread`, `ExecuteFrame` hands each execution to the host's
+submission thread instead of submitting it itself (O-M7-1). The calling thread keeps everything up to the end of the epoch's
+`Update`. The thread does the rest. `ExecutionsOnSubmissionThread()` says whether it is on.
+
+-   **What stays on the calling thread.** Frame pacing, the run's lease (a kept copy with `SetKeptEpochs`), `beforePrepare`,
+    the passes' updates and the preparation, the frame placement freeze, the retirement of the graph's completed executions
+    (it changes graph state the owner thread reads: transient resources by name, retired pins), and the extensions'
+    `AfterExecute` (`RenderGraph::TakePersistentExecution`, `RunPersistentAfterExecute`). `GetLastSubmittedFrameData` and
+    `GetLastExecutedPreparationSlot` are set there too.
+-   **What the thread does.** The uploads, the admission, the recording of stale batches and of passes recorded at execution,
+    the queue submission and the commit (`RenderGraph::ExecuteTakenPersistentFrame`). Then the run's points, the descriptor
+    retirement of the caller's `resourceOwner`, and the kept run's statistics (`TakeKeptStats`). Entries finish in push
+    order, so same-queue order follows the calling thread's order.
+-   **One execution of an epoch at a time.** `ExecuteFrame(epoch)` waits until the epoch's previous execution has passed the
+    thread before its `beforePrepare`. So a pass's `Update` may write what its own `Record` at execution reads, and the graph's
+    preparation never runs while the thread still executes that graph. Normally the previous execution passed long ago (a frame
+    later), and the wait costs nothing. When the thread lags, it is the backpressure. State that one epoch's `Record` reads and
+    the calling thread writes for another epoch, or outside the graphs, is the caller's to keep safe.
+-   **Queued leases.** A run's lease is queued until the thread passes its execution: it has no points yet, and
+    `RetireReachedLeases` skips it. Frame pacing and a kept copy that need its points wait for the thread first, which never
+    waits for the calling thread, so the wait ends. A graph's first run after a staging by run (`RecordStagedCopies` with
+    runs) counts a queued copy as not free, so it does not start its copies at copy 0 while one of them is still queued.
+-   **Deferred deletions.** An `AssignmentScope` opens before `beforePrepare` and closes once the thread has published the
+    execution's queue values. Deletions and descriptor releases made meanwhile (by the caller's commit, the passes' updates,
+    the preparation) wait for a frontier that covers the execution.
+-   **Graphs replaced while an execution is queued.** The replaced graph's frame production stops behind its queued execution,
+    on the thread, and the graph is retired by the point taken after that (`SubmittedPoint`, with its pending part). It is
+    released once that point is passed and reached. `DestroyGraph` drains the thread first. `SetKeptEpochs` waits for an epoch
+    that stops keeping.
+-   **Failures.** An execution that throws on the thread fails its epoch. The thread logs it and goes on with the other
+    epochs. The epoch's next `ExecuteFrame` throws `EpochFailedError` (and reports it, `PollEpochFailures`), a frame later than
+    without the thread. A rebuild recovers, as for any failed epoch.
+-   **What the caller must do.**
+    -   Drain the thread (`DrainSubmissions`) before anything that must reach the GPU after the epochs submitted so far: a
+        device or queue wait, a present, another queue user's submission. `SubmittedPoint` and, with `Desc::queuedSeals`,
+        `SealedPoint` have a pending part until the thread passes them.
+    -   Keep the execution's host data alive until the thread passes it. `UpdateExecutionContext::ownedHostData` is kept by
+        the execution; a bare `hostData` pointer must outlive it.
+    -   The extensions' `AfterExecute` runs after the hand-over. Its external client submissions are queued behind the
+        execution (below). A direct `rhi::Queue::Submit` there is not: drain the thread first.
+    -   `GetLastPresentDependency`, `LastPersistentExecuteTimings` and `LastKeptRun` are written by the thread. Read the
+        thread's reports instead (`TakeSubmittedExecutions`). `LastFrameTimings` then covers the calling thread only.
+    -   State that an epoch's passes read when they record at execution, and that the caller changes outside that epoch's
+        `ExecuteFrame`, waits for the epoch first: `WaitForEpochExecution(epoch, why)` waits until the epoch's last execution
+        has gone through the thread. BR's CLod ray tracing system advances its frame count this way.
+-   **Admission retirement.** An execution holds the runtime's sequencer from its admission to its commit. The owner thread's
+    retirement (`RetirePersistentExecutions`) skips the admission's part while the sequencer is held, and with the thread busy
+    it would fall behind until the admission runs out of frames ("Synchronous frame capacity exhausted"). So each execution also
+    retires its graph's completed admissions when it takes the sequencer (`SubmitPersistentSegment`).
+-   **Graphs replaced at an attach.** The replaced graph's `StopFrameProduction` runs on the thread (it waits for the graph's
+    build scope); its time is logged ("stopped its frame production on the submission thread in").
+-   **Statistics.** `SubmitThreadStats` counts the executions, the failed ones, the calling thread's waits for queued
+    executions by reason (`epochWaits`, `epochWaitsByReason`), and the external client submissions queued behind the thread
+    (`externalQueued`). The statistics manager's query state is shared by the thread
+    that records and submits and the one that retires runs, so it is under a lock (`StatisticsManager::m_queryMutex`).
+    Pass registration (`RegisterPass`, on build threads) takes it too, and a recording looks its passes' indices up in a
+    table taken once (`IStatisticsService::PassIndices`) instead of reading `GetPassNames` while passes register. The host's
+    owners of failed or uncertain submissions are under a lock of their own (`m_uncertainOwnersMutex`): the thread adds to
+    them.
+-   Test: `PersistentVulkanHostTests sync-submit` (and `sync-submit inline`): every `sync-reuse` check with the executions on
+    the thread and queued seals; an execution still queued when `ExecuteFrame` returns, and the epoch's next `ExecuteFrame`
+    waiting for it; frames back to back; a graph staged by run attached while the old graph's last run is still queued on copy
+    0 (the new graph's first run takes copy 1); and a pass that fails to record on the thread. `placement sync-submit` and
+    `shared-rebuild sync-submit` run those scenarios on the thread, the second also attaching each set while a frame of both
+    epochs is queued.
+
+### External client submissions behind the submission thread
+
+With `Desc::executeOnSubmissionThread`, every graph's external client (`RenderGraph::GetExternalClient`) gets the host's router
+(`ExternalSubmitRouter`, `ExternalClient::Desc::router`). An `ExternalClient::Submit` made off the thread while the thread still
+has entries queued (or while the calling thread holds entries back, `HoldSubmissions`) is split:
+
+-   `Record` runs at once, on the calling thread: the caller's commands, the publication built from the accesses, the backings
+    current then. The caller's by-reference captures are only valid during the call, so this part cannot wait.
+-   `SubmitRecorded` (admission, barriers, queue submission, commit) is queued on the thread behind what is queued, as a
+    closure. So the submission follows every execution queued before it, as it would without the thread. Its admission starts
+    from the states those executions leave.
+
+A submission made on the thread itself (a pass that submits through the client while it records there), or with nothing
+queued, is made at once, as without a router: everything the thread was given is on the queues by then.
+
+-   **The returned signal.** A queued submission has no value on its slot's timeline yet. `Submit` returns a value reserved at
+    once on a timeline of the client's for queued submissions (one per slot), which the queued submission also signals.
+    Values are reserved and pushed under one lock, and the thread submits in push order, so each such timeline rises in
+    submission order. Waiting on the signal before the thread gets there just waits longer. A value on the slot's own
+    timeline would not work: a submission made on the thread meanwhile would take the next value and reach the queue first.
+-   **Failures.** A queued submission that fails on the thread cannot throw to its caller, who has returned. It is logged, and
+    its reserved value and the caller's `signals` are signalled on the queue without the work, so no wait on them hangs. Before
+    that, the failure is reported in two ways:
+    -   the returned `Signal`'s `failed` flag is set (`Signal::Failed()`). A caller that keeps the signal checks it once the value
+        is reached, and drops or retries the work instead of reading its results;
+    -   `Submit`'s `onQueuedFailure` callback is called, on the submission thread. A caller that retries a submission that throws
+        does the same there (under its own lock).
+
+    `FailedQueuedSubmissions()` counts them. `Record`'s own errors (a resource without a backing) still throw from `Submit`.
+-   **Order with the body.** The body is recorded before the work it follows is admitted. That was always the contract
+    (`Record`: "it must not depend on the state a resource is in beforehand"). Queueing only widens the gap.
+-   **Lifetime.** A client waits for its queued submissions in its destructor (not on the thread, where it would wait for its
+    own queue). A graph replaced while its client has queued submissions is retired by a point taken after them, so its client
+    is destroyed only after they passed.
+-   **The host's end.** The router closes when the thread stops. Later submissions are made on their calling threads.
+-   **What is not covered.** Direct queue submissions (`rhi::Queue::Submit` on a queue the host submits to) and device waits
+    are not routed: drain the thread first (`DrainSubmissions`), or put them in a closure (`EnqueueOnSubmitThread`).
+-   Test: `PersistentVulkanHostTests sync-submit` step 5: a copy of the epoch's output made with nothing queued is not queued; one
+    made while the epoch's execution is held in the queue is queued, has not run while the thread is held, and copies what
+    that execution wrote once the thread goes on (with the router bypassed it copies the frame before); two in a row take
+    rising values on the slot's queued timeline; one made in a closure on the thread is made there.
+
+### Kept recordings' timestamps from shared pools
+
+A kept recording's own timestamp queries (`IStatisticsService::CreateOwnedTimestamps`) are a slice of a shared timestamp pool
+and readback buffer (`StatisticsManager::TimestampBlock`, 32768 queries each, by queue kind), not a pool of their own. Making
+a pool and buffer cost about 0.15-0.5 ms, once per recorded batch; a block is made once. A slice is given back when its
+recording goes (once its submissions are complete), and is used again only once 8 frames began since (`kRecycleFrames`). A
+recording's queries are `first` .. `first + 2 * capacity - 1` of `poolHandle`; they resolve into `readbackBuffer` at
+`first * stride`. Test: `sync-submit` step 6 (slices do not overlap, a released slice waits its frames and is used again from
+the same pool, and recording timestamps read back).
+
 ## Live and published recordings
 
 With `Desc::reuseRecordings` (`RenderGraph::SetPersistentRecordingReuse`), tickets record replayable recordings: a segment
@@ -852,5 +972,7 @@ keeps a shard of its own, and Begin resets the whole allocator.
     -   `staged-placement` (staged sets placed at their build, kept versions, a dropped set, a set of every epoch with the
         summaries first or not, the trim prepared on a worker or not) and `shared-rebuild` (sets of two
         epochs for new objects of new sizes, a transient shared by both, with the frame placement off and on);
+    -   `sync-submit`, `sync-submit inline`, `placement sync-submit` and `shared-rebuild sync-submit`: synchronous executions on the
+        submission thread (above);
     -   `leases` and `leases open` (an epoch that runs many times a frame, each run with a lease of its own, and the frame
         arena's regions), and `leases-wide` (260 runs a frame, so lease indices pass 255, with replayable recordings).

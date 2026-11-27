@@ -70,11 +70,19 @@ public:
 	void MergePendingResolves(rhi::QueueKind queueKind, unsigned frameIndex, QueryRecordingContext& ctx);
 	void PublishAtCompletion(unsigned frameIndex, std::function<void()> publish);
 
-	// Kept recordings' own queries (IStatisticsService::CreateOwnedTimestamps).
+	// Kept recordings' own queries (IStatisticsService::CreateOwnedTimestamps): a slice of a shared pool and readback buffer.
 	std::shared_ptr<OwnedTimestampQueries> CreateOwnedTimestamps(rhi::QueueKind queueKind, uint32_t ranges);
-	// A released kept recording's pool and readback buffer (~OwnedTimestampQueries), for CreateOwnedTimestamps to use again.
-	// False when they were not taken: the caller deletes them.
-	bool RecycleOwnedTimestamps(rhi::QueryPoolPtr& pool, rhi::ResourcePtr& readback, rhi::QueueKind queueKind, uint32_t queries, uint64_t stride);
+	// The shared pools the slices come from (TimestampBlock), for tests and diagnostics.
+	struct OwnedTimestampPoolStats {
+		uint32_t blocks = 0;
+		uint64_t queries = 0;      // in all blocks
+		uint64_t sliced = 0;       // queries in slices held now
+		uint64_t blocksMade = 0;   // since the start
+		uint64_t slicesMade = 0;
+	};
+	OwnedTimestampPoolStats GetOwnedTimestampPoolStats();
+	// The pass names and their indices now (IStatisticsService::PassIndices). Made again after a pass registers.
+	std::shared_ptr<const org::runtime::PassIndexTable> PassIndices();
 	void BeginRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	void EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	void BeginListRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
@@ -104,22 +112,20 @@ private:
 	StatisticsManager() = default;
 	~StatisticsManager();
 
-	// Released kept recordings' pools and readback buffers (RecycleOwnedTimestamps). Making them cost about 0.15-0.35 ms each,
-	// and a Visibility recording makes one per batch: 4-10 ms per re-recorded Visibility before this (M6 step 9b). One is used
-	// again only once kRecycleFrames frames began since its release, which is past any frame that could still run it.
-	struct RecycledTimestamps {
-		rhi::QueryPoolPtr pool;
-		rhi::ResourcePtr readback;
-		rhi::QueueKind queueKind = rhi::QueueKind::Graphics;
-		uint32_t queries = 0;
-		uint64_t stride = 0;
-		uint64_t releasedFrame = 0;
-	};
+	// Kept recordings' queries come from shared blocks: one timestamp pool and readback buffer each, sliced per recording.
+	// A pool and buffer of their own cost about 0.15-0.5 ms to make, and a Visibility recording takes one per batch (4-10 ms
+	// per re-recorded Visibility, about 50 ms of a session's first resize staging). A block is made once and sliced from
+	// then on. A released slice is used again only once kRecycleFrames frames began since its release, which is past any
+	// frame that could still run it. Under m_blockMutex.
+	struct TimestampBlock;
+	struct TimestampSlice;
 	static constexpr uint64_t kRecycleFrames = 8;
-	static constexpr size_t kRecycleMost = 512;
-	std::mutex m_recycleMutex;
-	std::vector<RecycledTimestamps> m_recycledTimestamps;
-	std::atomic<uint64_t> m_recycleFrame{0};  // m_frameSerial, for threads other than the frame's
+	static constexpr uint32_t kBlockQueries = 32768;
+	std::mutex m_blockMutex;
+	std::vector<std::shared_ptr<TimestampBlock>> m_timestampBlocks;
+	uint64_t m_blocksMade = 0, m_slicesMade = 0;
+	// The pass index table (PassIndices), under m_queryMutex; null after a pass registers.
+	std::shared_ptr<const org::runtime::PassIndexTable> m_passIndexTable;
 
 	void EnsureQueueBuffers(rhi::QueueKind queueKind);
 	bool BeginOwnedRange(OwnedTimestampQueries& owned, std::string_view name, int passIndex, org::runtime::TimestampRangeKind kind, rhi::CommandList& cmd);
@@ -132,6 +138,9 @@ private:
 	bool m_collectPipelineStatistics = false;
 	std::function<bool()> m_getCollectPipelineStatistics;
 	std::mutex m_cpuStatsMutex;
+	// The query pools, readback buffers and pending resolves: recording, submission (MergePendingResolves) and completion
+	// (OnFrameComplete) may run on different threads.
+	std::recursive_mutex m_queryMutex;
 
 	// The shared pools and readback buffers of one query heap size. Every list that writes or resolves them holds the
 	// current one (QueryRecordingContext::sharedQueries). SetupQueryHeap moves the objects it replaces into it, and it

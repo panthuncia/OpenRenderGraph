@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <rhi_helpers.h>
 #include <spdlog/spdlog.h>
+#include <BasicTelemetry/Tracy.h>
 
 #include "Managers/Singletons/DeviceManager.h"
 #include "Managers/Singletons/DeletionManager.h"
@@ -15,9 +17,77 @@
 namespace org {
 
 namespace {
-// False once the manager is gone: a recording released after it deletes its queries itself.
-std::atomic<bool> g_statisticsManagerAlive{true};
+// The frame serial, for the threads that release slices (StatisticsManager::TimestampSlice). It outlives the manager.
+std::atomic<uint64_t> g_recycleFrame{0};
 }
+
+// A shared timestamp pool and its readback buffer, sliced per kept recording (CreateOwnedTimestamps). The free ranges are its
+// own, under its mutex: a slice may be released on any thread, after the manager is gone too.
+struct StatisticsManager::TimestampBlock {
+    rhi::QueryPoolPtr pool;
+    rhi::ResourcePtr readback;
+    rhi::QueueKind queueKind = rhi::QueueKind::Graphics;
+    uint32_t queries = 0;
+    uint64_t stride = 0;
+    struct Range {
+        uint32_t first = 0, count = 0;
+        uint64_t released = 0;  // the frame serial at its release; 0: ready
+    };
+    std::mutex mutex;
+    std::vector<Range> free;  // by first query
+    uint64_t sliced = 0;      // queries in slices held now
+
+    ~TimestampBlock() {
+        // The last slice is released once its recording's submissions are complete. Deferred deletion still waits past what
+        // ORG's queues were given meanwhile.
+        auto& deletion = org::DeletionManager::GetInstance();
+        if (pool) deletion.MarkForDelete(std::move(pool));
+        if (readback) deletion.MarkForDelete(std::move(readback));
+    }
+    // A free range of `count` queries, released at least kRecycleFrames frames before `frame`. Ripe ranges merge with their
+    // ready neighbours first.
+    bool Take(uint32_t count, uint64_t frame, uint32_t& first) {
+        std::lock_guard lock(mutex);
+        for (auto& range : free)
+            if (range.released && frame >= range.released + kRecycleFrames) range.released = 0;
+        for (size_t i = 0; i + 1 < free.size();) {
+            auto& range = free[i];
+            const auto& next = free[i + 1];
+            if (!range.released && !next.released && range.first + range.count == next.first) {
+                range.count += next.count;
+                free.erase(free.begin() + static_cast<std::ptrdiff_t>(i + 1));
+            } else {
+                ++i;
+            }
+        }
+        for (size_t i = 0; i < free.size(); ++i) {
+            auto& range = free[i];
+            if (range.released || range.count < count) continue;
+            first = range.first;
+            range.first += count;
+            range.count -= count;
+            if (!range.count) free.erase(free.begin() + static_cast<std::ptrdiff_t>(i));
+            sliced += count;
+            return true;
+        }
+        return false;
+    }
+    void Give(uint32_t first, uint32_t count, uint64_t frame) {
+        std::lock_guard lock(mutex);
+        const auto at = std::lower_bound(free.begin(), free.end(), first, [](const Range& range, uint32_t value) { return range.first < value; });
+        free.insert(at, Range{first, count, (std::max)(frame, uint64_t{1})});
+        sliced -= (std::min)(sliced, uint64_t{count});
+    }
+};
+
+// One recording's queries in a block: given back when the recording goes.
+struct StatisticsManager::TimestampSlice {
+    std::shared_ptr<TimestampBlock> block;
+    uint32_t first = 0, count = 0;
+    ~TimestampSlice() {
+        if (block) block->Give(first, count, g_recycleFrame.load(std::memory_order_acquire));
+    }
+};
 
 StatisticsManager& StatisticsManager::GetInstance() {
     static StatisticsManager inst;
@@ -25,23 +95,34 @@ StatisticsManager& StatisticsManager::GetInstance() {
 }
 
 StatisticsManager::~StatisticsManager() {
-    g_statisticsManagerAlive.store(false, std::memory_order_release);
-    std::lock_guard lock(m_recycleMutex);
-    auto& deletion = org::DeletionManager::GetInstance();
-    for (auto& recycled : m_recycledTimestamps) {
-        if (recycled.pool) deletion.MarkForDelete(std::move(recycled.pool));
-        if (recycled.readback) deletion.MarkForDelete(std::move(recycled.readback));
-    }
-    m_recycledTimestamps.clear();
+    // Blocks still sliced go once their last slice does.
+    std::lock_guard lock(m_blockMutex);
+    m_timestampBlocks.clear();
 }
 
-bool StatisticsManager::RecycleOwnedTimestamps(rhi::QueryPoolPtr& pool, rhi::ResourcePtr& readback, rhi::QueueKind queueKind, uint32_t queries,
-    uint64_t stride) {
-    if (!pool || !readback || !queries || !stride) return false;
-    std::lock_guard lock(m_recycleMutex);
-    if (m_recycledTimestamps.size() >= kRecycleMost) return false;
-    m_recycledTimestamps.push_back({std::move(pool), std::move(readback), queueKind, queries, stride, m_recycleFrame.load(std::memory_order_acquire)});
-    return true;
+StatisticsManager::OwnedTimestampPoolStats StatisticsManager::GetOwnedTimestampPoolStats() {
+    std::lock_guard lock(m_blockMutex);
+    OwnedTimestampPoolStats stats;
+    stats.blocks = static_cast<uint32_t>(m_timestampBlocks.size());
+    for (const auto& block : m_timestampBlocks) {
+        stats.queries += block->queries;
+        std::lock_guard blockLock(block->mutex);
+        stats.sliced += block->sliced;
+    }
+    stats.blocksMade = m_blocksMade;
+    stats.slicesMade = m_slicesMade;
+    return stats;
+}
+
+std::shared_ptr<const org::runtime::PassIndexTable> StatisticsManager::PassIndices() {
+    std::scoped_lock queryLock(m_queryMutex);
+    if (!m_passIndexTable) {
+        auto table = std::make_shared<org::runtime::PassIndexTable>();
+        table->names = m_passNames;
+        for (unsigned i = 0; i < table->names.size(); ++i) table->indices.emplace(table->names[i], i);
+        m_passIndexTable = std::move(table);
+    }
+    return m_passIndexTable;
 }
 
 StatisticsManager::SharedQueryObjects::~SharedQueryObjects() {
@@ -114,6 +195,9 @@ void StatisticsManager::Initialize() {
 }
 
 void StatisticsManager::RegisterPasses(const std::vector<std::string>& passNames) {
+    // Recordings on other threads read the names (BeginQuery, PassIndices) and the CPU samples the stats.
+    std::scoped_lock locks(m_queryMutex, m_cpuStatsMutex);
+    m_passIndexTable.reset();
     m_passNames = passNames;
     m_numPasses = static_cast<unsigned>(passNames.size());
     m_passTechniquePaths.assign(m_numPasses, {});
@@ -130,6 +214,9 @@ void StatisticsManager::RegisterPasses(const std::vector<std::string>& passNames
 }
 
 unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeometryPass, std::string_view techniquePath) {
+    // Builds register their passes on build threads, while recordings on other threads read the names (BeginQuery,
+    // PassIndices) and the CPU samples the stats.
+    std::scoped_lock locks(m_queryMutex, m_cpuStatsMutex);
     if (!passName.empty()) {
         auto it = m_passNameToIndex.find(passName);
         if (it != m_passNameToIndex.end()) {
@@ -159,6 +246,7 @@ unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeo
     }
 
     const unsigned index = static_cast<unsigned>(m_passNames.size());
+    m_passIndexTable.reset();
     m_passNames.push_back(resolvedName);
     m_passNameToIndex[resolvedName] = index;
 
@@ -173,7 +261,7 @@ unsigned StatisticsManager::RegisterPass(const std::string& passName, bool isGeo
 
 void StatisticsManager::BeginFrame() {
     ++m_frameSerial;
-    m_recycleFrame.store(m_frameSerial, std::memory_order_release);
+    g_recycleFrame.store(m_frameSerial, std::memory_order_release);
 
     org::runtime::MemoryBudgetStats memoryBudgetStats{};
     memoryBudgetStats.sampleFrameSerial = m_frameSerial;
@@ -275,6 +363,9 @@ void StatisticsManager::MarkGeometryPass(const std::string& passName) {
 }
 
 void StatisticsManager::RegisterQueue(rhi::QueueKind queueKind) {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     m_timestampBuffers[queueKind];
     m_meshStatsBuffers[queueKind];
     m_recordedQueries[queueKind];
@@ -305,6 +396,9 @@ void StatisticsManager::EnsureQueueBuffers(rhi::QueueKind queueKind) {
 }
 
 void StatisticsManager::EnsureFrameCapacity(unsigned frames) {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     if (frames <= m_numFramesInFlight) return;
     // Doubled, so a host whose runs in flight climb makes a few pools, not one per run.
     unsigned grown = (std::max)(m_numFramesInFlight, 1u);
@@ -319,6 +413,9 @@ void StatisticsManager::EnsureFrameCapacity(unsigned frames) {
 }
 
 void StatisticsManager::SetupQueryHeap() {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     auto device = DeviceManager::GetInstance().GetDevice();
     if (!m_collectPassStatistics) {
         return;
@@ -403,6 +500,9 @@ void StatisticsManager::BeginQuery(
     rhi::Queue& queue,
     rhi::CommandList& cmd)
 {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     if (!m_collectPassStatistics) return;
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
@@ -432,6 +532,9 @@ void StatisticsManager::EndQuery(
     rhi::Queue& queue,
     rhi::CommandList& cmd)
 {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     if (!m_collectPassStatistics) return;
     if (!m_timestampPool || passIndex >= m_numPasses || passIndex >= m_queryPoolPassCapacity) return;
 
@@ -459,6 +562,9 @@ void StatisticsManager::ResolveQueries(
     rhi::Queue& queue,
     rhi::CommandList& cmd)
 {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     if (!m_collectPassStatistics) return;
     if (!m_timestampPool || m_timestampQueryInfo.elementSize == 0) return;
 
@@ -540,6 +646,9 @@ void StatisticsManager::BeginQuery(
     rhi::CommandList& cmd,
     QueryRecordingContext& ctx)
 {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     if (!m_collectPassStatistics) return;
     if (ctx.owned) {
         if (passIndex < m_passNames.size())
@@ -573,6 +682,9 @@ void StatisticsManager::EndQuery(
     rhi::CommandList& cmd,
     QueryRecordingContext& ctx)
 {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     if (!m_collectPassStatistics) return;
     if (ctx.owned) {
         EndOwnedRange(*ctx.owned, cmd);
@@ -603,13 +715,17 @@ void StatisticsManager::ResolveQueries(
     rhi::CommandList& cmd,
     QueryRecordingContext& ctx)
 {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     if (!m_collectPassStatistics) return;
     if (ctx.owned) {
         // Resolve every range the list recorded into the recording's own buffer. Each submission resolves them again.
         auto& owned = *ctx.owned;
         EndOwnedRange(owned, cmd, true);
         if (!owned.resolved && !owned.entries.empty())
-            cmd.ResolveQueryData(owned.pool->GetHandle(), 0, static_cast<uint32_t>(owned.entries.size() * 2u), owned.readback->GetHandle(), 0);
+            cmd.ResolveQueryData(owned.poolHandle, owned.first, static_cast<uint32_t>(owned.entries.size() * 2u), owned.readbackBuffer.GetHandle(),
+                owned.stride * owned.first);
         owned.resolved = true;
         return;
     }
@@ -682,6 +798,9 @@ void StatisticsManager::MergePendingResolves(
     unsigned frameIndex,
     QueryRecordingContext& ctx)
 {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     if (ctx.owned) {
         // This is a submission of a kept recording. The completion of its frame slot reads what this submission
         // wrote. The recording is never cleared from the context. Each slot's pending list has a size limit, in case
@@ -704,6 +823,9 @@ void StatisticsManager::MergePendingResolves(
 }
 
 void StatisticsManager::PublishAtCompletion(unsigned frameIndex, std::function<void()> publish) {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     auto& pending = m_publishAtCompletion[frameIndex];
     if (publish && pending.size() < 256) pending.push_back(std::move(publish));
 }
@@ -712,6 +834,9 @@ void StatisticsManager::OnFrameComplete(
     unsigned frameIndex,
     rhi::Queue& queue)
 {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     // Some of the slot's recordings were made after their submission, for late batches. They merge their queries
     // first, before the slot's queries are read.
     if (const auto found = m_publishAtCompletion.find(frameIndex); found != m_publishAtCompletion.end()) {
@@ -860,43 +985,57 @@ void StatisticsManager::OnFrameComplete(
 std::shared_ptr<OwnedTimestampQueries> StatisticsManager::CreateOwnedTimestamps(rhi::QueueKind queueKind, uint32_t ranges) {
     if (!m_collectPassStatistics || ranges == 0) return nullptr;
     auto device = DeviceManager::GetInstance().GetDevice();
-    auto owned = std::make_shared<OwnedTimestampQueries>();
-    rhi::QueryPoolDesc desc;
-    desc.type = rhi::QueryType::Timestamp;
-    desc.count = ranges * 2u;
+    const uint32_t count = ranges * 2u;
+    const uint64_t frame = g_recycleFrame.load(std::memory_order_acquire);
+    auto slice = std::make_shared<TimestampSlice>();
+    slice->count = count;
     {
-        // A released one of the same queue and size, from long enough ago (RecycledTimestamps).
-        std::lock_guard lock(m_recycleMutex);
-        const uint64_t frame = m_recycleFrame.load(std::memory_order_acquire);
-        const auto found = std::find_if(m_recycledTimestamps.begin(), m_recycledTimestamps.end(), [&](const RecycledTimestamps& recycled) {
-            return recycled.queueKind == queueKind && recycled.queries == desc.count && frame >= recycled.releasedFrame + kRecycleFrames;
-        });
-        if (found != m_recycledTimestamps.end()) {
-            owned->pool = std::move(found->pool);
-            owned->readback = std::move(found->readback);
-            owned->stride = found->stride;
-            m_recycledTimestamps.erase(found);
+        // A slice of a block of the queue's (TimestampBlock), or of a new block when none has room.
+        std::lock_guard lock(m_blockMutex);
+        for (const auto& block : m_timestampBlocks)
+            if (block->queueKind == queueKind && block->Take(count, frame, slice->first)) {
+                slice->block = block;
+                break;
+            }
+        if (!slice->block) {
+            BT_ZONE_SCOPE("ORG.Statistics.MakeTimestampBlock");
+            const auto start = std::chrono::steady_clock::now();
+            auto block = std::make_shared<TimestampBlock>();
+            block->queueKind = queueKind;
+            block->queries = (std::max)(kBlockQueries, count);
+            rhi::QueryPoolDesc desc;
+            desc.type = rhi::QueryType::Timestamp;
+            desc.count = block->queries;
+            if (device.CreateQueryPool(desc, block->pool) != rhi::Result::Ok || !block->pool) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true))
+                    spdlog::warn("StatisticsManager: could not create a timestamp pool of {} queries for kept recordings; their passes are not timed",
+                        block->queries);
+                return nullptr;
+            }
+            block->stride = block->pool->GetQueryResultInfo().elementSize;
+            const auto readback = rhi::helpers::ResourceDesc::Buffer(block->stride * block->queries, rhi::HeapType::Readback);
+            if (block->stride == 0 || device.CreateCommittedResource(readback, block->readback) != rhi::Result::Ok || !block->readback)
+                return nullptr;
+            block->readback->SetName("ORG.Statistics.KeptTimestamps");
+            block->free.push_back({0, block->queries, 0});
+            if (!block->Take(count, frame, slice->first)) return nullptr;
+            slice->block = block;
+            m_timestampBlocks.push_back(std::move(block));
+            ++m_blocksMade;
+            spdlog::info("StatisticsManager: timestamp pool {} for kept recordings made ({} queries, {:.2f} ms; {} slices so far)", m_blocksMade,
+                m_timestampBlocks.back()->queries, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+                m_slicesMade + 1);
         }
+        ++m_slicesMade;
     }
-    if (owned->pool) {
-        owned->ticksToMilliseconds = GetGpuTicksToMilliseconds();
-        if (const auto ticksPerSecond = DeviceManager::GetInstance().GetDevice().GetTimestampCalibration(queueKind).ticksPerSecond)
-            owned->ticksToMilliseconds = 1000.0 / double(ticksPerSecond);
-        owned->queueKind = queueKind;
-        owned->capacity = ranges;
-        owned->entries.reserve(ranges);
-        return owned;
-    }
-    if (device.CreateQueryPool(desc, owned->pool) != rhi::Result::Ok || !owned->pool) {
-        static std::atomic<bool> warned{false};
-        if (!warned.exchange(true))
-            spdlog::warn("StatisticsManager: could not create a kept recording's timestamp pool ({} ranges); its passes are not timed", ranges);
-        return nullptr;
-    }
-    owned->stride = owned->pool->GetQueryResultInfo().elementSize;
-    const auto readback = rhi::helpers::ResourceDesc::Buffer(owned->stride * desc.count, rhi::HeapType::Readback);
-    if (owned->stride == 0 || device.CreateCommittedResource(readback, owned->readback) != rhi::Result::Ok || !owned->readback)
-        return nullptr;
+    auto owned = std::make_shared<OwnedTimestampQueries>();
+    const auto& block = *slice->block;
+    owned->poolHandle = block.pool->GetHandle();
+    owned->readbackBuffer = block.readback.Get();
+    owned->first = slice->first;
+    owned->stride = block.stride;
+    owned->slice = std::move(slice);
     const auto ticksPerSecond = device.GetTimestampCalibration(queueKind).ticksPerSecond;
     owned->ticksToMilliseconds = ticksPerSecond ? 1000.0 / double(ticksPerSecond) : GetGpuTicksToMilliseconds();
     owned->queueKind = queueKind;
@@ -917,12 +1056,12 @@ bool StatisticsManager::BeginOwnedRange(OwnedTimestampQueries& owned, std::strin
         return false;
     }
     // The list's first range resets all the queries. That gives one reset per submission, outside any render pass.
-    if (owned.entries.empty()) cmd.ResetQueries(owned.pool->GetHandle(), 0, owned.capacity * 2u);
+    if (owned.entries.empty()) cmd.ResetQueries(owned.poolHandle, owned.first, owned.capacity * 2u);
     uint32_t occurrence = 0;
     for (const auto& entry : owned.entries) occurrence += entry.name == name;
     owned.entries.push_back({std::string(name), passIndex, kind, occurrence});
     const auto index = static_cast<uint32_t>(owned.entries.size() - 1);
-    cmd.WriteTimestamp(owned.pool->GetHandle(), index * 2u, rhi::Stage::Top);
+    cmd.WriteTimestamp(owned.poolHandle, owned.first + index * 2u, rhi::Stage::Top);
     owned.open.push_back(static_cast<int>(index));
     return true;
 }
@@ -945,7 +1084,7 @@ void StatisticsManager::EndOwnedRange(OwnedTimestampQueries& owned, rhi::Command
             rhi::ResourceAccessType::IndirectArgument };
         cmd.Barriers(rhi::BarrierBatch{ {}, {}, { &wait, 1u } });
     }
-    cmd.WriteTimestamp(owned.pool->GetHandle(), static_cast<uint32_t>(owned.open.back()) * 2u + 1u, rhi::Stage::Bottom);
+    cmd.WriteTimestamp(owned.poolHandle, owned.first + static_cast<uint32_t>(owned.open.back()) * 2u + 1u, rhi::Stage::Bottom);
     owned.open.pop_back();
 }
 
@@ -976,7 +1115,8 @@ void StatisticsManager::ReadOwnedTimestamps(unsigned frameIndex) {
     for (auto& owned : submitted) {
         const auto queries = static_cast<uint64_t>(owned->entries.size()) * 2u;
         void* mapped = nullptr;
-        owned->readback->Map(&mapped, 0, owned->stride * queries);
+        auto buffer = owned->readbackBuffer;
+        buffer.Map(&mapped, owned->stride * owned->first, owned->stride * queries);
         if (!mapped) continue;
         const auto* base = static_cast<const uint8_t*>(mapped);
         for (size_t i = 0; i < owned->entries.size(); ++i) {
@@ -997,12 +1137,15 @@ void StatisticsManager::ReadOwnedTimestamps(unsigned frameIndex) {
             if (static_cast<size_t>(entry.passIndex) < m_passLastExecutionFrame.size())
                 m_passLastExecutionFrame[entry.passIndex] = m_frameSerial;
         }
-        owned->readback->Unmap(0, 0);
+        buffer.Unmap(0, 0);
         m_completedOwned.push_back(std::move(owned));
     }
 }
 
 void StatisticsManager::ClearAll() {
+    // Shared with the thread that submits (MergePendingResolves) and the one that retires runs (OnFrameComplete), which
+    // are not one thread with a host's submission thread. Recursive: a completion runs publications that merge.
+    std::scoped_lock queryLock(m_queryMutex);
     m_timestampPool.Reset();
     m_pipelineStatsPool.Reset();
     for (auto& kv:m_timestampBuffers) kv.second.Reset();
@@ -1040,11 +1183,10 @@ void StatisticsManager::ClearAll() {
 namespace org::runtime {
 
 OwnedTimestampQueries::~OwnedTimestampQueries() {
-    // A recording is released once its submissions are complete. Its pool and buffer go back to the manager for another
-    // kept recording (StatisticsManager::RecycleOwnedTimestamps), or to deferred deletion, which keeps the destruction off the
-    // thread that drops the recording. The shared pool is handled the same way.
-    if (g_statisticsManagerAlive.load(std::memory_order_acquire)
-        && org::StatisticsManager::GetInstance().RecycleOwnedTimestamps(pool, readback, queueKind, capacity * 2u, stride)) return;
+    // A recording is released once its submissions are complete. Its slice goes back to its block for another kept recording
+    // (StatisticsManager::TimestampSlice). A pool and buffer of its own go to deferred deletion, which keeps the destruction
+    // off the thread that drops the recording.
+    slice.reset();
     auto& deletion = org::DeletionManager::GetInstance();
     if (pool) deletion.MarkForDelete(std::move(pool));
     if (readback) deletion.MarkForDelete(std::move(readback));
