@@ -653,29 +653,43 @@ private:
 };
 
 // Executes an external execution's segments, each in its own submission of a primary of its own (a submission per segment
-// meets every segment's split). The caller waits for the device before executing the next.
+// meets every segment's split). The caller may execute the next before the last completes: a primary is reused only once
+// its last submission has completed (the executor's own timeline, signalled with every segment), else a new one is made.
 struct SegmentExecutor {
+	struct Primary {
+		rhi::CommandAllocatorPtr allocator;
+		rhi::CommandListPtr list;
+		uint64_t submitted = 0; // the executor's timeline value its last submission signals
+	};
 	rhi::Device device;
-	std::vector<std::pair<rhi::CommandAllocatorPtr, rhi::CommandListPtr>> primaries;
+	std::vector<Primary> primaries;
+	rhi::TimelinePtr done;
+	uint64_t doneValue = 0;
 	bool Execute(org::ExternalEpochExecution& a_execution) {
 		auto queue = device.GetQueue(rhi::QueueKind::Graphics);
+		if (!done && device.CreateTimeline(done, 0, "SegmentExecutor") != rhi::Result::Ok) return false;
 		for (size_t index = 0; index < a_execution.segments.size(); ++index) {
-			if (primaries.size() <= index) {
-				auto& [allocator, primary] = primaries.emplace_back();
-				if (device.CreateCommandAllocator(rhi::QueueKind::Graphics, allocator) != rhi::Result::Ok
-					|| device.CreateCommandList(rhi::QueueKind::Graphics, allocator.Get(), primary) != rhi::Result::Ok)
+			const uint64_t completed = done->GetCompletedValue();
+			auto free = std::ranges::find_if(primaries, [&](const Primary& a_primary) { return a_primary.submitted <= completed; });
+			if (free == primaries.end()) {
+				auto& made = primaries.emplace_back();
+				if (device.CreateCommandAllocator(rhi::QueueKind::Graphics, made.allocator) != rhi::Result::Ok
+					|| device.CreateCommandList(rhi::QueueKind::Graphics, made.allocator.Get(), made.list) != rhi::Result::Ok)
 					return false;
-				primary->End();
+				made.list->End();
+				free = std::prev(primaries.end());
 			}
-			auto& [allocator, primary] = primaries[index];
-			allocator->Recycle();
-			primary->Recycle(allocator.Get());
-			a_execution.Execute(index, primary.Get());
-			if (primary->EndChecked() != rhi::Result::Ok) return false;
-			auto list = primary.Get();
+			auto& primary = *free;
+			primary.allocator->Recycle();
+			primary.list->Recycle(primary.allocator.Get());
+			a_execution.Execute(index, primary.list.Get());
+			if (primary.list->EndChecked() != rhi::Result::Ok) return false;
+			auto list = primary.list.Get();
 			const auto& segment = a_execution.segments[index];
 			auto waits = segment.waits;
 			auto signals = segment.signals;
+			primary.submitted = ++doneValue;
+			signals.push_back({done->GetHandle(), primary.submitted});
 			if (queue.Submit({&list, 1}, {{waits.data(), static_cast<uint32_t>(waits.size())},
 					{signals.data(), static_cast<uint32_t>(signals.size())}}) != rhi::Result::Ok)
 				return false;

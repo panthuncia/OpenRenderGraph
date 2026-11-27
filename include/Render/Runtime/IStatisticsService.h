@@ -129,6 +129,17 @@ public:
     }
     virtual const std::vector<std::string>& GetPassTechniquePaths() const = 0;
     virtual const std::vector<PassStats>& GetPassStats() const = 0;
+    // The pass names, technique paths, stats and geometry flags as of one moment. GetPassNames, GetPassStats and the others return
+    // the live vectors, which a pass registered on a build thread reallocates: a reader on another thread takes this copy.
+    struct PassStatsSnapshot {
+        std::vector<std::string> names;
+        std::vector<std::string> techniquePaths;
+        std::vector<PassStats> stats;
+        std::vector<bool> isGeometryPass;
+    };
+    virtual PassStatsSnapshot SnapshotPassStats() const {
+        return { GetPassNames(), GetPassTechniquePaths(), GetPassStats(), GetIsGeometryPassVector() };
+    }
     virtual const std::vector<MeshPipelineStats>& GetMeshStats() const = 0;
     virtual MemoryBudgetStats GetMemoryBudgetStats() const = 0;
     virtual const std::vector<bool>& GetIsGeometryPassVector() const = 0;

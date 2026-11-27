@@ -99,6 +99,10 @@ public:
         return StatisticsManager::GetInstance().GetPassStats();
     }
 
+    PassStatsSnapshot SnapshotPassStats() const override {
+        return StatisticsManager::GetInstance().SnapshotPassStats();
+    }
+
     const std::vector<MeshPipelineStats>& GetMeshStats() const override {
         return StatisticsManager::GetInstance().GetMeshStats();
     }

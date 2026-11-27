@@ -83,6 +83,8 @@ public:
 	OwnedTimestampPoolStats GetOwnedTimestampPoolStats();
 	// The pass names and their indices now (IStatisticsService::PassIndices). Made again after a pass registers.
 	std::shared_ptr<const org::runtime::PassIndexTable> PassIndices();
+	// A copy of the pass names, technique paths, stats and geometry flags, under the registration locks.
+	org::runtime::IStatisticsService::PassStatsSnapshot SnapshotPassStats();
 	void BeginRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	void EndRangeQuery(rhi::CommandList& cmdList, QueryRecordingContext& ctx);
 	void BeginListRangeQuery(std::string_view name, rhi::CommandList& cmdList, QueryRecordingContext& ctx);

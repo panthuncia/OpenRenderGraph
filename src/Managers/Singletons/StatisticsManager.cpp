@@ -125,6 +125,12 @@ std::shared_ptr<const org::runtime::PassIndexTable> StatisticsManager::PassIndic
     return m_passIndexTable;
 }
 
+org::runtime::IStatisticsService::PassStatsSnapshot StatisticsManager::SnapshotPassStats() {
+    // RegisterPass takes both: the GPU samples are written under the query lock, the CPU samples under the stats lock.
+    std::scoped_lock locks(m_queryMutex, m_cpuStatsMutex);
+    return { m_passNames, m_passTechniquePaths, m_stats, m_isGeometryPass };
+}
+
 StatisticsManager::SharedQueryObjects::~SharedQueryObjects() {
     // The last list that named these objects is released, so its submissions are complete. The deletion queue still
     // defers them past what ORG's own queues were given meanwhile.
